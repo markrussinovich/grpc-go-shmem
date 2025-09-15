@@ -18,7 +18,9 @@ package shm_test
 
 import (
 	"bytes"
+	"encoding/binary"
 	"fmt"
+	"sync"
 	"testing"
 
 	"google.golang.org/grpc/internal/transport/shm"
@@ -907,5 +909,418 @@ func TestRing_CacheLinePadding(t *testing.T) {
 	}
 	if !bytes.Equal(buf, testData) {
 		t.Errorf("Read data = %q, want %q", buf, testData)
+	}
+}
+
+func TestRing_WrapAroundIntegrity(t *testing.T) {
+	// Use 64-byte capacity as specified
+	ring, err := shm.NewRing(64)
+	if err != nil {
+		t.Fatalf("NewRing(64) failed: %v", err)
+	}
+
+	// Step 1: Write 48 bytes
+	data1 := make([]byte, 48)
+	for i := range data1 {
+		data1[i] = byte(i)
+	}
+	n, err := ring.Write(data1)
+	if err != nil {
+		t.Fatalf("Write 48 bytes failed: %v", err)
+	}
+	if n != 48 {
+		t.Fatalf("Write 48 bytes = %d, want 48", n)
+	}
+
+	// Step 2: Read 40 bytes
+	buf1 := make([]byte, 40)
+	n, err = ring.Read(buf1)
+	if err != nil {
+		t.Fatalf("Read 40 bytes failed: %v", err)
+	}
+	if n != 40 {
+		t.Fatalf("Read 40 bytes = %d, want 40", n)
+	}
+
+	// Verify first 40 bytes
+	if !bytes.Equal(buf1, data1[:40]) {
+		t.Errorf("First read data mismatch: got %v, want %v", buf1, data1[:40])
+	}
+
+	// At this point: 8 bytes remain in buffer, write pointer at 48, read pointer at 40
+	// Available space: 64 - 8 = 56 bytes
+
+	// Step 3: Write 40 bytes (this forces wrap around)
+	data2 := make([]byte, 40)
+	for i := range data2 {
+		data2[i] = byte(100 + i) // Different pattern to distinguish from data1
+	}
+	n, err = ring.Write(data2)
+	if err != nil {
+		t.Fatalf("Write 40 bytes (wrap) failed: %v", err)
+	}
+	if n != 40 {
+		t.Fatalf("Write 40 bytes (wrap) = %d, want 40", n)
+	}
+
+	// Step 4: Read all remaining data and verify concatenation
+	// Should have: 8 bytes from data1 + 40 bytes from data2 = 48 bytes total
+	remainingBuf := make([]byte, 48)
+	n, err = ring.Read(remainingBuf)
+	if err != nil {
+		t.Fatalf("Read remaining failed: %v", err)
+	}
+	if n != 48 {
+		t.Fatalf("Read remaining = %d, want 48", n)
+	}
+
+	// Verify concatenation: first 8 bytes should be remainder of data1,
+	// next 40 bytes should be data2
+	expectedConcatenation := make([]byte, 0, 48)
+	expectedConcatenation = append(expectedConcatenation, data1[40:]...) // Last 8 bytes of data1
+	expectedConcatenation = append(expectedConcatenation, data2...)      // All 40 bytes of data2
+
+	if !bytes.Equal(remainingBuf, expectedConcatenation) {
+		t.Errorf("Concatenation mismatch")
+		t.Errorf("Got:      %v", remainingBuf)
+		t.Errorf("Expected: %v", expectedConcatenation)
+	}
+
+	// Verify ring is now empty
+	if ring.AvailableRead() != 0 {
+		t.Errorf("Ring should be empty, but has %d bytes available", ring.AvailableRead())
+	}
+}
+
+func TestRing_PartialProgress(t *testing.T) {
+	// Use small ring to easily test partial writes
+	ring, err := shm.NewRing(16)
+	if err != nil {
+		t.Fatalf("NewRing(16) failed: %v", err)
+	}
+
+	// Step 1: Fill almost full (14 out of 16 bytes)
+	fillData := make([]byte, 14)
+	for i := range fillData {
+		fillData[i] = byte(i)
+	}
+	n, err := ring.Write(fillData)
+	if err != nil {
+		t.Fatalf("Fill write failed: %v", err)
+	}
+	if n != 14 {
+		t.Fatalf("Fill write = %d, want 14", n)
+	}
+
+	// Verify available space
+	if ring.AvailableWrite() != 2 {
+		t.Errorf("Available write space = %d, want 2", ring.AvailableWrite())
+	}
+
+	// Step 2: Attempt to write more than available space
+	bigData := []byte{100, 101, 102, 103, 104} // 5 bytes, but only 2 available
+	n, err = ring.Write(bigData)
+	if err != nil {
+		t.Errorf("Partial write should not return error, got: %v", err)
+	}
+	if n != 2 {
+		t.Errorf("Partial write = %d, want 2 bytes (short write)", n)
+	}
+
+	// Verify ring is now full
+	if ring.AvailableWrite() != 0 {
+		t.Errorf("Ring should be full, available write = %d", ring.AvailableWrite())
+	}
+
+	// Step 3: Free some space by reading
+	readBuf := make([]byte, 5)
+	n, err = ring.Read(readBuf)
+	if err != nil {
+		t.Fatalf("Read to free space failed: %v", err)
+	}
+	if n != 5 {
+		t.Fatalf("Read to free space = %d, want 5", n)
+	}
+
+	// Verify we have space again
+	if ring.AvailableWrite() != 5 {
+		t.Errorf("Available write after read = %d, want 5", ring.AvailableWrite())
+	}
+
+	// Step 4: Write the remaining data
+	remainingData := bigData[2:] // The 3 bytes that didn't fit before
+	n, err = ring.Write(remainingData)
+	if err != nil {
+		t.Fatalf("Write remaining failed: %v", err)
+	}
+	if n != 3 {
+		t.Fatalf("Write remaining = %d, want 3", n)
+	}
+
+	// Step 5: Verify data integrity
+	// Read all remaining data and verify the pattern
+	finalBuf := make([]byte, ring.AvailableRead())
+	n, err = ring.Read(finalBuf)
+	if err != nil {
+		t.Fatalf("Final read failed: %v", err)
+	}
+
+	// Expected: fillData[5:] (bytes 5-13) + first 2 bytes of bigData + remaining 3 bytes
+	expected := make([]byte, 0)
+	expected = append(expected, fillData[5:]...) // Remaining 9 bytes from fillData
+	expected = append(expected, bigData[:2]...)  // First 2 bytes that fit
+	expected = append(expected, bigData[2:]...)  // Remaining 3 bytes
+
+	if !bytes.Equal(finalBuf, expected) {
+		t.Errorf("Final data integrity check failed")
+		t.Errorf("Got:      %v", finalBuf)
+		t.Errorf("Expected: %v", expected)
+	}
+}
+
+func TestRing_Concurrent_NoLossNoDup(t *testing.T) {
+	const (
+		recordSize = 8      // 8-byte little-endian counter
+		numRecords = 100000 // 100k records as specified
+		ringCap    = 4096   // 4KB capacity as specified
+	)
+
+	ring, err := shm.NewRing(ringCap)
+	if err != nil {
+		t.Fatalf("NewRing(%d) failed: %v", ringCap, err)
+	}
+
+	// Channel to signal completion
+	writerDone := make(chan struct{})
+	readerDone := make(chan error, 1)
+
+	// Writer goroutine: generate sequence of 8-byte little-endian counter values
+	go func() {
+		defer close(writerDone)
+
+		for counter := uint64(0); counter < numRecords; counter++ {
+			// Create 8-byte record with little-endian counter
+			record := make([]byte, recordSize)
+			binary.LittleEndian.PutUint64(record, counter)
+
+			// Keep trying to write until all bytes are written
+			for written := 0; written < recordSize; {
+				n, err := ring.Write(record[written:])
+				if err != nil {
+					t.Errorf("Writer failed at counter %d: %v", counter, err)
+					return
+				}
+				written += n
+				// No sleep - tight polling as specified
+			}
+		}
+	}()
+
+	// Reader goroutine: accumulate and validate records
+	go func() {
+		defer func() {
+			readerDone <- nil
+		}()
+
+		readBuf := make([]byte, 1024) // Read buffer
+		accumBuf := make([]byte, 0)   // Accumulation buffer
+		expectedCounter := uint64(0)
+
+		for expectedCounter < numRecords {
+			// Read available data
+			n, err := ring.Read(readBuf)
+			if err != nil {
+				readerDone <- fmt.Errorf("reader failed at counter %d: %v", expectedCounter, err)
+				return
+			}
+
+			if n > 0 {
+				// Accumulate the read data
+				accumBuf = append(accumBuf, readBuf[:n]...)
+
+				// Process complete records
+				for len(accumBuf) >= recordSize {
+					// Extract one record
+					recordBytes := accumBuf[:recordSize]
+					accumBuf = accumBuf[recordSize:]
+
+					// Decode and validate counter
+					counter := binary.LittleEndian.Uint64(recordBytes)
+					if counter != expectedCounter {
+						readerDone <- fmt.Errorf("counter mismatch: got %d, expected %d", counter, expectedCounter)
+						return
+					}
+					expectedCounter++
+				}
+			}
+			// No sleep - tight polling as specified
+		}
+
+		// Ensure no leftover partial data
+		if len(accumBuf) != 0 {
+			readerDone <- fmt.Errorf("leftover partial data: %d bytes", len(accumBuf))
+			return
+		}
+	}()
+
+	// Wait for writer to complete
+	<-writerDone
+
+	// Wait for reader to complete or timeout
+	select {
+	case err := <-readerDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Final verification: ring should be empty
+	if ring.AvailableRead() != 0 {
+		t.Errorf("Ring should be empty at end, but has %d bytes", ring.AvailableRead())
+	}
+}
+
+func TestRing_Concurrent_CloseSemantics(t *testing.T) {
+	const (
+		recordSize = 8
+		ringCap    = 1024
+	)
+
+	ring, err := shm.NewRing(ringCap)
+	if err != nil {
+		t.Fatalf("NewRing(%d) failed: %v", ringCap, err)
+	}
+
+	var wg sync.WaitGroup
+	writerStopped := make(chan struct{})
+	readerStopped := make(chan struct{})
+
+	// Track what happened
+	var writerErrors []error
+	var readerErrors []error
+	var mutex sync.Mutex
+
+	recordError := func(errs *[]error, err error) {
+		mutex.Lock()
+		*errs = append(*errs, err)
+		mutex.Unlock()
+	}
+
+	// Writer goroutine: keep writing until it gets ErrClosed
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer close(writerStopped)
+
+		counter := uint64(0)
+		for {
+			record := make([]byte, recordSize)
+			binary.LittleEndian.PutUint64(record, counter)
+
+			n, err := ring.Write(record)
+			if err == shm.ErrClosed {
+				// Expected: writer should see ErrClosed after Close()
+				if n != 0 {
+					recordError(&writerErrors, fmt.Errorf("write after close returned n=%d, expected 0", n))
+				}
+				return
+			}
+			if err != nil {
+				recordError(&writerErrors, fmt.Errorf("unexpected write error: %v", err))
+				return
+			}
+
+			if n == recordSize {
+				counter++
+			}
+			// If n < recordSize, we got a partial write, keep trying
+		}
+	}()
+
+	// Reader goroutine: keep reading until ring is empty and closed
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer close(readerStopped)
+
+		readBuf := make([]byte, 256)
+		dataReceived := 0
+
+		for {
+			n, err := ring.Read(readBuf)
+			if err == shm.ErrClosed {
+				// Expected: reader should only see ErrClosed when empty and closed
+				if n != 0 {
+					recordError(&readerErrors, fmt.Errorf("read returned ErrClosed but n=%d", n))
+				}
+				return
+			}
+			if err != nil {
+				recordError(&readerErrors, fmt.Errorf("unexpected read error: %v", err))
+				return
+			}
+
+			dataReceived += n
+		}
+	}()
+
+	// Let producer and consumer run for a bit
+	// Use a small controlled delay to let some data flow
+	for i := 0; i < 1000; i++ {
+		if ring.AvailableRead() > 100 {
+			break
+		}
+	}
+
+	// Close the ring while producer/consumer are active
+	ring.Close()
+
+	// Wait for both goroutines to finish
+	wg.Wait()
+
+	// Verify no unexpected errors occurred
+	mutex.Lock()
+	defer mutex.Unlock()
+
+	for _, err := range writerErrors {
+		t.Errorf("Writer error: %v", err)
+	}
+	for _, err := range readerErrors {
+		t.Errorf("Reader error: %v", err)
+	}
+
+	// Verify ring is now closed
+	if !ring.Closed() {
+		t.Error("Ring should be closed")
+	}
+
+	// Verify subsequent operations fail appropriately
+	_, err = ring.Write([]byte{1, 2, 3})
+	if err != shm.ErrClosed {
+		t.Errorf("Write after close should return ErrClosed, got: %v", err)
+	}
+
+	// If ring has data, reading should work until empty
+	for ring.AvailableRead() > 0 {
+		buf := make([]byte, 100)
+		n, err := ring.Read(buf)
+		if err != nil {
+			t.Errorf("Read from closed ring with data failed: %v", err)
+			break
+		}
+		if n == 0 {
+			t.Error("Read from non-empty closed ring returned 0 bytes")
+			break
+		}
+	}
+
+	// Final read from empty closed ring should return ErrClosed
+	buf := make([]byte, 10)
+	n, err := ring.Read(buf)
+	if err != shm.ErrClosed {
+		t.Errorf("Final read from empty closed ring: got error=%v n=%d, want ErrClosed n=0", err, n)
+	}
+	if n != 0 {
+		t.Errorf("Final read from empty closed ring: got n=%d, want 0", n)
 	}
 }
