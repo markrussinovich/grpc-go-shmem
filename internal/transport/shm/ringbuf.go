@@ -73,10 +73,43 @@ func roundUpPowerOfTwo(n int) uint64 {
 	return x
 }
 
-// Ring implements a single-producer/single-consumer circular byte buffer.
-// Capacity is a power of two. It is safe for one writer goroutine and one reader
-// goroutine concurrently. No blocking: operations return immediately with
-// progress made (may be zero).
+// Ring implements a single-producer/single-consumer (SPSC) circular byte buffer
+// with non-blocking semantics and power-of-two capacity.
+//
+// The ring buffer is designed for high-performance communication between exactly
+// one writer goroutine and one reader goroutine. All operations are lock-free
+// and non-blocking, using atomic operations for synchronization.
+//
+// Key characteristics:
+//   - SPSC: Safe for one concurrent writer and one concurrent reader
+//   - Non-blocking: All operations return immediately with progress made (may be zero)
+//   - Power-of-two capacity: Enables efficient modulo operations using bitwise AND
+//   - Lock-free: Uses only atomic operations, no mutexes or condition variables
+//   - Cache-optimized: Padded counters prevent false sharing between cores
+//
+// The ring buffer supports both copying I/O (Read/Write) and zero-copy I/O
+// (ReserveWrite/CommitWrite and PeekRead/CommitRead) for maximum flexibility.
+//
+// Typical usage:
+//
+//	ring, err := NewRing(1024)
+//	if err != nil {
+//	    // handle error
+//	}
+//
+//	// Writer goroutine
+//	go func() {
+//	    data := []byte("hello")
+//	    n, err := ring.Write(data)
+//	    // handle partial writes and errors
+//	}()
+//
+//	// Reader goroutine
+//	go func() {
+//	    buf := make([]byte, 100)
+//	    n, err := ring.Read(buf)
+//	    // handle partial reads and errors
+//	}()
 type Ring struct {
 	// 64-bit monotonic counters with cache-line padding to avoid false sharing.
 	// Writer owns w; reader owns r.
@@ -92,9 +125,23 @@ type Ring struct {
 	closed atomic.Uint32
 }
 
-// NewRing returns a new Ring with at least the requested capacity. The actual
-// capacity is the next power of two >= minCap and at least 16 bytes.
-// If minCap <= 0, NewRing returns an error.
+// NewRing creates a new Ring with at least the requested capacity.
+//
+// The actual capacity will be the next power of two >= minCap, with a minimum
+// of 16 bytes. This power-of-two requirement enables efficient modulo operations
+// using bitwise AND instead of expensive division.
+//
+// Parameters:
+//   - minCap: minimum desired capacity in bytes (must be > 0)
+//
+// Returns:
+//   - *Ring: a new ring buffer ready for SPSC operation
+//   - error: non-nil if minCap <= 0
+//
+// Examples:
+//   - NewRing(100) creates a ring with 128-byte capacity
+//   - NewRing(1024) creates a ring with 1024-byte capacity
+//   - NewRing(1) creates a ring with 16-byte capacity (minimum)
 func NewRing(minCap int) (*Ring, error) {
 	if minCap <= 0 {
 		return nil, errors.New("ring: capacity must be positive")
@@ -114,13 +161,30 @@ func (r *Ring) Capacity() int {
 	return int(r.cap)
 }
 
-// Close marks the ring as closed. Further writes fail with ErrClosed.
-// Reads of existing data continue until empty, then return 0, io.EOF-like semantics.
+// Close marks the ring as closed for writing.
+//
+// After Close is called:
+//   - All subsequent Write and ReserveWrite operations will return ErrClosed
+//   - Read operations continue to work normally until the ring is empty
+//   - Once empty, Read operations return (0, ErrClosed)
+//
+// This provides clean shutdown semantics similar to io.EOF, allowing readers
+// to drain all remaining data before seeing the closed state.
+//
+// Close is safe to call multiple times and safe to call concurrently with
+// Read/Write operations.
 func (r *Ring) Close() {
 	r.closed.Store(1)
 }
 
 // Closed reports whether the ring has been closed.
+//
+// Returns true if Close has been called, false otherwise.
+// This method is safe to call concurrently with other operations.
+//
+// Note that a closed ring may still contain readable data. Use AvailableRead
+// to check for remaining data, and Read operations will work normally until
+// the ring is both closed and empty.
 func (r *Ring) Closed() bool {
 	return r.closed.Load() == 1
 }
@@ -143,8 +207,27 @@ func (r *Ring) AvailableWrite() int {
 	return int(free)
 }
 
-// Write copies up to len(p) bytes into the ring. It is non-blocking; it may
-// return a short write if the ring lacks space. Returns (n, ErrClosed) if closed.
+// Write copies up to len(p) bytes into the ring buffer.
+//
+// Write is non-blocking and may return a short write if insufficient space
+// is available. The operation returns immediately with the number of bytes
+// actually written. A short write is not an error condition.
+//
+// Parameters:
+//   - p: byte slice to write (may be empty)
+//
+// Returns:
+//   - n: number of bytes actually written (0 <= n <= len(p))
+//   - error: ErrClosed if the ring has been closed, nil otherwise
+//
+// Write behavior:
+//   - If ring is closed: returns (0, ErrClosed) immediately
+//   - If ring is full: returns (0, nil) - no error, just no progress
+//   - If ring has partial space: returns (k, nil) where k < len(p)
+//   - If ring has sufficient space: returns (len(p), nil)
+//
+// Write is safe to call concurrently with Read operations from another goroutine.
+// Only one goroutine should call Write concurrently (SPSC design).
 func (r *Ring) Write(p []byte) (int, error) {
 	// If closed, return error immediately
 	if r.closed.Load() == 1 {
@@ -192,9 +275,30 @@ func (r *Ring) Write(p []byte) (int, error) {
 	return int(want), nil
 }
 
-// Read copies up to len(p) bytes from the ring into p. It is non-blocking; it
-// returns 0 if no data is available. Returns 0, ErrClosed only if the ring was
-// closed *and* empty at the time of call.
+// Read copies up to len(p) bytes from the ring buffer into p.
+//
+// Read is non-blocking and returns immediately with the number of bytes
+// actually read. If no data is available, it returns (0, nil).
+//
+// Parameters:
+//   - p: destination buffer (may be empty)
+//
+// Returns:
+//   - n: number of bytes actually read (0 <= n <= len(p))
+//   - error: ErrClosed only if ring is both closed AND empty, nil otherwise
+//
+// Read behavior:
+//   - If ring is empty and open: returns (0, nil)
+//   - If ring is empty and closed: returns (0, ErrClosed)
+//   - If ring has partial data: returns (k, nil) where k < len(p)
+//   - If ring has sufficient data: returns (len(p), nil)
+//
+// The ErrClosed return follows EOF semantics: data can still be read from
+// a closed ring until it becomes empty. Only when both closed AND empty
+// does Read return ErrClosed.
+//
+// Read is safe to call concurrently with Write operations from another goroutine.
+// Only one goroutine should call Read concurrently (SPSC design).
 func (r *Ring) Read(p []byte) (int, error) {
 	// Load current indices
 	w := r.w.Load() // acquire
