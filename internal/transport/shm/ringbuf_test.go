@@ -99,3 +99,41 @@ func TestRing_NewRingInvalidCapacity(t *testing.T) {
 		})
 	}
 }
+
+func TestRing_Availability(t *testing.T) {
+	ring, err := shm.NewRing(64)
+	if err != nil {
+		t.Fatalf("NewRing(64) failed: %v", err)
+	}
+
+	// After creating a new ring, no data has been written yet
+	if availRead := ring.AvailableRead(); availRead != 0 {
+		t.Errorf("AvailableRead() = %d, want 0 for new ring", availRead)
+	}
+
+	// All capacity should be available for writing
+	expectedCap := ring.Capacity()
+	if availWrite := ring.AvailableWrite(); availWrite != expectedCap {
+		t.Errorf("AvailableWrite() = %d, want %d for new ring", availWrite, expectedCap)
+	}
+
+	// Test different ring sizes
+	testCases := []int{16, 32, 128, 256, 1024}
+	for _, capacity := range testCases {
+		t.Run(fmt.Sprintf("capacity_%d", capacity), func(t *testing.T) {
+			r, err := shm.NewRing(capacity)
+			if err != nil {
+				t.Fatalf("NewRing(%d) failed: %v", capacity, err)
+			}
+
+			if availRead := r.AvailableRead(); availRead != 0 {
+				t.Errorf("AvailableRead() = %d, want 0 for new ring", availRead)
+			}
+
+			actualCap := r.Capacity()
+			if availWrite := r.AvailableWrite(); availWrite != actualCap {
+				t.Errorf("AvailableWrite() = %d, want %d for new ring", availWrite, actualCap)
+			}
+		})
+	}
+}

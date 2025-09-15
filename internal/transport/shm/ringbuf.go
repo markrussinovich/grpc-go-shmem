@@ -104,10 +104,21 @@ func (r *Ring) Closed() bool { /* stub */ return false }
 
 // AvailableRead returns the number of bytes currently readable (may be stale if
 // called by the writer).
-func (r *Ring) AvailableRead() int { /* stub */ return 0 }
+func (r *Ring) AvailableRead() int {
+	w := r.w.Load()
+	rd := r.r.Load()
+	used := w - rd
+	return int(used)
+}
 
 // AvailableWrite returns the number of bytes currently writable (free space).
-func (r *Ring) AvailableWrite() int { /* stub */ return 0 }
+func (r *Ring) AvailableWrite() int {
+	w := r.w.Load()
+	rd := r.r.Load()
+	used := w - rd
+	free := r.cap - used
+	return int(free)
+}
 
 // Write copies up to len(p) bytes into the ring. It is non-blocking; it may
 // return a short write if the ring lacks space. Returns (n, ErrClosed) if closed.
