@@ -23,6 +23,7 @@ package shm
 
 import (
 	"fmt"
+	"os"
 	"sync/atomic"
 	"unsafe"
 )
@@ -46,6 +47,12 @@ const (
 
 	// Default ring capacity (64KB)
 	DefaultRingCapacity = 65536
+)
+
+// Platform-specific functions (implemented in platform-specific files)
+var (
+	// unmapMemory unmaps a memory-mapped region
+	unmapMemory func([]byte) error
 )
 
 // SegmentHeader represents the shared memory segment header.
@@ -434,4 +441,325 @@ func ValidateSegmentHeader(h *SegmentHeader) error {
 	}
 
 	return nil
+}
+
+// Segment represents a mapped shared memory segment
+type Segment struct {
+	File *os.File  // File descriptor for the shared memory file
+	Mem  []byte    // Memory-mapped region
+	H    *hdrView  // Typed view of the segment header
+	A    *ringView // Typed view of ring A
+	B    *ringView // Typed view of ring B
+	Path string    // File path
+}
+
+// hdrView provides typed access to the segment header via pointer arithmetic
+type hdrView struct {
+	basePtr unsafe.Pointer // Base pointer to the memory region
+}
+
+// ringView provides typed access to a ring header and data via pointer arithmetic
+type ringView struct {
+	basePtr unsafe.Pointer // Base pointer to the memory region
+	offset  uint64         // Offset to the ring header within the segment
+}
+
+// Close unmaps the memory and closes the file
+func (s *Segment) Close() error {
+	var firstErr error
+
+	// Unmap the memory
+	if s.Mem != nil {
+		if err := unmapMemory(s.Mem); err != nil && firstErr == nil {
+			firstErr = err
+		}
+		s.Mem = nil
+	}
+
+	// Close the file
+	if s.File != nil {
+		if err := s.File.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+		s.File = nil
+	}
+
+	return firstErr
+}
+
+// hdrView methods - provide typed access to the segment header
+
+// header returns a pointer to the SegmentHeader
+func (h *hdrView) header() *SegmentHeader {
+	return (*SegmentHeader)(h.basePtr)
+}
+
+// Magic returns the magic bytes
+func (h *hdrView) Magic() [8]byte {
+	return h.header().Magic()
+}
+
+// SetMagic sets the magic bytes
+func (h *hdrView) SetMagic(magic [8]byte) {
+	h.header().SetMagic(magic)
+}
+
+// Version returns the protocol version
+func (h *hdrView) Version() uint32 {
+	return h.header().Version()
+}
+
+// SetVersion sets the protocol version
+func (h *hdrView) SetVersion(version uint32) {
+	h.header().SetVersion(version)
+}
+
+// TotalSize returns the total segment size
+func (h *hdrView) TotalSize() uint64 {
+	return h.header().TotalSize()
+}
+
+// SetTotalSize sets the total segment size
+func (h *hdrView) SetTotalSize(size uint64) {
+	h.header().SetTotalSize(size)
+}
+
+// RingAOffset returns the offset to ring A header
+func (h *hdrView) RingAOffset() uint64 {
+	return h.header().RingAOffset()
+}
+
+// SetRingAOffset sets the offset to ring A header
+func (h *hdrView) SetRingAOffset(offset uint64) {
+	h.header().SetRingAOffset(offset)
+}
+
+// RingACapacity returns ring A capacity
+func (h *hdrView) RingACapacity() uint64 {
+	return h.header().RingACapacity()
+}
+
+// SetRingACapacity sets ring A capacity
+func (h *hdrView) SetRingACapacity(capacity uint64) {
+	h.header().SetRingACapacity(capacity)
+}
+
+// RingBOffset returns the offset to ring B header
+func (h *hdrView) RingBOffset() uint64 {
+	return h.header().RingBOffset()
+}
+
+// SetRingBOffset sets the offset to ring B header
+func (h *hdrView) SetRingBOffset(offset uint64) {
+	h.header().SetRingBOffset(offset)
+}
+
+// RingBCapacity returns ring B capacity
+func (h *hdrView) RingBCapacity() uint64 {
+	return h.header().RingBCapacity()
+}
+
+// SetRingBCapacity sets ring B capacity
+func (h *hdrView) SetRingBCapacity(capacity uint64) {
+	h.header().SetRingBCapacity(capacity)
+}
+
+// ServerPID returns the server process ID
+func (h *hdrView) ServerPID() uint32 {
+	return h.header().ServerPID()
+}
+
+// SetServerPID sets the server process ID
+func (h *hdrView) SetServerPID(pid uint32) {
+	h.header().SetServerPID(pid)
+}
+
+// ClientPID returns the client process ID
+func (h *hdrView) ClientPID() uint32 {
+	return h.header().ClientPID()
+}
+
+// SetClientPID sets the client process ID
+func (h *hdrView) SetClientPID(pid uint32) {
+	h.header().SetClientPID(pid)
+}
+
+// ServerReady returns the server ready flag
+func (h *hdrView) ServerReady() bool {
+	return h.header().ServerReady()
+}
+
+// SetServerReady sets the server ready flag
+func (h *hdrView) SetServerReady(ready bool) {
+	h.header().SetServerReady(ready)
+}
+
+// ClientReady returns the client ready flag
+func (h *hdrView) ClientReady() bool {
+	return h.header().ClientReady()
+}
+
+// SetClientReady sets the client ready flag
+func (h *hdrView) SetClientReady(ready bool) {
+	h.header().SetClientReady(ready)
+}
+
+// Closed returns the closed flag
+func (h *hdrView) Closed() bool {
+	return h.header().Closed()
+}
+
+// SetClosed sets the closed flag
+func (h *hdrView) SetClosed(closed bool) {
+	h.header().SetClosed(closed)
+}
+
+// ringView methods - provide typed access to ring headers
+
+// header returns a pointer to the RingHeader
+func (r *ringView) header() *RingHeader {
+	return (*RingHeader)(unsafe.Pointer(uintptr(r.basePtr) + uintptr(r.offset)))
+}
+
+// DataArea returns a pointer to the ring's data area
+func (r *ringView) DataArea() unsafe.Pointer {
+	return unsafe.Pointer(uintptr(r.basePtr) + uintptr(r.offset) + RingHeaderSize)
+}
+
+// Capacity returns the ring capacity
+func (r *ringView) Capacity() uint64 {
+	return r.header().Capacity()
+}
+
+// SetCapacity sets the ring capacity
+func (r *ringView) SetCapacity(capacity uint64) {
+	r.header().SetCapacity(capacity)
+}
+
+// WriteIndex returns the monotonic write index
+func (r *ringView) WriteIndex() uint64 {
+	return r.header().WriteIndex()
+}
+
+// SetWriteIndex sets the monotonic write index
+func (r *ringView) SetWriteIndex(idx uint64) {
+	r.header().SetWriteIndex(idx)
+}
+
+// ReadIndex returns the monotonic read index
+func (r *ringView) ReadIndex() uint64 {
+	return r.header().ReadIndex()
+}
+
+// SetReadIndex sets the monotonic read index
+func (r *ringView) SetReadIndex(idx uint64) {
+	r.header().SetReadIndex(idx)
+}
+
+// DataSequence returns the data sequence number for futex
+func (r *ringView) DataSequence() uint32 {
+	return r.header().DataSequence()
+}
+
+// IncrementDataSequence atomically increments the data sequence
+func (r *ringView) IncrementDataSequence() uint32 {
+	return r.header().IncrementDataSequence()
+}
+
+// SpaceSequence returns the space sequence number for futex
+func (r *ringView) SpaceSequence() uint32 {
+	return r.header().SpaceSequence()
+}
+
+// IncrementSpaceSequence atomically increments the space sequence
+func (r *ringView) IncrementSpaceSequence() uint32 {
+	return r.header().IncrementSpaceSequence()
+}
+
+// Closed returns the closed flag
+func (r *ringView) Closed() bool {
+	return r.header().Closed()
+}
+
+// SetClosed sets the closed flag
+func (r *ringView) SetClosed(closed bool) {
+	r.header().SetClosed(closed)
+}
+
+// Ring invariant calculation methods
+
+// Used returns the number of bytes currently used in the ring
+func (r *ringView) Used() uint64 {
+	return r.header().Used()
+}
+
+// Available returns the number of bytes available for writing
+func (r *ringView) Available() uint64 {
+	return r.header().Available()
+}
+
+// Offset converts a monotonic index to a ring buffer offset
+func (r *ringView) Offset(index uint64) uint64 {
+	return r.header().Offset(index)
+}
+
+// IsEmpty returns true if the ring is empty
+func (r *ringView) IsEmpty() bool {
+	return r.header().IsEmpty()
+}
+
+// IsFull returns true if the ring is full
+func (r *ringView) IsFull() bool {
+	return r.header().IsFull()
+}
+
+// CanWrite returns true if at least n bytes can be written
+func (r *ringView) CanWrite(n uint64) bool {
+	return r.header().CanWrite(n)
+}
+
+// CanRead returns true if at least n bytes can be read
+func (r *ringView) CanRead(n uint64) bool {
+	return r.header().CanRead(n)
+}
+
+// Utility functions
+
+// RemoveSegment removes a shared memory segment file
+func RemoveSegment(name string) error {
+	// Try both possible paths
+	paths := []string{
+		"/dev/shm/grpc_shm_" + name,
+		os.TempDir() + "/grpc_shm_" + name,
+	}
+
+	var lastErr error
+	for _, path := range paths {
+		if err := os.Remove(path); err == nil {
+			return nil // Successfully removed
+		} else if !os.IsNotExist(err) {
+			lastErr = err // Keep track of non-NotExist errors
+		}
+	}
+
+	// If we get here, the file wasn't found in either location
+	if lastErr != nil {
+		return lastErr
+	}
+	return os.ErrNotExist
+}
+
+// SegmentExists checks if a shared memory segment exists
+func SegmentExists(name string) bool {
+	paths := []string{
+		"/dev/shm/grpc_shm_" + name,
+		os.TempDir() + "/grpc_shm_" + name,
+	}
+
+	for _, path := range paths {
+		if _, err := os.Stat(path); err == nil {
+			return true
+		}
+	}
+	return false
 }

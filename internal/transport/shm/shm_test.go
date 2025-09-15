@@ -307,3 +307,284 @@ func TestSegmentHeaderAtomicAccess(t *testing.T) {
 		t.Error("Closed() = false, want true")
 	}
 }
+
+func TestCreateAndOpenSegment(t *testing.T) {
+	// Skip test on non-Linux platforms
+	if !isLinuxPlatform() {
+		t.Skip("Segment tests only supported on Linux")
+	}
+
+	name := "test_segment_create_open"
+	ringCapA := uint64(4096)
+	ringCapB := uint64(8192)
+
+	// Ensure clean state
+	RemoveSegment(name)
+	defer RemoveSegment(name)
+
+	// Test CreateSegment
+	segment, err := CreateSegment(name, ringCapA, ringCapB)
+	if err != nil {
+		t.Fatalf("CreateSegment() error = %v", err)
+	}
+	defer segment.Close()
+
+	// Verify segment properties
+	if segment.File == nil {
+		t.Error("segment.File is nil")
+	}
+	if segment.Mem == nil {
+		t.Error("segment.Mem is nil")
+	}
+	if segment.H == nil {
+		t.Error("segment.H is nil")
+	}
+	if segment.A == nil {
+		t.Error("segment.A is nil")
+	}
+	if segment.B == nil {
+		t.Error("segment.B is nil")
+	}
+
+	// Verify header values
+	magic := [8]byte{'G', 'R', 'P', 'C', 'S', 'H', 'M', 0}
+	if segment.H.Magic() != magic {
+		t.Errorf("segment.H.Magic() = %v, want %v", segment.H.Magic(), magic)
+	}
+	if segment.H.Version() != SegmentVersion {
+		t.Errorf("segment.H.Version() = %d, want %d", segment.H.Version(), SegmentVersion)
+	}
+	if segment.H.RingACapacity() != ringCapA {
+		t.Errorf("segment.H.RingACapacity() = %d, want %d", segment.H.RingACapacity(), ringCapA)
+	}
+	if segment.H.RingBCapacity() != ringCapB {
+		t.Errorf("segment.H.RingBCapacity() = %d, want %d", segment.H.RingBCapacity(), ringCapB)
+	}
+	if !segment.H.ServerReady() {
+		t.Error("segment.H.ServerReady() = false, want true")
+	}
+
+	// Verify ring configurations
+	if segment.A.Capacity() != ringCapA {
+		t.Errorf("segment.A.Capacity() = %d, want %d", segment.A.Capacity(), ringCapA)
+	}
+	if segment.B.Capacity() != ringCapB {
+		t.Errorf("segment.B.Capacity() = %d, want %d", segment.B.Capacity(), ringCapB)
+	}
+
+	// Test that rings are initially empty
+	if !segment.A.IsEmpty() {
+		t.Error("segment.A.IsEmpty() = false, want true for new ring")
+	}
+	if !segment.B.IsEmpty() {
+		t.Error("segment.B.IsEmpty() = false, want true for new ring")
+	}
+
+	// Test OpenSegment from another "process" (same process for testing)
+	clientSegment, err := OpenSegment(name)
+	if err != nil {
+		t.Fatalf("OpenSegment() error = %v", err)
+	}
+	defer clientSegment.Close()
+
+	// Verify client segment can read server data
+	if clientSegment.H.Magic() != magic {
+		t.Errorf("clientSegment.H.Magic() = %v, want %v", clientSegment.H.Magic(), magic)
+	}
+	if clientSegment.H.Version() != SegmentVersion {
+		t.Errorf("clientSegment.H.Version() = %d, want %d", clientSegment.H.Version(), SegmentVersion)
+	}
+	if clientSegment.H.RingACapacity() != ringCapA {
+		t.Errorf("clientSegment.H.RingACapacity() = %d, want %d", clientSegment.H.RingACapacity(), ringCapA)
+	}
+	if clientSegment.H.RingBCapacity() != ringCapB {
+		t.Errorf("clientSegment.H.RingBCapacity() = %d, want %d", clientSegment.H.RingBCapacity(), ringCapB)
+	}
+	if !clientSegment.H.ServerReady() {
+		t.Error("clientSegment.H.ServerReady() = false, want true")
+	}
+	if !clientSegment.H.ClientReady() {
+		t.Error("clientSegment.H.ClientReady() = false, want true after OpenSegment")
+	}
+}
+
+func TestCreateSegmentAlreadyExists(t *testing.T) {
+	// Skip test on non-Linux platforms
+	if !isLinuxPlatform() {
+		t.Skip("Segment tests only supported on Linux")
+	}
+
+	name := "test_segment_exists"
+
+	// Ensure clean state
+	RemoveSegment(name)
+	defer RemoveSegment(name)
+
+	// Create first segment
+	segment1, err := CreateSegment(name, 4096, 4096)
+	if err != nil {
+		t.Fatalf("CreateSegment() error = %v", err)
+	}
+	defer segment1.Close()
+
+	// Try to create another segment with same name (should fail)
+	segment2, err := CreateSegment(name, 4096, 4096)
+	if err == nil {
+		segment2.Close()
+		t.Fatal("CreateSegment() should fail when segment already exists")
+	}
+}
+
+func TestOpenSegmentNotExists(t *testing.T) {
+	// Skip test on non-Linux platforms
+	if !isLinuxPlatform() {
+		t.Skip("Segment tests only supported on Linux")
+	}
+
+	name := "test_segment_not_exists"
+
+	// Ensure segment doesn't exist
+	RemoveSegment(name)
+
+	// Try to open non-existent segment
+	segment, err := OpenSegment(name)
+	if err == nil {
+		segment.Close()
+		t.Fatal("OpenSegment() should fail when segment doesn't exist")
+	}
+}
+
+func TestSegmentUtilities(t *testing.T) {
+	name := "test_segment_utilities"
+
+	// Test SegmentExists with non-existent segment
+	if SegmentExists(name) {
+		t.Error("SegmentExists() = true for non-existent segment")
+	}
+
+	// Skip remaining tests on non-Linux platforms
+	if !isLinuxPlatform() {
+		t.Skip("Remaining segment tests only supported on Linux")
+	}
+
+	// Ensure clean state
+	RemoveSegment(name)
+	defer RemoveSegment(name)
+
+	// Create segment
+	segment, err := CreateSegment(name, 4096, 4096)
+	if err != nil {
+		t.Fatalf("CreateSegment() error = %v", err)
+	}
+	defer segment.Close()
+
+	// Test SegmentExists with existing segment
+	if !SegmentExists(name) {
+		t.Error("SegmentExists() = false for existing segment")
+	}
+
+	// Close and remove segment
+	segment.Close()
+	err = RemoveSegment(name)
+	if err != nil {
+		t.Errorf("RemoveSegment() error = %v", err)
+	}
+
+	// Test SegmentExists after removal
+	if SegmentExists(name) {
+		t.Error("SegmentExists() = true after removal")
+	}
+}
+
+func TestRingViewOperations(t *testing.T) {
+	// Skip test on non-Linux platforms
+	if !isLinuxPlatform() {
+		t.Skip("Segment tests only supported on Linux")
+	}
+
+	name := "test_ring_operations"
+	ringCap := uint64(4096)
+
+	// Ensure clean state
+	RemoveSegment(name)
+	defer RemoveSegment(name)
+
+	// Create segment
+	segment, err := CreateSegment(name, ringCap, ringCap)
+	if err != nil {
+		t.Fatalf("CreateSegment() error = %v", err)
+	}
+	defer segment.Close()
+
+	ring := segment.A
+
+	// Test initial state
+	if ring.WriteIndex() != 0 {
+		t.Errorf("WriteIndex() = %d, want 0", ring.WriteIndex())
+	}
+	if ring.ReadIndex() != 0 {
+		t.Errorf("ReadIndex() = %d, want 0", ring.ReadIndex())
+	}
+	if !ring.IsEmpty() {
+		t.Error("IsEmpty() = false, want true")
+	}
+	if ring.IsFull() {
+		t.Error("IsFull() = true, want false")
+	}
+	if ring.Used() != 0 {
+		t.Errorf("Used() = %d, want 0", ring.Used())
+	}
+	if ring.Available() != ringCap {
+		t.Errorf("Available() = %d, want %d", ring.Available(), ringCap)
+	}
+
+	// Test write operations
+	ring.SetWriteIndex(100)
+	if ring.WriteIndex() != 100 {
+		t.Errorf("WriteIndex() = %d, want 100", ring.WriteIndex())
+	}
+	if ring.Used() != 100 {
+		t.Errorf("Used() = %d, want 100", ring.Used())
+	}
+	if ring.Available() != ringCap-100 {
+		t.Errorf("Available() = %d, want %d", ring.Available(), ringCap-100)
+	}
+	if ring.IsEmpty() {
+		t.Error("IsEmpty() = true, want false after writing")
+	}
+
+	// Test offset calculation
+	offset := ring.Offset(4200) // > capacity
+	expectedOffset := uint64(4200) & (ringCap - 1)
+	if offset != expectedOffset {
+		t.Errorf("Offset(4200) = %d, want %d", offset, expectedOffset)
+	}
+
+	// Test sequence operations
+	seq1 := ring.IncrementDataSequence()
+	seq2 := ring.IncrementDataSequence()
+	if seq2 != seq1+1 {
+		t.Errorf("IncrementDataSequence() not incrementing correctly: %d, %d", seq1, seq2)
+	}
+
+	// Test closed flag
+	if ring.Closed() {
+		t.Error("Closed() = true, want false initially")
+	}
+	ring.SetClosed(true)
+	if !ring.Closed() {
+		t.Error("Closed() = false, want true after SetClosed(true)")
+	}
+}
+
+// isLinuxPlatform returns true if we're running on a supported Linux platform
+func isLinuxPlatform() bool {
+	// This will be true only when the Linux-specific files are compiled
+	segment, err := CreateSegment("__test_platform_check__", 4096, 4096)
+	if err != nil {
+		return false
+	}
+	segment.Close()
+	RemoveSegment("__test_platform_check__")
+	return true
+}

@@ -19,3 +19,29 @@
  */
 
 package shm
+
+import (
+	"errors"
+)
+
+func init() {
+	// Set platform-specific function implementations
+	unmapMemory = munmapStub
+}
+
+var errUnsupportedPlatform = errors.New("shared memory transport not supported on this platform")
+
+// CreateSegment is not supported on this platform
+func CreateSegment(name string, ringCapA, ringCapB uint64) (*Segment, error) {
+	return nil, errUnsupportedPlatform
+}
+
+// OpenSegment is not supported on this platform
+func OpenSegment(name string) (*Segment, error) {
+	return nil, errUnsupportedPlatform
+}
+
+// munmapStub is a no-op implementation for unsupported platforms
+func munmapStub(data []byte) error {
+	return nil
+}
