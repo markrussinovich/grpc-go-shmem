@@ -176,7 +176,50 @@ func (r *Ring) Write(p []byte) (int, error) {
 // Read copies up to len(p) bytes from the ring into p. It is non-blocking; it
 // returns 0 if no data is available. Returns 0, ErrClosed only if the ring was
 // closed *and* empty at the time of call.
-func (r *Ring) Read(p []byte) (int, error) { /* stub */ return 0, nil }
+func (r *Ring) Read(p []byte) (int, error) {
+	// Load current indices
+	w := r.w.Load()   // acquire
+	rd := r.r.Load()
+
+	// Calculate available data
+	avail := w - rd
+	if avail == 0 {
+		// No data available
+		if r.closed.Load() == 1 {
+			return 0, ErrClosed // empty and closed
+		}
+		return 0, nil // empty but not closed
+	}
+
+	// Determine how much we can read
+	want := uint64(len(p))
+	if want > avail {
+		want = avail
+	}
+
+	// Compute read offset in buffer
+	off := rd & r.mask
+
+	// Compute bytes until end of buffer
+	first := want
+	if first > r.cap-off {
+		first = r.cap - off
+	}
+
+	// Copy first part
+	copy(p[:first], r.buf[off:off+first])
+
+	// Copy second part if needed (wrap around)
+	second := want - first
+	if second > 0 {
+		copy(p[first:first+second], r.buf[0:second])
+	}
+
+	// Publish the read (store after bytes are consumed)
+	r.r.Store(rd + want)
+
+	return int(want), nil
+}
 
 // ReserveWrite reserves n bytes for in-place writing and returns up to two
 // contiguous slices (head/tail) referencing internal storage. Caller must fill

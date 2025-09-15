@@ -17,6 +17,7 @@
 package shm_test
 
 import (
+	"bytes"
 	"fmt"
 	"testing"
 
@@ -170,6 +171,29 @@ func TestRing_WriteRead_Simple(t *testing.T) {
 	if availWrite := ring.AvailableWrite(); availWrite != expectedWrite {
 		t.Errorf("AvailableWrite() = %d, want %d after write", availWrite, expectedWrite)
 	}
+
+	// Now read the data back
+	readBuf := make([]byte, 5)
+	nRead, err := ring.Read(readBuf)
+	if err != nil {
+		t.Fatalf("Read() failed: %v", err)
+	}
+	if nRead != len(data) {
+		t.Errorf("Read() = %d bytes, want %d", nRead, len(data))
+	}
+	if !bytes.Equal(readBuf, data) {
+		t.Errorf("Read() = %q, want %q", readBuf, data)
+	}
+
+	// After reading, should have no data left
+	if availRead := ring.AvailableRead(); availRead != 0 {
+		t.Errorf("AvailableRead() = %d, want 0 after reading all data", availRead)
+	}
+
+	// Available write space should be back to full capacity
+	if availWrite := ring.AvailableWrite(); availWrite != ring.Capacity() {
+		t.Errorf("AvailableWrite() = %d, want %d after reading all data", availWrite, ring.Capacity())
+	}
 }
 
 func TestRing_Write_Wrap(t *testing.T) {
@@ -259,5 +283,142 @@ func TestRing_Write_Closed(t *testing.T) {
 	}
 	if n2 != 0 {
 		t.Errorf("Write after close = %d, want 0 bytes written", n2)
+	}
+}
+
+func TestRing_Read_Empty(t *testing.T) {
+	ring, err := shm.NewRing(64)
+	if err != nil {
+		t.Fatalf("NewRing(64) failed: %v", err)
+	}
+
+	// Read from empty ring should return (0, nil)
+	buf := make([]byte, 10)
+	n, err := ring.Read(buf)
+	if err != nil {
+		t.Errorf("Read from empty ring failed: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("Read from empty ring = %d, want 0 bytes", n)
+	}
+
+	// Test reading from closed empty ring
+	ring.Close()
+	n2, err2 := ring.Read(buf)
+	if err2 != shm.ErrClosed {
+		t.Errorf("Read from closed empty ring error = %v, want ErrClosed", err2)
+	}
+	if n2 != 0 {
+		t.Errorf("Read from closed empty ring = %d, want 0 bytes", n2)
+	}
+}
+
+func TestRing_WriteRead_Wrap(t *testing.T) {
+	// Use a small ring to test wrap-around during read
+	ring, err := shm.NewRing(16)
+	if err != nil {
+		t.Fatalf("NewRing(16) failed: %v", err)
+	}
+
+	// Write data that will wrap around when we read it
+	// First, fill most of the buffer
+	data1 := []byte("123456789012") // 12 bytes
+	n1, err := ring.Write(data1)
+	if err != nil {
+		t.Fatalf("First write failed: %v", err)
+	}
+	if n1 != len(data1) {
+		t.Errorf("First write = %d, want %d bytes", n1, len(data1))
+	}
+
+	// Read part of it to advance the read pointer
+	readBuf1 := make([]byte, 8)
+	nRead1, err := ring.Read(readBuf1)
+	if err != nil {
+		t.Fatalf("First read failed: %v", err)
+	}
+	if nRead1 != 8 {
+		t.Errorf("First read = %d, want 8 bytes", nRead1)
+	}
+	if !bytes.Equal(readBuf1, []byte("12345678")) {
+		t.Errorf("First read = %q, want %q", readBuf1, "12345678")
+	}
+
+	// Now write more data that will wrap around in the buffer
+	data2 := []byte("abcdefghijk") // 11 bytes
+	n2, err := ring.Write(data2)
+	if err != nil {
+		t.Fatalf("Second write failed: %v", err)
+	}
+	if n2 != len(data2) {
+		t.Errorf("Second write = %d, want %d bytes", n2, len(data2))
+	}
+
+	// Now read all remaining data - this should exercise wrap-around in read
+	remainingData := []byte("9012") // 4 bytes remaining from first write
+	remainingData = append(remainingData, data2...) // plus 11 bytes from second write
+	
+	readBuf2 := make([]byte, len(remainingData))
+	nRead2, err := ring.Read(readBuf2)
+	if err != nil {
+		t.Fatalf("Second read failed: %v", err)
+	}
+	if nRead2 != len(remainingData) {
+		t.Errorf("Second read = %d, want %d bytes", nRead2, len(remainingData))
+	}
+	if !bytes.Equal(readBuf2, remainingData) {
+		t.Errorf("Second read = %q, want %q", readBuf2, remainingData)
+	}
+
+	// Ring should now be empty
+	if availRead := ring.AvailableRead(); availRead != 0 {
+		t.Errorf("AvailableRead() = %d, want 0 after reading all data", availRead)
+	}
+	if availWrite := ring.AvailableWrite(); availWrite != ring.Capacity() {
+		t.Errorf("AvailableWrite() = %d, want %d after reading all data", availWrite, ring.Capacity())
+	}
+}
+
+func TestRing_Read_PartialRead(t *testing.T) {
+	ring, err := shm.NewRing(64)
+	if err != nil {
+		t.Fatalf("NewRing(64) failed: %v", err)
+	}
+
+	// Write some data
+	data := []byte("hello")
+	n, err := ring.Write(data)
+	if err != nil {
+		t.Fatalf("Write failed: %v", err)
+	}
+	if n != len(data) {
+		t.Errorf("Write = %d, want %d bytes", n, len(data))
+	}
+
+	// Try to read more than available - should only read what's available
+	largeBuf := make([]byte, 20)
+	nRead, err := ring.Read(largeBuf)
+	if err != nil {
+		t.Fatalf("Read failed: %v", err)
+	}
+	if nRead != len(data) {
+		t.Errorf("Read = %d, want %d bytes (partial read)", nRead, len(data))
+	}
+	if !bytes.Equal(largeBuf[:nRead], data) {
+		t.Errorf("Read data = %q, want %q", largeBuf[:nRead], data)
+	}
+
+	// Try to read with a smaller buffer
+	ring.Write([]byte("world123"))
+	smallBuf := make([]byte, 3)
+	nRead2, err := ring.Read(smallBuf)
+	if err != nil {
+		t.Fatalf("Read with small buffer failed: %v", err)
+	}
+	if nRead2 != 3 {
+		t.Errorf("Read with small buffer = %d, want 3 bytes", nRead2)
+	}
+	if !bytes.Equal(smallBuf, []byte("wor")) {
+		t.Errorf("Read with small buffer = %q, want %q", smallBuf, "wor")
 	}
 }
