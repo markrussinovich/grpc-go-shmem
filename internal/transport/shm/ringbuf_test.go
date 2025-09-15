@@ -226,7 +226,7 @@ func TestRing_Write_Wrap(t *testing.T) {
 	// NOTE: This test will be completed when Read is implemented
 	// TODO: Read 5 bytes, then write 10 bytes to test wrap-around
 	// For now, test writing up to the limit
-	
+
 	// Try to write 6 more bytes - should fit exactly
 	data2 := []byte("abcdef") // 6 bytes
 	n2, err := ring.Write(data2)
@@ -355,9 +355,9 @@ func TestRing_WriteRead_Wrap(t *testing.T) {
 	}
 
 	// Now read all remaining data - this should exercise wrap-around in read
-	remainingData := []byte("9012") // 4 bytes remaining from first write
+	remainingData := []byte("9012")                 // 4 bytes remaining from first write
 	remainingData = append(remainingData, data2...) // plus 11 bytes from second write
-	
+
 	readBuf2 := make([]byte, len(remainingData))
 	nRead2, err := ring.Read(readBuf2)
 	if err != nil {
@@ -836,12 +836,12 @@ func TestRing_CommitWrite_ZeroBytes(t *testing.T) {
 	}
 
 	initialAvail := ring.AvailableRead()
-	
+
 	// Committing zero bytes should be safe and do nothing
 	ring.CommitWrite(0)
-	
+
 	if ring.AvailableRead() != initialAvail {
-		t.Errorf("CommitWrite(0) changed available data: %d -> %d", 
+		t.Errorf("CommitWrite(0) changed available data: %d -> %d",
 			initialAvail, ring.AvailableRead())
 	}
 }
@@ -863,12 +863,12 @@ func TestRing_CommitRead_ZeroBytes(t *testing.T) {
 	}
 
 	initialAvail := ring.AvailableRead()
-	
+
 	// Committing zero bytes should be safe and do nothing
 	ring.CommitRead(0)
-	
+
 	if ring.AvailableRead() != initialAvail {
-		t.Errorf("CommitRead(0) changed available data: %d -> %d", 
+		t.Errorf("CommitRead(0) changed available data: %d -> %d",
 			initialAvail, ring.AvailableRead())
 	}
 }

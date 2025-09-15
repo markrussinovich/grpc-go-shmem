@@ -97,12 +97,12 @@ func (r *Ring) Capacity() int {
 
 // Close marks the ring as closed. Further writes fail with ErrClosed.
 // Reads of existing data continue until empty, then return 0, io.EOF-like semantics.
-func (r *Ring) Close() { 
+func (r *Ring) Close() {
 	r.closed.Store(1)
 }
 
 // Closed reports whether the ring has been closed.
-func (r *Ring) Closed() bool { 
+func (r *Ring) Closed() bool {
 	return r.closed.Load() == 1
 }
 
@@ -178,7 +178,7 @@ func (r *Ring) Write(p []byte) (int, error) {
 // closed *and* empty at the time of call.
 func (r *Ring) Read(p []byte) (int, error) {
 	// Load current indices
-	w := r.w.Load()   // acquire
+	w := r.w.Load() // acquire
 	rd := r.r.Load()
 
 	// Calculate available data
