@@ -868,7 +868,7 @@ func TestRing_CommitRead_ZeroBytes(t *testing.T) {
 	ring.CommitRead(0)
 
 	if ring.AvailableRead() != initialAvail {
-		t.Errorf("CommitRead(0) changed available data: %d -> %d", 
+		t.Errorf("CommitRead(0) changed available data: %d -> %d",
 			initialAvail, ring.AvailableRead())
 	}
 }
@@ -877,16 +877,16 @@ func TestRing_CacheLinePadding(t *testing.T) {
 	// This test verifies that our cache-line padding is working as expected.
 	// We can't easily test the performance benefit in a unit test, but we can
 	// verify that the struct has the expected size characteristics.
-	
+
 	ring, err := shm.NewRing(64)
 	if err != nil {
 		t.Fatalf("NewRing(64) failed: %v", err)
 	}
-	
+
 	// The paddedUint64 should be 64 bytes (8 for atomic.Uint64 + 56 padding)
 	// This is a basic sanity check that our padding is in place
 	_ = ring // Prevent unused variable warning
-	
+
 	// Test that basic operations still work with padding
 	testData := []byte("cache line test")
 	n, err := ring.Write(testData)
@@ -896,7 +896,7 @@ func TestRing_CacheLinePadding(t *testing.T) {
 	if n != len(testData) {
 		t.Fatalf("Write = %d, want %d", n, len(testData))
 	}
-	
+
 	buf := make([]byte, len(testData))
 	n, err = ring.Read(buf)
 	if err != nil {

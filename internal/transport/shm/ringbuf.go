@@ -26,13 +26,13 @@ import (
 var ErrClosed = errors.New("ring: closed")
 
 // paddedUint64 wraps an atomic.Uint64 with cache-line padding to prevent false sharing.
-// 
-// False sharing occurs when multiple CPU cores access different variables that 
-// happen to be on the same cache line. When one core modifies its variable, the 
+//
+// False sharing occurs when multiple CPU cores access different variables that
+// happen to be on the same cache line. When one core modifies its variable, the
 // entire cache line is invalidated on other cores, forcing them to reload the
 // cache line even if they only need their own variable.
 //
-// In a ring buffer, the writer frequently updates 'w' while the reader frequently 
+// In a ring buffer, the writer frequently updates 'w' while the reader frequently
 // updates 'r'. Without padding, these could end up on the same cache line, causing
 // unnecessary cache line bouncing between cores and degrading performance.
 //
