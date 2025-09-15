@@ -20,3 +20,418 @@
 // segments, enabling high-performance inter-process communication (IPC) for
 // local gRPC clients and servers.
 package shm
+
+import (
+	"fmt"
+	"sync/atomic"
+	"unsafe"
+)
+
+// Memory layout constants
+const (
+	// Magic bytes for segment identification
+	SegmentMagic = "GRPCSHM\x00"
+
+	// Current protocol version
+	SegmentVersion = uint32(1)
+
+	// Segment header size (aligned to 128 bytes)
+	SegmentHeaderSize = 128
+
+	// Ring header size (aligned to 64 bytes)
+	RingHeaderSize = 64
+
+	// Minimum ring capacity (4KB)
+	MinRingCapacity = 4096
+
+	// Default ring capacity (64KB)
+	DefaultRingCapacity = 65536
+)
+
+// SegmentHeader represents the shared memory segment header.
+// Layout follows the specification with 128-byte alignment.
+type SegmentHeader struct {
+	magic       [8]byte  // 0x00: "GRPCSHM\0"
+	version     uint32   // 0x08: protocol version
+	flags       uint32   // 0x0C: reserved flags
+	totalSize   uint64   // 0x10: total segment size
+	ringAOff    uint64   // 0x18: offset to ring A header
+	ringACap    uint64   // 0x20: ring A capacity (power of 2)
+	ringBOff    uint64   // 0x28: offset to ring B header
+	ringBCap    uint64   // 0x30: ring B capacity (power of 2)
+	serverPID   uint32   // 0x38: server process ID
+	clientPID   uint32   // 0x3C: client process ID
+	serverReady uint32   // 0x40: server ready flag (0->1)
+	clientReady uint32   // 0x44: client mapped flag (0->1)
+	closed      uint32   // 0x48: closed flag (0 open, 1 closed)
+	pad         uint32   // 0x4C: padding
+	reserved    [48]byte // 0x50-0x7F: reserved/padding to 128B
+}
+
+// SegmentHeader atomic access methods
+
+// Magic returns the magic bytes
+func (h *SegmentHeader) Magic() [8]byte {
+	return h.magic
+}
+
+// SetMagic sets the magic bytes
+func (h *SegmentHeader) SetMagic(magic [8]byte) {
+	h.magic = magic
+}
+
+// Version returns the protocol version
+func (h *SegmentHeader) Version() uint32 {
+	return atomic.LoadUint32(&h.version)
+}
+
+// SetVersion sets the protocol version
+func (h *SegmentHeader) SetVersion(version uint32) {
+	atomic.StoreUint32(&h.version, version)
+}
+
+// TotalSize returns the total segment size
+func (h *SegmentHeader) TotalSize() uint64 {
+	return atomic.LoadUint64(&h.totalSize)
+}
+
+// SetTotalSize sets the total segment size
+func (h *SegmentHeader) SetTotalSize(size uint64) {
+	atomic.StoreUint64(&h.totalSize, size)
+}
+
+// RingAOffset returns the offset to ring A header
+func (h *SegmentHeader) RingAOffset() uint64 {
+	return atomic.LoadUint64(&h.ringAOff)
+}
+
+// SetRingAOffset sets the offset to ring A header
+func (h *SegmentHeader) SetRingAOffset(offset uint64) {
+	atomic.StoreUint64(&h.ringAOff, offset)
+}
+
+// RingACapacity returns ring A capacity
+func (h *SegmentHeader) RingACapacity() uint64 {
+	return atomic.LoadUint64(&h.ringACap)
+}
+
+// SetRingACapacity sets ring A capacity
+func (h *SegmentHeader) SetRingACapacity(capacity uint64) {
+	atomic.StoreUint64(&h.ringACap, capacity)
+}
+
+// RingBOffset returns the offset to ring B header
+func (h *SegmentHeader) RingBOffset() uint64 {
+	return atomic.LoadUint64(&h.ringBOff)
+}
+
+// SetRingBOffset sets the offset to ring B header
+func (h *SegmentHeader) SetRingBOffset(offset uint64) {
+	atomic.StoreUint64(&h.ringBOff, offset)
+}
+
+// RingBCapacity returns ring B capacity
+func (h *SegmentHeader) RingBCapacity() uint64 {
+	return atomic.LoadUint64(&h.ringBCap)
+}
+
+// SetRingBCapacity sets ring B capacity
+func (h *SegmentHeader) SetRingBCapacity(capacity uint64) {
+	atomic.StoreUint64(&h.ringBCap, capacity)
+}
+
+// ServerPID returns the server process ID
+func (h *SegmentHeader) ServerPID() uint32 {
+	return atomic.LoadUint32(&h.serverPID)
+}
+
+// SetServerPID sets the server process ID
+func (h *SegmentHeader) SetServerPID(pid uint32) {
+	atomic.StoreUint32(&h.serverPID, pid)
+}
+
+// ClientPID returns the client process ID
+func (h *SegmentHeader) ClientPID() uint32 {
+	return atomic.LoadUint32(&h.clientPID)
+}
+
+// SetClientPID sets the client process ID
+func (h *SegmentHeader) SetClientPID(pid uint32) {
+	atomic.StoreUint32(&h.clientPID, pid)
+}
+
+// ServerReady returns the server ready flag
+func (h *SegmentHeader) ServerReady() bool {
+	return atomic.LoadUint32(&h.serverReady) != 0
+}
+
+// SetServerReady sets the server ready flag
+func (h *SegmentHeader) SetServerReady(ready bool) {
+	var val uint32
+	if ready {
+		val = 1
+	}
+	atomic.StoreUint32(&h.serverReady, val)
+}
+
+// ClientReady returns the client ready flag
+func (h *SegmentHeader) ClientReady() bool {
+	return atomic.LoadUint32(&h.clientReady) != 0
+}
+
+// SetClientReady sets the client ready flag
+func (h *SegmentHeader) SetClientReady(ready bool) {
+	var val uint32
+	if ready {
+		val = 1
+	}
+	atomic.StoreUint32(&h.clientReady, val)
+}
+
+// Closed returns the closed flag
+func (h *SegmentHeader) Closed() bool {
+	return atomic.LoadUint32(&h.closed) != 0
+}
+
+// SetClosed sets the closed flag
+func (h *SegmentHeader) SetClosed(closed bool) {
+	var val uint32
+	if closed {
+		val = 1
+	}
+	atomic.StoreUint32(&h.closed, val)
+}
+
+// RingHeader represents a ring buffer header with atomic access fields.
+// Layout follows the specification with 64-byte alignment.
+type RingHeader struct {
+	capacity uint64   // 0x00: power-of-two capacity in bytes
+	widx     uint64   // 0x08: monotonic write index (producer)
+	ridx     uint64   // 0x10: monotonic read index (consumer)
+	dataSeq  uint32   // 0x18: data sequence for futex (producer increments)
+	spaceSeq uint32   // 0x1C: space sequence for futex (consumer increments)
+	closed   uint32   // 0x20: closed flag (producer sets to 1)
+	pad      uint32   // 0x24: padding
+	reserved [24]byte // 0x28-0x3F: reserved/padding to 64B
+	// data area starts at offset 0x40
+}
+
+// RingHeader atomic access methods
+
+// Capacity returns the ring capacity
+func (r *RingHeader) Capacity() uint64 {
+	return atomic.LoadUint64(&r.capacity)
+}
+
+// SetCapacity sets the ring capacity
+func (r *RingHeader) SetCapacity(capacity uint64) {
+	atomic.StoreUint64(&r.capacity, capacity)
+}
+
+// WriteIndex returns the monotonic write index (producer)
+func (r *RingHeader) WriteIndex() uint64 {
+	return atomic.LoadUint64(&r.widx)
+}
+
+// SetWriteIndex sets the monotonic write index (producer)
+func (r *RingHeader) SetWriteIndex(idx uint64) {
+	atomic.StoreUint64(&r.widx, idx)
+}
+
+// ReadIndex returns the monotonic read index (consumer)
+func (r *RingHeader) ReadIndex() uint64 {
+	return atomic.LoadUint64(&r.ridx)
+}
+
+// SetReadIndex sets the monotonic read index (consumer)
+func (r *RingHeader) SetReadIndex(idx uint64) {
+	atomic.StoreUint64(&r.ridx, idx)
+}
+
+// DataSequence returns the data sequence number for futex
+func (r *RingHeader) DataSequence() uint32 {
+	return atomic.LoadUint32(&r.dataSeq)
+}
+
+// IncrementDataSequence atomically increments the data sequence
+func (r *RingHeader) IncrementDataSequence() uint32 {
+	return atomic.AddUint32(&r.dataSeq, 1)
+}
+
+// SpaceSequence returns the space sequence number for futex
+func (r *RingHeader) SpaceSequence() uint32 {
+	return atomic.LoadUint32(&r.spaceSeq)
+}
+
+// IncrementSpaceSequence atomically increments the space sequence
+func (r *RingHeader) IncrementSpaceSequence() uint32 {
+	return atomic.AddUint32(&r.spaceSeq, 1)
+}
+
+// Closed returns the closed flag
+func (r *RingHeader) Closed() bool {
+	return atomic.LoadUint32(&r.closed) != 0
+}
+
+// SetClosed sets the closed flag
+func (r *RingHeader) SetClosed(closed bool) {
+	var val uint32
+	if closed {
+		val = 1
+	}
+	atomic.StoreUint32(&r.closed, val)
+}
+
+// DataArea returns a pointer to the ring's data area
+func (r *RingHeader) DataArea() unsafe.Pointer {
+	return unsafe.Pointer(uintptr(unsafe.Pointer(r)) + RingHeaderSize)
+}
+
+// Ring invariant calculation helpers
+
+// Used returns the number of bytes currently used in the ring
+func (r *RingHeader) Used() uint64 {
+	// Use atomic loads to ensure consistency
+	w := atomic.LoadUint64(&r.widx)
+	rd := atomic.LoadUint64(&r.ridx)
+	return w - rd // uint64 arithmetic handles wrap-around
+}
+
+// Available returns the number of bytes available for writing
+func (r *RingHeader) Available() uint64 {
+	capacity := atomic.LoadUint64(&r.capacity)
+	used := r.Used()
+	return capacity - used
+}
+
+// Offset converts a monotonic index to a ring buffer offset
+func (r *RingHeader) Offset(index uint64) uint64 {
+	capacity := atomic.LoadUint64(&r.capacity)
+	return index & (capacity - 1) // fast masked wrap for power-of-2
+}
+
+// IsEmpty returns true if the ring is empty
+func (r *RingHeader) IsEmpty() bool {
+	return r.Used() == 0
+}
+
+// IsFull returns true if the ring is full
+func (r *RingHeader) IsFull() bool {
+	return r.Available() == 0
+}
+
+// CanWrite returns true if at least n bytes can be written
+func (r *RingHeader) CanWrite(n uint64) bool {
+	return r.Available() >= n
+}
+
+// CanRead returns true if at least n bytes can be read
+func (r *RingHeader) CanRead(n uint64) bool {
+	return r.Used() >= n
+}
+
+// Layout calculation and validation helpers
+
+// IsPowerOfTwo returns true if n is a power of two
+func IsPowerOfTwo(n uint64) bool {
+	return n > 0 && (n&(n-1)) == 0
+}
+
+// NextPowerOfTwo returns the next power of two >= n
+func NextPowerOfTwo(n uint64) uint64 {
+	if n == 0 {
+		return 1
+	}
+	if IsPowerOfTwo(n) {
+		return n
+	}
+
+	// Find the highest set bit and shift left by 1
+	n--
+	n |= n >> 1
+	n |= n >> 2
+	n |= n >> 4
+	n |= n >> 8
+	n |= n >> 16
+	n |= n >> 32
+	n++
+	return n
+}
+
+// CalculateSegmentLayout calculates the memory layout for a segment with given ring capacities
+func CalculateSegmentLayout(ringACapacity, ringBCapacity uint64) (totalSize, ringAOffset, ringBOffset uint64, err error) {
+	// Validate capacities are powers of two
+	if !IsPowerOfTwo(ringACapacity) {
+		return 0, 0, 0, fmt.Errorf("ring A capacity %d is not a power of two", ringACapacity)
+	}
+	if !IsPowerOfTwo(ringBCapacity) {
+		return 0, 0, 0, fmt.Errorf("ring B capacity %d is not a power of two", ringBCapacity)
+	}
+
+	// Validate minimum capacity
+	if ringACapacity < MinRingCapacity {
+		return 0, 0, 0, fmt.Errorf("ring A capacity %d is below minimum %d", ringACapacity, MinRingCapacity)
+	}
+	if ringBCapacity < MinRingCapacity {
+		return 0, 0, 0, fmt.Errorf("ring B capacity %d is below minimum %d", ringBCapacity, MinRingCapacity)
+	}
+
+	// Calculate offsets (aligned to 64-byte boundaries)
+	ringAOffset = alignTo64(SegmentHeaderSize)
+	ringBOffset = alignTo64(ringAOffset + RingHeaderSize + ringACapacity)
+	totalSize = alignTo64(ringBOffset + RingHeaderSize + ringBCapacity)
+
+	return totalSize, ringAOffset, ringBOffset, nil
+}
+
+// alignTo64 aligns a size to 64-byte boundary
+func alignTo64(size uint64) uint64 {
+	return (size + 63) &^ 63
+}
+
+// ValidateSegmentHeader validates a segment header for consistency
+func ValidateSegmentHeader(h *SegmentHeader) error {
+	// Check magic
+	if h.Magic() != [8]byte{'G', 'R', 'P', 'C', 'S', 'H', 'M', 0} {
+		return fmt.Errorf("invalid magic bytes")
+	}
+
+	// Check version
+	if h.Version() != SegmentVersion {
+		return fmt.Errorf("unsupported version %d, expected %d", h.Version(), SegmentVersion)
+	}
+
+	// Check ring capacities are powers of two
+	if !IsPowerOfTwo(h.RingACapacity()) {
+		return fmt.Errorf("ring A capacity %d is not a power of two", h.RingACapacity())
+	}
+	if !IsPowerOfTwo(h.RingBCapacity()) {
+		return fmt.Errorf("ring B capacity %d is not a power of two", h.RingBCapacity())
+	}
+
+	// Check minimum capacities
+	if h.RingACapacity() < MinRingCapacity {
+		return fmt.Errorf("ring A capacity %d is below minimum %d", h.RingACapacity(), MinRingCapacity)
+	}
+	if h.RingBCapacity() < MinRingCapacity {
+		return fmt.Errorf("ring B capacity %d is below minimum %d", h.RingBCapacity(), MinRingCapacity)
+	}
+
+	// Validate offsets and total size
+	expectedTotal, expectedRingAOff, expectedRingBOff, err := CalculateSegmentLayout(h.RingACapacity(), h.RingBCapacity())
+	if err != nil {
+		return fmt.Errorf("layout calculation failed: %w", err)
+	}
+
+	if h.TotalSize() != expectedTotal {
+		return fmt.Errorf("total size mismatch: got %d, expected %d", h.TotalSize(), expectedTotal)
+	}
+	if h.RingAOffset() != expectedRingAOff {
+		return fmt.Errorf("ring A offset mismatch: got %d, expected %d", h.RingAOffset(), expectedRingAOff)
+	}
+	if h.RingBOffset() != expectedRingBOff {
+		return fmt.Errorf("ring B offset mismatch: got %d, expected %d", h.RingBOffset(), expectedRingBOff)
+	}
+
+	return nil
+}
