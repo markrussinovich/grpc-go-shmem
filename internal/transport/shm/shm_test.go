@@ -19,7 +19,9 @@
 package shm
 
 import (
+	"sync/atomic"
 	"testing"
+	"time"
 	"unsafe"
 )
 
@@ -587,4 +589,304 @@ func isLinuxPlatform() bool {
 	segment.Close()
 	RemoveSegment("__test_platform_check__")
 	return true
+}
+
+func TestFutexBasic(t *testing.T) {
+	// Test basic futex operations
+	var addr uint32 = 42
+
+	// Test wake on address with no waiters - should return 0
+	n, err := futexWake(&addr, 1)
+	if !isLinuxPlatform() {
+		// On non-Linux platforms, should return ErrUnsupported
+		if err == nil {
+			t.Error("futexWake should return error on non-Linux platforms")
+		}
+		return
+	}
+
+	if err != nil {
+		t.Fatalf("futexWake failed: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("futexWake returned %d, want 0 (no waiters)", n)
+	}
+
+	// Test wait with wrong value - should return immediately
+	addr = 42
+	err = futexWait(&addr, 100) // wrong value
+	if err != nil {
+		t.Errorf("futexWait with wrong value failed: %v", err)
+	}
+}
+
+func TestFutexWaitWake(t *testing.T) {
+	if !isLinuxPlatform() {
+		t.Skip("Futex tests only supported on Linux")
+	}
+
+	var addr uint32 = 0
+	waitDone := make(chan bool, 1)
+	wakeCount := make(chan int, 1)
+
+	// Start a goroutine that waits
+	go func() {
+		err := futexWait(&addr, 0) // wait while addr == 0
+		if err != nil {
+			t.Errorf("futexWait failed: %v", err)
+		}
+		waitDone <- true
+	}()
+
+	// Give the waiter a chance to start waiting
+	time.Sleep(10 * time.Millisecond)
+
+	// Wake the waiter
+	go func() {
+		n, err := futexWake(&addr, 1)
+		if err != nil {
+			t.Errorf("futexWake failed: %v", err)
+		}
+		wakeCount <- n
+	}()
+
+	// Wait for both operations to complete
+	select {
+	case <-waitDone:
+		// Good - waiter was woken
+	case <-time.After(1 * time.Second):
+		t.Fatal("futexWait did not return within timeout")
+	}
+
+	select {
+	case n := <-wakeCount:
+		if n != 1 {
+			t.Errorf("futexWake returned %d, want 1", n)
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("futexWake did not complete within timeout")
+	}
+}
+
+func TestFutexMultipleWaiters(t *testing.T) {
+	if !isLinuxPlatform() {
+		t.Skip("Futex tests only supported on Linux")
+	}
+
+	var addr uint32 = 42
+	const numWaiters = 3
+	waitDone := make(chan bool, numWaiters)
+
+	// Start multiple waiters
+	for i := 0; i < numWaiters; i++ {
+		go func() {
+			err := futexWait(&addr, 42) // wait while addr == 42
+			if err != nil {
+				t.Errorf("futexWait failed: %v", err)
+			}
+			waitDone <- true
+		}()
+	}
+
+	// Give waiters a chance to start waiting
+	time.Sleep(10 * time.Millisecond)
+
+	// Wake all waiters
+	n, err := futexWake(&addr, numWaiters)
+	if err != nil {
+		t.Fatalf("futexWake failed: %v", err)
+	}
+
+	// Should wake all waiters (though some might not have been waiting yet)
+	if n > numWaiters {
+		t.Errorf("futexWake returned %d, want <= %d", n, numWaiters)
+	}
+
+	// Wait for all waiters to complete
+	for i := 0; i < numWaiters; i++ {
+		select {
+		case <-waitDone:
+			// Good - waiter was woken
+		case <-time.After(1 * time.Second):
+			t.Fatalf("Waiter %d did not return within timeout", i)
+		}
+	}
+}
+
+func TestFutexValueChange(t *testing.T) {
+	if !isLinuxPlatform() {
+		t.Skip("Futex tests only supported on Linux")
+	}
+
+	var addr uint32 = 0
+	waitDone := make(chan bool, 1)
+
+	// Start a waiter
+	go func() {
+		err := futexWait(&addr, 0) // wait while addr == 0
+		if err != nil {
+			t.Errorf("futexWait failed: %v", err)
+		}
+		waitDone <- true
+	}()
+
+	// Give the waiter a chance to start waiting
+	time.Sleep(10 * time.Millisecond)
+
+	// Change the value (this alone won't wake the waiter in our implementation)
+	atomic.StoreUint32(&addr, 1)
+
+	// Now wake the waiter
+	n, err := futexWake(&addr, 1)
+	if err != nil {
+		t.Fatalf("futexWake failed: %v", err)
+	}
+
+	// Wait for the waiter to complete
+	select {
+	case <-waitDone:
+		// Good - waiter was woken
+	case <-time.After(1 * time.Second):
+		t.Fatal("futexWait did not return within timeout")
+	}
+
+	t.Logf("futexWake woke %d waiters", n)
+}
+
+func TestFutexSpuriousWake(t *testing.T) {
+	if !isLinuxPlatform() {
+		t.Skip("Futex tests only supported on Linux")
+	}
+
+	var addr uint32 = 100
+	done := make(chan bool, 1)
+
+	// Test the typical usage pattern in a separate goroutine
+	go func() {
+		waitCount := 0
+		maxWaits := 5
+
+		for waitCount < maxWaits {
+			// Typical usage pattern: check condition, then wait only if condition unmet
+			currentVal := atomic.LoadUint32(&addr)
+			if currentVal != 100 {
+				break // Condition met - value changed
+			}
+
+			// Condition not met, wait for change
+			err := futexWait(&addr, 100)
+			if err != nil {
+				t.Errorf("futexWait failed: %v", err)
+				break
+			}
+
+			waitCount++
+
+			// After waking, check condition again (handles spurious wakes)
+			currentVal = atomic.LoadUint32(&addr)
+			if currentVal != 100 {
+				break // Condition actually changed
+			}
+
+			// For this test, we'll break after a few iterations
+			if waitCount >= 3 {
+				break
+			}
+		}
+
+		done <- true
+	}()
+
+	// Give the waiter a chance to start
+	time.Sleep(10 * time.Millisecond)
+
+	// Change the value and wake the waiter
+	atomic.StoreUint32(&addr, 200)
+	n, err := futexWake(&addr, 1)
+	if err != nil {
+		t.Errorf("futexWake failed: %v", err)
+	}
+
+	// Wait for completion
+	select {
+	case <-done:
+		t.Logf("Test completed successfully, futexWake woke %d waiters", n)
+	case <-time.After(2 * time.Second):
+		t.Fatal("Test did not complete within timeout")
+	}
+}
+
+func TestFutexWithSharedMemory(t *testing.T) {
+	if !isLinuxPlatform() {
+		t.Skip("Futex tests only supported on Linux")
+	}
+
+	name := "test_futex_shared"
+	defer RemoveSegment(name)
+
+	// Create a shared memory segment
+	segment, err := CreateSegment(name, 4096, 4096)
+	if err != nil {
+		t.Fatalf("CreateSegment failed: %v", err)
+	}
+	defer segment.Close()
+
+	// Test futex operations on shared memory
+	// Use the dataSeq field from ring A as our futex target
+	ring := segment.A
+
+	// Test initial state
+	if ring.DataSequence() != 0 {
+		t.Errorf("Initial DataSequence = %d, want 0", ring.DataSequence())
+	}
+
+	// Test increment and futex wake
+	oldSeq := ring.IncrementDataSequence()
+	newSeq := ring.DataSequence()
+	if newSeq != oldSeq {
+		t.Errorf("DataSequence after increment = %d, want %d", newSeq, oldSeq)
+	}
+
+	// Get pointer to the sequence field for futex operations
+	seqPtr := (*uint32)(unsafe.Pointer(uintptr(unsafe.Pointer(ring.header())) + unsafe.Offsetof(ring.header().dataSeq)))
+
+	// Test futex wake on the sequence field
+	n, err := futexWake(seqPtr, 1)
+	if err != nil {
+		t.Errorf("futexWake on shared memory failed: %v", err)
+	}
+	if n != 0 {
+		t.Logf("futexWake woke %d waiters (expected 0)", n)
+	}
+
+	// Test async wait/wake pattern
+	waitDone := make(chan bool, 1)
+	currentSeq := ring.DataSequence()
+
+	go func() {
+		// Wait for sequence to change
+		err := futexWait(seqPtr, currentSeq)
+		if err != nil {
+			t.Errorf("futexWait on shared memory failed: %v", err)
+		}
+		waitDone <- true
+	}()
+
+	// Give waiter time to start
+	time.Sleep(10 * time.Millisecond)
+
+	// Increment sequence and wake
+	ring.IncrementDataSequence()
+	n, err = futexWake(seqPtr, 1)
+	if err != nil {
+		t.Errorf("futexWake failed: %v", err)
+	}
+
+	// Wait for completion
+	select {
+	case <-waitDone:
+		t.Logf("Shared memory futex test completed successfully, woke %d waiters", n)
+	case <-time.After(1 * time.Second):
+		t.Fatal("Futex wait on shared memory did not complete within timeout")
+	}
 }

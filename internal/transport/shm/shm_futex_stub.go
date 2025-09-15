@@ -19,3 +19,19 @@
  */
 
 package shm
+
+import (
+	"errors"
+)
+
+var ErrUnsupported = errors.New("futex operations not supported on this platform")
+
+// futexWait is not supported on this platform
+func futexWait(addr *uint32, val uint32) error {
+	return ErrUnsupported
+}
+
+// futexWake is not supported on this platform
+func futexWake(addr *uint32, n int) (int, error) {
+	return 0, ErrUnsupported
+}
