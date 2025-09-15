@@ -25,6 +25,33 @@ import (
 // ErrClosed indicates the ring has been closed; further I/O is disallowed.
 var ErrClosed = errors.New("ring: closed")
 
+// roundUpPowerOfTwo returns the next power of two >= n, with minimum value of 16.
+func roundUpPowerOfTwo(n int) uint64 {
+	if n < 16 {
+		return 16
+	}
+
+	// Convert to uint64 for bit manipulation
+	x := uint64(n)
+
+	// If already a power of two, return as-is
+	if x&(x-1) == 0 {
+		return x
+	}
+
+	// Round up to next power of two using bit manipulation
+	x--
+	x |= x >> 1
+	x |= x >> 2
+	x |= x >> 4
+	x |= x >> 8
+	x |= x >> 16
+	x |= x >> 32
+	x++
+
+	return x
+}
+
 // Ring implements a single-producer/single-consumer circular byte buffer.
 // Capacity is a power of two. It is safe for one writer goroutine and one reader
 // goroutine concurrently. No blocking: operations return immediately with
@@ -49,10 +76,24 @@ type Ring struct {
 // NewRing returns a new Ring with at least the requested capacity. The actual
 // capacity is the next power of two >= minCap and at least 16 bytes.
 // If minCap <= 0, NewRing returns an error.
-func NewRing(minCap int) (*Ring, error) { /* stub */ return nil, nil }
+func NewRing(minCap int) (*Ring, error) {
+	if minCap <= 0 {
+		return nil, errors.New("ring: capacity must be positive")
+	}
+
+	capacity := roundUpPowerOfTwo(minCap)
+
+	return &Ring{
+		buf:  make([]byte, capacity),
+		mask: capacity - 1,
+		cap:  capacity,
+	}, nil
+}
 
 // Capacity returns the byte capacity of the ring.
-func (r *Ring) Capacity() int { /* stub */ return 0 }
+func (r *Ring) Capacity() int {
+	return int(r.cap)
+}
 
 // Close marks the ring as closed. Further writes fail with ErrClosed.
 // Reads of existing data continue until empty, then return 0, io.EOF-like semantics.
