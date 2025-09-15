@@ -137,3 +137,127 @@ func TestRing_Availability(t *testing.T) {
 		})
 	}
 }
+
+func TestRing_WriteRead_Simple(t *testing.T) {
+	ring, err := shm.NewRing(64)
+	if err != nil {
+		t.Fatalf("NewRing(64) failed: %v", err)
+	}
+
+	// Initially, should have no data available to read
+	if availRead := ring.AvailableRead(); availRead != 0 {
+		t.Errorf("AvailableRead() = %d, want 0 before write", availRead)
+	}
+
+	// Write "hello"
+	data := []byte("hello")
+	n, err := ring.Write(data)
+	if err != nil {
+		t.Fatalf("Write(%q) failed: %v", data, err)
+	}
+	if n != len(data) {
+		t.Errorf("Write(%q) = %d, want %d bytes written", data, n, len(data))
+	}
+
+	// After write, should have data available to read
+	expectedAvail := len(data)
+	if availRead := ring.AvailableRead(); availRead != expectedAvail {
+		t.Errorf("AvailableRead() = %d, want %d after write", availRead, expectedAvail)
+	}
+
+	// Available write space should be reduced
+	expectedWrite := ring.Capacity() - len(data)
+	if availWrite := ring.AvailableWrite(); availWrite != expectedWrite {
+		t.Errorf("AvailableWrite() = %d, want %d after write", availWrite, expectedWrite)
+	}
+}
+
+func TestRing_Write_Wrap(t *testing.T) {
+	// Use a small ring to easily test wrap-around
+	ring, err := shm.NewRing(16)
+	if err != nil {
+		t.Fatalf("NewRing(16) failed: %v", err)
+	}
+
+	// Write 10 bytes - should fit without wrapping
+	data1 := []byte("1234567890") // 10 bytes
+	n1, err := ring.Write(data1)
+	if err != nil {
+		t.Fatalf("First Write(%q) failed: %v", data1, err)
+	}
+	if n1 != len(data1) {
+		t.Errorf("First Write(%q) = %d, want %d bytes written", data1, n1, len(data1))
+	}
+
+	// Available read should be 10
+	if availRead := ring.AvailableRead(); availRead != 10 {
+		t.Errorf("AvailableRead() = %d, want 10 after first write", availRead)
+	}
+
+	// Available write should be 6 (16 - 10)
+	if availWrite := ring.AvailableWrite(); availWrite != 6 {
+		t.Errorf("AvailableWrite() = %d, want 6 after first write", availWrite)
+	}
+
+	// NOTE: This test will be completed when Read is implemented
+	// TODO: Read 5 bytes, then write 10 bytes to test wrap-around
+	// For now, test writing up to the limit
+	
+	// Try to write 6 more bytes - should fit exactly
+	data2 := []byte("abcdef") // 6 bytes
+	n2, err := ring.Write(data2)
+	if err != nil {
+		t.Fatalf("Second Write(%q) failed: %v", data2, err)
+	}
+	if n2 != len(data2) {
+		t.Errorf("Second Write(%q) = %d, want %d bytes written", data2, n2, len(data2))
+	}
+
+	// Ring should now be full
+	if availRead := ring.AvailableRead(); availRead != 16 {
+		t.Errorf("AvailableRead() = %d, want 16 after second write (full)", availRead)
+	}
+	if availWrite := ring.AvailableWrite(); availWrite != 0 {
+		t.Errorf("AvailableWrite() = %d, want 0 after second write (full)", availWrite)
+	}
+
+	// Try to write when full - should return 0 bytes written
+	data3 := []byte("x")
+	n3, err := ring.Write(data3)
+	if err != nil {
+		t.Fatalf("Write to full ring failed: %v", err)
+	}
+	if n3 != 0 {
+		t.Errorf("Write to full ring = %d, want 0 bytes written", n3)
+	}
+}
+
+func TestRing_Write_Closed(t *testing.T) {
+	ring, err := shm.NewRing(64)
+	if err != nil {
+		t.Fatalf("NewRing(64) failed: %v", err)
+	}
+
+	// Write should work before closing
+	data := []byte("test")
+	n, err := ring.Write(data)
+	if err != nil {
+		t.Fatalf("Write before close failed: %v", err)
+	}
+	if n != len(data) {
+		t.Errorf("Write before close = %d, want %d bytes written", n, len(data))
+	}
+
+	// Close the ring
+	ring.Close()
+
+	// Write should return ErrClosed after closing
+	data2 := []byte("should fail")
+	n2, err2 := ring.Write(data2)
+	if err2 != shm.ErrClosed {
+		t.Errorf("Write after close error = %v, want ErrClosed", err2)
+	}
+	if n2 != 0 {
+		t.Errorf("Write after close = %d, want 0 bytes written", n2)
+	}
+}

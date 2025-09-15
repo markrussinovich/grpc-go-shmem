@@ -97,10 +97,14 @@ func (r *Ring) Capacity() int {
 
 // Close marks the ring as closed. Further writes fail with ErrClosed.
 // Reads of existing data continue until empty, then return 0, io.EOF-like semantics.
-func (r *Ring) Close() { /* stub */ }
+func (r *Ring) Close() { 
+	r.closed.Store(1)
+}
 
 // Closed reports whether the ring has been closed.
-func (r *Ring) Closed() bool { /* stub */ return false }
+func (r *Ring) Closed() bool { 
+	return r.closed.Load() == 1
+}
 
 // AvailableRead returns the number of bytes currently readable (may be stale if
 // called by the writer).
@@ -122,7 +126,52 @@ func (r *Ring) AvailableWrite() int {
 
 // Write copies up to len(p) bytes into the ring. It is non-blocking; it may
 // return a short write if the ring lacks space. Returns (n, ErrClosed) if closed.
-func (r *Ring) Write(p []byte) (int, error) { /* stub */ return 0, nil }
+func (r *Ring) Write(p []byte) (int, error) {
+	// If closed, return error immediately
+	if r.closed.Load() == 1 {
+		return 0, ErrClosed
+	}
+
+	// Load current indices
+	w := r.w.Load()
+	rd := r.r.Load()
+
+	// Calculate available space
+	used := w - rd
+	free := r.cap - used
+	if free == 0 {
+		return 0, nil // No space available
+	}
+
+	// Determine how much we can write
+	want := uint64(len(p))
+	if want > free {
+		want = free
+	}
+
+	// Compute write offset in buffer
+	off := w & r.mask
+
+	// Compute bytes until end of buffer
+	first := want
+	if first > r.cap-off {
+		first = r.cap - off
+	}
+
+	// Copy first part
+	copy(r.buf[off:off+first], p[:first])
+
+	// Copy second part if needed (wrap around)
+	second := want - first
+	if second > 0 {
+		copy(r.buf[0:second], p[first:first+second])
+	}
+
+	// Publish the write (store after bytes are visible)
+	r.w.Store(w + want)
+
+	return int(want), nil
+}
 
 // Read copies up to len(p) bytes from the ring into p. It is non-blocking; it
 // returns 0 if no data is available. Returns 0, ErrClosed only if the ring was
