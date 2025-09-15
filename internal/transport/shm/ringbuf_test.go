@@ -495,3 +495,380 @@ func TestRing_Close_ReadDrainsThenErrClosed(t *testing.T) {
 		t.Errorf("Read from empty closed ring = %d, want 0 bytes", n2)
 	}
 }
+
+func TestRing_ReserveCommitWrite_PeekCommitRead(t *testing.T) {
+	ring, err := shm.NewRing(64)
+	if err != nil {
+		t.Fatalf("NewRing(64) failed: %v", err)
+	}
+
+	// Reserve space for writing
+	testData := []byte("hello world test")
+	s1, s2, ok := ring.ReserveWrite(len(testData))
+	if !ok {
+		t.Fatalf("ReserveWrite(%d) failed", len(testData))
+	}
+
+	// Total reserved space should match requested
+	totalReserved := len(s1) + len(s2)
+	if totalReserved != len(testData) {
+		t.Errorf("ReserveWrite total space = %d, want %d", totalReserved, len(testData))
+	}
+
+	// Write known pattern into the reserved slices
+	written := 0
+	if len(s1) > 0 {
+		copy(s1, testData[written:written+len(s1)])
+		written += len(s1)
+	}
+	if len(s2) > 0 {
+		copy(s2, testData[written:written+len(s2)])
+		written += len(s2)
+	}
+
+	// Commit the write
+	ring.CommitWrite(len(testData))
+
+	// Verify AvailableRead shows the data
+	if ring.AvailableRead() != len(testData) {
+		t.Errorf("AvailableRead after commit = %d, want %d", ring.AvailableRead(), len(testData))
+	}
+
+	// Peek at the data
+	p1, p2, ok := ring.PeekRead(len(testData))
+	if !ok {
+		t.Fatalf("PeekRead(%d) failed", len(testData))
+	}
+
+	// Total peeked space should match available data
+	totalPeeked := len(p1) + len(p2)
+	if totalPeeked != len(testData) {
+		t.Errorf("PeekRead total space = %d, want %d", totalPeeked, len(testData))
+	}
+
+	// Verify the peeked data matches what we wrote
+	readData := make([]byte, 0, len(testData))
+	if len(p1) > 0 {
+		readData = append(readData, p1...)
+	}
+	if len(p2) > 0 {
+		readData = append(readData, p2...)
+	}
+
+	if !bytes.Equal(readData, testData) {
+		t.Errorf("PeekRead data = %q, want %q", readData, testData)
+	}
+
+	// Commit the read
+	ring.CommitRead(len(testData))
+
+	// Verify the ring is now empty
+	if ring.AvailableRead() != 0 {
+		t.Errorf("AvailableRead after commit read = %d, want 0", ring.AvailableRead())
+	}
+}
+
+func TestRing_Reserve_FailsWhenInsufficientSpace(t *testing.T) {
+	ring, err := shm.NewRing(16) // Small ring
+	if err != nil {
+		t.Fatalf("NewRing(16) failed: %v", err)
+	}
+
+	// Fill the ring to capacity using regular Write
+	fillData := make([]byte, 16)
+	for i := range fillData {
+		fillData[i] = byte(i)
+	}
+	n, err := ring.Write(fillData)
+	if err != nil {
+		t.Fatalf("Write to fill ring failed: %v", err)
+	}
+	if n != 16 {
+		t.Fatalf("Write to fill ring = %d, want 16", n)
+	}
+
+	// Reserve should fail when no space available
+	s1, s2, ok := ring.ReserveWrite(1)
+	if ok {
+		t.Error("ReserveWrite should fail when ring is full")
+	}
+	if s1 != nil || s2 != nil {
+		t.Error("ReserveWrite should return nil slices when failing")
+	}
+
+	// Reserve should also fail when requesting more than capacity
+	ring2, err := shm.NewRing(16)
+	if err != nil {
+		t.Fatalf("NewRing(16) failed: %v", err)
+	}
+	s1, s2, ok = ring2.ReserveWrite(32) // More than capacity
+	if ok {
+		t.Error("ReserveWrite should fail when requesting more than capacity")
+	}
+	if s1 != nil || s2 != nil {
+		t.Error("ReserveWrite should return nil slices when failing")
+	}
+}
+
+func TestRing_Peek_FailsWhenNoData(t *testing.T) {
+	ring, err := shm.NewRing(64)
+	if err != nil {
+		t.Fatalf("NewRing(64) failed: %v", err)
+	}
+
+	// PeekRead should fail when ring is empty
+	s1, s2, ok := ring.PeekRead(10)
+	if ok {
+		t.Error("PeekRead should fail when ring is empty")
+	}
+	if s1 != nil || s2 != nil {
+		t.Error("PeekRead should return nil slices when failing")
+	}
+
+	// PeekRead should also fail with invalid input
+	s1, s2, ok = ring.PeekRead(0)
+	if ok {
+		t.Error("PeekRead should fail with zero bytes requested")
+	}
+	if s1 != nil || s2 != nil {
+		t.Error("PeekRead should return nil slices when failing")
+	}
+
+	s1, s2, ok = ring.PeekRead(-1)
+	if ok {
+		t.Error("PeekRead should fail with negative bytes requested")
+	}
+	if s1 != nil || s2 != nil {
+		t.Error("PeekRead should return nil slices when failing")
+	}
+}
+
+func TestRing_ReserveWrite_FailsWhenClosed(t *testing.T) {
+	ring, err := shm.NewRing(64)
+	if err != nil {
+		t.Fatalf("NewRing(64) failed: %v", err)
+	}
+
+	// Close the ring
+	ring.Close()
+
+	// ReserveWrite should fail when ring is closed
+	s1, s2, ok := ring.ReserveWrite(10)
+	if ok {
+		t.Error("ReserveWrite should fail when ring is closed")
+	}
+	if s1 != nil || s2 != nil {
+		t.Error("ReserveWrite should return nil slices when failing")
+	}
+}
+
+func TestRing_ReserveCommit_WrapAround(t *testing.T) {
+	ring, err := shm.NewRing(16) // Small ring to force wrap-around
+	if err != nil {
+		t.Fatalf("NewRing(16) failed: %v", err)
+	}
+
+	// Write some data to move the write pointer forward
+	initialData := []byte("abc")
+	n, err := ring.Write(initialData)
+	if err != nil {
+		t.Fatalf("Initial write failed: %v", err)
+	}
+	if n != len(initialData) {
+		t.Fatalf("Initial write = %d, want %d", n, len(initialData))
+	}
+
+	// Read it back to move read pointer forward
+	buf := make([]byte, len(initialData))
+	n, err = ring.Read(buf)
+	if err != nil {
+		t.Fatalf("Initial read failed: %v", err)
+	}
+	if n != len(initialData) {
+		t.Fatalf("Initial read = %d, want %d", n, len(initialData))
+	}
+
+	// Now reserve space that will wrap around the buffer
+	// Ring capacity is 16, we've written 3 bytes starting at 0, so write pointer is at 3
+	// Request 14 bytes: should get one slice from position 3 to 15 (13 bytes)
+	// and another slice from position 0 to 0 (1 byte)
+	wrapData := make([]byte, 14)
+	for i := range wrapData {
+		wrapData[i] = byte('A' + i)
+	}
+
+	s1, s2, ok := ring.ReserveWrite(len(wrapData))
+	if !ok {
+		t.Fatalf("ReserveWrite(%d) failed", len(wrapData))
+	}
+
+	// Verify we got two slices for wrap-around
+	if len(s2) == 0 {
+		t.Error("Expected wrap-around with two slices, got only one")
+	}
+
+	totalReserved := len(s1) + len(s2)
+	if totalReserved != len(wrapData) {
+		t.Errorf("ReserveWrite total = %d, want %d", totalReserved, len(wrapData))
+	}
+
+	// Write the data
+	written := 0
+	copy(s1, wrapData[written:written+len(s1)])
+	written += len(s1)
+	copy(s2, wrapData[written:written+len(s2)])
+
+	// Commit the write
+	ring.CommitWrite(len(wrapData))
+
+	// Peek and verify the data
+	p1, p2, ok := ring.PeekRead(len(wrapData))
+	if !ok {
+		t.Fatalf("PeekRead(%d) failed", len(wrapData))
+	}
+
+	readData := make([]byte, 0, len(wrapData))
+	readData = append(readData, p1...)
+	readData = append(readData, p2...)
+
+	if !bytes.Equal(readData, wrapData) {
+		t.Errorf("PeekRead wrap-around data = %v, want %v", readData, wrapData)
+	}
+
+	// Commit the read
+	ring.CommitRead(len(wrapData))
+
+	// Verify ring is empty
+	if ring.AvailableRead() != 0 {
+		t.Errorf("Ring should be empty after commit, got %d bytes", ring.AvailableRead())
+	}
+}
+
+func TestRing_PeekRead_Partial(t *testing.T) {
+	ring, err := shm.NewRing(64)
+	if err != nil {
+		t.Fatalf("NewRing(64) failed: %v", err)
+	}
+
+	// Write more data than we'll peek at
+	testData := []byte("hello world this is more data")
+	n, err := ring.Write(testData)
+	if err != nil {
+		t.Fatalf("Write failed: %v", err)
+	}
+	if n != len(testData) {
+		t.Fatalf("Write = %d, want %d", n, len(testData))
+	}
+
+	// Peek at only part of the data
+	peekSize := 10
+	s1, s2, ok := ring.PeekRead(peekSize)
+	if !ok {
+		t.Fatalf("PeekRead(%d) failed", peekSize)
+	}
+
+	totalPeeked := len(s1) + len(s2)
+	if totalPeeked != peekSize {
+		t.Errorf("PeekRead total = %d, want %d", totalPeeked, peekSize)
+	}
+
+	// Verify peeked data matches first part of written data
+	peekedData := make([]byte, 0, peekSize)
+	peekedData = append(peekedData, s1...)
+	peekedData = append(peekedData, s2...)
+
+	if !bytes.Equal(peekedData, testData[:peekSize]) {
+		t.Errorf("PeekRead partial data = %q, want %q", peekedData, testData[:peekSize])
+	}
+
+	// Commit only part of the data
+	ring.CommitRead(peekSize)
+
+	// Verify remaining data is still available
+	remaining := len(testData) - peekSize
+	if ring.AvailableRead() != remaining {
+		t.Errorf("AvailableRead after partial commit = %d, want %d", ring.AvailableRead(), remaining)
+	}
+
+	// Read the rest and verify it's correct
+	buf := make([]byte, remaining)
+	n, err = ring.Read(buf)
+	if err != nil {
+		t.Fatalf("Read remaining failed: %v", err)
+	}
+	if n != remaining {
+		t.Fatalf("Read remaining = %d, want %d", n, remaining)
+	}
+	if !bytes.Equal(buf, testData[peekSize:]) {
+		t.Errorf("Remaining data = %q, want %q", buf, testData[peekSize:])
+	}
+}
+
+func TestRing_ReserveWrite_InvalidInput(t *testing.T) {
+	ring, err := shm.NewRing(64)
+	if err != nil {
+		t.Fatalf("NewRing(64) failed: %v", err)
+	}
+
+	// Test zero bytes
+	s1, s2, ok := ring.ReserveWrite(0)
+	if ok {
+		t.Error("ReserveWrite(0) should fail")
+	}
+	if s1 != nil || s2 != nil {
+		t.Error("ReserveWrite(0) should return nil slices")
+	}
+
+	// Test negative bytes
+	s1, s2, ok = ring.ReserveWrite(-1)
+	if ok {
+		t.Error("ReserveWrite(-1) should fail")
+	}
+	if s1 != nil || s2 != nil {
+		t.Error("ReserveWrite(-1) should return nil slices")
+	}
+}
+
+func TestRing_CommitWrite_ZeroBytes(t *testing.T) {
+	ring, err := shm.NewRing(64)
+	if err != nil {
+		t.Fatalf("NewRing(64) failed: %v", err)
+	}
+
+	initialAvail := ring.AvailableRead()
+	
+	// Committing zero bytes should be safe and do nothing
+	ring.CommitWrite(0)
+	
+	if ring.AvailableRead() != initialAvail {
+		t.Errorf("CommitWrite(0) changed available data: %d -> %d", 
+			initialAvail, ring.AvailableRead())
+	}
+}
+
+func TestRing_CommitRead_ZeroBytes(t *testing.T) {
+	ring, err := shm.NewRing(64)
+	if err != nil {
+		t.Fatalf("NewRing(64) failed: %v", err)
+	}
+
+	// Write some data first
+	testData := []byte("test")
+	n, err := ring.Write(testData)
+	if err != nil {
+		t.Fatalf("Write failed: %v", err)
+	}
+	if n != len(testData) {
+		t.Fatalf("Write = %d, want %d", n, len(testData))
+	}
+
+	initialAvail := ring.AvailableRead()
+	
+	// Committing zero bytes should be safe and do nothing
+	ring.CommitRead(0)
+	
+	if ring.AvailableRead() != initialAvail {
+		t.Errorf("CommitRead(0) changed available data: %d -> %d", 
+			initialAvail, ring.AvailableRead())
+	}
+}

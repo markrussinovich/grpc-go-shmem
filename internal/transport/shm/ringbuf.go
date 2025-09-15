@@ -225,16 +225,106 @@ func (r *Ring) Read(p []byte) (int, error) {
 // contiguous slices (head/tail) referencing internal storage. Caller must fill
 // at most len(s1)+len(s2) bytes and then call CommitWrite(k). Returns ok=false
 // if insufficient space or ring is closed.
-func (r *Ring) ReserveWrite(n int) (s1, s2 []byte, ok bool) { /* stub */ return nil, nil, false }
+func (r *Ring) ReserveWrite(n int) (s1, s2 []byte, ok bool) {
+	// Check if closed
+	if r.closed.Load() == 1 {
+		return nil, nil, false
+	}
+
+	// Check for valid input
+	if n <= 0 {
+		return nil, nil, false
+	}
+
+	// Load current indices
+	w := r.w.Load()
+	rd := r.r.Load()
+
+	// Calculate available space
+	used := w - rd
+	free := r.cap - used
+	if uint64(n) > free {
+		return nil, nil, false
+	}
+
+	// Compute write offset in buffer
+	off := w & r.mask
+
+	// Compute bytes until end of buffer
+	first := uint64(n)
+	if first > r.cap-off {
+		first = r.cap - off
+	}
+
+	// Create first slice
+	s1 = r.buf[off : off+first]
+
+	// Create second slice if needed (wrap around)
+	second := uint64(n) - first
+	if second > 0 {
+		s2 = r.buf[0:second]
+	}
+
+	return s1, s2, true
+}
 
 // CommitWrite advances the write index by n bytes previously obtained via
 // ReserveWrite. It is the caller's responsibility to not over-commit.
-func (r *Ring) CommitWrite(n int) { /* stub */ }
+func (r *Ring) CommitWrite(n int) {
+	if n > 0 {
+		r.w.Add(uint64(n))
+	}
+}
 
 // PeekRead returns up to n bytes available for reading as two contiguous slices.
 // Caller must call CommitRead(k) after consuming bytes from s1/s2. Returns
 // (nil,nil,false) if no data.
-func (r *Ring) PeekRead(n int) (s1, s2 []byte, ok bool) { /* stub */ return nil, nil, false }
+func (r *Ring) PeekRead(n int) (s1, s2 []byte, ok bool) {
+	// Check for valid input
+	if n <= 0 {
+		return nil, nil, false
+	}
+
+	// Load current indices
+	w := r.w.Load()
+	rd := r.r.Load()
+
+	// Calculate available data
+	avail := w - rd
+	if avail == 0 {
+		return nil, nil, false
+	}
+
+	// Determine how much we can peek
+	want := uint64(n)
+	if want > avail {
+		want = avail
+	}
+
+	// Compute read offset in buffer
+	off := rd & r.mask
+
+	// Compute bytes until end of buffer
+	first := want
+	if first > r.cap-off {
+		first = r.cap - off
+	}
+
+	// Create first slice
+	s1 = r.buf[off : off+first]
+
+	// Create second slice if needed (wrap around)
+	second := want - first
+	if second > 0 {
+		s2 = r.buf[0:second]
+	}
+
+	return s1, s2, true
+}
 
 // CommitRead advances the read index by n bytes previously obtained via PeekRead.
-func (r *Ring) CommitRead(n int) { /* stub */ }
+func (r *Ring) CommitRead(n int) {
+	if n > 0 {
+		r.r.Add(uint64(n))
+	}
+}
