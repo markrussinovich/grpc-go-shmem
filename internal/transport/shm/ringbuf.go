@@ -156,7 +156,16 @@ func NewRing(minCap int) (*Ring, error) {
 	}, nil
 }
 
-// Capacity returns the byte capacity of the ring.
+// Capacity returns the total byte capacity of the ring buffer.
+//
+// The capacity is always a power of two and represents the maximum number
+// of bytes that can be stored in the buffer. This value is fixed at
+// construction time and never changes.
+//
+// Example:
+//
+//	ring, _ := NewRing(1000)    // Requests 1000 bytes
+//	cap := ring.Capacity()      // Returns 1024 (next power of 2)
 func (r *Ring) Capacity() int {
 	return int(r.cap)
 }
@@ -189,8 +198,23 @@ func (r *Ring) Closed() bool {
 	return r.closed.Load() == 1
 }
 
-// AvailableRead returns the number of bytes currently readable (may be stale if
-// called by the writer).
+// AvailableRead returns the number of bytes currently available for reading.
+//
+// This method provides a snapshot of readable data at the time of the call.
+// The value may become stale immediately due to concurrent operations:
+//   - If called by a reader: value is accurate for immediate use
+//   - If called by a writer: value may increase due to concurrent writes
+//
+// Use this method to check data availability before Read/PeekRead operations
+// or to implement flow control logic.
+//
+// Example:
+//
+//	if ring.AvailableRead() >= messageSize {
+//	    // Guaranteed that at least messageSize bytes can be read
+//	    data := make([]byte, messageSize)
+//	    n, err := ring.Read(data)
+//	}
 func (r *Ring) AvailableRead() int {
 	w := r.w.Load()
 	rd := r.r.Load()
@@ -198,7 +222,22 @@ func (r *Ring) AvailableRead() int {
 	return int(used)
 }
 
-// AvailableWrite returns the number of bytes currently writable (free space).
+// AvailableWrite returns the number of bytes currently available for writing.
+//
+// This method provides a snapshot of free space at the time of the call.
+// The value may become stale immediately due to concurrent operations:
+//   - If called by a writer: value is accurate for immediate use
+//   - If called by a reader: value may increase due to concurrent reads
+//
+// Use this method to check space availability before Write/ReserveWrite
+// operations or to implement backpressure mechanisms.
+//
+// Example:
+//
+//	if ring.AvailableWrite() >= len(data) {
+//	    // Guaranteed that data can be written without blocking
+//	    n, err := ring.Write(data)
+//	}
 func (r *Ring) AvailableWrite() int {
 	w := r.w.Load()
 	rd := r.r.Load()
@@ -344,10 +383,37 @@ func (r *Ring) Read(p []byte) (int, error) {
 	return int(want), nil
 }
 
-// ReserveWrite reserves n bytes for in-place writing and returns up to two
-// contiguous slices (head/tail) referencing internal storage. Caller must fill
-// at most len(s1)+len(s2) bytes and then call CommitWrite(k). Returns ok=false
-// if insufficient space or ring is closed.
+// ReserveWrite reserves n bytes for zero-copy in-place writing.
+//
+// This method provides direct access to the ring buffer's internal memory,
+// eliminating the need to copy data. The returned slices reference the actual
+// ring buffer storage where data should be written.
+//
+// Parameters:
+//   - n: number of bytes to reserve (must be > 0)
+//
+// Returns:
+//   - s1: first contiguous slice for writing (may be entire reservation)
+//   - s2: second contiguous slice for writing (nil if no wrap-around needed)
+//   - ok: true if reservation succeeded, false if insufficient space or closed
+//
+// Usage pattern:
+//  1. Call ReserveWrite(n) to get direct memory access
+//  2. Write data directly into s1 and s2 slices
+//  3. Call CommitWrite(actualBytes) to publish the data
+//
+// The total capacity of s1+s2 equals n bytes. Due to the circular nature of
+// the buffer, the reservation may be split into two contiguous segments when
+// wrap-around is needed.
+//
+// ReserveWrite will fail (ok=false) if:
+//   - n <= 0
+//   - Insufficient space available
+//   - Ring is closed
+//
+// After a successful ReserveWrite, the caller MUST call CommitWrite exactly once
+// with the number of bytes actually written. Calling ReserveWrite again before
+// CommitWrite results in undefined behavior.
 func (r *Ring) ReserveWrite(n int) (s1, s2 []byte, ok bool) {
 	// Check if closed
 	if r.closed.Load() == 1 {
@@ -391,17 +457,53 @@ func (r *Ring) ReserveWrite(n int) (s1, s2 []byte, ok bool) {
 	return s1, s2, true
 }
 
-// CommitWrite advances the write index by n bytes previously obtained via
-// ReserveWrite. It is the caller's responsibility to not over-commit.
+// CommitWrite advances the write index by n bytes, completing a zero-copy write
+// operation started with ReserveWrite. The n parameter must not exceed the
+// number of bytes previously reserved, and the caller must have written exactly
+// n bytes to the slice returned by ReserveWrite.
+//
+// Example zero-copy write pattern:
+//
+//	data := []byte("hello")
+//	buf, ok := ring.ReserveWrite(len(data))
+//	if ok {
+//	    copy(buf, data)           // Write directly to ring buffer
+//	    ring.CommitWrite(len(data)) // Make data visible to readers
+//	}
+//
+// CommitWrite is safe to call from multiple goroutines, but the caller is
+// responsible for ensuring that the n value corresponds to data actually
+// written to the reserved buffer slice.
 func (r *Ring) CommitWrite(n int) {
 	if n > 0 {
 		r.w.Add(uint64(n))
 	}
 }
 
-// PeekRead returns up to n bytes available for reading as two contiguous slices.
-// Caller must call CommitRead(k) after consuming bytes from s1/s2. Returns
-// (nil,nil,false) if no data.
+// PeekRead provides zero-copy access to up to n bytes of buffered data without
+// advancing the read position. Returns up to two contiguous byte slices (s1, s2)
+// that together contain the available data, and ok=true if any data is available.
+// Returns (nil, nil, false) if no data is available or n <= 0.
+//
+// The data may span the ring buffer boundary, requiring two slices:
+//   - s1: First contiguous portion of data
+//   - s2: Second portion if data wraps around (may be nil)
+//
+// After processing the data from s1 and s2, the caller must call CommitRead
+// with the number of bytes actually consumed to advance the read position.
+//
+// Example zero-copy read pattern:
+//
+//	s1, s2, ok := ring.PeekRead(1024)
+//	if ok {
+//	    consumed := process(s1) + process(s2)  // Process data in-place
+//	    ring.CommitRead(consumed)               // Advance read position
+//	}
+//
+// The returned slices are valid until the next call to PeekRead, CommitRead,
+// or any method that might advance the read position. PeekRead is safe to call
+// from multiple goroutines, but callers must coordinate to ensure proper
+// CommitRead sequencing.
 func (r *Ring) PeekRead(n int) (s1, s2 []byte, ok bool) {
 	// Check for valid input
 	if n <= 0 {
@@ -445,7 +547,23 @@ func (r *Ring) PeekRead(n int) (s1, s2 []byte, ok bool) {
 	return s1, s2, true
 }
 
-// CommitRead advances the read index by n bytes previously obtained via PeekRead.
+// CommitRead advances the read index by n bytes, completing a zero-copy read
+// operation started with PeekRead. The n parameter should not exceed the
+// total number of bytes available in the slices returned by PeekRead, and
+// represents the number of bytes actually consumed by the application.
+//
+// Example usage with partial consumption:
+//
+//	s1, s2, ok := ring.PeekRead(1024)
+//	if ok {
+//	    // Process only part of available data
+//	    consumed := processHeader(s1[:headerSize])
+//	    ring.CommitRead(consumed)  // Advance by actual consumption
+//	}
+//
+// CommitRead is safe to call from multiple goroutines, but callers must
+// ensure that the n value corresponds to data actually processed from
+// the most recent PeekRead operation.
 func (r *Ring) CommitRead(n int) {
 	if n > 0 {
 		r.r.Add(uint64(n))
