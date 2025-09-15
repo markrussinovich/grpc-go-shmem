@@ -422,3 +422,76 @@ func TestRing_Read_PartialRead(t *testing.T) {
 		t.Errorf("Read with small buffer = %q, want %q", smallBuf, "wor")
 	}
 }
+
+func TestRing_Close_WriteFails(t *testing.T) {
+	ring, err := shm.NewRing(64)
+	if err != nil {
+		t.Fatalf("NewRing(64) failed: %v", err)
+	}
+
+	// Ring should not be closed initially
+	if ring.Closed() {
+		t.Error("New ring should not be closed")
+	}
+
+	// Close the ring first
+	ring.Close()
+
+	// Ring should now be closed
+	if !ring.Closed() {
+		t.Error("Ring should be closed after Close()")
+	}
+
+	// Write should return ErrClosed after closing
+	data := []byte("should fail")
+	n, err := ring.Write(data)
+	if err != shm.ErrClosed {
+		t.Errorf("Write after close error = %v, want ErrClosed", err)
+	}
+	if n != 0 {
+		t.Errorf("Write after close = %d, want 0 bytes written", n)
+	}
+}
+
+func TestRing_Close_ReadDrainsThenErrClosed(t *testing.T) {
+	ring, err := shm.NewRing(64)
+	if err != nil {
+		t.Fatalf("NewRing(64) failed: %v", err)
+	}
+
+	// Write some data first
+	testData := []byte("hello world")
+	n, err := ring.Write(testData)
+	if err != nil {
+		t.Fatalf("Write failed: %v", err)
+	}
+	if n != len(testData) {
+		t.Fatalf("Write = %d, want %d bytes written", n, len(testData))
+	}
+
+	// Close the ring
+	ring.Close()
+
+	// First read should drain the existing data successfully
+	buf := make([]byte, len(testData))
+	n, err = ring.Read(buf)
+	if err != nil {
+		t.Errorf("Read from closed ring with data failed: %v", err)
+	}
+	if n != len(testData) {
+		t.Errorf("Read from closed ring = %d, want %d bytes", n, len(testData))
+	}
+	if !bytes.Equal(buf, testData) {
+		t.Errorf("Read from closed ring = %q, want %q", buf, testData)
+	}
+
+	// Second read should return ErrClosed since ring is now empty and closed
+	buf2 := make([]byte, 10)
+	n2, err2 := ring.Read(buf2)
+	if err2 != shm.ErrClosed {
+		t.Errorf("Read from empty closed ring error = %v, want ErrClosed", err2)
+	}
+	if n2 != 0 {
+		t.Errorf("Read from empty closed ring = %d, want 0 bytes", n2)
+	}
+}
