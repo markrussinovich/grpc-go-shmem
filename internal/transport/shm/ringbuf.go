@@ -25,6 +25,27 @@ import (
 // ErrClosed indicates the ring has been closed; further I/O is disallowed.
 var ErrClosed = errors.New("ring: closed")
 
+// paddedUint64 wraps an atomic.Uint64 with cache-line padding to prevent false sharing.
+// 
+// False sharing occurs when multiple CPU cores access different variables that 
+// happen to be on the same cache line. When one core modifies its variable, the 
+// entire cache line is invalidated on other cores, forcing them to reload the
+// cache line even if they only need their own variable.
+//
+// In a ring buffer, the writer frequently updates 'w' while the reader frequently 
+// updates 'r'. Without padding, these could end up on the same cache line, causing
+// unnecessary cache line bouncing between cores and degrading performance.
+//
+// By padding each atomic counter to its own 64-byte cache line, we ensure that
+// updates to 'w' and 'r' don't interfere with each other at the cache level.
+//
+// Assumes 64-byte cache lines (common on x86-64). The atomic.Uint64 itself is 8 bytes,
+// so we pad with 56 bytes to reach the full 64-byte cache line size.
+type paddedUint64 struct {
+	atomic.Uint64
+	_ [56]byte // Cache line padding (64 - 8 = 56)
+}
+
 // roundUpPowerOfTwo returns the next power of two >= n, with minimum value of 16.
 func roundUpPowerOfTwo(n int) uint64 {
 	if n < 16 {
@@ -57,9 +78,10 @@ func roundUpPowerOfTwo(n int) uint64 {
 // goroutine concurrently. No blocking: operations return immediately with
 // progress made (may be zero).
 type Ring struct {
-	// 64-bit monotonic counters. Writer owns w; reader owns r.
-	w atomic.Uint64 // next write position (bytes since start)
-	r atomic.Uint64 // next read position  (bytes since start)
+	// 64-bit monotonic counters with cache-line padding to avoid false sharing.
+	// Writer owns w; reader owns r.
+	w paddedUint64 // next write position (bytes since start)
+	r paddedUint64 // next read position  (bytes since start)
 
 	// Buffer storage and fast mask for modulo (capacity - 1).
 	buf  []byte
@@ -68,9 +90,6 @@ type Ring struct {
 
 	// Closed flag: 0 = open, 1 = closed.
 	closed atomic.Uint32
-
-	// Optional padding to keep w and r on separate cache lines (avoid false sharing).
-	// (We will add padding later if needed; not required for correctness.)
 }
 
 // NewRing returns a new Ring with at least the requested capacity. The actual
