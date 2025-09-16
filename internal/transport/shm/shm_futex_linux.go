@@ -22,6 +22,7 @@ package shm
 
 import (
 	"fmt"
+	"sync/atomic"
 	"syscall"
 	"unsafe"
 )
@@ -42,6 +43,13 @@ const (
 // and *addr == val. Always re-check the condition after this returns due
 // to possible spurious wakeups.
 func futexWait(addr *uint32, val uint32) error {
+	// Critical: Re-check the value atomically before entering the syscall
+	// This prevents the lost-wake race where another thread increments
+	// the sequence and wakes us between our snapshot and futex entry
+	if atomic.LoadUint32(addr) != val {
+		return nil // Value already changed, no need to wait
+	}
+
 	// Use syscall.RawSyscall6 for the futex system call
 	// syscall number, uaddr, futex_op, val, timeout, uaddr2, val3
 	r1, _, errno := syscall.RawSyscall6(
@@ -62,6 +70,65 @@ func futexWait(addr *uint32, val uint32) error {
 		// EINTR means interrupted by signal - also not a real error for our purposes
 		if errno == syscall.EINTR {
 			return nil
+		}
+		return fmt.Errorf("futex wait failed: %w", errno)
+	}
+
+	// r1 == 0 means successful wait and wake
+	_ = r1
+	return nil
+}
+
+// futexWaitTimeout waits on addr until the value changes from val or timeout elapses.
+// timeout is specified in nanoseconds. Returns an error if the wait times out.
+//
+// This function should only be called when the logical condition is unmet
+// and *addr == val. Always re-check the condition after this returns due
+// to possible spurious wakeups.
+func futexWaitTimeout(addr *uint32, val uint32, timeoutNs int64) error {
+	if timeoutNs <= 0 {
+		return futexWait(addr, val) // No timeout, use infinite wait
+	}
+
+	// Critical: Re-check the value atomically before entering the syscall
+	// This prevents the lost-wake race where another thread increments
+	// the sequence and wakes us between our snapshot and futex entry
+	currentVal := atomic.LoadUint32(addr)
+	if currentVal != val {
+		return nil // Value already changed, no need to wait
+	}
+
+	// Convert nanoseconds to timespec
+	var ts syscall.Timespec
+	ts.Sec = timeoutNs / 1e9
+	ts.Nsec = timeoutNs % 1e9
+
+	// Use syscall.RawSyscall6 for the futex system call with timeout
+	r1, r2, errno := syscall.RawSyscall6(
+		syscall.SYS_FUTEX,
+		uintptr(unsafe.Pointer(addr)),      // uaddr - address to wait on
+		FUTEX_WAIT_PRIVATE,                 // futex_op - wait operation with private flag
+		uintptr(val),                       // val - expected value
+		uintptr(unsafe.Pointer(&ts)),       // timeout - timespec pointer
+		0,                                  // uaddr2 - unused
+		0,                                  // val3 - unused
+	)
+
+	// Debug: Check what we got back
+	_ = r2 // not used but let's acknowledge it
+
+	if errno != 0 {
+		// EAGAIN means the value didn't match - not an error
+		if errno == syscall.EAGAIN {
+			return nil
+		}
+		// EINTR means interrupted by signal - not an error
+		if errno == syscall.EINTR {
+			return nil
+		}
+		// ETIMEDOUT means the wait timed out
+		if errno == syscall.ETIMEDOUT {
+			return fmt.Errorf("futex wait timed out")
 		}
 		return fmt.Errorf("futex wait failed: %w", errno)
 	}

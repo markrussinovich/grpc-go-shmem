@@ -4,14 +4,20 @@ package shm
 
 import (
 	"context"
+	"fmt"
+	"os"
 	"testing"
 	"time"
 )
 
 func TestHandshake(t *testing.T) {
-	name := "test-handshake"
+	name := fmt.Sprintf("test-handshake-%d", os.Getpid())
 	ringCapA := uint64(4096)
 	ringCapB := uint64(4096)
+
+	// Ensure clean state
+	RemoveSegment(name)
+	defer RemoveSegment(name)
 
 	// Server creates segment
 	serverSeg, err := CreateSegment(name, ringCapA, ringCapB)
@@ -53,9 +59,13 @@ func TestHandshake(t *testing.T) {
 }
 
 func TestHandshakeTimeout(t *testing.T) {
-	name := "test-handshake-timeout"
+	name := fmt.Sprintf("test-handshake-timeout-%d", os.Getpid())
 	ringCapA := uint64(4096)
 	ringCapB := uint64(4096)
+
+	// Ensure clean state
+	RemoveSegment(name)
+	defer RemoveSegment(name)
 
 	// Server creates segment but doesn't mark ready
 	serverSeg, err := CreateSegment(name, ringCapA, ringCapB)
@@ -96,9 +106,13 @@ func TestHandshakeTimeout(t *testing.T) {
 }
 
 func TestShmConn(t *testing.T) {
-	name := "test-conn"
+	name := fmt.Sprintf("test-conn-%d", os.Getpid())
 	ringCapA := uint64(4096)
 	ringCapB := uint64(4096)
+
+	// Ensure clean state
+	RemoveSegment(name)
+	defer RemoveSegment(name)
 
 	// Server creates segment
 	serverSeg, err := CreateSegment(name, ringCapA, ringCapB)
@@ -194,9 +208,13 @@ func TestShmConn(t *testing.T) {
 }
 
 func TestShmConnLargeData(t *testing.T) {
-	name := "test-conn-large"
+	name := fmt.Sprintf("test-conn-large-%d", os.Getpid())
 	ringCapA := uint64(16384) // 16KB
 	ringCapB := uint64(16384) // 16KB
+
+	// Ensure clean state
+	RemoveSegment(name)
+	defer RemoveSegment(name)
 
 	// Server creates segment
 	serverSeg, err := CreateSegment(name, ringCapA, ringCapB)

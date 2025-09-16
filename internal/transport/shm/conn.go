@@ -19,6 +19,7 @@
 package shm
 
 import (
+	"context"
 	"errors"
 	"sync/atomic"
 )
@@ -82,22 +83,92 @@ func (c *ShmConn) Read(p []byte) (int, error) {
 	return n, nil
 }
 
+// ReadContext reads data from the connection with context timeout support
+func (c *ShmConn) ReadContext(ctx context.Context, p []byte) (int, error) {
+	if c.closed.Load() {
+		return 0, ErrConnectionClosed
+	}
+	
+	n, err := c.readR.ReadBlockingContext(ctx, p)
+	if err != nil {
+		// Check if the connection was closed while we were waiting
+		if c.closed.Load() {
+			return 0, ErrConnectionClosed
+		}
+		return n, err
+	}
+	
+	return n, nil
+}
+
 // Write writes data to the connection
 func (c *ShmConn) Write(p []byte) (int, error) {
 	if c.closed.Load() {
 		return 0, ErrConnectionClosed
 	}
 	
-	err := c.writeR.WriteBlocking(p)
-	if err != nil {
-		// Check if the connection was closed while we were waiting
-		if c.closed.Load() {
-			return 0, ErrConnectionClosed
+	// Handle large writes by chunking them to fit within ring capacity
+	totalWritten := 0
+	ringCapacity := int(c.writeR.Capacity())
+	
+	for totalWritten < len(p) {
+		// Determine chunk size (remaining data or ring capacity, whichever is smaller)
+		remaining := len(p) - totalWritten
+		chunkSize := remaining
+		if chunkSize > ringCapacity {
+			chunkSize = ringCapacity
 		}
-		return 0, err
+		
+		// Write this chunk
+		chunk := p[totalWritten : totalWritten+chunkSize]
+		err := c.writeR.WriteBlocking(chunk)
+		if err != nil {
+			// Check if the connection was closed while we were waiting
+			if c.closed.Load() {
+				return totalWritten, ErrConnectionClosed
+			}
+			return totalWritten, err
+		}
+		
+		totalWritten += chunkSize
 	}
 	
-	return len(p), nil
+	return totalWritten, nil
+}
+
+// WriteContext writes data to the connection with context timeout support
+func (c *ShmConn) WriteContext(ctx context.Context, p []byte) (int, error) {
+	if c.closed.Load() {
+		return 0, ErrConnectionClosed
+	}
+	
+	// Handle large writes by chunking them to fit within ring capacity
+	totalWritten := 0
+	ringCapacity := int(c.writeR.Capacity())
+	
+	for totalWritten < len(p) {
+		// Determine chunk size (remaining data or ring capacity, whichever is smaller)
+		remaining := len(p) - totalWritten
+		chunkSize := remaining
+		if chunkSize > ringCapacity {
+			chunkSize = ringCapacity
+		}
+		
+		// Write this chunk
+		chunk := p[totalWritten : totalWritten+chunkSize]
+		err := c.writeR.WriteBlockingContext(ctx, chunk)
+		if err != nil {
+			// Check if the connection was closed while we were waiting
+			if c.closed.Load() {
+				return totalWritten, ErrConnectionClosed
+			}
+			return totalWritten, err
+		}
+		
+		totalWritten += chunkSize
+	}
+	
+	return totalWritten, nil
 }
 
 // Close closes the connection

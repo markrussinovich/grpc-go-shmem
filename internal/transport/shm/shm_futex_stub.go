@@ -31,6 +31,11 @@ func futexWait(addr *uint32, val uint32) error {
 	return ErrUnsupported
 }
 
+// futexWaitTimeout is not supported on this platform
+func futexWaitTimeout(addr *uint32, val uint32, timeoutNs int64) error {
+	return ErrUnsupported
+}
+
 // futexWake is not supported on this platform
 func futexWake(addr *uint32, n int) (int, error) {
 	return 0, ErrUnsupported

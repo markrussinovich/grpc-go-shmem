@@ -94,7 +94,7 @@ func TestShmRingWrapAround(t *testing.T) {
 	ring := NewShmRingFromSegment(ringA, segment.Mem)
 
 	// Write data that wraps around the ring
-	capacity := ring.capacity()
+	capacity := ring.Capacity()
 	testData := make([]byte, capacity/2) // Half capacity
 	for i := range testData {
 		testData[i] = byte(i % 256)
@@ -241,7 +241,7 @@ func TestShmRingUtilities(t *testing.T) {
 	if ring.Used() != 0 {
 		t.Fatal("new ring should have 0 used bytes")
 	}
-	if ring.Available() != ring.capacity() {
+	if ring.Available() != ring.Capacity() {
 		t.Fatal("new ring should have full capacity available")
 	}
 
@@ -258,7 +258,7 @@ func TestShmRingUtilities(t *testing.T) {
 	if ring.Used() != uint64(len(testData)) {
 		t.Fatalf("expected %d used bytes, got %d", len(testData), ring.Used())
 	}
-	if ring.Available() != ring.capacity()-uint64(len(testData)) {
+	if ring.Available() != ring.Capacity()-uint64(len(testData)) {
 		t.Fatalf("available bytes mismatch")
 	}
 
@@ -283,7 +283,7 @@ func TestShmRingFullBuffer(t *testing.T) {
 	ring := NewShmRingFromSegment(ringA, segment.Mem)
 
 	// Fill the ring completely
-	capacity := ring.capacity()
+	capacity := ring.Capacity()
 	fillData := make([]byte, capacity)
 	for i := range fillData {
 		fillData[i] = byte(i % 256)
