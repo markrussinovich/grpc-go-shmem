@@ -19,13 +19,12 @@
 package shm
 
 import (
-	"context"
-	"encoding/binary"
-	"errors"
-	"fmt"
-	"io"
-	"time"
-	"unsafe"
+    "context"
+    "errors"
+    "fmt"
+    "io"
+    "time"
+    "unsafe"
 )
 
 // ErrRingClosed indicates that the ring has been closed for writing
@@ -57,29 +56,8 @@ type ShmRing struct {
 	// No Go pointers into shared memory stored here; compute addresses on demand
 }
 
-// Frame header definitions for ring-level framing.
-//
-// - Headers are 16 bytes and 16-byte aligned.
-// - Type 0 is a PAD frame; its payload is ignored by readers and is used only
-//   to skip to the beginning of the ring without ever splitting a header across
-//   the end of the ring.
-const (
-    frameHeaderSize = 16
-    frameTypePAD    = uint32(0)
-)
-
-// writeFrameHeader writes a 16-byte header at ptr with the given type/length.
-// Layout (little endian):
-//   uint32 type | uint32 length | 8 bytes reserved (zeros)
-func writeFrameHeader(ptr unsafe.Pointer, typ uint32, length uint32) {
-    b := (*[1 << 30]byte)(ptr)[:frameHeaderSize]
-    binary.LittleEndian.PutUint32(b[0:4], typ)
-    binary.LittleEndian.PutUint32(b[4:8], length)
-    // Zero the reserved bytes for determinism
-    for i := 8; i < frameHeaderSize; i++ {
-        b[i] = 0
-    }
-}
+// SMF (Shared Memory Framing) helpers are defined in frame.go. This file uses
+// ReserveFrameHeader to ensure 16-byte-aligned headers and PAD behavior.
 
 // NewShmRingFromSegment creates a ShmRing from a segment's ring view.
 // This provides the high-level blocking API over the low-level ring view.
@@ -961,7 +939,16 @@ func (r *ShmRing) ReserveFrameHeader(ctx context.Context) (WriteReservation, err
             // Need to emit PAD: write PAD header at offset 0, skip remaining tail.
             // 1) Write PAD header at offset 0 (not yet visible to reader since w not advanced)
             padHdrPtr := r.dataPtr()
-            writeFrameHeader(padHdrPtr, frameTypePAD, uint32(remaining))
+            var fh FrameHeader
+            fh.Length = uint32(remaining)
+            fh.StreamID = 0
+            fh.Type = FrameTypePAD
+            fh.Flags = 0
+            fh.Reserved = 0
+            fh.Reserved2 = 0
+            var hdrBytes [frameHeaderSize]byte
+            encodeFrameHeaderTo(&hdrBytes, fh)
+            copy((*[1<<30]byte)(padHdrPtr)[:frameHeaderSize], hdrBytes[:])
 
             // 2) Publish w to include [tail payload + PAD header]
             padAdvance := remaining + frameHeaderSize
