@@ -32,13 +32,13 @@ var (
 // Server: read from ring A (client->server), write to ring B (server->client)
 // Client: read from ring B (server->client), write to ring A (client->server)
 type ShmConn struct {
-	seg      *Segment
-	readR    *ShmRing
-	writeR   *ShmRing
-	readView *ringView  // For accessing close/increment methods
+	seg       *Segment
+	readR     *ShmRing
+	writeR    *ShmRing
+	readView  *ringView // For accessing close/increment methods
 	writeView *ringView // For accessing close/increment methods
-	closed   atomic.Bool
-	isServer bool // true if this is the server side
+	closed    atomic.Bool
+	isServer  bool // true if this is the server side
 }
 
 // NewServerConn creates a new server-side connection
@@ -70,7 +70,7 @@ func (c *ShmConn) Read(p []byte) (int, error) {
 	if c.closed.Load() {
 		return 0, ErrConnectionClosed
 	}
-	
+
 	n, err := c.readR.ReadBlocking(p)
 	if err != nil {
 		// Check if the connection was closed while we were waiting
@@ -79,7 +79,7 @@ func (c *ShmConn) Read(p []byte) (int, error) {
 		}
 		return n, err
 	}
-	
+
 	return n, nil
 }
 
@@ -88,7 +88,7 @@ func (c *ShmConn) ReadContext(ctx context.Context, p []byte) (int, error) {
 	if c.closed.Load() {
 		return 0, ErrConnectionClosed
 	}
-	
+
 	n, err := c.readR.ReadBlockingContext(ctx, p)
 	if err != nil {
 		// Check if the connection was closed while we were waiting
@@ -97,7 +97,7 @@ func (c *ShmConn) ReadContext(ctx context.Context, p []byte) (int, error) {
 		}
 		return n, err
 	}
-	
+
 	return n, nil
 }
 
@@ -106,11 +106,11 @@ func (c *ShmConn) Write(p []byte) (int, error) {
 	if c.closed.Load() {
 		return 0, ErrConnectionClosed
 	}
-	
+
 	// Handle large writes by chunking them to fit within ring capacity
 	totalWritten := 0
 	ringCapacity := int(c.writeR.Capacity())
-	
+
 	for totalWritten < len(p) {
 		// Determine chunk size (remaining data or ring capacity, whichever is smaller)
 		remaining := len(p) - totalWritten
@@ -118,7 +118,7 @@ func (c *ShmConn) Write(p []byte) (int, error) {
 		if chunkSize > ringCapacity {
 			chunkSize = ringCapacity
 		}
-		
+
 		// Write this chunk
 		chunk := p[totalWritten : totalWritten+chunkSize]
 		err := c.writeR.WriteBlocking(chunk)
@@ -129,10 +129,10 @@ func (c *ShmConn) Write(p []byte) (int, error) {
 			}
 			return totalWritten, err
 		}
-		
+
 		totalWritten += chunkSize
 	}
-	
+
 	return totalWritten, nil
 }
 
@@ -141,11 +141,11 @@ func (c *ShmConn) WriteContext(ctx context.Context, p []byte) (int, error) {
 	if c.closed.Load() {
 		return 0, ErrConnectionClosed
 	}
-	
+
 	// Handle large writes by chunking them to fit within ring capacity
 	totalWritten := 0
 	ringCapacity := int(c.writeR.Capacity())
-	
+
 	for totalWritten < len(p) {
 		// Determine chunk size (remaining data or ring capacity, whichever is smaller)
 		remaining := len(p) - totalWritten
@@ -153,7 +153,7 @@ func (c *ShmConn) WriteContext(ctx context.Context, p []byte) (int, error) {
 		if chunkSize > ringCapacity {
 			chunkSize = ringCapacity
 		}
-		
+
 		// Write this chunk
 		chunk := p[totalWritten : totalWritten+chunkSize]
 		err := c.writeR.WriteBlockingContext(ctx, chunk)
@@ -164,10 +164,10 @@ func (c *ShmConn) WriteContext(ctx context.Context, p []byte) (int, error) {
 			}
 			return totalWritten, err
 		}
-		
+
 		totalWritten += chunkSize
 	}
-	
+
 	return totalWritten, nil
 }
 
@@ -176,23 +176,23 @@ func (c *ShmConn) Close() error {
 	if !c.closed.CompareAndSwap(false, true) {
 		return nil // Already closed
 	}
-	
+
 	// Set both rings as closed to notify the other side
 	c.readR.Close()
 	c.writeR.Close()
-	
+
 	// Set the segment header closed flag
 	c.seg.H.SetClosed(true)
-	
+
 	// Increment data sequence numbers and wake any waiters
 	c.readView.IncrementDataSequence()
 	c.writeView.IncrementDataSequence()
-	
+
 	// If this is the server (segment creator), it owns the segment and cleans up
 	if c.isServer {
 		return c.seg.Close()
 	}
-	
+
 	// Client only unmaps, doesn't unlink the file
 	return c.seg.Close()
 }

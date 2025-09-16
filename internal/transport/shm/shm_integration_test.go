@@ -272,10 +272,10 @@ func TestCrossProcessEcho(t *testing.T) {
 		name string
 		data []byte
 	}{
-		{"small", []byte("hello world")},                     // 11 bytes
-		{"medium", bytes.Repeat([]byte("x"), 1000)},          // 1KB 
-		{"large", bytes.Repeat([]byte("test"), 5000)},        // 20KB
-		{"xlarge", bytes.Repeat([]byte("data"), 10000)},      // 40KB - would deadlock without concurrent I/O
+		{"small", []byte("hello world")},                // 11 bytes
+		{"medium", bytes.Repeat([]byte("x"), 1000)},     // 1KB
+		{"large", bytes.Repeat([]byte("test"), 5000)},   // 20KB
+		{"xlarge", bytes.Repeat([]byte("data"), 10000)}, // 40KB - would deadlock without concurrent I/O
 	}
 
 	for _, tc := range testCases {
@@ -284,7 +284,7 @@ func TestCrossProcessEcho(t *testing.T) {
 			// The server echoes immediately, so client must read concurrently
 			wg := &sync.WaitGroup{}
 			wg.Add(2)
-			
+
 			var writeErr, readErr error
 			received := make([]byte, len(tc.data))
 
@@ -303,7 +303,7 @@ func TestCrossProcessEcho(t *testing.T) {
 				// Signal end of data to server (optional, server handles connection close)
 			}()
 
-			// Reader goroutine  
+			// Reader goroutine
 			go func() {
 				defer wg.Done()
 				read := 0
@@ -324,7 +324,7 @@ func TestCrossProcessEcho(t *testing.T) {
 
 			// Wait for both operations to complete
 			wg.Wait()
-			
+
 			// Check for errors
 			if writeErr != nil {
 				t.Fatalf("Write error: %v", writeErr)

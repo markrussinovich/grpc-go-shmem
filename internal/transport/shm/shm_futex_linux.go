@@ -106,12 +106,12 @@ func futexWaitTimeout(addr *uint32, val uint32, timeoutNs int64) error {
 	// Use syscall.RawSyscall6 for the futex system call with timeout
 	r1, r2, errno := syscall.RawSyscall6(
 		syscall.SYS_FUTEX,
-		uintptr(unsafe.Pointer(addr)),      // uaddr - address to wait on
-		FUTEX_WAIT_PRIVATE,                 // futex_op - wait operation with private flag
-		uintptr(val),                       // val - expected value
-		uintptr(unsafe.Pointer(&ts)),       // timeout - timespec pointer
-		0,                                  // uaddr2 - unused
-		0,                                  // val3 - unused
+		uintptr(unsafe.Pointer(addr)), // uaddr - address to wait on
+		FUTEX_WAIT_PRIVATE,            // futex_op - wait operation with private flag
+		uintptr(val),                  // val - expected value
+		uintptr(unsafe.Pointer(&ts)),  // timeout - timespec pointer
+		0,                             // uaddr2 - unused
+		0,                             // val3 - unused
 	)
 
 	// Debug: Check what we got back

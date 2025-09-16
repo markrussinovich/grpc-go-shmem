@@ -34,11 +34,11 @@ func TestRing_ExactCapacityWriteDoesNotBlock(t *testing.T) {
 
 	cap := uint64(64 * 1024)
 	name := "test_ring_exact_capacity"
-	
+
 	// Ensure clean state
 	RemoveSegment(name)
 	defer RemoveSegment(name)
-	
+
 	seg, err := CreateSegment(name, cap, cap)
 	if err != nil {
 		t.Fatalf("Failed to create segment: %v", err)
@@ -46,7 +46,7 @@ func TestRing_ExactCapacityWriteDoesNotBlock(t *testing.T) {
 	defer seg.Close()
 
 	ring := NewShmRingFromSegment(seg.A, seg.Mem)
-	
+
 	// Verify the ring reports the correct capacity
 	if ring.Capacity() != cap {
 		t.Fatalf("Expected ring capacity %d, got %d", cap, ring.Capacity())
@@ -122,11 +122,11 @@ func TestRing_CapacityPlus1WriteBlocks(t *testing.T) {
 
 	cap := uint64(4096) // Use minimum capacity for test
 	name := "test_ring_capacity_plus1"
-	
+
 	// Ensure clean state
 	RemoveSegment(name)
 	defer RemoveSegment(name)
-	
+
 	seg, err := CreateSegment(name, cap, cap)
 	if err != nil {
 		t.Fatalf("Failed to create segment: %v", err)
@@ -134,7 +134,7 @@ func TestRing_CapacityPlus1WriteBlocks(t *testing.T) {
 	defer seg.Close()
 
 	ring := NewShmRingFromSegment(seg.A, seg.Mem)
-	
+
 	// Try to write capacity + 1 bytes
 	payload := make([]byte, cap+1)
 	for i := range payload {
@@ -177,11 +177,11 @@ func TestRing_MonotonicIndices(t *testing.T) {
 
 	cap := uint64(4096) // Use minimum capacity for fast wraparound
 	name := "test_ring_monotonic"
-	
+
 	// Ensure clean state
 	RemoveSegment(name)
 	defer RemoveSegment(name)
-	
+
 	seg, err := CreateSegment(name, cap, cap)
 	if err != nil {
 		t.Fatalf("Failed to create segment: %v", err)
@@ -189,22 +189,22 @@ func TestRing_MonotonicIndices(t *testing.T) {
 	defer seg.Close()
 
 	ring := NewShmRingFromSegment(seg.A, seg.Mem)
-	
+
 	chunkSize := 32
 	totalWrites := 10 // Will cause multiple wraparounds
-	
+
 	for i := 0; i < totalWrites; i++ {
 		// Write data
 		writeData := make([]byte, chunkSize)
 		for j := range writeData {
 			writeData[j] = byte((i*chunkSize + j) % 256)
 		}
-		
+
 		err := ring.WriteBlocking(writeData)
 		if err != nil {
 			t.Fatalf("write %d failed: %v", i, err)
 		}
-		
+
 		// Read it back
 		readData := make([]byte, chunkSize)
 		n, err := ring.ReadBlocking(readData)
@@ -214,11 +214,11 @@ func TestRing_MonotonicIndices(t *testing.T) {
 		if n != chunkSize {
 			t.Fatalf("read %d: expected %d bytes, got %d", i, chunkSize, n)
 		}
-		
+
 		// Verify data integrity
 		for j := 0; j < chunkSize; j++ {
 			if readData[j] != writeData[j] {
-				t.Fatalf("data mismatch at write %d, offset %d: expected %d, got %d", 
+				t.Fatalf("data mismatch at write %d, offset %d: expected %d, got %d",
 					i, j, writeData[j], readData[j])
 			}
 		}
@@ -234,11 +234,11 @@ func TestRing_ContextAwareWaits(t *testing.T) {
 
 	cap := uint64(4096)
 	name := "test_ring_context_waits"
-	
+
 	// Ensure clean state
 	RemoveSegment(name)
 	defer RemoveSegment(name)
-	
+
 	seg, err := CreateSegment(name, cap, cap)
 	if err != nil {
 		t.Fatalf("Failed to create segment: %v", err)
@@ -246,7 +246,7 @@ func TestRing_ContextAwareWaits(t *testing.T) {
 	defer seg.Close()
 
 	ring := NewShmRingFromSegment(seg.A, seg.Mem)
-	
+
 	// Test 1: Write with timeout when buffer is full
 	t.Run("WriteTimeout", func(t *testing.T) {
 		// Fill the ring to capacity
@@ -255,28 +255,28 @@ func TestRing_ContextAwareWaits(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Failed to fill ring: %v", err)
 		}
-		
+
 		// Try to write more with a short timeout - should fail with DeadlineExceeded
 		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 		defer cancel()
-		
+
 		extraData := make([]byte, 1)
 		err = ring.WriteBlockingContext(ctx, extraData)
 		if err != context.DeadlineExceeded {
 			t.Fatalf("Expected context.DeadlineExceeded, got: %v", err)
 		}
-		
+
 		// Verify ring state shows it's full
 		state := ring.DebugState()
 		if state.Used != state.Capacity {
 			t.Fatalf("Expected ring to be full: used=%d, capacity=%d", state.Used, state.Capacity)
 		}
-		
+
 		// Clean up: read some data to make space
 		readBuf := make([]byte, 1000)
 		ring.ReadBlocking(readBuf)
 	})
-	
+
 	// Test 2: Read with timeout when buffer is empty
 	t.Run("ReadTimeout", func(t *testing.T) {
 		// Ensure ring is empty
@@ -284,17 +284,17 @@ func TestRing_ContextAwareWaits(t *testing.T) {
 			buf := make([]byte, 100)
 			ring.ReadBlocking(buf)
 		}
-		
+
 		// Try to read with a short timeout - should fail with DeadlineExceeded
 		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 		defer cancel()
-		
+
 		readBuf := make([]byte, 100)
 		_, err := ring.ReadBlockingContext(ctx, readBuf)
 		if err != context.DeadlineExceeded {
 			t.Fatalf("Expected context.DeadlineExceeded, got: %v", err)
 		}
-		
+
 		// Verify ring state shows it's empty
 		state := ring.DebugState()
 		if state.Used != 0 {
@@ -313,20 +313,20 @@ func TestRing_DuelingBuffersDiagnostics(t *testing.T) {
 	cap := uint64(4096)
 	name1 := "test_ring_dueling_1"
 	name2 := "test_ring_dueling_2"
-	
+
 	// Ensure clean state
 	RemoveSegment(name1)
 	RemoveSegment(name2)
 	defer RemoveSegment(name1)
 	defer RemoveSegment(name2)
-	
+
 	// Create two segments to simulate client→server and server→client rings
 	seg1, err := CreateSegment(name1, cap, cap)
 	if err != nil {
 		t.Fatalf("Failed to create segment 1: %v", err)
 	}
 	defer seg1.Close()
-	
+
 	seg2, err := CreateSegment(name2, cap, cap)
 	if err != nil {
 		t.Fatalf("Failed to create segment 2: %v", err)
@@ -335,7 +335,7 @@ func TestRing_DuelingBuffersDiagnostics(t *testing.T) {
 
 	clientToServer := NewShmRingFromSegment(seg1.A, seg1.Mem)
 	serverToClient := NewShmRingFromSegment(seg2.A, seg2.Mem)
-	
+
 	// Test normal state (not dueling)
 	isDueling, diagnostic := DiagnoseDuelingBuffers(clientToServer, serverToClient)
 	if isDueling {
@@ -344,21 +344,21 @@ func TestRing_DuelingBuffersDiagnostics(t *testing.T) {
 	if !strings.Contains(diagnostic, "Ring Buffer State:") {
 		t.Errorf("Expected normal diagnostic message")
 	}
-	
+
 	// Fill both rings to capacity to simulate dueling buffers
 	fillData1 := make([]byte, cap)
 	fillData2 := make([]byte, cap)
-	
+
 	err = clientToServer.WriteBlocking(fillData1)
 	if err != nil {
 		t.Fatalf("Failed to fill client→server ring: %v", err)
 	}
-	
+
 	err = serverToClient.WriteBlocking(fillData2)
 	if err != nil {
 		t.Fatalf("Failed to fill server→client ring: %v", err)
 	}
-	
+
 	// Test dueling state detection
 	isDueling, diagnostic = DiagnoseDuelingBuffers(clientToServer, serverToClient)
 	if !isDueling {
@@ -370,7 +370,7 @@ func TestRing_DuelingBuffersDiagnostics(t *testing.T) {
 	if !strings.Contains(diagnostic, "concurrent read/write") {
 		t.Errorf("Expected solution suggestion in diagnostic")
 	}
-	
+
 	// Log the diagnostic for manual inspection
 	t.Logf("Dueling buffers diagnostic:\n%s", diagnostic)
 }

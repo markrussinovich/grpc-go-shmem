@@ -90,7 +90,7 @@ func TestFutexWithWaker(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 		t.Logf("Waker: changing value from 100 to 101")
 		atomic.StoreUint32(addr, 101)
-		
+
 		// Wake the waiter
 		r1, r2, errno := syscall.RawSyscall6(
 			syscall.SYS_FUTEX,

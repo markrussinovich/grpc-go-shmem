@@ -17,13 +17,13 @@ func main() {
 
 	// Create a ring and check its capacity
 	ring := shm.NewShmRingFromSegment(seg.A, seg.Mem)
-	
+
 	fmt.Printf("Configured capacity: 65536 bytes\n")
 	fmt.Printf("Actual ring capacity: %d bytes\n", ring.Capacity())
-	
+
 	// Try to determine the actual usable space
 	testSizes := []int{10, 20, 30, 40, 50, 100, 200, 500, 1000}
-	
+
 	for _, size := range testSizes {
 		data := make([]byte, size)
 		err := ring.WriteBlocking(data)

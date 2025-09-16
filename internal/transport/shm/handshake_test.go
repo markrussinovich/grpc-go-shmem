@@ -98,7 +98,7 @@ func TestHandshakeTimeout(t *testing.T) {
 	if err != context.DeadlineExceeded {
 		t.Errorf("Expected deadline exceeded, got: %v", err)
 	}
-	
+
 	// Verify it actually timed out around the expected time
 	if elapsed < 40*time.Millisecond || elapsed > 100*time.Millisecond {
 		t.Errorf("Timeout took %v, expected around 50ms", elapsed)
@@ -134,7 +134,7 @@ func TestShmConn(t *testing.T) {
 
 	// Test data roundtrip: client writes, server reads
 	testData := []byte("Hello, shared memory!")
-	
+
 	// Client writes
 	n, err := clientConn.Write(testData)
 	if err != nil {

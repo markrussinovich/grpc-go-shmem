@@ -37,7 +37,7 @@ type RingState struct {
 	Ridx     uint64 // Current read index (monotonic)
 	Used     uint64 // Bytes currently in ring (Widx - Ridx)
 	DataSeq  uint32 // Data availability sequence number
-	SpaceSeq uint32 // Space availability sequence number  
+	SpaceSeq uint32 // Space availability sequence number
 	Closed   uint32 // Ring closed flag (0 = open, 1 = closed)
 }
 
@@ -61,11 +61,11 @@ type ShmRing struct {
 func NewShmRingFromSegment(ringView *ringView, mem []byte) *ShmRing {
 	capacity := ringView.Capacity()
 	return &ShmRing{
-		capMask: capacity - 1, // For modulo operations: pos = idx & capMask
-		hdrOff:  uintptr(ringView.offset),
-		dataOff: uintptr(ringView.offset + RingHeaderSize),
-		mem:     mem,
-		capacity: capacity,    // Store actual capacity separately
+		capMask:  capacity - 1, // For modulo operations: pos = idx & capMask
+		hdrOff:   uintptr(ringView.offset),
+		dataOff:  uintptr(ringView.offset + RingHeaderSize),
+		mem:      mem,
+		capacity: capacity, // Store actual capacity separately
 	}
 }
 
@@ -88,7 +88,7 @@ func (r *ShmRing) Capacity() uint64 {
 // All values are read atomically for consistent state observation.
 func (r *ShmRing) DebugState() RingState {
 	hdr := r.header()
-	
+
 	// Read all state atomically for consistent snapshot
 	widx := hdr.WriteIndex()
 	ridx := hdr.ReadIndex()
@@ -98,7 +98,7 @@ func (r *ShmRing) DebugState() RingState {
 	if hdr.Closed() {
 		closed = 1
 	}
-	
+
 	return RingState{
 		Capacity: r.capacity,
 		Widx:     widx,
@@ -446,9 +446,9 @@ func (r *ShmRing) ReadBlockingContext(ctx context.Context, buf []byte) (int, err
 		// Load current indices to check available data
 		writeIdx := hdr.WriteIndex()
 		readIdx := hdr.ReadIndex()
-		
+
 		usedBefore := writeIdx - readIdx
-		
+
 		if usedBefore > 0 {
 			// Data available - perform the read
 			toRead := usedBefore
@@ -533,32 +533,32 @@ func (r *ShmRing) ReadBlockingContext(ctx context.Context, buf []byte) (int, err
 func DiagnoseDuelingBuffers(clientToServer, serverToClient *ShmRing) (bool, string) {
 	csState := clientToServer.DebugState()
 	scState := serverToClient.DebugState()
-	
+
 	// Check if both rings are full or nearly full
 	csUsedPercent := float64(csState.Used) / float64(csState.Capacity) * 100
 	scUsedPercent := float64(scState.Used) / float64(scState.Capacity) * 100
-	
+
 	isDueling := csUsedPercent >= 95.0 && scUsedPercent >= 95.0
-	
+
 	diagnostic := ""
 	if isDueling {
 		diagnostic = "DUELING FULL BUFFERS DETECTED:\n"
 	} else {
 		diagnostic = "Ring Buffer State:\n"
 	}
-	
+
 	diagnostic += fmt.Sprintf("Client→Server: Used=%d/%d (%.1f%%) Widx=%d Ridx=%d DataSeq=%d SpaceSeq=%d Closed=%d\n",
 		csState.Used, csState.Capacity, csUsedPercent,
 		csState.Widx, csState.Ridx, csState.DataSeq, csState.SpaceSeq, csState.Closed)
-	
+
 	diagnostic += fmt.Sprintf("Server→Client: Used=%d/%d (%.1f%%) Widx=%d Ridx=%d DataSeq=%d SpaceSeq=%d Closed=%d\n",
 		scState.Used, scState.Capacity, scUsedPercent,
 		scState.Widx, scState.Ridx, scState.DataSeq, scState.SpaceSeq, scState.Closed)
-	
+
 	if isDueling {
 		diagnostic += "This indicates both sides are blocked: client can't write (server→client full), server can't echo (client→server full).\n"
 		diagnostic += "Solution: Use concurrent read/write instead of sequential operations."
 	}
-	
+
 	return isDueling, diagnostic
 }
