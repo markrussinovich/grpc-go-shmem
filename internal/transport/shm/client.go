@@ -171,8 +171,11 @@ func (c *ShmUnaryClient) UnaryCall(ctx context.Context, method, authority string
     c.streams[id] = s
     c.streamsM.Unlock()
 
-    // Send HEADERS
+    // Send HEADERS. Populate deadline hint if present.
     hdr := HeadersV1{Version: 1, HdrType: 0, Method: method, Authority: authority, Metadata: md}
+    if dl, ok := ctx.Deadline(); ok {
+        hdr.DeadlineUnixNano = uint64(dl.UnixNano())
+    }
     hbytes := encodeHeaders(hdr)
     c.writeMu.Lock()
     if err := writeFrame(c.tx, FrameHeader{StreamID: id, Type: FrameTypeHEADERS, Flags: HeadersFlagINITIAL}, hbytes); err != nil {
