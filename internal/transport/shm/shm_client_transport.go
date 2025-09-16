@@ -3,13 +3,13 @@
 package shm
 
 import (
-    "context"
-    "errors"
-    "net"
-    "sync"
-    "sync/atomic"
-
-    "google.golang.org/grpc/internal/transport"
+	"context"
+	"errors"
+	"net"
+	"sync"
+	"sync/atomic"
+	
+	"google.golang.org/grpc/internal/transport"
 )
 
 // ShmClientTransport implements the gRPC ClientTransport interface
@@ -40,6 +40,12 @@ type ShmClientTransport struct {
 	goAwayCh  chan struct{}
 }
 
+// test hook: allow disabling the background reader in tests to avoid
+// interference when a different client is used on the same segment.
+var enableClientReader atomic.Bool
+
+func init() { enableClientReader.Store(true) }
+
 // NewShmClientTransport creates a new shared memory client transport.
 func NewShmClientTransport(segment *Segment, localAddr, remoteAddr net.Addr) (*ShmClientTransport, error) {
 	if segment == nil {
@@ -66,8 +72,10 @@ func NewShmClientTransport(segment *Segment, localAddr, remoteAddr net.Addr) (*S
 		goAwayCh:       make(chan struct{}),
 	}
 
-	// Start processing incoming data from the server
-	go t.processIncomingData()
+    // Start processing incoming data from the server (test hook guarded)
+    if enableClientReader.Load() {
+        go t.processIncomingData()
+    }
 
 	return t, nil
 }
