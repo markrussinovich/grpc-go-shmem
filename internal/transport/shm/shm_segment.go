@@ -184,6 +184,11 @@ func (h *SegmentHeader) SetServerReady(ready bool) {
 		val = 1
 	}
 	atomic.StoreUint32(&h.serverReady, val)
+	
+	// Wake up any waiters when setting to ready
+	if ready {
+		futexWake(&h.serverReady, 1) // Ignore error - wake is best effort
+	}
 }
 
 // ClientReady returns the client ready flag
@@ -198,6 +203,11 @@ func (h *SegmentHeader) SetClientReady(ready bool) {
 		val = 1
 	}
 	atomic.StoreUint32(&h.clientReady, val)
+	
+	// Wake up any waiters when setting to ready
+	if ready {
+		futexWake(&h.clientReady, 1) // Ignore error - wake is best effort
+	}
 }
 
 // Closed returns the closed flag
