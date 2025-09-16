@@ -3,14 +3,13 @@
 package shm
 
 import (
-	"context"
-	"errors"
-	"net"
-	"sync"
-	"sync/atomic"
-	"time"
+    "context"
+    "errors"
+    "net"
+    "sync"
+    "sync/atomic"
 
-	"google.golang.org/grpc/internal/transport"
+    "google.golang.org/grpc/internal/transport"
 )
 
 // ShmClientTransport implements the gRPC ClientTransport interface
@@ -81,55 +80,22 @@ func (t *ShmClientTransport) processIncomingData() {
 		}
 	}()
 
-	// Buffer for reading frames
-	buf := make([]byte, 64*1024) // 64KB buffer
-
-	for {
-		// Check for cancellation first
-		select {
-		case <-t.ctx.Done():
-			return
-		default:
-		}
-
-		if t.closed.Load() {
-			return
-		}
-
-		// Read data from server->client ring with timeout by checking empty first
-		if t.serverToClient.IsEmpty() {
-			// Brief sleep to avoid busy waiting
-			select {
-			case <-t.ctx.Done():
-				return
-			case <-time.After(10 * time.Millisecond):
-				continue
-			}
-		}
-
-		// Try to read data (this might still block, but less likely)
-		n, err := t.serverToClient.ReadBlocking(buf)
-		if err != nil {
-			if errors.Is(err, ErrRingClosed) || t.closed.Load() {
-				return // Ring closed, exit gracefully
-			}
-			// Other errors - continue with brief pause
-			select {
-			case <-t.ctx.Done():
-				return
-			case <-time.After(10 * time.Millisecond):
-				continue
-			}
-		}
-
-		if n > 0 {
-			// Process the received data as gRPC frames
-			if err := t.processFrameData(buf[:n]); err != nil {
-				// Log error but continue processing
-				continue
-			}
-		}
-	}
+    for {
+        if t.closed.Load() {
+            return
+        }
+        // Event-driven: block on next frame from rx ring.
+        fh, payload, err := readFrame(t.serverToClient)
+        if err != nil {
+            if errors.Is(err, ErrRingClosed) || t.closed.Load() {
+                return
+            }
+            continue
+        }
+        _ = fh
+        _ = payload
+        // TODO: dispatch to streams once stream management is in place.
+    }
 }
 
 // processFrameData processes incoming gRPC frame data
