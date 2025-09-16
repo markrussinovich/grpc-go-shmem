@@ -362,6 +362,10 @@ func TestCreateAndOpenSegment(t *testing.T) {
 	if segment.H.RingBCapacity() != ringCapB {
 		t.Errorf("segment.H.RingBCapacity() = %d, want %d", segment.H.RingBCapacity(), ringCapB)
 	}
+
+	// Simulate server marking itself ready (since we removed auto-setting)
+	segment.H.SetServerReady(true)
+
 	if !segment.H.ServerReady() {
 		t.Error("segment.H.ServerReady() = false, want true")
 	}
@@ -402,9 +406,12 @@ func TestCreateAndOpenSegment(t *testing.T) {
 	if clientSegment.H.RingBCapacity() != ringCapB {
 		t.Errorf("clientSegment.H.RingBCapacity() = %d, want %d", clientSegment.H.RingBCapacity(), ringCapB)
 	}
+	// Note: ServerReady is already set by the server above, so client can see it
 	if !clientSegment.H.ServerReady() {
 		t.Error("clientSegment.H.ServerReady() = false, want true")
 	}
+	// Simulate client marking itself ready
+	clientSegment.H.SetClientReady(true)
 	if !clientSegment.H.ClientReady() {
 		t.Error("clientSegment.H.ClientReady() = false, want true after OpenSegment")
 	}

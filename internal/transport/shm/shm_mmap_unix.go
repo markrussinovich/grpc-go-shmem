@@ -89,7 +89,7 @@ func CreateSegment(name string, ringCapA, ringCapB uint64) (*Segment, error) {
 	segment.H.SetRingBOffset(ringBOffset)
 	segment.H.SetRingBCapacity(ringCapB)
 	segment.H.SetServerPID(uint32(os.Getpid()))
-	segment.H.SetServerReady(true)
+	// Note: ServerReady should be set by the actual server, not during segment creation
 
 	// Initialize ring headers
 	segment.A.SetCapacity(ringCapA)

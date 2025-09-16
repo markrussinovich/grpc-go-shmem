@@ -47,6 +47,11 @@ const (
 
 	// Default ring capacity (64KB)
 	DefaultRingCapacity = 65536
+
+	// Default sizes for shared memory segments and rings
+	DefaultSegmentSize = 4 * 1024 * 1024 // 4MB total segment
+	DefaultRingASize   = 1024 * 1024     // 1MB for client->server
+	DefaultRingBSize   = 1024 * 1024     // 1MB for server->client
 )
 
 // Platform-specific functions (implemented in platform-specific files)
@@ -592,6 +597,13 @@ func (h *hdrView) ServerReady() bool {
 // SetServerReady sets the server ready flag
 func (h *hdrView) SetServerReady(ready bool) {
 	h.header().SetServerReady(ready)
+}
+
+// IsValidSharedMemorySegment checks if this segment has valid magic numbers and structure
+func (h *hdrView) IsValidSharedMemorySegment() bool {
+	magic := h.header().Magic()
+	version := h.header().Version()
+	return string(magic[:]) == SegmentMagic && version == SegmentVersion
 }
 
 // ClientReady returns the client ready flag
