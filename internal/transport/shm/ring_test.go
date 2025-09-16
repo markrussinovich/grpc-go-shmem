@@ -330,8 +330,10 @@ func TestShmRingFullBuffer(t *testing.T) {
 	}
 }
 
-// TestShmRingReserveWriteWrapHeader tests that headers can straddle wrap boundaries
-func TestShmRingReserveWriteWrapHeader(t *testing.T) {
+// TestShmRingReserveHeaderPadsAtEnd validates that a 16-byte frame header never
+// straddles the end of the ring. If fewer than 16 bytes remain, a PAD frame
+// (type=0) is emitted to consume the tail, and the next header is reserved at 0.
+func TestShmRingReserveHeaderPadsAtEnd(t *testing.T) {
 	segName := fmt.Sprintf("test-ring-wrap-header-%d", time.Now().UnixNano())
 	segment, err := CreateSegment(segName, 4096, 4096) // Use minimum required size
 	if err != nil {
@@ -365,54 +367,53 @@ func TestShmRingReserveWriteWrapHeader(t *testing.T) {
 		t.Fatalf("ReadBlocking failed: %v, n=%d", err, n)
 	}
 
-	// Now reserve 16 bytes - this should wrap if positioned correctly
-	reservation, err := ring.ReserveWrite(16, ctx)
-	if err != nil {
-		t.Fatalf("ReserveWrite failed: %v", err)
-	}
+    // Compute remaining bytes before wrap at the current write position
+    wIdxBefore := ring.header().WriteIndex()
+    cap := ring.Capacity()
+    mask := cap - 1
+    remainingToEnd := int(cap - (wIdxBefore & mask))
+    if remainingToEnd >= 16 {
+        t.Fatalf("test precondition failed: remainingToEnd=%d should be < 16", remainingToEnd)
+    }
 
-	// Write header across potential wrap boundary
-	headerData := []byte("0123456789ABCDEF") // 16-byte header
-	written := 0
-	written += copy(reservation.First, headerData[written:])
-	if len(reservation.Second) > 0 {
-		written += copy(reservation.Second, headerData[written:])
-	}
+    // Reserve a frame header. This should emit a PAD frame (type=0) to consume
+    // the tail and place the 16-byte header at the start of the ring.
+    _, err = ring.ReserveFrameHeader(ctx)
+    if err != nil {
+        t.Fatalf("ReserveFrameHeader failed: %v", err)
+    }
 
-	if err := reservation.Commit(written); err != nil {
-		t.Fatalf("Commit failed: %v", err)
-	}
+    // Drain the remaining old data we intentionally left (15 bytes), then drain
+    // the tail bytes (PAD payload) to reach the PAD header at 0.
+    {
+        remainingOldData := 15
+        discard := make([]byte, remainingOldData)
+        n, err = ring.ReadBlocking(discard)
+        if err != nil || n != remainingOldData {
+            t.Fatalf("failed to drain old data: err=%v n=%d want=%d", err, n, remainingOldData)
+        }
+    }
+    if remainingToEnd > 0 {
+        discard := make([]byte, remainingToEnd)
+        n, err = ring.ReadBlocking(discard)
+        if err != nil || n != remainingToEnd {
+            t.Fatalf("failed to drain tail: err=%v n=%d want=%d", err, n, remainingToEnd)
+        }
+    }
 
-	// First read the remaining old fill data to get to the header position
-	remainingOldData := 15 // We left 15 bytes of old data in the ring
-	oldBuf := make([]byte, remainingOldData)
-	n, err = ring.ReadBlocking(oldBuf)
-	if err != nil || n != remainingOldData {
-		t.Fatalf("ReadBlocking old data failed: %v, n=%d", err, n)
-	}
-
-	// Now read back the header using ReadSlices to test wrap reconstruction
-	first, second, commit, err := ring.ReadSlices(16, ctx)
-	if err != nil {
-		t.Fatalf("ReadSlices failed: %v", err)
-	}
-
-	// Reconstruct header into stack buffer (as spec requires)
-	var reconstructed [16]byte
-	copied := 0
-	copied += copy(reconstructed[copied:], first)
-	if len(second) > 0 {
-		copied += copy(reconstructed[copied:], second)
-	}
-
-	if copied != 16 {
-		t.Fatalf("expected to reconstruct 16 bytes, got %d", copied)
-	}
-	if string(reconstructed[:]) != string(headerData) {
-		t.Fatalf("header mismatch: expected %q, got %q", headerData, reconstructed[:])
-	}
-
-	commit(16)
+    // Read the 16-byte PAD header from the start of the ring.
+    hdrBytes, err := ring.ReadExact(16, nil, ctx)
+    if err != nil {
+        t.Fatalf("failed to read PAD header: %v", err)
+    }
+    typ := uint32(hdrBytes[0]) | uint32(hdrBytes[1])<<8 | uint32(hdrBytes[2])<<16 | uint32(hdrBytes[3])<<24
+    length := uint32(hdrBytes[4]) | uint32(hdrBytes[5])<<8 | uint32(hdrBytes[6])<<16 | uint32(hdrBytes[7])<<24
+    if typ != 0 {
+        t.Fatalf("expected PAD frame type=0, got %d", typ)
+    }
+    if int(length) != remainingToEnd {
+        t.Fatalf("expected PAD length=%d, got %d", remainingToEnd, length)
+    }
 }
 
 // TestShmRingNoPolling verifies that blocking operations are event-driven, not polling

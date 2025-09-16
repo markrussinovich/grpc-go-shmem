@@ -20,6 +20,7 @@ package shm
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -54,6 +55,30 @@ type ShmRing struct {
 	dataOff  uintptr // base address of data area
 	mem      []byte  // the mmapped region (no copying)
 	// No Go pointers into shared memory stored here; compute addresses on demand
+}
+
+// Frame header definitions for ring-level framing.
+//
+// - Headers are 16 bytes and 16-byte aligned.
+// - Type 0 is a PAD frame; its payload is ignored by readers and is used only
+//   to skip to the beginning of the ring without ever splitting a header across
+//   the end of the ring.
+const (
+    frameHeaderSize = 16
+    frameTypePAD    = uint32(0)
+)
+
+// writeFrameHeader writes a 16-byte header at ptr with the given type/length.
+// Layout (little endian):
+//   uint32 type | uint32 length | 8 bytes reserved (zeros)
+func writeFrameHeader(ptr unsafe.Pointer, typ uint32, length uint32) {
+    b := (*[1 << 30]byte)(ptr)[:frameHeaderSize]
+    binary.LittleEndian.PutUint32(b[0:4], typ)
+    binary.LittleEndian.PutUint32(b[4:8], length)
+    // Zero the reserved bytes for determinism
+    for i := 8; i < frameHeaderSize; i++ {
+        b[i] = 0
+    }
 }
 
 // NewShmRingFromSegment creates a ShmRing from a segment's ring view.
@@ -167,11 +192,16 @@ func (r *ShmRing) WriteBlocking(data []byte) error {
 				copy((*[1 << 30]byte)(destPtr2)[:len(data)-int(firstChunk)], data[firstChunk:])
 			}
 
-			// Advance write index
-			hdr.SetWriteIndex(writeIdx + uint64(len(data)))
+			// Advance write index.
+			// Memory ordering rationale:
+			// 1) Bytes are copied into the ring first (normal stores)
+			// 2) Publish the new write index with an atomic store (acts as a release)
+			// 3) Bump dataSeq and futex_wake so any waiter sees the published bytes
+			hdr.SetWriteIndex(writeIdx + uint64(len(data))) // release-publish
 
-			// Only wake readers if buffer transitioned from empty → non-empty
-			// This is the key optimization: avoid unnecessary kernel calls
+			// Only wake readers if buffer transitioned from empty → non-empty.
+			// Waiters use futex_wait on dataSeq with equality semantics; we increment
+			// after publishing w to avoid lost wakeups.
 			if usedBefore == 0 {
 				hdr.IncrementDataSequence()
 				futexWake(&hdr.dataSeq, 1)
@@ -257,11 +287,14 @@ func (r *ShmRing) ReadBlocking(buf []byte) (int, error) {
 				bytesRead += copy(buf[bytesRead:], (*[1 << 30]byte)(srcPtr2)[:toRead-firstChunk])
 			}
 
-			// Advance read index
-			hdr.SetReadIndex(readIdx + uint64(bytesRead))
+			// Advance read index.
+			// Memory ordering rationale:
+			// 1) Reader copies out bytes first
+			// 2) Publish the new read index with an atomic store (acts as a release)
+			// 3) Bump spaceSeq and futex_wake so a blocked writer can proceed
+			hdr.SetReadIndex(readIdx + uint64(bytesRead)) // release-publish
 
-			// Only wake writers if buffer transitioned from full → not-full
-			// This is the key optimization: avoid unnecessary kernel calls
+			// Only wake writers if buffer transitioned from full → not-full.
 			usedBefore := writeIdx - readIdx
 			if usedBefore == r.capacity {
 				hdr.IncrementSpaceSequence()
@@ -380,11 +413,10 @@ func (r *ShmRing) WriteBlockingContext(ctx context.Context, data []byte) error {
 				copy((*[1 << 30]byte)(destPtr2)[:len(data)-int(firstChunk)], data[firstChunk:])
 			}
 
-			// Advance write index
+			// Advance write index (release-publish) then signal via dataSeq/futex.
 			hdr.SetWriteIndex(writeIdx + uint64(len(data)))
 
-			// Only wake readers if buffer transitioned from empty → non-empty
-			// This is the key optimization: avoid unnecessary kernel calls
+			// Only wake readers if buffer transitioned from empty → non-empty.
 			if usedBefore == 0 {
 				hdr.IncrementDataSequence()
 				futexWake(&hdr.dataSeq, 1)
@@ -479,11 +511,10 @@ func (r *ShmRing) ReadBlockingContext(ctx context.Context, buf []byte) (int, err
 				bytesRead += copy(buf[bytesRead:], (*[1 << 30]byte)(srcPtr2)[:secondChunk])
 			}
 
-			// Advance read index
+			// Advance read index (release-publish) then signal via spaceSeq/futex.
 			hdr.SetReadIndex(readIdx + uint64(bytesRead))
 
-			// Only wake writers if buffer transitioned from full → not-full
-			// This is the key optimization: avoid unnecessary kernel calls
+			// Only wake writers if buffer transitioned from full → not-full.
 			if usedBefore == r.capacity {
 				hdr.IncrementSpaceSequence()
 				futexWake(&hdr.spaceSeq, 1)
@@ -634,16 +665,20 @@ func (r *ShmRing) ReserveWrite(n int, ctx context.Context) (WriteReservation, er
 				second = (*[1 << 30]byte)(secondPtr)[:secondLen:secondLen]
 			}
 
-			// Create commit function that captures the current write state
+			// Create commit function that captures the current write state.
+			// Memory ordering rationale: the caller copies into First/Second slices
+			// first, then Commit performs a release store of the new w index, then
+			// bumps dataSeq and futex_wake, which prevents lost wakeups (waiters
+			// wait on equality of the sequence value).
 			commitFunc := func(written int) error {
 				if written < 0 || written > n {
 					return fmt.Errorf("invalid written count %d, expected 0-%d", written, n)
 				}
 
-				// Advance write index
-				hdr.SetWriteIndex(writeIdx + uint64(written))
+				// Publish new write index and wake any waiting readers.
+				hdr.SetWriteIndex(writeIdx + uint64(written)) // release-publish
 
-				// Wake readers if any data was written
+				// Wake readers if any data was written.
 				if written > 0 {
 					hdr.IncrementDataSequence()
 					futexWake(&hdr.dataSeq, 1)
@@ -736,7 +771,7 @@ func (r *ShmRing) ReadSlices(n int, ctx context.Context) (first, second []byte, 
 					return // Invalid consumption, ignore
 				}
 
-				// Advance read index
+				// Advance read index (release-publish)
 				hdr.SetReadIndex(readIdx + uint64(consumed))
 
 				// Only wake writers if buffer transitioned from full → not-full
@@ -856,4 +891,117 @@ func (r *ShmRing) ReadExact(n int, dst []byte, ctx context.Context) ([]byte, err
 	}
 
 	return result, nil
+}
+
+// ReserveFrameHeader reserves a 16-byte, 16-byte-aligned header region that will
+// never straddle the end of the ring. If fewer than 16 bytes remain before the
+// end, this method emits a PAD frame (type=0) that fills the remainder to the
+// end, publishes it (w += padLen + headerSize), and then returns a reservation
+// for the header at the start of the ring.
+//
+// Memory ordering follows the SPSC invariant:
+//   writer: memcpy header/pad -> atomic.Store(w,new) [release] -> AddUint32(dataSeq) -> futex_wake
+//   reader: atomic.Load(w) [acquire] -> copy -> atomic.Store(r,new) [release] -> AddUint32(spaceSeq) -> futex_wake
+func (r *ShmRing) ReserveFrameHeader(ctx context.Context) (WriteReservation, error) {
+    hdr := r.header()
+
+    for {
+        // Respect context cancellation/deadline.
+        select {
+        case <-ctx.Done():
+            return WriteReservation{}, ctx.Err()
+        default:
+        }
+
+        if hdr.Closed() {
+            return WriteReservation{}, ErrRingClosed
+        }
+
+        writeIdx := hdr.WriteIndex()
+        readIdx := hdr.ReadIndex()
+        used := writeIdx - readIdx
+        available := r.capacity - used
+
+        writePos := writeIdx & r.capMask
+        remaining := r.capacity - writePos
+
+        // Determine how much free space is needed to both place/emit a PAD (if any)
+        // and to hold the 16B header itself.
+        needed := uint64(frameHeaderSize)
+        if remaining < frameHeaderSize {
+            // Need to consume the tail with a PAD frame: pad payload is 'remaining',
+            // plus 16B PAD header that will be written at offset 0, plus the 16B
+            // actual header we are about to reserve at the start.
+            needed += remaining + frameHeaderSize
+        }
+
+        if available >= needed {
+            // We can proceed.
+            if remaining >= frameHeaderSize {
+                // Happy path: header fits contiguously; return a 16B slice at writePos.
+                firstPtr := unsafe.Pointer(uintptr(r.dataPtr()) + uintptr(writePos))
+                first := (*[1 << 30]byte)(firstPtr)[:frameHeaderSize:frameHeaderSize]
+
+                commit := func(written int) error {
+                    if written < 0 || written > frameHeaderSize {
+                        return fmt.Errorf("invalid header write size %d", written)
+                    }
+                    // Publish new w and signal availability.
+                    hdr.SetWriteIndex(writeIdx + uint64(written))
+                    if written > 0 {
+                        hdr.IncrementDataSequence()
+                        futexWake(&hdr.dataSeq, 1)
+                    }
+                    return nil
+                }
+
+                return WriteReservation{First: first, Second: nil, commit: commit}, nil
+            }
+
+            // Need to emit PAD: write PAD header at offset 0, skip remaining tail.
+            // 1) Write PAD header at offset 0 (not yet visible to reader since w not advanced)
+            padHdrPtr := r.dataPtr()
+            writeFrameHeader(padHdrPtr, frameTypePAD, uint32(remaining))
+
+            // 2) Publish w to include [tail payload + PAD header]
+            padAdvance := remaining + frameHeaderSize
+            newW := writeIdx + padAdvance
+            hdr.SetWriteIndex(newW)
+            // Wake reader if needed (conditional wakeup optimization: if buffer was empty
+            // before this publish, reader may be waiting on dataSeq).
+            if used == 0 {
+                hdr.IncrementDataSequence()
+                futexWake(&hdr.dataSeq, 1)
+            }
+
+            // 3) Now return a reservation for the actual 16B header at start (offset 16)
+            headerPos := uint64(frameHeaderSize) // start-of-ring after PAD header
+            firstPtr := unsafe.Pointer(uintptr(r.dataPtr()) + uintptr(headerPos))
+            first := (*[1 << 30]byte)(firstPtr)[:frameHeaderSize:frameHeaderSize]
+
+            commit := func(written int) error {
+                if written < 0 || written > frameHeaderSize {
+                    return fmt.Errorf("invalid header write size %d", written)
+                }
+                // Publish new w and signal availability.
+                hdr.SetWriteIndex(newW + uint64(written))
+                if written > 0 {
+                    hdr.IncrementDataSequence()
+                    futexWake(&hdr.dataSeq, 1)
+                }
+                return nil
+            }
+
+            return WriteReservation{First: first, Second: nil, commit: commit}, nil
+        }
+
+        // Not enough space: wait on spaceSeq, event-driven (no polling)
+        spaceSeq := hdr.SpaceSequence()
+        if err := futexWait(&hdr.spaceSeq, spaceSeq); err != nil {
+            if hdr.Closed() {
+                return WriteReservation{}, ErrRingClosed
+            }
+            // Spurious wake or EINTR; loop and re-check
+        }
+    }
 }

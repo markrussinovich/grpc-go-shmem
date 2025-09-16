@@ -44,11 +44,20 @@ func CreateSegment(name string, ringCapA, ringCapB uint64) (*Segment, error) {
 		return nil, fmt.Errorf("layout calculation failed: %w", err)
 	}
 
-	// Create the file with exclusive access
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0600)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create segment file %s: %w", path, err)
-	}
+    // Create the file with exclusive access. If /dev/shm exists but is not
+    // writable in this environment, gracefully fall back to the temp dir.
+    file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0600)
+    if err != nil {
+        if os.IsPermission(err) {
+            // Retry under temp directory
+            altPath := filepath.Join(os.TempDir(), "grpc_shm_"+name)
+            path = altPath
+            file, err = os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0600)
+        }
+        if err != nil {
+            return nil, fmt.Errorf("failed to create segment file %s: %w", path, err)
+        }
+    }
 
 	// Ensure cleanup on error
 	cleanup := func() {
@@ -110,11 +119,19 @@ func OpenSegment(name string) (*Segment, error) {
 	// Generate the segment path
 	path := generateSegmentPath(name)
 
-	// Open the existing file
-	file, err := os.OpenFile(path, os.O_RDWR, 0)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open segment file %s: %w", path, err)
-	}
+    // Open the existing file. If /dev/shm path exists but is not accessible,
+    // fall back to temp dir.
+    file, err := os.OpenFile(path, os.O_RDWR, 0)
+    if err != nil {
+        if os.IsPermission(err) || os.IsNotExist(err) {
+            altPath := filepath.Join(os.TempDir(), "grpc_shm_"+name)
+            path = altPath
+            file, err = os.OpenFile(path, os.O_RDWR, 0)
+        }
+        if err != nil {
+            return nil, fmt.Errorf("failed to open segment file %s: %w", path, err)
+        }
+    }
 
 	// Get file info to determine size
 	info, err := file.Stat()
