@@ -4,6 +4,7 @@ package shm
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 )
@@ -11,7 +12,7 @@ import (
 // TestStep5Implementation tests the complete Step 5 implementation:
 // handshake and ShmConn functionality
 func TestStep5Implementation(t *testing.T) {
-	name := "test-step5-implementation"
+	name := fmt.Sprintf("test-step5-implementation-%d", time.Now().UnixNano())
 	ringCapA := uint64(8192)
 	ringCapB := uint64(8192)
 
@@ -22,7 +23,7 @@ func TestStep5Implementation(t *testing.T) {
 	}
 	defer serverSeg.Close()
 
-	// 2. Client opens segment 
+	// 2. Client opens segment
 	clientSeg, err := OpenSegment(name)
 	if err != nil {
 		t.Fatalf("Failed to open segment: %v", err)
@@ -32,7 +33,7 @@ func TestStep5Implementation(t *testing.T) {
 	// 3. Test handshake protocol
 	// Server sets ready
 	serverSeg.H.SetServerReady(true)
-	
+
 	// Client sets ready
 	clientSeg.H.SetClientReady(true)
 
@@ -136,8 +137,8 @@ func TestStep5HandshakeScenarios(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			segName := "test-handshake-" + tc.name
-			
+			segName := fmt.Sprintf("test-handshake-%s-%d", tc.name, time.Now().UnixNano())
+
 			// Create segments
 			serverSeg, err := CreateSegment(segName, 4096, 4096)
 			if err != nil {

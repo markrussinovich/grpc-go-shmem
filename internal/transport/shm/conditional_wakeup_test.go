@@ -3,6 +3,7 @@
 package shm
 
 import (
+	"fmt"
 	"testing"
 	"time"
 )
@@ -14,7 +15,7 @@ func TestConditionalWakeups(t *testing.T) {
 	}
 
 	cap := uint64(4096)
-	name := "test-conditional-wakeups"
+	name := fmt.Sprintf("test-conditional-wakeups-%d", time.Now().UnixNano())
 
 	// Ensure clean state
 	RemoveSegment(name)
@@ -185,7 +186,7 @@ func TestConditionalWakeupPerformance(t *testing.T) {
 	}
 
 	cap := uint64(4096)
-	name := "test-wakeup-performance"
+	name := fmt.Sprintf("test-wakeup-performance-%d", time.Now().UnixNano())
 
 	// Ensure clean state
 	RemoveSegment(name)

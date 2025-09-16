@@ -2,6 +2,7 @@ package shm
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"sync"
 	"testing"
@@ -9,8 +10,9 @@ import (
 )
 
 func TestShmRingBasics(t *testing.T) {
-	// Create a test segment for ring operations
-	segment, err := CreateSegment("test-ring-basics", 4096, 4096)
+	// Create a test segment for ring operations with unique name
+	segName := fmt.Sprintf("test-ring-basics-%d", time.Now().UnixNano())
+	segment, err := CreateSegment(segName, 4096, 4096)
 	if err != nil {
 		t.Fatalf("failed to create segment: %v", err)
 	}
@@ -43,7 +45,8 @@ func TestShmRingBasics(t *testing.T) {
 }
 
 func TestShmRingEmpty(t *testing.T) {
-	segment, err := CreateSegment("test-ring-empty", 4096, 4096)
+	segName := fmt.Sprintf("test-ring-empty-%d", time.Now().UnixNano())
+	segment, err := CreateSegment(segName, 4096, 4096)
 	if err != nil {
 		t.Fatalf("failed to create segment: %v", err)
 	}
@@ -83,8 +86,9 @@ func TestShmRingEmpty(t *testing.T) {
 }
 
 func TestShmRingWrapAround(t *testing.T) {
-	// Create small ring to test wrap-around
-	segment, err := CreateSegment("test-ring-wrap", 4096, 4096)
+	// Create small ring to test wrap-around with unique name
+	segName := fmt.Sprintf("test-ring-wrap-%d", time.Now().UnixNano())
+	segment, err := CreateSegment(segName, 4096, 4096)
 	if err != nil {
 		t.Fatalf("failed to create segment: %v", err)
 	}
@@ -139,7 +143,8 @@ func TestShmRingWrapAround(t *testing.T) {
 }
 
 func TestShmRingConcurrent(t *testing.T) {
-	segment, err := CreateSegment("test-ring-concurrent", 4096, 4096)
+	segName := fmt.Sprintf("test-ring-concurrent-%d", time.Now().UnixNano())
+	segment, err := CreateSegment(segName, 4096, 4096)
 	if err != nil {
 		t.Fatalf("failed to create segment: %v", err)
 	}
@@ -219,7 +224,8 @@ func TestShmRingConcurrent(t *testing.T) {
 }
 
 func TestShmRingUtilities(t *testing.T) {
-	segment, err := CreateSegment("test-ring-utils", 4096, 4096)
+	segName := fmt.Sprintf("test-ring-utils-%d", time.Now().UnixNano())
+	segment, err := CreateSegment(segName, 4096, 4096)
 	if err != nil {
 		t.Fatalf("failed to create segment: %v", err)
 	}
@@ -272,8 +278,9 @@ func TestShmRingUtilities(t *testing.T) {
 }
 
 func TestShmRingFullBuffer(t *testing.T) {
-	// Create small ring to test full buffer handling
-	segment, err := CreateSegment("test-ring-full", 4096, 4096)
+	// Create small ring to test full buffer handling with unique name
+	segName := fmt.Sprintf("test-ring-full-%d", time.Now().UnixNano())
+	segment, err := CreateSegment(segName, 4096, 4096)
 	if err != nil {
 		t.Fatalf("failed to create segment: %v", err)
 	}

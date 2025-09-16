@@ -2,6 +2,7 @@ package shm
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -17,8 +18,9 @@ func (t testAddr) Network() string { return t.network }
 func (t testAddr) String() string  { return t.address }
 
 func TestShmServerTransportBasics(t *testing.T) {
-	// Create a test segment
-	segment, err := CreateSegment("test-server-transport", 8192, 8192)
+	// Create a test segment with unique name
+	segName := fmt.Sprintf("test-server-transport-%d", time.Now().UnixNano())
+	segment, err := CreateSegment(segName, 8192, 8192)
 	if err != nil {
 		t.Fatalf("failed to create segment: %v", err)
 	}
@@ -48,8 +50,9 @@ func TestShmServerTransportBasics(t *testing.T) {
 }
 
 func TestShmClientTransportBasics(t *testing.T) {
-	// Create a test segment
-	segment, err := CreateSegment("test-client-transport", 8192, 8192)
+	// Create a test segment with unique name
+	segName := fmt.Sprintf("test-client-transport-%d", time.Now().UnixNano())
+	segment, err := CreateSegment(segName, 8192, 8192)
 	if err != nil {
 		t.Fatalf("failed to create segment: %v", err)
 	}
@@ -88,13 +91,15 @@ func TestShmClientTransportBasics(t *testing.T) {
 
 func TestShmTransportLifecycle(t *testing.T) {
 	// Create separate segments for each transport to avoid ring conflicts
-	serverSegment, err := CreateSegment("test-transport-lifecycle-server", 8192, 8192)
+	serverSegName := fmt.Sprintf("test-transport-lifecycle-server-%d", time.Now().UnixNano())
+	serverSegment, err := CreateSegment(serverSegName, 8192, 8192)
 	if err != nil {
 		t.Fatalf("failed to create server segment: %v", err)
 	}
 	defer serverSegment.Close()
 
-	clientSegment, err := CreateSegment("test-transport-lifecycle-client", 8192, 8192)
+	clientSegName := fmt.Sprintf("test-transport-lifecycle-client-%d", time.Now().UnixNano())
+	clientSegment, err := CreateSegment(clientSegName, 8192, 8192)
 	if err != nil {
 		t.Fatalf("failed to create client segment: %v", err)
 	}
@@ -149,8 +154,9 @@ func TestShmTransportLifecycle(t *testing.T) {
 }
 
 func TestShmTransportCloseIdempotent(t *testing.T) {
-	// Create a test segment
-	segment, err := CreateSegment("test-transport-close-idempotent", 8192, 8192)
+	// Create a test segment with unique name
+	segName := fmt.Sprintf("test-transport-close-idempotent-%d", time.Now().UnixNano())
+	segment, err := CreateSegment(segName, 8192, 8192)
 	if err != nil {
 		t.Fatalf("failed to create segment: %v", err)
 	}
