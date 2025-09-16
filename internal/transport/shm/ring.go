@@ -562,3 +562,298 @@ func DiagnoseDuelingBuffers(clientToServer, serverToClient *ShmRing) (bool, stri
 
 	return isDueling, diagnostic
 }
+
+// WriteReservation represents a reservation for writing data to the ring.
+// The caller must fill exactly the reserved bytes and call Commit with the actual bytes written.
+type WriteReservation struct {
+	First  []byte // First contiguous slice (from write position to end of buffer or requested size)
+	Second []byte // Second contiguous slice (from start of buffer) - may be empty if First has enough space
+	commit func(written int) error
+}
+
+// Commit commits the written bytes and advances the write index.
+// written must not exceed the total capacity of First + Second slices.
+func (wr *WriteReservation) Commit(written int) error {
+	return wr.commit(written)
+}
+
+// ReserveWrite blocks until at least n bytes of contiguous space is available, then returns
+// the writable slice(s) and a commit function. This enables zero-copy writes directly into
+// the ring buffer memory. Headers may span across wrap boundaries via First+Second slices.
+func (r *ShmRing) ReserveWrite(n int, ctx context.Context) (WriteReservation, error) {
+	if n <= 0 {
+		return WriteReservation{}, errors.New("reservation size must be positive")
+	}
+
+	if uint64(n) > r.capacity {
+		return WriteReservation{}, errors.New("reservation larger than ring capacity")
+	}
+
+	hdr := r.header()
+
+	for {
+		// Check context cancellation first
+		select {
+		case <-ctx.Done():
+			return WriteReservation{}, ctx.Err()
+		default:
+		}
+
+		// Check for closure - do this after context check to avoid race with segment cleanup
+		if hdr.Closed() {
+			return WriteReservation{}, ErrRingClosed
+		}
+
+		// Load current indices to check available space
+		writeIdx := hdr.WriteIndex()
+		readIdx := hdr.ReadIndex()
+
+		// Calculate available space
+		usedBefore := writeIdx - readIdx
+		available := r.capacity - usedBefore
+
+		if uint64(n) <= available {
+			// Space available - create reservation
+			writePos := writeIdx & r.capMask
+
+			var first, second []byte
+
+			// Handle ring wrap-around - headers may straddle wrap
+			if writePos+uint64(n) <= r.capacity {
+				// Simple case: no wrap needed
+				firstPtr := unsafe.Pointer(uintptr(r.dataPtr()) + uintptr(writePos))
+				first = (*[1 << 30]byte)(firstPtr)[:n:n]
+			} else {
+				// Wrap case: split across end and beginning (header can straddle)
+				firstLen := r.capacity - writePos
+				firstPtr := unsafe.Pointer(uintptr(r.dataPtr()) + uintptr(writePos))
+				first = (*[1 << 30]byte)(firstPtr)[:firstLen:firstLen]
+
+				secondLen := uint64(n) - firstLen
+				secondPtr := r.dataPtr()
+				second = (*[1 << 30]byte)(secondPtr)[:secondLen:secondLen]
+			}
+
+			// Create commit function that captures the current write state
+			commitFunc := func(written int) error {
+				if written < 0 || written > n {
+					return fmt.Errorf("invalid written count %d, expected 0-%d", written, n)
+				}
+
+				// Advance write index
+				hdr.SetWriteIndex(writeIdx + uint64(written))
+
+				// Wake readers if any data was written
+				if written > 0 {
+					hdr.IncrementDataSequence()
+					futexWake(&hdr.dataSeq, 1)
+				}
+
+				return nil
+			}
+
+			return WriteReservation{
+				First:  first,
+				Second: second,
+				commit: commitFunc,
+			}, nil
+		}
+
+		// No space available - wait for consumer to free space (event-driven, no polling)
+		spaceSeq := hdr.SpaceSequence()
+		if err := futexWait(&hdr.spaceSeq, spaceSeq); err != nil {
+			// Check for closure again after wake
+			if hdr.Closed() {
+				return WriteReservation{}, ErrRingClosed
+			}
+			// Continue loop for spurious wake or other wake reasons
+		}
+	}
+}
+
+// ReadSlices blocks until at least n bytes are available to read; returns slices spanning wrap.
+// This enables proper reconstruction of headers that may straddle wrap boundaries.
+// The caller must call commit with the number of bytes consumed.
+func (r *ShmRing) ReadSlices(n int, ctx context.Context) (first, second []byte, commit func(consumed int), err error) {
+	if n <= 0 {
+		return nil, nil, nil, errors.New("read size must be positive")
+	}
+
+	hdr := r.header()
+
+	for {
+		// Check context cancellation first
+		select {
+		case <-ctx.Done():
+			return nil, nil, nil, ctx.Err()
+		default:
+		}
+
+		// Check for closure - do this after context check to avoid race with segment cleanup
+		if hdr.Closed() {
+			// Check if data is still available even when closed
+			writeIdx := hdr.WriteIndex()
+			readIdx := hdr.ReadIndex()
+			availableBefore := writeIdx - readIdx
+			if availableBefore == 0 {
+				return nil, nil, nil, io.EOF
+			}
+			// Fall through to read remaining data if available
+		}
+		
+		// Load current indices to check available data
+		writeIdx := hdr.WriteIndex()
+		readIdx := hdr.ReadIndex()
+
+		// Calculate available data
+		availableBefore := writeIdx - readIdx
+
+		if availableBefore >= uint64(n) {
+			// Data available - create slices (may span wrap for header reconstruction)
+			readPos := readIdx & r.capMask
+
+			var firstSlice, secondSlice []byte
+
+			// Handle ring wrap-around - allow headers to straddle wrap
+			if readPos+uint64(n) <= r.capacity {
+				// Simple case: no wrap needed
+				srcPtr := unsafe.Pointer(uintptr(r.dataPtr()) + uintptr(readPos))
+				firstSlice = (*[1 << 30]byte)(srcPtr)[:n:n]
+			} else {
+				// Wrap case: split across end and beginning
+				firstLen := r.capacity - readPos
+				firstPtr := unsafe.Pointer(uintptr(r.dataPtr()) + uintptr(readPos))
+				firstSlice = (*[1 << 30]byte)(firstPtr)[:firstLen:firstLen]
+
+				secondLen := uint64(n) - firstLen
+				secondPtr := r.dataPtr()
+				secondSlice = (*[1 << 30]byte)(secondPtr)[:secondLen:secondLen]
+			}
+
+			// Create commit function
+			commitFunc := func(consumed int) {
+				if consumed < 0 || consumed > n {
+					return // Invalid consumption, ignore
+				}
+
+				// Advance read index
+				hdr.SetReadIndex(readIdx + uint64(consumed))
+
+				// Only wake writers if buffer transitioned from full → not-full
+				if availableBefore == r.capacity && consumed > 0 {
+					hdr.IncrementSpaceSequence()
+					futexWake(&hdr.spaceSeq, 1)
+				}
+			}
+
+			return firstSlice, secondSlice, commitFunc, nil
+		}
+
+		// No data available and not closed - wait for producer (event-driven, no polling)
+		if !hdr.Closed() {
+			dataSeq := hdr.DataSequence()
+			if err := futexWait(&hdr.dataSeq, dataSeq); err != nil {
+				// Continue loop for spurious wake or other wake reasons
+			}
+		} else {
+			// Closed and insufficient data - return EOF
+			return nil, nil, nil, io.EOF
+		}
+	}
+}
+
+// WriteAll writes all bytes to the ring buffer, blocking as needed.
+// This is a convenience method that handles multiple reservations if needed.
+// Supports chunking when message > available space.
+func (r *ShmRing) WriteAll(p []byte, ctx context.Context) error {
+	if len(p) == 0 {
+		return nil
+	}
+
+	remaining := p
+	for len(remaining) > 0 {
+		// Reserve space for as much as possible (up to remaining length)
+		toWrite := len(remaining)
+		if uint64(toWrite) > r.capacity {
+			toWrite = int(r.capacity)
+		}
+
+		reservation, err := r.ReserveWrite(toWrite, ctx)
+		if err != nil {
+			return err
+		}
+
+		// Copy data into the reservation (zero-copy into ring memory)
+		written := 0
+		if len(reservation.First) > 0 {
+			n := copy(reservation.First, remaining[written:])
+			written += n
+		}
+		if len(reservation.Second) > 0 && written < toWrite {
+			n := copy(reservation.Second, remaining[written:])
+			written += n
+		}
+
+		// Commit the written bytes
+		if err := reservation.Commit(written); err != nil {
+			return err
+		}
+
+		remaining = remaining[written:]
+	}
+
+	return nil
+}
+
+// ReadExact reads exactly n bytes into dst, blocking as needed.
+// If len(dst) >= n, it uses dst as the buffer (alloc-free).
+// Otherwise, it allocates a new slice. Handles header reconstruction across wraps.
+func (r *ShmRing) ReadExact(n int, dst []byte, ctx context.Context) ([]byte, error) {
+	if n <= 0 {
+		return nil, errors.New("read size must be positive")
+	}
+
+	// Use dst if it's large enough, otherwise allocate
+	var result []byte
+	if len(dst) >= n {
+		result = dst[:n]
+	} else {
+		result = make([]byte, n)
+	}
+
+	totalRead := 0
+	for totalRead < n {
+		remaining := n - totalRead
+
+		// Read slices for the remaining bytes
+		first, second, commit, err := r.ReadSlices(remaining, ctx)
+		if err != nil {
+			return nil, err
+		}
+
+		// Copy from the slices to our result buffer (handles wrap reconstruction)
+		copied := 0
+		if len(first) > 0 {
+			copyLen := len(first)
+			if copyLen > remaining {
+				copyLen = remaining
+			}
+			copy(result[totalRead:], first[:copyLen])
+			copied += copyLen
+		}
+		if len(second) > 0 && copied < remaining {
+			copyLen := len(second)
+			if copyLen > remaining-copied {
+				copyLen = remaining - copied
+			}
+			copy(result[totalRead+copied:], second[:copyLen])
+			copied += copyLen
+		}
+
+		// Commit the read
+		commit(copied)
+		totalRead += copied
+	}
+
+	return result, nil
+}

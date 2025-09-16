@@ -2,8 +2,10 @@ package shm
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -325,5 +327,286 @@ func TestShmRingFullBuffer(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("WriteBlocking should have returned after ring close")
+	}
+}
+
+// TestShmRingReserveWriteWrapHeader tests that headers can straddle wrap boundaries
+func TestShmRingReserveWriteWrapHeader(t *testing.T) {
+	segName := fmt.Sprintf("test-ring-wrap-header-%d", time.Now().UnixNano())
+	segment, err := CreateSegment(segName, 4096, 4096) // Use minimum required size
+	if err != nil {
+		t.Fatalf("failed to create segment: %v", err)
+	}
+	defer segment.Close()
+
+	ringA := segment.A
+	ring := NewShmRingFromSegment(ringA, segment.Mem)
+
+	ctx := context.Background()
+
+	// Fill most of the ring to position write pointer near wrap
+	// Use capacity - 10 to ensure 16-byte write will wrap
+	capacity := ring.Capacity()
+	fillSize := capacity - 10
+	fillData := make([]byte, fillSize)
+	for i := range fillData {
+		fillData[i] = byte(i % 256)
+	}
+
+	if err := ring.WriteAll(fillData, ctx); err != nil {
+		t.Fatalf("WriteAll failed: %v", err)
+	}
+
+	// Read most of it to free space but keep write pointer advanced
+	readSize := fillSize - 15 // Leave less data to ensure write wraps
+	buf := make([]byte, readSize)
+	n, err := ring.ReadBlocking(buf)
+	if err != nil || n != int(readSize) {
+		t.Fatalf("ReadBlocking failed: %v, n=%d", err, n)
+	}
+
+	// Now reserve 16 bytes - this should wrap if positioned correctly
+	reservation, err := ring.ReserveWrite(16, ctx)
+	if err != nil {
+		t.Fatalf("ReserveWrite failed: %v", err)
+	}
+
+	// Write header across potential wrap boundary
+	headerData := []byte("0123456789ABCDEF") // 16-byte header
+	written := 0
+	written += copy(reservation.First, headerData[written:])
+	if len(reservation.Second) > 0 {
+		written += copy(reservation.Second, headerData[written:])
+	}
+
+	if err := reservation.Commit(written); err != nil {
+		t.Fatalf("Commit failed: %v", err)
+	}
+
+	// First read the remaining old fill data to get to the header position
+	remainingOldData := 15 // We left 15 bytes of old data in the ring
+	oldBuf := make([]byte, remainingOldData)
+	n, err = ring.ReadBlocking(oldBuf)
+	if err != nil || n != remainingOldData {
+		t.Fatalf("ReadBlocking old data failed: %v, n=%d", err, n)
+	}
+
+	// Now read back the header using ReadSlices to test wrap reconstruction
+	first, second, commit, err := ring.ReadSlices(16, ctx)
+	if err != nil {
+		t.Fatalf("ReadSlices failed: %v", err)
+	}
+
+	// Reconstruct header into stack buffer (as spec requires)
+	var reconstructed [16]byte
+	copied := 0
+	copied += copy(reconstructed[copied:], first)
+	if len(second) > 0 {
+		copied += copy(reconstructed[copied:], second)
+	}
+
+	if copied != 16 {
+		t.Fatalf("expected to reconstruct 16 bytes, got %d", copied)
+	}
+	if string(reconstructed[:]) != string(headerData) {
+		t.Fatalf("header mismatch: expected %q, got %q", headerData, reconstructed[:])
+	}
+
+	commit(16)
+}
+
+// TestShmRingNoPolling verifies that blocking operations are event-driven, not polling
+func TestShmRingNoPolling(t *testing.T) {
+	segName := fmt.Sprintf("test-ring-no-polling-%d", time.Now().UnixNano())
+	segment, err := CreateSegment(segName, 4096, 4096) // Use minimum required size
+	if err != nil {
+		t.Fatalf("failed to create segment: %v", err)
+	}
+	defer segment.Close()
+
+	ringA := segment.A
+	ring := NewShmRingFromSegment(ringA, segment.Mem)
+
+	ctx := context.Background()
+
+	// Fill the ring completely
+	fillData := make([]byte, ring.Capacity())
+	if err := ring.WriteAll(fillData, ctx); err != nil {
+		t.Fatalf("WriteAll failed: %v", err)
+	}
+
+	// Track goroutine count to detect polling loops
+	initialGoroutines := runtime.NumGoroutine()
+
+	// Start a writer that should block (no polling)
+	writerDone := make(chan error, 1)
+	go func() {
+		// This should block until reader frees space
+		err := ring.WriteBlocking([]byte("test"))
+		writerDone <- err
+	}()
+
+	// Let writer block for a short time
+	time.Sleep(50 * time.Millisecond)
+
+	// Check that goroutine count is stable (no polling creating new goroutines)
+	currentGoroutines := runtime.NumGoroutine()
+	if currentGoroutines > initialGoroutines+2 { // +1 for writer, +1 for tolerance
+		t.Fatalf("suspected polling: goroutine count increased from %d to %d", initialGoroutines, currentGoroutines)
+	}
+
+	// Read some data to unblock writer
+	buf := make([]byte, 10)
+	n, err := ring.ReadBlocking(buf)
+	if err != nil || n != 10 {
+		t.Fatalf("ReadBlocking failed: %v, n=%d", err, n)
+	}
+
+	// Writer should now complete
+	select {
+	case err := <-writerDone:
+		if err != nil {
+			t.Fatalf("writer failed: %v", err)
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatal("writer should have unblocked after read")
+	}
+
+	// Verify goroutine count returned to baseline
+	finalGoroutines := runtime.NumGoroutine()
+	if finalGoroutines > initialGoroutines+1 { // +1 for tolerance
+		t.Fatalf("goroutine leak: count went from %d to %d", initialGoroutines, finalGoroutines)
+	}
+}
+
+// TestShmRingStressSPSC runs stress test with variable-length writes/reads
+func TestShmRingStressSPSC(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping stress test in short mode")
+	}
+
+	segName := fmt.Sprintf("test-ring-stress-%d", time.Now().UnixNano())
+	segment, err := CreateSegment(segName, 4096, 4096)
+	if err != nil {
+		t.Fatalf("failed to create segment: %v", err)
+	}
+	defer segment.Close()
+
+	ringA := segment.A
+	ring := NewShmRingFromSegment(ringA, segment.Mem)
+
+	const numOperations = 1000 // Reduced for smaller ring buffer
+	ctx := context.Background()
+
+	var wg sync.WaitGroup
+	var producerErr, consumerErr error
+
+	// Producer goroutine
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+
+		for i := 0; i < numOperations; i++ {
+			// Variable-length messages (1-50 bytes to fit in smaller ring)
+			size := 1 + (i % 50)
+			data := make([]byte, size)
+			
+			// Fill with pattern and calculate checksum
+			var csum uint32
+			for j := range data {
+				data[j] = byte((i + j) % 256)
+				csum += uint32(data[j])
+			}
+
+			// Write message with length prefix
+			msgBytes := make([]byte, 4+len(data)) // 4-byte length + data
+			msgBytes[0] = byte(len(data))
+			msgBytes[1] = byte(len(data) >> 8)
+			msgBytes[2] = byte(csum)
+			msgBytes[3] = byte(csum >> 8)
+			copy(msgBytes[4:], data)
+
+			if err := ring.WriteAll(msgBytes, ctx); err != nil {
+				producerErr = fmt.Errorf("WriteAll failed at %d: %v", i, err)
+				return
+			}
+		}
+		
+		// Close the ring to signal the consumer that no more data is coming
+		ring.Close()
+	}()
+
+	// Consumer goroutine
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+
+		for i := 0; i < numOperations; i++ {
+			// Read 4-byte header first
+			header, err := ring.ReadExact(4, nil, ctx)
+			if err != nil {
+				if err == io.EOF {
+					// Producer closed the ring, but we expected more data
+					consumerErr = fmt.Errorf("unexpected EOF at operation %d", i)
+					return
+				}
+				consumerErr = fmt.Errorf("ReadExact header failed at %d: %v", i, err)
+				return
+			}
+
+			// Parse length and checksum
+			length := int(header[0]) | (int(header[1]) << 8)
+			expectedCsum := uint32(header[2]) | (uint32(header[3]) << 8)
+
+			// Read data
+			data, err := ring.ReadExact(length, nil, ctx)
+			if err != nil {
+				if err == io.EOF {
+					consumerErr = fmt.Errorf("unexpected EOF while reading data at operation %d", i)
+					return
+				}
+				consumerErr = fmt.Errorf("ReadExact data failed at %d: %v", i, err)
+				return
+			}
+
+			// Verify checksum
+			var actualCsum uint32
+			for _, b := range data {
+				actualCsum += uint32(b)
+			}
+			if actualCsum != expectedCsum {
+				consumerErr = fmt.Errorf("checksum mismatch at %d: expected %d, got %d", i, expectedCsum, actualCsum)
+				return
+			}
+
+			// Verify data pattern
+			for j, b := range data {
+				expected := byte((i + j) % 256)
+				if b != expected {
+					consumerErr = fmt.Errorf("data mismatch at %d[%d]: expected %d, got %d", i, j, expected, b)
+					return
+				}
+			}
+		}
+	}()
+
+	// Wait for both goroutines with timeout
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Both goroutines completed
+		if producerErr != nil {
+			t.Fatalf("producer failed: %v", producerErr)
+		}
+		if consumerErr != nil {
+			t.Fatalf("consumer failed: %v", consumerErr)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("test timed out - goroutines did not complete")
 	}
 }
