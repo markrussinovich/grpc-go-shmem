@@ -3,16 +3,15 @@
 package shm
 
 import (
-	"context"
-	"errors"
-	"fmt"
-	"net"
-	"path/filepath"
-	"sync"
-	"sync/atomic"
-	"time"
+    "context"
+    "errors"
+    "fmt"
+    "net"
+    "sync"
+    "sync/atomic"
+    "time"
 
-	"google.golang.org/grpc/internal/transport"
+    "google.golang.org/grpc/internal/transport"
 )
 
 // ShmAddr represents a shared memory network address
@@ -32,9 +31,10 @@ func (a *ShmAddr) String() string {
 
 // ShmListener implements net.Listener for shared memory connections
 type ShmListener struct {
-	addr     *ShmAddr
-	baseName string // Base name for segment creation
-	connID   uint64 // Atomic counter for connection IDs
+    addr     *ShmAddr
+    baseName string // Base name for segment creation
+    connID   uint64 // Atomic counter for connection IDs
+    segment  *Segment
 
 	// Lifecycle management
 	ctx       context.Context
@@ -86,135 +86,58 @@ func NewShmListener(addr *ShmAddr, segmentSize, ringASize, ringBSize uint64) (*S
 		ringBSize:   ringBSize,
 	}
 
-	// Start the connection acceptor
-	go l.acceptLoop()
+    // Server owns lifetime: create a single segment now and mark server ready.
+    seg, err := CreateSegment(addr.Name, ringASize, ringBSize)
+    if err != nil {
+        cancel()
+        return nil, fmt.Errorf("create segment: %w", err)
+    }
+    l.segment = seg
+    l.segment.H.SetServerReady(true)
 
-	return l, nil
+    return l, nil
 }
 
 // acceptLoop continuously monitors for new connection requests
-func (l *ShmListener) acceptLoop() {
-	ticker := time.NewTicker(100 * time.Millisecond) // Check every 100ms
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-l.ctx.Done():
-			return
-		case <-ticker.C:
-			if l.closed.Load() {
-				return
-			}
-
-			// Check for new connection requests
-			if err := l.checkForConnections(); err != nil {
-				// Log error but continue
-				continue
-			}
-		}
-	}
-}
+func (l *ShmListener) acceptLoop() {}
 
 // checkForConnections looks for new segment creation requests
-func (l *ShmListener) checkForConnections() error {
-	// Look for segments with our base name pattern: grpc_shm_<listener_name>_<timestamp>
-	pattern := fmt.Sprintf("/dev/shm/grpc_shm_%s_*", l.baseName)
-	matches, err := filepath.Glob(pattern)
-	if err != nil {
-		return fmt.Errorf("failed to check for connections: %v", err)
-	}
-
-	for _, path := range matches {
-		// Extract segment name from path
-		fileName := filepath.Base(path)
-
-		// Check if we've already processed this segment by checking if server ready is set
-		if err := l.handlePotentialConnection(fileName); err != nil {
-			// Log error but continue with other connections
-			continue
-		}
-	}
-
-	return nil
-}
+func (l *ShmListener) checkForConnections() error { return nil }
 
 // handlePotentialConnection processes a potential new connection
-func (l *ShmListener) handlePotentialConnection(segmentName string) error {
-	// Try to open the segment
-	segment, err := OpenSegment(segmentName)
-	if err != nil {
-		return fmt.Errorf("failed to open segment %s: %v", segmentName, err)
-	}
+func (l *ShmListener) handlePotentialConnection(segmentName string) (*shmConn, error) {
+    // Single-connection mode: wait for client to set ClientReady on our precreated segment.
+    segment := l.segment
+    // Block event-driven until client ready.
+    if err := segment.WaitForClient(l.ctx); err != nil {
+        return nil, err
+    }
+    conn := &shmConn{
+        segment:    segment,
+        localAddr:  l.addr,
+        remoteAddr: &ShmAddr{Name: segmentName + "_client"},
+    }
+    serverTransport, err := NewShmServerTransport(segment, l.addr, conn.remoteAddr)
+    if err != nil {
+        return nil, fmt.Errorf("failed to create server transport: %v", err)
+    }
 
-	// Check if this is a valid connection request
-	hdr := segment.H
-	if !hdr.IsValidSharedMemorySegment() {
-		segment.Close()
-		return errors.New("invalid shared memory segment")
-	}
-
-	// Check if client is ready for connection
-	if !hdr.ClientReady() {
-		segment.Close()
-		return errors.New("client not ready")
-	}
-
-	// Check if server has already processed this connection
-	if hdr.ServerReady() {
-		segment.Close()
-		return errors.New("connection already established")
-	}
-
-	// Create the connection
-	conn := &shmConn{
-		segment:    segment,
-		localAddr:  l.addr,
-		remoteAddr: &ShmAddr{Name: segmentName + "_client"},
-	}
-
-	// Create server transport for this connection
-	serverTransport, err := NewShmServerTransport(segment, l.addr, conn.remoteAddr)
-	if err != nil {
-		segment.Close()
-		return fmt.Errorf("failed to create server transport: %v", err)
-	}
-
-	conn.transport = serverTransport
-
-	// Mark server as ready
-	hdr.SetServerReady(true)
-
-	// Signal connection established
-	conn.established.Store(true)
-
-	// Send to accept channel
-	select {
-	case l.acceptCh <- conn:
-		// Connection queued successfully
-	case <-l.ctx.Done():
-		conn.Close()
-		return errors.New("listener closed")
-	default:
-		// Channel full, reject connection
-		conn.Close()
-		return errors.New("accept queue full")
-	}
-
-	return nil
+    conn.transport = serverTransport
+    conn.established.Store(true)
+    return conn, nil
 }
 
 // Accept waits for and returns the next connection to the listener
 func (l *ShmListener) Accept() (net.Conn, error) {
-	if l.closed.Load() {
-		return nil, errors.New("listener closed")
-	}
-
-	select {
-	case conn := <-l.acceptCh:
-		return conn, nil
-	case <-l.ctx.Done():
-		return nil, errors.New("listener closed")
-	}
+    if l.closed.Load() {
+        return nil, errors.New("listener closed")
+    }
+    // Use single-connection blocking accept using event-driven handshake.
+    conn, err := l.handlePotentialConnection(l.addr.Name)
+    if err != nil {
+        return nil, err
+    }
+    return conn, nil
 }
 
 // Close closes the listener

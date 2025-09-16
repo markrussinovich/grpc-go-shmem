@@ -32,7 +32,7 @@ var ErrRingClosed = errors.New("ring closed")
 
 // RingState represents a snapshot of ring buffer state for debugging and diagnostics
 type RingState struct {
-	Capacity uint64 // Total ring capacity in bytes
+	Capacity uint64 // Total ri
 	Widx     uint64 // Current write index (monotonic)
 	Ridx     uint64 // Current read index (monotonic)
 	Used     uint64 // Bytes currently in ring (Widx - Ridx)
