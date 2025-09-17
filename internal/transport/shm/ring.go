@@ -178,14 +178,17 @@ func (r *ShmRing) WriteBlocking(data []byte) error {
 			// Advance write index.
 			// Memory ordering rationale:
 			// 1) Bytes are copied into the ring first (normal stores)
-			// 2) Publish the new write index with an atomic store (acts as a release)
-			// 3) Bump dataSeq and futex_wake so any waiter sees the published bytes
+			// 2) Check emptiness right before publishing (avoids lost wake race)
+			// 3) Publish the new write index with an atomic store (acts as a release)
+			// 4) Wake only if we actually transitioned empty -> non-empty
+
+			// Check emptiness at commit time to avoid lost wake race
+			emptyBefore := (hdr.ReadIndex() == writeIdx)
+
 			hdr.SetWriteIndex(writeIdx + uint64(len(data))) // release-publish
 
-			// Only wake readers if buffer transitioned from empty → non-empty.
-			// Waiters use futex_wait on dataSeq with equality semantics; we increment
-			// after publishing w to avoid lost wakeups.
-			if usedBefore == 0 {
+			// Wake only if we actually transitioned empty -> non-empty
+			if len(data) > 0 && emptyBefore {
 				hdr.IncrementDataSequence()
 				futexWake(&hdr.dataSeq, 1)
 			}
@@ -445,11 +448,14 @@ func (r *ShmRing) WriteBlockingContext(ctx context.Context, data []byte) error {
 				copy((*[1 << 30]byte)(destPtr2)[:len(data)-firstChunkI], data[firstChunkI:])
 			}
 
-			// Advance write index (release-publish) then signal via dataSeq/futex.
-			hdr.SetWriteIndex(writeIdx + uint64(len(data)))
+			// Advance write index.
+			// Check emptiness right before publishing to avoid lost wake race
+			emptyBefore := (hdr.ReadIndex() == writeIdx)
 
-			// Only wake readers if buffer transitioned from empty → non-empty.
-			if usedBefore == 0 {
+			hdr.SetWriteIndex(writeIdx + uint64(len(data))) // release-publish
+
+			// Wake only if we actually transitioned empty -> non-empty
+			if len(data) > 0 && emptyBefore {
 				hdr.IncrementDataSequence()
 				futexWake(&hdr.dataSeq, 1)
 			}
@@ -782,19 +788,20 @@ func (r *ShmRing) ReserveWrite(n int, ctx context.Context) (WriteReservation, er
 			// Create commit function that captures the current write state.
 			// Memory ordering rationale: the caller copies into First/Second slices
 			// first, then Commit performs a release store of the new w index, then
-			// bumps dataSeq and futex_wake, which prevents lost wakeups (waiters
-			// wait on equality of the sequence value).
-			wasEmpty := (usedBefore == 0)
+			// checks emptiness at commit time to avoid lost wake race.
 			commitFunc := func(written int) error {
 				if written < 0 || written > n {
 					return fmt.Errorf("invalid written count %d, expected 0-%d", written, n)
 				}
 
+				// Check emptiness at commit time to avoid lost wake race
+				emptyBefore := (hdr.ReadIndex() == writeIdx)
+
 				// Publish new write index and wake any waiting readers.
 				hdr.SetWriteIndex(writeIdx + uint64(written)) // release-publish
 
-				// Wake readers if any data was written.
-				if written > 0 && wasEmpty {
+				// Wake readers only if we actually transitioned empty -> non-empty
+				if written > 0 && emptyBefore {
 					hdr.IncrementDataSequence()
 					futexWake(&hdr.dataSeq, 1)
 				}
@@ -1109,9 +1116,14 @@ func (r *ShmRing) ReserveFrameHeader(ctx context.Context) (WriteReservation, err
 					if written < 0 || written > frameHeaderSize {
 						return fmt.Errorf("invalid header write size %d", written)
 					}
+					// Check emptiness at commit time to avoid lost wake race
+					emptyBefore := (hdr.ReadIndex() == writeIdx)
+
 					// Publish new w and signal availability.
 					hdr.SetWriteIndex(writeIdx + uint64(written))
-					if written > 0 {
+
+					// Wake only if we actually transitioned empty -> non-empty
+					if written > 0 && emptyBefore {
 						hdr.IncrementDataSequence()
 						futexWake(&hdr.dataSeq, 1)
 					}
@@ -1156,9 +1168,14 @@ func (r *ShmRing) ReserveFrameHeader(ctx context.Context) (WriteReservation, err
 				if written < 0 || written > frameHeaderSize {
 					return fmt.Errorf("invalid header write size %d", written)
 				}
+				// Check emptiness at commit time to avoid lost wake race
+				emptyBefore := (hdr.ReadIndex() == newW)
+
 				// Publish new w and signal availability.
 				hdr.SetWriteIndex(newW + uint64(written))
-				if written > 0 {
+
+				// Wake only if we actually transitioned empty -> non-empty
+				if written > 0 && emptyBefore {
 					hdr.IncrementDataSequence()
 					futexWake(&hdr.dataSeq, 1)
 				}
