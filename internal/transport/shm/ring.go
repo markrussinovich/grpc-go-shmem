@@ -1095,49 +1095,60 @@ func (r *ShmRing) ReserveFrameHeader(ctx context.Context) (WriteReservation, err
 		writePos := writeIdx & r.capMask
 		remaining := r.capacity - writePos
 
-		// Determine how much free space is needed to both place/emit a PAD (if any)
-		// and to hold the 16B header itself.
-		needed := uint64(frameHeaderSize)
-		if remaining < frameHeaderSize {
-			// Need to consume the tail with a PAD frame: pad payload is 'remaining',
-			// plus 16B PAD header that will be written at offset 0, plus the 16B
-			// actual header we are about to reserve at the start.
-			needed += remaining + frameHeaderSize
-		}
+		if remaining >= frameHeaderSize && available >= frameHeaderSize {
+			// Happy path: header fits contiguously at current position
+			firstPtr := unsafe.Pointer(uintptr(r.dataPtr()) + uintptr(writePos))
+			first := (*[1 << 30]byte)(firstPtr)[:frameHeaderSize:frameHeaderSize]
 
-		if available >= needed {
-			// We can proceed.
-			if remaining >= frameHeaderSize {
-				// Happy path: header fits contiguously; return a 16B slice at writePos.
-				firstPtr := unsafe.Pointer(uintptr(r.dataPtr()) + uintptr(writePos))
-				first := (*[1 << 30]byte)(firstPtr)[:frameHeaderSize:frameHeaderSize]
-
-				commit := func(written int) error {
-					if written < 0 || written > frameHeaderSize {
-						return fmt.Errorf("invalid header write size %d", written)
-					}
-					// Check emptiness at commit time to avoid lost wake race
-					emptyBefore := (hdr.ReadIndex() == writeIdx)
-
-					// Publish new w and signal availability.
-					hdr.SetWriteIndex(writeIdx + uint64(written))
-
-					// Wake only if we actually transitioned empty -> non-empty
-					if written > 0 && emptyBefore {
-						hdr.IncrementDataSequence()
-						futexWake(&hdr.dataSeq, 1)
-					}
-					return nil
+			commit := func(written int) error {
+				if written < 0 || written > frameHeaderSize {
+					return fmt.Errorf("invalid header write size %d", written)
 				}
+				// Check emptiness at commit time to avoid lost wake race
+				emptyBefore := (hdr.ReadIndex() == writeIdx)
 
-				return WriteReservation{First: first, Second: nil, commit: commit}, nil
+				// Publish new w and signal availability.
+				hdr.SetWriteIndex(writeIdx + uint64(written))
+
+				// Wake only if we actually transitioned empty -> non-empty
+				if written > 0 && emptyBefore {
+					hdr.IncrementDataSequence()
+					futexWake(&hdr.dataSeq, 1)
+				}
+				return nil
 			}
 
-			// Need to emit PAD: write PAD header at current tail position (writePos), then skip remaining tail.
-			// 1) Write PAD header at the current tail (writePos).
-			padHdrPtr := unsafe.Pointer(uintptr(r.dataPtr()) + uintptr(writePos))
+			return WriteReservation{First: first, Second: nil, commit: commit}, nil
+		} else if remaining < frameHeaderSize && available >= remaining+frameHeaderSize {
+			// PAD path: header doesn't fit at tail, but we have space for PAD+header
+			// 1) Fill tail with PAD payload (remaining bytes of padding)
+			//    No header written at tail - just padding bytes
+			if remaining > 0 {
+				padPayloadPtr := unsafe.Pointer(uintptr(r.dataPtr()) + uintptr(writePos))
+				// Zero out the PAD payload
+				for i := 0; i < int(remaining); i++ {
+					*(*byte)(unsafe.Pointer(uintptr(padPayloadPtr) + uintptr(i))) = 0
+				}
+			}
+
+			// 2) Check emptiness before advancing to avoid lost wake race
+			emptyBefore := (hdr.ReadIndex() == writeIdx)
+
+			// Advance by remaining to wrap to offset 0
+			newW := writeIdx + remaining
+			hdr.SetWriteIndex(newW)
+
+			// Wake reader if buffer transitioned empty -> non-empty
+			if emptyBefore {
+				hdr.IncrementDataSequence()
+				futexWake(&hdr.dataSeq, 1)
+			}
+
+			// 3) Write PAD header at wrapped position (offset 0)
+			headerPos := newW & r.capMask // Should be 0
+			padHdrPtr := unsafe.Pointer(uintptr(r.dataPtr()) + uintptr(headerPos))
 			var fh FrameHeader
-			fh.Length = uint32(remaining) // payload is the remaining tail bytes
+			fh.Length = uint32(remaining) // PAD payload length
 			fh.StreamID = 0
 			fh.Type = FrameTypePAD
 			fh.Flags = 0
@@ -1147,21 +1158,13 @@ func (r *ShmRing) ReserveFrameHeader(ctx context.Context) (WriteReservation, err
 			encodeFrameHeaderTo(&hdrBytes, fh)
 			copy((*[1 << 30]byte)(padHdrPtr)[:frameHeaderSize], hdrBytes[:])
 
-			// 2) Publish w to include [PAD header + PAD payload at tail]
-			padAdvance := frameHeaderSize + remaining
-			newW := writeIdx + padAdvance
-			hdr.SetWriteIndex(newW)
-			// Wake reader if needed (conditional wakeup optimization: if buffer was empty
-			// before this publish, reader may be waiting on dataSeq).
-			if used == 0 {
-				hdr.IncrementDataSequence()
-				futexWake(&hdr.dataSeq, 1)
-			}
+			// 4) Advance past PAD header to position for real header
+			finalW := newW + frameHeaderSize
+			hdr.SetWriteIndex(finalW)
 
-			// 3) Now return a reservation for the actual 16B header at start (offset 16)
-			// The actual header is at the new tail position (wrap to head). Compute its position via newW & capMask.
-			headerPos := newW & r.capMask
-			firstPtr := unsafe.Pointer(uintptr(r.dataPtr()) + uintptr(headerPos))
+			// 5) Return reservation for the real header after PAD header
+			realHeaderPos := finalW & r.capMask
+			firstPtr := unsafe.Pointer(uintptr(r.dataPtr()) + uintptr(realHeaderPos))
 			first := (*[1 << 30]byte)(firstPtr)[:frameHeaderSize:frameHeaderSize]
 
 			commit := func(written int) error {
@@ -1169,10 +1172,11 @@ func (r *ShmRing) ReserveFrameHeader(ctx context.Context) (WriteReservation, err
 					return fmt.Errorf("invalid header write size %d", written)
 				}
 				// Check emptiness at commit time to avoid lost wake race
-				emptyBefore := (hdr.ReadIndex() == newW)
+				currentW := finalW // Position before real header
+				emptyBefore := (hdr.ReadIndex() == currentW)
 
 				// Publish new w and signal availability.
-				hdr.SetWriteIndex(newW + uint64(written))
+				hdr.SetWriteIndex(currentW + uint64(written))
 
 				// Wake only if we actually transitioned empty -> non-empty
 				if written > 0 && emptyBefore {
@@ -1185,10 +1189,11 @@ func (r *ShmRing) ReserveFrameHeader(ctx context.Context) (WriteReservation, err
 			return WriteReservation{First: first, Second: nil, commit: commit}, nil
 		}
 
-		// Not enough space for PAD+header path.
-		// If the tail is short (< headerSize), this is a contiguity-limited case: wait on contigSeq.
-		// Otherwise, wait on spaceSeq.
+		// Not enough space. Determine what we're waiting for:
+		// If tail is too short for PAD header (< frameHeaderSize), wait on contigSeq.
+		// Otherwise, we need more space overall, so wait on spaceSeq.
 		if remaining < frameHeaderSize {
+			// Contiguity-limited: tail too short for PAD header, wait for read to advance
 			hdr.AddContigWaiter(1)
 			exp := hdr.ContigSequence()
 			// Re-check condition to avoid missed wake
@@ -1198,14 +1203,13 @@ func (r *ShmRing) ReserveFrameHeader(ctx context.Context) (WriteReservation, err
 			available = r.capacity - used
 			writePos = writeIdx & r.capMask
 			remaining = r.capacity - writePos
-			needed = uint64(frameHeaderSize)
-			if remaining < frameHeaderSize {
-				needed += remaining + frameHeaderSize
-			}
-			if available >= needed {
+
+			// Check if we can now proceed with happy path
+			if remaining >= frameHeaderSize && available >= frameHeaderSize {
 				hdr.AddContigWaiter(^uint32(0))
 				continue
 			}
+
 			if err := futexWait(&hdr.contigSeq, exp); err != nil {
 				if hdr.Closed() {
 					hdr.AddContigWaiter(^uint32(0))
@@ -1219,6 +1223,7 @@ func (r *ShmRing) ReserveFrameHeader(ctx context.Context) (WriteReservation, err
 			}
 			continue
 		} else {
+			// Space-limited: tail can fit PAD header but need more total space
 			hdr.AddSpaceWaiter(1)
 			spaceSeq := hdr.SpaceSequence()
 			// Re-check condition to avoid missed wake
@@ -1226,10 +1231,16 @@ func (r *ShmRing) ReserveFrameHeader(ctx context.Context) (WriteReservation, err
 			readIdx = hdr.ReadIndex()
 			used = writeIdx - readIdx
 			available = r.capacity - used
-			if available >= needed {
+			writePos = writeIdx & r.capMask
+			remaining = r.capacity - writePos
+
+			// Check if we can now proceed (either happy path or PAD path)
+			if (remaining >= frameHeaderSize && available >= frameHeaderSize) ||
+				(remaining >= frameHeaderSize && available >= remaining+frameHeaderSize) {
 				hdr.AddSpaceWaiter(^uint32(0))
 				continue
 			}
+
 			if err := futexWait(&hdr.spaceSeq, spaceSeq); err != nil {
 				if hdr.Closed() {
 					hdr.AddSpaceWaiter(^uint32(0))

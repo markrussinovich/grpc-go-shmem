@@ -116,9 +116,10 @@ func TestRing_PAD_NoWait(t *testing.T) {
 	ring := NewShmRingFromSegment(seg.A, seg.Mem)
 	hdr := ring.header()
 
-	// Arrange: writePos at cap-8 (tail=8), available >= 40 so no wait; e.g., used=24 -> available=40
-	// With cap=4096: w=4088, available=32. Need available >= 40, so use larger gap.
-	// Set w=4088, r=4064 => used=24, available=72 (>=40), writePos=4088.
+	// Arrange: PAD path triggered when remaining < frameHeaderSize but total space sufficient
+	// remaining < 16, but available >= remaining + 16
+	// Set w=4088, r=4064 => used=24, available=72, remaining=8
+	// PAD condition: remaining=8 < frameHeaderSize=16 ✓ AND available=72 >= 8+16=24 ✓
 	hdr.SetWriteIndex(4088)
 	hdr.SetReadIndex(4064)
 
@@ -137,7 +138,8 @@ func TestRing_PAD_NoWait(t *testing.T) {
 	}
 
 	// w should have advanced by 8 (tail payload) + 16 (PAD header) + 16 (real header) = 40
-	expectedFinal := uint64(4088 + 40) // 4128
+	// From writePos=4088: total advance=40 -> final=4088+40=4128
+	expectedFinal := uint64(4088 + 40)
 	if hdr.WriteIndex() != expectedFinal {
 		t.Fatalf("write index advance mismatch: got=%d want=%d", hdr.WriteIndex(), expectedFinal)
 	}
