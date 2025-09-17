@@ -19,12 +19,12 @@
 package shm
 
 import (
-    "context"
-    "errors"
-    "fmt"
-    "io"
-    "time"
-    "unsafe"
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"time"
+	"unsafe"
 )
 
 // ErrRingClosed indicates that the ring has been closed for writing
@@ -32,7 +32,7 @@ var ErrRingClosed = errors.New("ring closed")
 
 // RingState represents a snapshot of ring buffer state for debugging and diagnostics
 type RingState struct {
-	Capacity uint64 // Total ri
+	Capacity uint64 // Total ring capacity
 	Widx     uint64 // Current write index (monotonic)
 	Ridx     uint64 // Current read index (monotonic)
 	Used     uint64 // Bytes currently in ring (Widx - Ridx)
@@ -63,6 +63,10 @@ type ShmRing struct {
 // This provides the high-level blocking API over the low-level ring view.
 func NewShmRingFromSegment(ringView *ringView, mem []byte) *ShmRing {
 	capacity := ringView.Capacity()
+	// Enforce power-of-two capacity invariant for masked indexing
+	if capacity == 0 || !IsPowerOfTwo(capacity) {
+		panic("ShmRing capacity must be a power of two")
+	}
 	return &ShmRing{
 		capMask:  capacity - 1, // For modulo operations: pos = idx & capMask
 		hdrOff:   uintptr(ringView.offset),
@@ -160,14 +164,15 @@ func (r *ShmRing) WriteBlocking(data []byte) error {
 			} else {
 				// Wrap case: split the write
 				firstChunk := r.capacity - writePos
+				firstChunkI := int(firstChunk)
 
 				// Write first chunk at end of buffer
 				destPtr1 := unsafe.Pointer(uintptr(r.dataPtr()) + uintptr(writePos))
-				copy((*[1 << 30]byte)(destPtr1)[:firstChunk], data[:firstChunk])
+				copy((*[1 << 30]byte)(destPtr1)[:firstChunkI], data[:firstChunkI])
 
 				// Write second chunk at beginning of buffer
 				destPtr2 := r.dataPtr()
-				copy((*[1 << 30]byte)(destPtr2)[:len(data)-int(firstChunk)], data[firstChunk:])
+				copy((*[1 << 30]byte)(destPtr2)[:len(data)-firstChunkI], data[firstChunkI:])
 			}
 
 			// Advance write index.
@@ -188,14 +193,46 @@ func (r *ShmRing) WriteBlocking(data []byte) error {
 			return nil
 		}
 
-		// No space available - wait for consumer to free space
-		spaceSeq := hdr.SpaceSequence()
-		if err := futexWait(&hdr.spaceSeq, spaceSeq); err != nil {
-			// Check for closure again after wake
+		// Insufficient space. Distinguish strictly full vs need-more-space.
+		// Re-check under the same loop to avoid missed wake.
+		writeIdx = hdr.WriteIndex()
+		readIdx = hdr.ReadIndex()
+		usedBefore = writeIdx - readIdx
+		available = r.capacity - usedBefore
+		if available == 0 {
+			// Full: wait on spaceSeq (full→not-full)
+			hdr.AddSpaceWaiter(1)
+			exp := hdr.SpaceSequence()
+			// Re-check condition to avoid missed wake
+			writeIdx = hdr.WriteIndex()
+			readIdx = hdr.ReadIndex()
+			if (r.capacity - (writeIdx - readIdx)) >= uint64(len(data)) {
+				hdr.AddSpaceWaiter(^uint32(0))
+				continue
+			}
+			_ = futexWait(&hdr.spaceSeq, exp)
+			hdr.AddSpaceWaiter(^uint32(0))
+			// Re-check closure after wake to avoid infinite loop
 			if hdr.Closed() {
 				return ErrRingClosed
 			}
-			// Continue loop for spurious wake or other wake reasons
+			continue
+		}
+		// Not full but not enough: any read helps; wait on contigSeq.
+		hdr.AddContigWaiter(1)
+		exp := hdr.ContigSequence()
+		// Re-check prior to waiting
+		writeIdx = hdr.WriteIndex()
+		readIdx = hdr.ReadIndex()
+		if (r.capacity - (writeIdx - readIdx)) >= uint64(len(data)) {
+			hdr.AddContigWaiter(^uint32(0))
+			continue
+		}
+		_ = futexWait(&hdr.contigSeq, exp)
+		hdr.AddContigWaiter(^uint32(0))
+		// Re-check closure after wake to avoid infinite loop
+		if hdr.Closed() {
+			return ErrRingClosed
 		}
 	}
 }
@@ -251,38 +288,51 @@ func (r *ShmRing) ReadBlocking(buf []byte) (int, error) {
 			if readPos+toRead <= r.capacity {
 				// Simple case: no wrap
 				srcPtr := unsafe.Pointer(uintptr(r.dataPtr()) + uintptr(readPos))
-				bytesRead = copy(buf, (*[1 << 30]byte)(srcPtr)[:toRead])
+				toReadI := int(toRead)
+				bytesRead = copy(buf, (*[1 << 30]byte)(srcPtr)[:toReadI])
 			} else {
 				// Wrap case: split the read
 				firstChunk := r.capacity - readPos
+				firstChunkI := int(firstChunk)
 
 				// Read first chunk from end of buffer
 				srcPtr1 := unsafe.Pointer(uintptr(r.dataPtr()) + uintptr(readPos))
-				bytesRead = copy(buf, (*[1 << 30]byte)(srcPtr1)[:firstChunk])
+				bytesRead = copy(buf, (*[1 << 30]byte)(srcPtr1)[:firstChunkI])
 
 				// Read second chunk from beginning of buffer
 				srcPtr2 := r.dataPtr()
-				bytesRead += copy(buf[bytesRead:], (*[1 << 30]byte)(srcPtr2)[:toRead-firstChunk])
+				secondI := int(toRead - firstChunk)
+				bytesRead += copy(buf[bytesRead:], (*[1 << 30]byte)(srcPtr2)[:secondI])
 			}
 
 			// Advance read index.
 			// Memory ordering rationale:
 			// 1) Reader copies out bytes first
 			// 2) Publish the new read index with an atomic store (acts as a release)
-			// 3) Bump spaceSeq and futex_wake so a blocked writer can proceed
+			// 3) Bump contigSeq always (contiguity improved), and spaceSeq only on full→not-full.
+			prevUsed := availableBefore
 			hdr.SetReadIndex(readIdx + uint64(bytesRead)) // release-publish
 
-			// Only wake writers if buffer transitioned from full → not-full.
-			usedBefore := writeIdx - readIdx
-			if usedBefore == r.capacity {
+			if bytesRead > 0 {
+				// Contiguity: always bump after any positive read commit
+				hdr.IncrementContigSequence()
+				if hdr.ContigWaiters() > 0 {
+					futexWake(&hdr.contigSeq, 1)
+				}
+			}
+
+			// Space became available only if we were full before this read
+			if prevUsed == r.capacity {
 				hdr.IncrementSpaceSequence()
-				futexWake(&hdr.spaceSeq, 1)
+				if hdr.SpaceWaiters() > 0 {
+					futexWake(&hdr.spaceSeq, 1)
+				}
 			}
 
 			return bytesRead, nil
 		}
 
-		// No data available and not closed - wait for producer
+		// No data available - check closure and wait for producer
 		if !hdr.Closed() {
 			dataSeq := hdr.DataSequence()
 			if err := futexWait(&hdr.dataSeq, dataSeq); err != nil {
@@ -300,9 +350,12 @@ func (r *ShmRing) Close() error {
 	hdr := r.header()
 	hdr.SetClosed(true)
 
-	// Wake up any waiting readers and writers
+	// Wake up any waiting readers and writers; bump sequences to release waiters.
+	hdr.IncrementSpaceSequence()
+	hdr.IncrementContigSequence()
 	futexWake(&hdr.dataSeq, 1)
 	futexWake(&hdr.spaceSeq, 1)
+	futexWake(&hdr.contigSeq, 1)
 
 	return nil
 }
@@ -381,14 +434,15 @@ func (r *ShmRing) WriteBlockingContext(ctx context.Context, data []byte) error {
 			} else {
 				// Wrap case: split the write
 				firstChunk := r.capacity - writePos
+				firstChunkI := int(firstChunk)
 
 				// Write first chunk at end of buffer
 				destPtr1 := unsafe.Pointer(uintptr(r.dataPtr()) + uintptr(writePos))
-				copy((*[1 << 30]byte)(destPtr1)[:firstChunk], data[:firstChunk])
+				copy((*[1 << 30]byte)(destPtr1)[:firstChunkI], data[:firstChunkI])
 
 				// Write second chunk at beginning of buffer
 				destPtr2 := r.dataPtr()
-				copy((*[1 << 30]byte)(destPtr2)[:len(data)-int(firstChunk)], data[firstChunk:])
+				copy((*[1 << 30]byte)(destPtr2)[:len(data)-firstChunkI], data[firstChunkI:])
 			}
 
 			// Advance write index (release-publish) then signal via dataSeq/futex.
@@ -403,8 +457,7 @@ func (r *ShmRing) WriteBlockingContext(ctx context.Context, data []byte) error {
 			return nil
 		}
 
-		// Need to wait for space
-		spaceSeq := hdr.SpaceSequence()
+		// Need to wait for space (distinguish full vs partial)
 
 		// Calculate timeout from context deadline
 		var timeoutNs int64
@@ -419,14 +472,78 @@ func (r *ShmRing) WriteBlockingContext(ctx context.Context, data []byte) error {
 		// Wait for space with timeout
 		var err error
 		if timeoutNs > 0 {
-			err = futexWaitTimeout(&hdr.spaceSeq, spaceSeq, timeoutNs)
+			// Re-check and choose wait primitive
+			writeIdx = hdr.WriteIndex()
+			readIdx = hdr.ReadIndex()
+			usedBefore = writeIdx - readIdx
+			available = r.capacity - usedBefore
+			if uint64(len(data)) <= available {
+				continue
+			}
+			if available == 0 {
+				hdr.AddSpaceWaiter(1)
+				exp := hdr.SpaceSequence()
+				// Re-check
+				writeIdx = hdr.WriteIndex()
+				readIdx = hdr.ReadIndex()
+				if (r.capacity - (writeIdx - readIdx)) >= uint64(len(data)) {
+					hdr.AddSpaceWaiter(^uint32(0))
+					continue
+				}
+				err = futexWaitTimeout(&hdr.spaceSeq, exp, timeoutNs)
+				hdr.AddSpaceWaiter(^uint32(0))
+			} else {
+				hdr.AddContigWaiter(1)
+				exp := hdr.ContigSequence()
+				// Re-check
+				writeIdx = hdr.WriteIndex()
+				readIdx = hdr.ReadIndex()
+				if (r.capacity - (writeIdx - readIdx)) >= uint64(len(data)) {
+					hdr.AddContigWaiter(^uint32(0))
+					continue
+				}
+				err = futexWaitTimeout(&hdr.contigSeq, exp, timeoutNs)
+				hdr.AddContigWaiter(^uint32(0))
+			}
 		} else {
-			err = futexWait(&hdr.spaceSeq, spaceSeq)
+			// No timeout: same logic with infinite waits
+			writeIdx = hdr.WriteIndex()
+			readIdx = hdr.ReadIndex()
+			usedBefore = writeIdx - readIdx
+			available = r.capacity - usedBefore
+			if uint64(len(data)) <= available {
+				continue
+			}
+			if available == 0 {
+				hdr.AddSpaceWaiter(1)
+				exp := hdr.SpaceSequence()
+				// Re-check
+				writeIdx = hdr.WriteIndex()
+				readIdx = hdr.ReadIndex()
+				if (r.capacity - (writeIdx - readIdx)) >= uint64(len(data)) {
+					hdr.AddSpaceWaiter(^uint32(0))
+					continue
+				}
+				err = futexWait(&hdr.spaceSeq, exp)
+				hdr.AddSpaceWaiter(^uint32(0))
+			} else {
+				hdr.AddContigWaiter(1)
+				exp := hdr.ContigSequence()
+				// Re-check
+				writeIdx = hdr.WriteIndex()
+				readIdx = hdr.ReadIndex()
+				if (r.capacity - (writeIdx - readIdx)) >= uint64(len(data)) {
+					hdr.AddContigWaiter(^uint32(0))
+					continue
+				}
+				err = futexWait(&hdr.contigSeq, exp)
+				hdr.AddContigWaiter(^uint32(0))
+			}
 		}
 
 		if err != nil {
 			// Check if it's a timeout error
-			if err.Error() == "futex wait timed out" {
+			if errors.Is(err, ErrFutexTimeout) {
 				return context.DeadlineExceeded
 			}
 			return err
@@ -474,28 +591,45 @@ func (r *ShmRing) ReadBlockingContext(ctx context.Context, buf []byte) (int, err
 			if readPos+toRead <= r.capacity {
 				// Simple case: no wrap
 				srcPtr := unsafe.Pointer(uintptr(r.dataPtr()) + uintptr(readPos))
-				bytesRead = copy(buf, (*[1 << 30]byte)(srcPtr)[:toRead])
+				toReadI := int(toRead)
+				bytesRead = copy(buf, (*[1 << 30]byte)(srcPtr)[:toReadI])
 			} else {
 				// Wrap case: split the read
 				firstChunk := r.capacity - readPos
+				firstChunkI := int(firstChunk)
 
 				// Read first chunk from end of buffer
 				srcPtr1 := unsafe.Pointer(uintptr(r.dataPtr()) + uintptr(readPos))
-				bytesRead = copy(buf, (*[1 << 30]byte)(srcPtr1)[:firstChunk])
+				bytesRead = copy(buf, (*[1 << 30]byte)(srcPtr1)[:firstChunkI])
 
 				// Read second chunk from beginning of buffer
 				srcPtr2 := r.dataPtr()
-				secondChunk := toRead - firstChunk
-				bytesRead += copy(buf[bytesRead:], (*[1 << 30]byte)(srcPtr2)[:secondChunk])
+				secondChunkI := int(toRead - firstChunk)
+				bytesRead += copy(buf[bytesRead:], (*[1 << 30]byte)(srcPtr2)[:secondChunkI])
 			}
 
-			// Advance read index (release-publish) then signal via spaceSeq/futex.
-			hdr.SetReadIndex(readIdx + uint64(bytesRead))
+			// Advance read index.
+			// Memory ordering rationale:
+			// 1) Reader copies out bytes first
+			// 2) Publish the new read index with an atomic store (acts as a release)
+			// 3) Bump contigSeq always (contiguity improved), and spaceSeq only on full→not-full.
+			prevUsed := usedBefore
+			hdr.SetReadIndex(readIdx + uint64(bytesRead)) // release-publish
 
-			// Only wake writers if buffer transitioned from full → not-full.
-			if usedBefore == r.capacity {
+			if bytesRead > 0 {
+				// Contiguity: always bump after any positive read commit
+				hdr.IncrementContigSequence()
+				if hdr.ContigWaiters() > 0 {
+					futexWake(&hdr.contigSeq, 1)
+				}
+			}
+
+			// Space became available only if we were full before this read
+			if prevUsed == r.capacity {
 				hdr.IncrementSpaceSequence()
-				futexWake(&hdr.spaceSeq, 1)
+				if hdr.SpaceWaiters() > 0 {
+					futexWake(&hdr.spaceSeq, 1)
+				}
 			}
 
 			return bytesRead, nil
@@ -529,7 +663,7 @@ func (r *ShmRing) ReadBlockingContext(ctx context.Context, buf []byte) (int, err
 
 		if err != nil {
 			// Check if it's a timeout error
-			if err.Error() == "futex wait timed out" {
+			if errors.Is(err, ErrFutexTimeout) {
 				return 0, context.DeadlineExceeded
 			}
 			return 0, err
@@ -636,11 +770,13 @@ func (r *ShmRing) ReserveWrite(n int, ctx context.Context) (WriteReservation, er
 				// Wrap case: split across end and beginning (header can straddle)
 				firstLen := r.capacity - writePos
 				firstPtr := unsafe.Pointer(uintptr(r.dataPtr()) + uintptr(writePos))
-				first = (*[1 << 30]byte)(firstPtr)[:firstLen:firstLen]
+				firstLenI := int(firstLen)
+				first = (*[1 << 30]byte)(firstPtr)[:firstLenI:firstLenI]
 
 				secondLen := uint64(n) - firstLen
 				secondPtr := r.dataPtr()
-				second = (*[1 << 30]byte)(secondPtr)[:secondLen:secondLen]
+				secondLenI := int(secondLen)
+				second = (*[1 << 30]byte)(secondPtr)[:secondLenI:secondLenI]
 			}
 
 			// Create commit function that captures the current write state.
@@ -648,6 +784,7 @@ func (r *ShmRing) ReserveWrite(n int, ctx context.Context) (WriteReservation, er
 			// first, then Commit performs a release store of the new w index, then
 			// bumps dataSeq and futex_wake, which prevents lost wakeups (waiters
 			// wait on equality of the sequence value).
+			wasEmpty := (usedBefore == 0)
 			commitFunc := func(written int) error {
 				if written < 0 || written > n {
 					return fmt.Errorf("invalid written count %d, expected 0-%d", written, n)
@@ -657,7 +794,7 @@ func (r *ShmRing) ReserveWrite(n int, ctx context.Context) (WriteReservation, er
 				hdr.SetWriteIndex(writeIdx + uint64(written)) // release-publish
 
 				// Wake readers if any data was written.
-				if written > 0 {
+				if written > 0 && wasEmpty {
 					hdr.IncrementDataSequence()
 					futexWake(&hdr.dataSeq, 1)
 				}
@@ -672,14 +809,43 @@ func (r *ShmRing) ReserveWrite(n int, ctx context.Context) (WriteReservation, er
 			}, nil
 		}
 
-		// No space available - wait for consumer to free space (event-driven, no polling)
-		spaceSeq := hdr.SpaceSequence()
-		if err := futexWait(&hdr.spaceSeq, spaceSeq); err != nil {
-			// Check for closure again after wake
+		// Insufficient space - choose wait type based on fullness
+		writeIdx = hdr.WriteIndex()
+		readIdx = hdr.ReadIndex()
+		free := r.capacity - (writeIdx - readIdx)
+		if free == 0 {
+			hdr.AddSpaceWaiter(1)
+			exp := hdr.SpaceSequence()
+			// Re-check
+			writeIdx = hdr.WriteIndex()
+			readIdx = hdr.ReadIndex()
+			if (r.capacity - (writeIdx - readIdx)) >= uint64(n) {
+				hdr.AddSpaceWaiter(^uint32(0))
+				continue
+			}
+			_ = futexWait(&hdr.spaceSeq, exp)
+			hdr.AddSpaceWaiter(^uint32(0))
+			// Re-check closure after wake to avoid infinite loop
 			if hdr.Closed() {
 				return WriteReservation{}, ErrRingClosed
 			}
-			// Continue loop for spurious wake or other wake reasons
+			continue
+		}
+		// Not full: contiguity-improving reads help
+		hdr.AddContigWaiter(1)
+		exp := hdr.ContigSequence()
+		// Re-check
+		writeIdx = hdr.WriteIndex()
+		readIdx = hdr.ReadIndex()
+		if (r.capacity - (writeIdx - readIdx)) >= uint64(n) {
+			hdr.AddContigWaiter(^uint32(0))
+			continue
+		}
+		_ = futexWait(&hdr.contigSeq, exp)
+		hdr.AddContigWaiter(^uint32(0))
+		// Re-check closure after wake to avoid infinite loop
+		if hdr.Closed() {
+			return WriteReservation{}, ErrRingClosed
 		}
 	}
 }
@@ -713,7 +879,7 @@ func (r *ShmRing) ReadSlices(n int, ctx context.Context) (first, second []byte, 
 			}
 			// Fall through to read remaining data if available
 		}
-		
+
 		// Load current indices to check available data
 		writeIdx := hdr.WriteIndex()
 		readIdx := hdr.ReadIndex()
@@ -736,11 +902,13 @@ func (r *ShmRing) ReadSlices(n int, ctx context.Context) (first, second []byte, 
 				// Wrap case: split across end and beginning
 				firstLen := r.capacity - readPos
 				firstPtr := unsafe.Pointer(uintptr(r.dataPtr()) + uintptr(readPos))
-				firstSlice = (*[1 << 30]byte)(firstPtr)[:firstLen:firstLen]
+				firstLenI := int(firstLen)
+				firstSlice = (*[1 << 30]byte)(firstPtr)[:firstLenI:firstLenI]
 
 				secondLen := uint64(n) - firstLen
 				secondPtr := r.dataPtr()
-				secondSlice = (*[1 << 30]byte)(secondPtr)[:secondLen:secondLen]
+				secondLenI := int(secondLen)
+				secondSlice = (*[1 << 30]byte)(secondPtr)[:secondLenI:secondLenI]
 			}
 
 			// Create commit function
@@ -750,19 +918,35 @@ func (r *ShmRing) ReadSlices(n int, ctx context.Context) (first, second []byte, 
 				}
 
 				// Advance read index (release-publish)
+				prevUsed := availableBefore
 				hdr.SetReadIndex(readIdx + uint64(consumed))
 
-				// Only wake writers if buffer transitioned from full → not-full
-				if availableBefore == r.capacity && consumed > 0 {
+				// Contiguity: always bump after any positive read commit
+				if consumed > 0 {
+					hdr.IncrementContigSequence()
+					if hdr.ContigWaiters() > 0 {
+						futexWake(&hdr.contigSeq, 1)
+					}
+				}
+				// Space: only on full→not-full
+				if prevUsed == r.capacity {
 					hdr.IncrementSpaceSequence()
-					futexWake(&hdr.spaceSeq, 1)
+					if hdr.SpaceWaiters() > 0 {
+						futexWake(&hdr.spaceSeq, 1)
+					}
 				}
 			}
 
 			return firstSlice, secondSlice, commitFunc, nil
 		}
 
-		// No data available and not closed - wait for producer (event-driven, no polling)
+		// No data available - wait for producer with context check
+		select {
+		case <-ctx.Done():
+			return nil, nil, nil, ctx.Err()
+		default:
+		}
+
 		if !hdr.Closed() {
 			dataSeq := hdr.DataSequence()
 			if err := futexWait(&hdr.dataSeq, dataSeq); err != nil {
@@ -878,117 +1062,169 @@ func (r *ShmRing) ReadExact(n int, dst []byte, ctx context.Context) ([]byte, err
 // for the header at the start of the ring.
 //
 // Memory ordering follows the SPSC invariant:
-//   writer: memcpy header/pad -> atomic.Store(w,new) [release] -> AddUint32(dataSeq) -> futex_wake
-//   reader: atomic.Load(w) [acquire] -> copy -> atomic.Store(r,new) [release] -> AddUint32(spaceSeq) -> futex_wake
+//
+//	writer: memcpy header/pad -> atomic.Store(w,new) [release] -> AddUint32(dataSeq) -> futex_wake
+//	reader: atomic.Load(w) [acquire] -> copy -> atomic.Store(r,new) [release] -> AddUint32(spaceSeq) -> futex_wake
 func (r *ShmRing) ReserveFrameHeader(ctx context.Context) (WriteReservation, error) {
-    hdr := r.header()
+	hdr := r.header()
 
-    for {
-        // Respect context cancellation/deadline.
-        select {
-        case <-ctx.Done():
-            return WriteReservation{}, ctx.Err()
-        default:
-        }
+	for {
+		// Respect context cancellation/deadline.
+		select {
+		case <-ctx.Done():
+			return WriteReservation{}, ctx.Err()
+		default:
+		}
 
-        if hdr.Closed() {
-            return WriteReservation{}, ErrRingClosed
-        }
+		if hdr.Closed() {
+			return WriteReservation{}, ErrRingClosed
+		}
 
-        writeIdx := hdr.WriteIndex()
-        readIdx := hdr.ReadIndex()
-        used := writeIdx - readIdx
-        available := r.capacity - used
+		writeIdx := hdr.WriteIndex()
+		readIdx := hdr.ReadIndex()
+		used := writeIdx - readIdx
+		available := r.capacity - used
 
-        writePos := writeIdx & r.capMask
-        remaining := r.capacity - writePos
+		writePos := writeIdx & r.capMask
+		remaining := r.capacity - writePos
 
-        // Determine how much free space is needed to both place/emit a PAD (if any)
-        // and to hold the 16B header itself.
-        needed := uint64(frameHeaderSize)
-        if remaining < frameHeaderSize {
-            // Need to consume the tail with a PAD frame: pad payload is 'remaining',
-            // plus 16B PAD header that will be written at offset 0, plus the 16B
-            // actual header we are about to reserve at the start.
-            needed += remaining + frameHeaderSize
-        }
+		// Determine how much free space is needed to both place/emit a PAD (if any)
+		// and to hold the 16B header itself.
+		needed := uint64(frameHeaderSize)
+		if remaining < frameHeaderSize {
+			// Need to consume the tail with a PAD frame: pad payload is 'remaining',
+			// plus 16B PAD header that will be written at offset 0, plus the 16B
+			// actual header we are about to reserve at the start.
+			needed += remaining + frameHeaderSize
+		}
 
-        if available >= needed {
-            // We can proceed.
-            if remaining >= frameHeaderSize {
-                // Happy path: header fits contiguously; return a 16B slice at writePos.
-                firstPtr := unsafe.Pointer(uintptr(r.dataPtr()) + uintptr(writePos))
-                first := (*[1 << 30]byte)(firstPtr)[:frameHeaderSize:frameHeaderSize]
+		if available >= needed {
+			// We can proceed.
+			if remaining >= frameHeaderSize {
+				// Happy path: header fits contiguously; return a 16B slice at writePos.
+				firstPtr := unsafe.Pointer(uintptr(r.dataPtr()) + uintptr(writePos))
+				first := (*[1 << 30]byte)(firstPtr)[:frameHeaderSize:frameHeaderSize]
 
-                commit := func(written int) error {
-                    if written < 0 || written > frameHeaderSize {
-                        return fmt.Errorf("invalid header write size %d", written)
-                    }
-                    // Publish new w and signal availability.
-                    hdr.SetWriteIndex(writeIdx + uint64(written))
-                    if written > 0 {
-                        hdr.IncrementDataSequence()
-                        futexWake(&hdr.dataSeq, 1)
-                    }
-                    return nil
-                }
+				commit := func(written int) error {
+					if written < 0 || written > frameHeaderSize {
+						return fmt.Errorf("invalid header write size %d", written)
+					}
+					// Publish new w and signal availability.
+					hdr.SetWriteIndex(writeIdx + uint64(written))
+					if written > 0 {
+						hdr.IncrementDataSequence()
+						futexWake(&hdr.dataSeq, 1)
+					}
+					return nil
+				}
 
-                return WriteReservation{First: first, Second: nil, commit: commit}, nil
-            }
+				return WriteReservation{First: first, Second: nil, commit: commit}, nil
+			}
 
-            // Need to emit PAD: write PAD header at offset 0, skip remaining tail.
-            // 1) Write PAD header at offset 0 (not yet visible to reader since w not advanced)
-            padHdrPtr := r.dataPtr()
-            var fh FrameHeader
-            fh.Length = uint32(remaining)
-            fh.StreamID = 0
-            fh.Type = FrameTypePAD
-            fh.Flags = 0
-            fh.Reserved = 0
-            fh.Reserved2 = 0
-            var hdrBytes [frameHeaderSize]byte
-            encodeFrameHeaderTo(&hdrBytes, fh)
-            copy((*[1<<30]byte)(padHdrPtr)[:frameHeaderSize], hdrBytes[:])
+			// Need to emit PAD: write PAD header at current tail position (writePos), then skip remaining tail.
+			// 1) Write PAD header at the current tail (writePos).
+			padHdrPtr := unsafe.Pointer(uintptr(r.dataPtr()) + uintptr(writePos))
+			var fh FrameHeader
+			fh.Length = uint32(remaining) // payload is the remaining tail bytes
+			fh.StreamID = 0
+			fh.Type = FrameTypePAD
+			fh.Flags = 0
+			fh.Reserved = 0
+			fh.Reserved2 = 0
+			var hdrBytes [frameHeaderSize]byte
+			encodeFrameHeaderTo(&hdrBytes, fh)
+			copy((*[1 << 30]byte)(padHdrPtr)[:frameHeaderSize], hdrBytes[:])
 
-            // 2) Publish w to include [tail payload + PAD header]
-            padAdvance := remaining + frameHeaderSize
-            newW := writeIdx + padAdvance
-            hdr.SetWriteIndex(newW)
-            // Wake reader if needed (conditional wakeup optimization: if buffer was empty
-            // before this publish, reader may be waiting on dataSeq).
-            if used == 0 {
-                hdr.IncrementDataSequence()
-                futexWake(&hdr.dataSeq, 1)
-            }
+			// 2) Publish w to include [PAD header + PAD payload at tail]
+			padAdvance := frameHeaderSize + remaining
+			newW := writeIdx + padAdvance
+			hdr.SetWriteIndex(newW)
+			// Wake reader if needed (conditional wakeup optimization: if buffer was empty
+			// before this publish, reader may be waiting on dataSeq).
+			if used == 0 {
+				hdr.IncrementDataSequence()
+				futexWake(&hdr.dataSeq, 1)
+			}
 
-            // 3) Now return a reservation for the actual 16B header at start (offset 16)
-            headerPos := uint64(frameHeaderSize) // start-of-ring after PAD header
-            firstPtr := unsafe.Pointer(uintptr(r.dataPtr()) + uintptr(headerPos))
-            first := (*[1 << 30]byte)(firstPtr)[:frameHeaderSize:frameHeaderSize]
+			// 3) Now return a reservation for the actual 16B header at start (offset 16)
+			// The actual header is at the new tail position (wrap to head). Compute its position via newW & capMask.
+			headerPos := newW & r.capMask
+			firstPtr := unsafe.Pointer(uintptr(r.dataPtr()) + uintptr(headerPos))
+			first := (*[1 << 30]byte)(firstPtr)[:frameHeaderSize:frameHeaderSize]
 
-            commit := func(written int) error {
-                if written < 0 || written > frameHeaderSize {
-                    return fmt.Errorf("invalid header write size %d", written)
-                }
-                // Publish new w and signal availability.
-                hdr.SetWriteIndex(newW + uint64(written))
-                if written > 0 {
-                    hdr.IncrementDataSequence()
-                    futexWake(&hdr.dataSeq, 1)
-                }
-                return nil
-            }
+			commit := func(written int) error {
+				if written < 0 || written > frameHeaderSize {
+					return fmt.Errorf("invalid header write size %d", written)
+				}
+				// Publish new w and signal availability.
+				hdr.SetWriteIndex(newW + uint64(written))
+				if written > 0 {
+					hdr.IncrementDataSequence()
+					futexWake(&hdr.dataSeq, 1)
+				}
+				return nil
+			}
 
-            return WriteReservation{First: first, Second: nil, commit: commit}, nil
-        }
+			return WriteReservation{First: first, Second: nil, commit: commit}, nil
+		}
 
-        // Not enough space: wait on spaceSeq, event-driven (no polling)
-        spaceSeq := hdr.SpaceSequence()
-        if err := futexWait(&hdr.spaceSeq, spaceSeq); err != nil {
-            if hdr.Closed() {
-                return WriteReservation{}, ErrRingClosed
-            }
-            // Spurious wake or EINTR; loop and re-check
-        }
-    }
+		// Not enough space for PAD+header path.
+		// If the tail is short (< headerSize), this is a contiguity-limited case: wait on contigSeq.
+		// Otherwise, wait on spaceSeq.
+		if remaining < frameHeaderSize {
+			hdr.AddContigWaiter(1)
+			exp := hdr.ContigSequence()
+			// Re-check condition to avoid missed wake
+			writeIdx = hdr.WriteIndex()
+			readIdx = hdr.ReadIndex()
+			used = writeIdx - readIdx
+			available = r.capacity - used
+			writePos = writeIdx & r.capMask
+			remaining = r.capacity - writePos
+			needed = uint64(frameHeaderSize)
+			if remaining < frameHeaderSize {
+				needed += remaining + frameHeaderSize
+			}
+			if available >= needed {
+				hdr.AddContigWaiter(^uint32(0))
+				continue
+			}
+			if err := futexWait(&hdr.contigSeq, exp); err != nil {
+				if hdr.Closed() {
+					hdr.AddContigWaiter(^uint32(0))
+					return WriteReservation{}, ErrRingClosed
+				}
+			}
+			hdr.AddContigWaiter(^uint32(0))
+			// Re-check closure after wake to avoid infinite loop
+			if hdr.Closed() {
+				return WriteReservation{}, ErrRingClosed
+			}
+			continue
+		} else {
+			hdr.AddSpaceWaiter(1)
+			spaceSeq := hdr.SpaceSequence()
+			// Re-check condition to avoid missed wake
+			writeIdx = hdr.WriteIndex()
+			readIdx = hdr.ReadIndex()
+			used = writeIdx - readIdx
+			available = r.capacity - used
+			if available >= needed {
+				hdr.AddSpaceWaiter(^uint32(0))
+				continue
+			}
+			if err := futexWait(&hdr.spaceSeq, spaceSeq); err != nil {
+				if hdr.Closed() {
+					hdr.AddSpaceWaiter(^uint32(0))
+					return WriteReservation{}, ErrRingClosed
+				}
+			}
+			hdr.AddSpaceWaiter(^uint32(0))
+			// Re-check closure after wake to avoid infinite loop
+			if hdr.Closed() {
+				return WriteReservation{}, ErrRingClosed
+			}
+			continue
+		}
+	}
 }

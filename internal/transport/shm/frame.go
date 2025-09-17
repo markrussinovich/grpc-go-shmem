@@ -440,3 +440,25 @@ func readFrame(rx *ShmRing) (FrameHeader, []byte, error) {
         return fh, payload, nil
     }
 }
+
+// writeMessageChunked writes a MESSAGE payload split across multiple frames if needed.
+// For all but the last chunk, the MORE flag is set. Chunking allows backpressure
+// and smaller ring capacities to be exercised without requiring a single large frame.
+func writeMessageChunked(tx *ShmRing, streamID uint32, payload []byte, chunkSize int) error {
+    if chunkSize <= 0 {
+        chunkSize = 32 * 1024
+    }
+    remaining := payload
+    for len(remaining) > 0 {
+        n := chunkSize
+        if n > len(remaining) { n = len(remaining) }
+        chunk := remaining[:n]
+        remaining = remaining[n:]
+        flags := uint8(0)
+        if len(remaining) > 0 { flags = MessageFlagMORE }
+        if err := writeFrame(tx, FrameHeader{StreamID: streamID, Type: FrameTypeMESSAGE, Flags: flags}, chunk); err != nil {
+            return err
+        }
+    }
+    return nil
+}

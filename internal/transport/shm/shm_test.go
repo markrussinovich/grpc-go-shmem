@@ -77,23 +77,26 @@ func TestSegmentHeaderFieldOffsets(t *testing.T) {
 }
 
 func TestRingHeaderFieldOffsets(t *testing.T) {
-	r := &RingHeader{}
+    r := &RingHeader{}
 
-	// Test field offsets match specification
-	tests := []struct {
-		name   string
-		offset uintptr
-		want   uintptr
-	}{
-		{"capacity", unsafe.Offsetof(r.capacity), 0x00},
-		{"widx", unsafe.Offsetof(r.widx), 0x08},
-		{"ridx", unsafe.Offsetof(r.ridx), 0x10},
-		{"dataSeq", unsafe.Offsetof(r.dataSeq), 0x18},
-		{"spaceSeq", unsafe.Offsetof(r.spaceSeq), 0x1C},
-		{"closed", unsafe.Offsetof(r.closed), 0x20},
-		{"pad", unsafe.Offsetof(r.pad), 0x24},
-		{"reserved", unsafe.Offsetof(r.reserved), 0x28},
-	}
+    // Test field offsets match specification
+    tests := []struct {
+        name   string
+        offset uintptr
+        want   uintptr
+    }{
+        {"capacity", unsafe.Offsetof(r.capacity), 0x00},
+        {"widx", unsafe.Offsetof(r.widx), 0x08},
+        {"ridx", unsafe.Offsetof(r.ridx), 0x10},
+        {"dataSeq", unsafe.Offsetof(r.dataSeq), 0x18},
+        {"spaceSeq", unsafe.Offsetof(r.spaceSeq), 0x1C},
+        {"closed", unsafe.Offsetof(r.closed), 0x20},
+        {"pad", unsafe.Offsetof(r.pad), 0x24},
+        {"contigSeq", unsafe.Offsetof(r.contigSeq), 0x28},
+        {"spaceWaiters", unsafe.Offsetof(r.spaceWaiters), 0x2C},
+        {"contigWaiters", unsafe.Offsetof(r.contigWaiters), 0x30},
+        {"reserved", unsafe.Offsetof(r.reserved), 0x34},
+    }
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

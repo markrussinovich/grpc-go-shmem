@@ -117,21 +117,21 @@ func futexWaitTimeout(addr *uint32, val uint32, timeoutNs int64) error {
 	// Debug: Check what we got back
 	_ = r2 // not used but let's acknowledge it
 
-	if errno != 0 {
-		// EAGAIN means the value didn't match - not an error
-		if errno == syscall.EAGAIN {
-			return nil
-		}
-		// EINTR means interrupted by signal - not an error
-		if errno == syscall.EINTR {
-			return nil
-		}
-		// ETIMEDOUT means the wait timed out
-		if errno == syscall.ETIMEDOUT {
-			return fmt.Errorf("futex wait timed out")
-		}
-		return fmt.Errorf("futex wait failed: %w", errno)
-	}
+    if errno != 0 {
+        // EAGAIN means the value didn't match - not an error
+        if errno == syscall.EAGAIN {
+            return nil
+        }
+        // EINTR means interrupted by signal - not an error
+        if errno == syscall.EINTR {
+            return nil
+        }
+        // ETIMEDOUT means the wait timed out
+        if errno == syscall.ETIMEDOUT {
+            return ErrFutexTimeout
+        }
+        return fmt.Errorf("futex wait failed: %w", errno)
+    }
 
 	// r1 == 0 means successful wait and wake
 	_ = r1

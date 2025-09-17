@@ -227,15 +227,19 @@ func (h *SegmentHeader) SetClosed(closed bool) {
 // RingHeader represents a ring buffer header with atomic access fields.
 // Layout follows the specification with 64-byte alignment.
 type RingHeader struct {
-	capacity uint64   // 0x00: power-of-two capacity in bytes
-	widx     uint64   // 0x08: monotonic write index (producer)
-	ridx     uint64   // 0x10: monotonic read index (consumer)
-	dataSeq  uint32   // 0x18: data sequence for futex (producer increments)
-	spaceSeq uint32   // 0x1C: space sequence for futex (consumer increments)
-	closed   uint32   // 0x20: closed flag (producer sets to 1)
-	pad      uint32   // 0x24: padding
-	reserved [24]byte // 0x28-0x3F: reserved/padding to 64B
-	// data area starts at offset 0x40
+    capacity uint64   // 0x00: power-of-two capacity in bytes
+    widx     uint64   // 0x08: monotonic write index (producer)
+    ridx     uint64   // 0x10: monotonic read index (consumer)
+    dataSeq  uint32   // 0x18: data sequence for futex (producer increments)
+    spaceSeq uint32   // 0x1C: space sequence for futex (consumer increments)
+    closed   uint32   // 0x20: closed flag (producer sets to 1)
+    pad      uint32   // 0x24: padding
+    // 0x28-0x33: reuse reserved slots for additional synchronization fields
+    contigSeq     uint32   // 0x28: contiguity sequence (consumer increments on every read commit)
+    spaceWaiters  uint32   // 0x2C: number of writers waiting on space
+    contigWaiters uint32   // 0x30: number of writers waiting on contiguity
+    reserved      [12]byte // 0x34-0x3F: reserved/padding to 64B
+    // data area starts at offset 0x40
 }
 
 // RingHeader atomic access methods
@@ -292,16 +296,46 @@ func (r *RingHeader) IncrementSpaceSequence() uint32 {
 
 // Closed returns the closed flag
 func (r *RingHeader) Closed() bool {
-	return atomic.LoadUint32(&r.closed) != 0
+    return atomic.LoadUint32(&r.closed) != 0
 }
 
 // SetClosed sets the closed flag
 func (r *RingHeader) SetClosed(closed bool) {
-	var val uint32
-	if closed {
-		val = 1
-	}
-	atomic.StoreUint32(&r.closed, val)
+    var val uint32
+    if closed {
+        val = 1
+    }
+    atomic.StoreUint32(&r.closed, val)
+}
+
+// ContigSequence returns the contiguity sequence number for futex
+func (r *RingHeader) ContigSequence() uint32 {
+    return atomic.LoadUint32(&r.contigSeq)
+}
+
+// IncrementContigSequence atomically increments the contiguity sequence
+func (r *RingHeader) IncrementContigSequence() uint32 {
+    return atomic.AddUint32(&r.contigSeq, 1)
+}
+
+// AddSpaceWaiter adds delta to the spaceWaiters counter (use +1 and ^uint32(0) for -1)
+func (r *RingHeader) AddSpaceWaiter(delta uint32) uint32 {
+    return atomic.AddUint32(&r.spaceWaiters, delta)
+}
+
+// SpaceWaiters returns the current number of writers waiting for space
+func (r *RingHeader) SpaceWaiters() uint32 {
+    return atomic.LoadUint32(&r.spaceWaiters)
+}
+
+// AddContigWaiter adds delta to the contigWaiters counter (use +1 and ^uint32(0) for -1)
+func (r *RingHeader) AddContigWaiter(delta uint32) uint32 {
+    return atomic.AddUint32(&r.contigWaiters, delta)
+}
+
+// ContigWaiters returns the current number of writers waiting for contiguity
+func (r *RingHeader) ContigWaiters() uint32 {
+    return atomic.LoadUint32(&r.contigWaiters)
 }
 
 // DataArea returns a pointer to the ring's data area
