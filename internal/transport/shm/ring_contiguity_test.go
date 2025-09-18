@@ -23,7 +23,7 @@ func newTestSegment(t *testing.T, cap uint64) *Segment {
 	return seg
 }
 
-// Tail-short: writer must wait on contigSeq when tail < headerSize and total free not enough for PAD+header.
+// Contiguity wait: writer waits on contigSeq when there's insufficient total space.
 func TestRing_ContiguityWait_TailShort(t *testing.T) {
 	if !isLinuxPlatform() {
 		t.Skip("Linux-only")
@@ -78,7 +78,7 @@ func TestRing_ContiguityWait_TailShort(t *testing.T) {
 	prevContig := hdr.ContigSequence()
 	prevSpace := hdr.SpaceSequence()
 
-	// Reader consumes 32 bytes to improve contiguity for PAD path; this increments contigSeq.
+	// Reader consumes 32 bytes to improve contiguity; this increments contigSeq.
 	first, second, commit, err := ring.ReadSlices(32, context.Background())
 	if err != nil {
 		t.Fatalf("ReadSlices: %v", err)
@@ -103,48 +103,6 @@ func TestRing_ContiguityWait_TailShort(t *testing.T) {
 	}
 	if hdr.SpaceSequence() != prevSpace {
 		t.Fatalf("spaceSeq should not increment (not full→not-full) prev=%d now=%d", prevSpace, hdr.SpaceSequence())
-	}
-}
-
-// PAD path: tail < headerSize but total free enough; writer should emit PAD and not wait.
-func TestRing_PAD_NoWait(t *testing.T) {
-	if !isLinuxPlatform() {
-		t.Skip("Linux-only")
-	}
-	const cap = 4096
-	seg := newTestSegment(t, cap)
-	ring := NewShmRingFromSegment(seg.A, seg.Mem)
-	hdr := ring.header()
-
-	// Arrange: PAD path triggered when remaining < frameHeaderSize but total space sufficient
-	// remaining < 16, but available >= remaining + 16
-	// Set w=4088, r=4064 => used=24, available=72, remaining=8
-	// PAD condition: remaining=8 < frameHeaderSize=16 ✓ AND available=72 >= 8+16=24 ✓
-	hdr.SetWriteIndex(4088)
-	hdr.SetReadIndex(4064)
-
-	start := time.Now()
-	res, err := ring.ReserveFrameHeader(context.Background())
-	if err != nil {
-		t.Fatalf("ReserveFrameHeader: %v", err)
-	}
-	// Commit full 16-byte header
-	if err := res.Commit(16); err != nil {
-		t.Fatalf("Commit header: %v", err)
-	}
-	elapsed := time.Since(start)
-	if elapsed > 50*time.Millisecond {
-		t.Fatalf("unexpected wait in PAD path; took %v", elapsed)
-	}
-
-	// w should have advanced by 8 (tail payload) + 16 (PAD header) + 16 (real header) = 40
-	// From writePos=4088: total advance=40 -> final=4088+40=4128
-	expectedFinal := uint64(4088 + 40)
-	if hdr.WriteIndex() != expectedFinal {
-		t.Fatalf("write index advance mismatch: got=%d want=%d", hdr.WriteIndex(), expectedFinal)
-	}
-	if hdr.ContigWaiters() != 0 {
-		t.Fatalf("contigWaiters should not increase on PAD path; got=%d", hdr.ContigWaiters())
 	}
 }
 
