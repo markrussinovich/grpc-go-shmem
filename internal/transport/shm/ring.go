@@ -32,13 +32,14 @@ var ErrRingClosed = errors.New("ring closed")
 
 // RingState represents a snapshot of ring buffer state for debugging and diagnostics
 type RingState struct {
-	Capacity uint64 // Total ring capacity
-	Widx     uint64 // Current write index (monotonic)
-	Ridx     uint64 // Current read index (monotonic)
-	Used     uint64 // Bytes currently in ring (Widx - Ridx)
-	DataSeq  uint32 // Data availability sequence number
-	SpaceSeq uint32 // Space availability sequence number
-	Closed   uint32 // Ring closed flag (0 = open, 1 = closed)
+	Capacity  uint64 // Total ring capacity
+	Widx      uint64 // Current write index (monotonic)
+	Ridx      uint64 // Current read index (monotonic)
+	Used      uint64 // Bytes currently in ring (Widx - Ridx)
+	DataSeq   uint32 // Data availability sequence number
+	SpaceSeq  uint32 // Space availability sequence number
+	ContigSeq uint32 // Contiguity sequence number (readSeq equivalent)
+	Closed    uint32 // Ring closed flag (0 = open, 1 = closed)
 }
 
 // ShmRing represents a single-producer single-consumer (SPSC) ring buffer
@@ -101,19 +102,21 @@ func (r *ShmRing) DebugState() RingState {
 	ridx := hdr.ReadIndex()
 	dataSeq := hdr.DataSequence()
 	spaceSeq := hdr.SpaceSequence()
+	contigSeq := hdr.ContigSequence()
 	closed := uint32(0)
 	if hdr.Closed() {
 		closed = 1
 	}
 
 	return RingState{
-		Capacity: r.capacity,
-		Widx:     widx,
-		Ridx:     ridx,
-		Used:     widx - ridx,
-		DataSeq:  dataSeq,
-		SpaceSeq: spaceSeq,
-		Closed:   closed,
+		Capacity:  r.capacity,
+		Widx:      widx,
+		Ridx:      ridx,
+		Used:      widx - ridx,
+		DataSeq:   dataSeq,
+		SpaceSeq:  spaceSeq,
+		ContigSeq: contigSeq,
+		Closed:    closed,
 	}
 }
 
@@ -204,17 +207,17 @@ func (r *ShmRing) WriteBlocking(data []byte) error {
 		available = r.capacity - usedBefore
 		if available == 0 {
 			// Full: wait on spaceSeq (full→not-full)
-			hdr.AddSpaceWaiter(1)
+			hdr.IncSpaceWaiters()
 			exp := hdr.SpaceSequence()
 			// Re-check condition to avoid missed wake
 			writeIdx = hdr.WriteIndex()
 			readIdx = hdr.ReadIndex()
 			if (r.capacity - (writeIdx - readIdx)) >= uint64(len(data)) {
-				hdr.AddSpaceWaiter(^uint32(0))
+				hdr.DecSpaceWaiters()
 				continue
 			}
 			_ = futexWait(&hdr.spaceSeq, exp)
-			hdr.AddSpaceWaiter(^uint32(0))
+			hdr.DecSpaceWaiters()
 			// Re-check closure after wake to avoid infinite loop
 			if hdr.Closed() {
 				return ErrRingClosed
@@ -222,17 +225,17 @@ func (r *ShmRing) WriteBlocking(data []byte) error {
 			continue
 		}
 		// Not full but not enough: any read helps; wait on contigSeq.
-		hdr.AddContigWaiter(1)
+		hdr.IncContigWaiters()
 		exp := hdr.ContigSequence()
 		// Re-check prior to waiting
 		writeIdx = hdr.WriteIndex()
 		readIdx = hdr.ReadIndex()
 		if (r.capacity - (writeIdx - readIdx)) >= uint64(len(data)) {
-			hdr.AddContigWaiter(^uint32(0))
+			hdr.DecContigWaiters()
 			continue
 		}
 		_ = futexWait(&hdr.contigSeq, exp)
-		hdr.AddContigWaiter(^uint32(0))
+		hdr.DecContigWaiters()
 		// Re-check closure after wake to avoid infinite loop
 		if hdr.Closed() {
 			return ErrRingClosed
@@ -487,29 +490,29 @@ func (r *ShmRing) WriteBlockingContext(ctx context.Context, data []byte) error {
 				continue
 			}
 			if available == 0 {
-				hdr.AddSpaceWaiter(1)
+				hdr.IncSpaceWaiters()
 				exp := hdr.SpaceSequence()
 				// Re-check
 				writeIdx = hdr.WriteIndex()
 				readIdx = hdr.ReadIndex()
 				if (r.capacity - (writeIdx - readIdx)) >= uint64(len(data)) {
-					hdr.AddSpaceWaiter(^uint32(0))
+					hdr.DecSpaceWaiters()
 					continue
 				}
 				err = futexWaitTimeout(&hdr.spaceSeq, exp, timeoutNs)
-				hdr.AddSpaceWaiter(^uint32(0))
+				hdr.DecSpaceWaiters()
 			} else {
-				hdr.AddContigWaiter(1)
+				hdr.IncContigWaiters()
 				exp := hdr.ContigSequence()
 				// Re-check
 				writeIdx = hdr.WriteIndex()
 				readIdx = hdr.ReadIndex()
 				if (r.capacity - (writeIdx - readIdx)) >= uint64(len(data)) {
-					hdr.AddContigWaiter(^uint32(0))
+					hdr.DecContigWaiters()
 					continue
 				}
 				err = futexWaitTimeout(&hdr.contigSeq, exp, timeoutNs)
-				hdr.AddContigWaiter(^uint32(0))
+				hdr.DecContigWaiters()
 			}
 		} else {
 			// No timeout: same logic with infinite waits
@@ -521,29 +524,29 @@ func (r *ShmRing) WriteBlockingContext(ctx context.Context, data []byte) error {
 				continue
 			}
 			if available == 0 {
-				hdr.AddSpaceWaiter(1)
+				hdr.IncSpaceWaiters()
 				exp := hdr.SpaceSequence()
 				// Re-check
 				writeIdx = hdr.WriteIndex()
 				readIdx = hdr.ReadIndex()
 				if (r.capacity - (writeIdx - readIdx)) >= uint64(len(data)) {
-					hdr.AddSpaceWaiter(^uint32(0))
+					hdr.DecSpaceWaiters()
 					continue
 				}
 				err = futexWait(&hdr.spaceSeq, exp)
-				hdr.AddSpaceWaiter(^uint32(0))
+				hdr.DecSpaceWaiters()
 			} else {
-				hdr.AddContigWaiter(1)
+				hdr.IncContigWaiters()
 				exp := hdr.ContigSequence()
 				// Re-check
 				writeIdx = hdr.WriteIndex()
 				readIdx = hdr.ReadIndex()
 				if (r.capacity - (writeIdx - readIdx)) >= uint64(len(data)) {
-					hdr.AddContigWaiter(^uint32(0))
+					hdr.DecContigWaiters()
 					continue
 				}
 				err = futexWait(&hdr.contigSeq, exp)
-				hdr.AddContigWaiter(^uint32(0))
+				hdr.DecContigWaiters()
 			}
 		}
 
@@ -821,17 +824,17 @@ func (r *ShmRing) ReserveWrite(n int, ctx context.Context) (WriteReservation, er
 		readIdx = hdr.ReadIndex()
 		free := r.capacity - (writeIdx - readIdx)
 		if free == 0 {
-			hdr.AddSpaceWaiter(1)
+			hdr.IncSpaceWaiters()
 			exp := hdr.SpaceSequence()
 			// Re-check
 			writeIdx = hdr.WriteIndex()
 			readIdx = hdr.ReadIndex()
 			if (r.capacity - (writeIdx - readIdx)) >= uint64(n) {
-				hdr.AddSpaceWaiter(^uint32(0))
+				hdr.DecSpaceWaiters()
 				continue
 			}
 			_ = futexWait(&hdr.spaceSeq, exp)
-			hdr.AddSpaceWaiter(^uint32(0))
+			hdr.DecSpaceWaiters()
 			// Re-check closure after wake to avoid infinite loop
 			if hdr.Closed() {
 				return WriteReservation{}, ErrRingClosed
@@ -839,17 +842,17 @@ func (r *ShmRing) ReserveWrite(n int, ctx context.Context) (WriteReservation, er
 			continue
 		}
 		// Not full: contiguity-improving reads help
-		hdr.AddContigWaiter(1)
+		hdr.IncContigWaiters()
 		exp := hdr.ContigSequence()
 		// Re-check
 		writeIdx = hdr.WriteIndex()
 		readIdx = hdr.ReadIndex()
 		if (r.capacity - (writeIdx - readIdx)) >= uint64(n) {
-			hdr.AddContigWaiter(^uint32(0))
+			hdr.DecContigWaiters()
 			continue
 		}
 		_ = futexWait(&hdr.contigSeq, exp)
-		hdr.AddContigWaiter(^uint32(0))
+		hdr.DecContigWaiters()
 		// Re-check closure after wake to avoid infinite loop
 		if hdr.Closed() {
 			return WriteReservation{}, ErrRingClosed

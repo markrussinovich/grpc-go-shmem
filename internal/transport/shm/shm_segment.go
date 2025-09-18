@@ -323,6 +323,16 @@ func (r *RingHeader) AddSpaceWaiter(delta uint32) uint32 {
     return atomic.AddUint32(&r.spaceWaiters, delta)
 }
 
+// IncSpaceWaiters increments the space waiters counter
+func (r *RingHeader) IncSpaceWaiters() uint32 {
+	return atomic.AddUint32(&r.spaceWaiters, 1)
+}
+
+// DecSpaceWaiters decrements the space waiters counter
+func (r *RingHeader) DecSpaceWaiters() uint32 {
+	return atomic.AddUint32(&r.spaceWaiters, ^uint32(0))
+}
+
 // SpaceWaiters returns the current number of writers waiting for space
 func (r *RingHeader) SpaceWaiters() uint32 {
     return atomic.LoadUint32(&r.spaceWaiters)
@@ -331,6 +341,16 @@ func (r *RingHeader) SpaceWaiters() uint32 {
 // AddContigWaiter adds delta to the contigWaiters counter (use +1 and ^uint32(0) for -1)
 func (r *RingHeader) AddContigWaiter(delta uint32) uint32 {
     return atomic.AddUint32(&r.contigWaiters, delta)
+}
+
+// IncContigWaiters increments the contiguity waiters counter
+func (r *RingHeader) IncContigWaiters() uint32 {
+	return atomic.AddUint32(&r.contigWaiters, 1)
+}
+
+// DecContigWaiters decrements the contiguity waiters counter
+func (r *RingHeader) DecContigWaiters() uint32 {
+	return atomic.AddUint32(&r.contigWaiters, ^uint32(0))
 }
 
 // ContigWaiters returns the current number of writers waiting for contiguity
