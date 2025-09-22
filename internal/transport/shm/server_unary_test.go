@@ -36,7 +36,7 @@ func TestShmServerUnary_Echo(t *testing.T) {
 		st := sc.transport
 
 		// Read initial HEADERS and MESSAGE from client
-		fh, pl, err := readFrame(st.clientToServer)
+		fh, pl, err := readFrame(st.clientToServer, context.Background())
 		if err != nil {
 			t.Errorf("server read headers: %v", err)
 			return
@@ -50,7 +50,7 @@ func TestShmServerUnary_Echo(t *testing.T) {
 			return
 		}
 
-		fh2, msg, err := readFrame(st.clientToServer)
+		fh2, msg, err := readFrame(st.clientToServer, context.Background())
 		if err != nil {
 			t.Errorf("server read message: %v", err)
 			return
@@ -62,16 +62,16 @@ func TestShmServerUnary_Echo(t *testing.T) {
 
 		// Send server HEADERS, then echo MESSAGE, then TRAILERS OK
 		h := HeadersV1{Version: 1, HdrType: 1, Metadata: []KV{{Key: "x-srv", Values: [][]byte{[]byte("ok")}}}}
-		if err := writeFrame(st.serverToClient, FrameHeader{StreamID: fh.StreamID, Type: FrameTypeHEADERS, Flags: HeadersFlagINITIAL}, encodeHeaders(h)); err != nil {
-			t.Errorf("server write headers: %v", err)
-			return
+		if err := writeFrame(st.serverToClient, FrameHeader{StreamID: fh.StreamID, Type: FrameTypeHEADERS, Flags: HeadersFlagINITIAL}, encodeHeaders(h), context.Background()); err != nil {
+			t.Fatalf("writeFrame headers: %v", err)
 		}
-		if err := writeFrame(st.serverToClient, FrameHeader{StreamID: fh.StreamID, Type: FrameTypeMESSAGE}, msg); err != nil {
+		// Send MESSAGE
+		if err := writeFrame(st.serverToClient, FrameHeader{StreamID: fh.StreamID, Type: FrameTypeMESSAGE}, msg, context.Background()); err != nil {
 			t.Errorf("server write message: %v", err)
 			return
 		}
 		tr := TrailersV1{Version: 1, GRPCStatusCode: 0}
-		if err := writeFrame(st.serverToClient, FrameHeader{StreamID: fh.StreamID, Type: FrameTypeTRAILERS, Flags: TrailersFlagEND_STREAM}, encodeTrailers(tr)); err != nil {
+		if err := writeFrame(st.serverToClient, FrameHeader{StreamID: fh.StreamID, Type: FrameTypeTRAILERS, Flags: TrailersFlagEND_STREAM}, encodeTrailers(tr), context.Background()); err != nil {
 			t.Errorf("server write trailers: %v", err)
 			return
 		}

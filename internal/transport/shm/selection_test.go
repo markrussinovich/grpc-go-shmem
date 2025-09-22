@@ -28,7 +28,7 @@ func TestSelection_ChoosesSHM_and_ExecutesUnary(t *testing.T) {
 		seg := lis.segment
 		srvRx := NewShmRingFromSegment(seg.A, seg.Mem)
 		srvTx := NewShmRingFromSegment(seg.B, seg.Mem)
-		fh, pl, err := readFrame(srvRx)
+		fh, pl, err := readFrame(srvRx, context.Background())
 		if err != nil {
 			t.Errorf("server read headers: %v", err)
 			return
@@ -41,7 +41,7 @@ func TestSelection_ChoosesSHM_and_ExecutesUnary(t *testing.T) {
 			t.Errorf("decode headers: %v", err)
 			return
 		}
-		fh2, msg, err := readFrame(srvRx)
+		fh2, msg, err := readFrame(srvRx, context.Background())
 		if err != nil {
 			t.Errorf("server read msg: %v", err)
 			return
@@ -52,10 +52,10 @@ func TestSelection_ChoosesSHM_and_ExecutesUnary(t *testing.T) {
 		}
 		// Respond
 		h := HeadersV1{Version: 1, HdrType: 1}
-		_ = writeFrame(srvTx, FrameHeader{StreamID: fh.StreamID, Type: FrameTypeHEADERS, Flags: HeadersFlagINITIAL}, encodeHeaders(h))
-		_ = writeFrame(srvTx, FrameHeader{StreamID: fh.StreamID, Type: FrameTypeMESSAGE}, msg)
+		_ = writeFrame(srvTx, FrameHeader{StreamID: fh.StreamID, Type: FrameTypeHEADERS, Flags: HeadersFlagINITIAL}, encodeHeaders(h), context.Background())
+		_ = writeFrame(srvTx, FrameHeader{StreamID: fh.StreamID, Type: FrameTypeMESSAGE}, msg, context.Background())
 		tr := TrailersV1{Version: 1, GRPCStatusCode: 0}
-		_ = writeFrame(srvTx, FrameHeader{StreamID: fh.StreamID, Type: FrameTypeTRAILERS, Flags: TrailersFlagEND_STREAM}, encodeTrailers(tr))
+		_ = writeFrame(srvTx, FrameHeader{StreamID: fh.StreamID, Type: FrameTypeTRAILERS, Flags: TrailersFlagEND_STREAM}, encodeTrailers(tr), context.Background())
 	}()
 
 	// Registry-like selection: prefer shm over tcp when present.

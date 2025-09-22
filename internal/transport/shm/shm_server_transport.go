@@ -3,17 +3,17 @@
 package shm
 
 import (
-    "context"
-    "errors"
-    "net"
-    "sync"
-    "sync/atomic"
+	"context"
+	"errors"
+	"net"
+	"sync"
+	"sync/atomic"
 
-    "google.golang.org/grpc/internal/transport"
-    "google.golang.org/grpc/mem"
-    "google.golang.org/grpc/metadata"
-    "google.golang.org/grpc/peer"
-    "google.golang.org/grpc/status"
+	"google.golang.org/grpc/internal/transport"
+	"google.golang.org/grpc/mem"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/peer"
+	"google.golang.org/grpc/status"
 )
 
 // ShmServerTransport implements the gRPC ServerTransport interface
@@ -109,21 +109,21 @@ func (t *ShmServerTransport) processIncomingData(ctx context.Context) {
 		}
 	}()
 
-    for {
-        if t.closed.Load() {
-            return
-        }
-        fh, payload, err := readFrame(t.clientToServer)
-        if err != nil {
-            if errors.Is(err, ErrRingClosed) || t.closed.Load() {
-                return
-            }
-            continue
-        }
-        _ = fh
-        _ = payload
-        // TODO: dispatch frames to stream handlers in future step.
-    }
+	for {
+		if t.closed.Load() {
+			return
+		}
+		fh, payload, err := readFrame(t.clientToServer, ctx)
+		if err != nil {
+			if errors.Is(err, ErrRingClosed) || t.closed.Load() {
+				return
+			}
+			continue
+		}
+		_ = fh
+		_ = payload
+		// TODO: dispatch frames to stream handlers in future step.
+	}
 }
 
 // processFrameData processes incoming gRPC frame data

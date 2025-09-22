@@ -83,16 +83,19 @@ func (c *ShmUnaryClient) Close() error {
 	return c.seg.Close()
 }
 
-// startReader starts the event-driven frame reader once.
+// startReader starts the event-driven frame reader once with a client-level context.
 func (c *ShmUnaryClient) startReader() {
 	c.readerOnce.Do(func() {
 		go func() {
 			defer close(c.readerDone)
 
 			// Single-threaded demux of frames.
+			// Use background context since reader should run until client is closed
+			ctx := context.Background()
 			for !c.closed.Load() {
-				fh, payload, err := readFrame(c.rx)
+				fh, payload, err := readFrame(c.rx, ctx)
 				if err != nil {
+					// Context cancelled or ring closed
 					return
 				}
 				switch fh.Type {
@@ -108,7 +111,7 @@ func (c *ShmUnaryClient) startReader() {
 				case FrameTypePING:
 					// Immediately reply with PONG
 					c.writeMu.Lock()
-					_ = writeFrame(c.tx, FrameHeader{StreamID: fh.StreamID, Type: FrameTypePONG}, payload)
+					_ = writeFrame(c.tx, FrameHeader{StreamID: fh.StreamID, Type: FrameTypePONG}, payload, ctx)
 					c.writeMu.Unlock()
 				case FrameTypeGOAWAY:
 					// Ignore in unary bring-up
@@ -207,12 +210,12 @@ func (c *ShmUnaryClient) UnaryCall(ctx context.Context, method, authority string
 	}
 	hbytes := encodeHeaders(hdr)
 	c.writeMu.Lock()
-	if err := writeFrame(c.tx, FrameHeader{StreamID: id, Type: FrameTypeHEADERS, Flags: HeadersFlagINITIAL}, hbytes); err != nil {
+	if err := writeFrame(c.tx, FrameHeader{StreamID: id, Type: FrameTypeHEADERS, Flags: HeadersFlagINITIAL}, hbytes, ctx); err != nil {
 		c.writeMu.Unlock()
 		return HeadersV1{}, nil, TrailersV1{}, err
 	}
 	// Send MESSAGE (single frame for unary)
-	if err := writeFrame(c.tx, FrameHeader{StreamID: id, Type: FrameTypeMESSAGE}, payload); err != nil {
+	if err := writeFrame(c.tx, FrameHeader{StreamID: id, Type: FrameTypeMESSAGE}, payload, ctx); err != nil {
 		c.writeMu.Unlock()
 		return HeadersV1{}, nil, TrailersV1{}, err
 	}
@@ -231,10 +234,33 @@ func (c *ShmUnaryClient) UnaryCall(ctx context.Context, method, authority string
 		}
 		select {
 		case <-ctx.Done():
-			// Best-effort CANCEL
+			// Best-effort CANCEL with non-cancellable context to ensure delivery
 			c.writeMu.Lock()
-			_ = writeFrame(c.tx, FrameHeader{StreamID: id, Type: FrameTypeCANCEL}, []byte{1})
+			_ = writeFrame(c.tx, FrameHeader{StreamID: id, Type: FrameTypeCANCEL}, []byte{1}, context.Background())
 			c.writeMu.Unlock()
+
+			// Remove stream from map and signal all channels to unblock any waiters
+			c.streamsM.Lock()
+			delete(c.streams, id)
+			c.streamsM.Unlock()
+			// Non-blocking send to all channels (in case anyone is waiting)
+			select {
+			case s.errCh <- ctx.Err():
+			default:
+			}
+			select {
+			case s.hdrCh <- HeadersV1{}:
+			default:
+			}
+			select {
+			case s.msgCh <- nil:
+			default:
+			}
+			select {
+			case s.trCh <- TrailersV1{}:
+			default:
+			}
+
 			return HeadersV1{}, nil, TrailersV1{}, ctx.Err()
 		case e := <-s.errCh:
 			return HeadersV1{}, nil, TrailersV1{}, e

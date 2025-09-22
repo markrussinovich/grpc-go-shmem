@@ -150,7 +150,7 @@ func TestUnary_BackpressureAndBlocking(t *testing.T) {
 			time.Sleep(20 * time.Millisecond)
 
 			// Read request HEADERS
-			fh, _, err := readFrame(cliTx)
+			fh, _, err := readFrame(cliTx, context.Background())
 			if err != nil {
 				serverResult <- fmt.Errorf("server read headers: %v", err)
 				return
@@ -163,7 +163,7 @@ func TestUnary_BackpressureAndBlocking(t *testing.T) {
 			// Read MESSAGE frame(s) - should be chunked due to ring size
 			var acc []byte
 			for {
-				fhm, p, err := readFrame(cliTx)
+				fhm, p, err := readFrame(cliTx, context.Background())
 				if err != nil {
 					serverResult <- fmt.Errorf("server read message: %v", err)
 					return
@@ -179,15 +179,15 @@ func TestUnary_BackpressureAndBlocking(t *testing.T) {
 			}
 
 			// Respond with same data
-			if err := writeFrame(cliRx, FrameHeader{StreamID: fh.StreamID, Type: FrameTypeHEADERS, Flags: HeadersFlagINITIAL}, encodeHeaders(HeadersV1{Version: 1, HdrType: 1})); err != nil {
+			if err := writeFrame(cliRx, FrameHeader{StreamID: fh.StreamID, Type: FrameTypeHEADERS, Flags: HeadersFlagINITIAL}, encodeHeaders(HeadersV1{Version: 1, HdrType: 1}), context.Background()); err != nil {
 				serverResult <- fmt.Errorf("server write headers: %v", err)
 				return
 			}
-			if err := writeFrame(cliRx, FrameHeader{StreamID: fh.StreamID, Type: FrameTypeMESSAGE}, acc); err != nil {
+			if err := writeFrame(cliRx, FrameHeader{StreamID: fh.StreamID, Type: FrameTypeMESSAGE}, acc, context.Background()); err != nil {
 				serverResult <- fmt.Errorf("server write message: %v", err)
 				return
 			}
-			if err := writeFrame(cliRx, FrameHeader{StreamID: fh.StreamID, Type: FrameTypeTRAILERS, Flags: TrailersFlagEND_STREAM}, encodeTrailers(TrailersV1{Version: 1, GRPCStatusCode: 0})); err != nil {
+			if err := writeFrame(cliRx, FrameHeader{StreamID: fh.StreamID, Type: FrameTypeTRAILERS, Flags: TrailersFlagEND_STREAM}, encodeTrailers(TrailersV1{Version: 1, GRPCStatusCode: 0}), context.Background()); err != nil {
 				serverResult <- fmt.Errorf("server write trailers: %v", err)
 				return
 			}

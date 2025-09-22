@@ -8,7 +8,7 @@ import (
 	"net"
 	"sync"
 	"sync/atomic"
-	
+
 	"google.golang.org/grpc/internal/transport"
 )
 
@@ -72,38 +72,38 @@ func NewShmClientTransport(segment *Segment, localAddr, remoteAddr net.Addr) (*S
 		goAwayCh:       make(chan struct{}),
 	}
 
-    // Start processing incoming data from the server (test hook guarded)
-    if enableClientReader.Load() {
-        go t.processIncomingData()
-    }
+	// Start processing incoming data from the server (test hook guarded)
+	if enableClientReader.Load() {
+		go t.processIncomingData(context.Background())
+	}
 
 	return t, nil
 }
 
 // processIncomingData reads data from the server->client ring and processes gRPC frames
-func (t *ShmClientTransport) processIncomingData() {
+func (t *ShmClientTransport) processIncomingData(ctx context.Context) {
 	defer func() {
 		if !t.closed.Load() {
 			t.Close(errors.New("incoming data processing ended"))
 		}
 	}()
 
-    for {
-        if t.closed.Load() {
-            return
-        }
-        // Event-driven: block on next frame from rx ring.
-        fh, payload, err := readFrame(t.serverToClient)
-        if err != nil {
-            if errors.Is(err, ErrRingClosed) || t.closed.Load() {
-                return
-            }
-            continue
-        }
-        _ = fh
-        _ = payload
-        // TODO: dispatch to streams once stream management is in place.
-    }
+	for {
+		if t.closed.Load() {
+			return
+		}
+		// Event-driven: block on next frame from rx ring.
+		fh, payload, err := readFrame(t.serverToClient, ctx)
+		if err != nil {
+			if errors.Is(err, ErrRingClosed) || t.closed.Load() {
+				return
+			}
+			continue
+		}
+		_ = fh
+		_ = payload
+		// TODO: dispatch to streams once stream management is in place.
+	}
 }
 
 // processFrameData processes incoming gRPC frame data

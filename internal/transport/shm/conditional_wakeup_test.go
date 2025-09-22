@@ -30,8 +30,8 @@ func TestConditionalWakeups(t *testing.T) {
 	ring := NewShmRingFromSegment(seg.A, seg.Mem)
 	hdr := ring.header()
 
-	// Test 1: Writer should wake reader only on empty→non-empty transition
-	t.Run("WriterWakesReaderOnlyOnEmptyToNonEmpty", func(t *testing.T) {
+	// Test 1: Every positive write should increment dataSeq (new semantics)
+	t.Run("EveryWriteIncrementsDataSeqBasic", func(t *testing.T) {
 		// Ensure ring is empty
 		for !ring.IsEmpty() {
 			buf := make([]byte, 100)
@@ -40,7 +40,7 @@ func TestConditionalWakeups(t *testing.T) {
 
 		initialDataSeq := hdr.DataSequence()
 
-		// First write: should increment dataSeq (empty→non-empty)
+		// First write: should increment dataSeq (every positive write increments)
 		err := ring.WriteBlocking([]byte("first"))
 		if err != nil {
 			t.Fatalf("First write failed: %v", err)
@@ -51,7 +51,7 @@ func TestConditionalWakeups(t *testing.T) {
 			t.Errorf("First write should increment dataSeq: expected %d, got %d", initialDataSeq+1, newDataSeq)
 		}
 
-		// Second write: should NOT increment dataSeq (non-empty→non-empty)
+		// Second write: should also increment dataSeq (every positive write increments)
 		prevDataSeq := newDataSeq
 		err = ring.WriteBlocking([]byte("second"))
 		if err != nil {
@@ -59,8 +59,8 @@ func TestConditionalWakeups(t *testing.T) {
 		}
 
 		finalDataSeq := hdr.DataSequence()
-		if finalDataSeq != prevDataSeq {
-			t.Errorf("Second write should NOT increment dataSeq: expected %d, got %d", prevDataSeq, finalDataSeq)
+		if finalDataSeq != prevDataSeq+1 {
+			t.Errorf("Second write should increment dataSeq: expected %d, got %d", prevDataSeq+1, finalDataSeq)
 		}
 	})
 
@@ -117,30 +117,21 @@ func TestConditionalWakeups(t *testing.T) {
 		}
 	})
 
-	// Test 3: Multiple small writes after empty→non-empty should not increment dataSeq
-	t.Run("MultipleWritesAfterFirstDoNotWake", func(t *testing.T) {
+	// Test 3: Every positive write should increment dataSeq (new semantics)
+	t.Run("EveryWriteIncrementsDataSeq", func(t *testing.T) {
 		// Ensure ring is empty
 		for !ring.IsEmpty() {
 			buf := make([]byte, 100)
 			ring.ReadBlocking(buf)
 		}
 
-		initialDataSeq := hdr.DataSequence()
-
-		// First write: should wake (empty→non-empty)
-		ring.WriteBlocking([]byte("1"))
-		firstSeq := hdr.DataSequence()
-		if firstSeq != initialDataSeq+1 {
-			t.Errorf("First write should wake: expected %d, got %d", initialDataSeq+1, firstSeq)
-		}
-
-		// Next several writes: should NOT wake
-		for i := 2; i <= 5; i++ {
+		// Every write should increment dataSeq
+		for i := 1; i <= 5; i++ {
 			prevSeq := hdr.DataSequence()
 			ring.WriteBlocking([]byte{byte(i)})
 			newSeq := hdr.DataSequence()
-			if newSeq != prevSeq {
-				t.Errorf("Write %d should NOT wake: expected %d, got %d", i, prevSeq, newSeq)
+			if newSeq != prevSeq+1 {
+				t.Errorf("Write %d should increment dataSeq: expected %d, got %d", i, prevSeq+1, newSeq)
 			}
 		}
 	})

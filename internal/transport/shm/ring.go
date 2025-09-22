@@ -68,6 +68,13 @@ func NewShmRingFromSegment(ringView *ringView, mem []byte) *ShmRing {
 	if capacity == 0 || !IsPowerOfTwo(capacity) {
 		panic("ShmRing capacity must be a power of two")
 	}
+
+	// Assert mmapped length vs offsets
+	end := ringView.offset + RingHeaderSize + capacity
+	if int(end) > len(mem) {
+		panic("segment too small for ring")
+	}
+
 	return &ShmRing{
 		capMask:  capacity - 1, // For modulo operations: pos = idx & capMask
 		hdrOff:   uintptr(ringView.offset),
@@ -163,7 +170,7 @@ func (r *ShmRing) WriteBlocking(data []byte) error {
 			if writePos+uint64(len(data)) <= r.capacity {
 				// Simple case: no wrap
 				destPtr := unsafe.Pointer(uintptr(r.dataPtr()) + uintptr(writePos))
-				copy((*[1 << 30]byte)(destPtr)[:len(data)], data)
+				copy(unsafe.Slice((*byte)(destPtr), len(data)), data)
 			} else {
 				// Wrap case: split the write
 				firstChunk := r.capacity - writePos
@@ -171,11 +178,11 @@ func (r *ShmRing) WriteBlocking(data []byte) error {
 
 				// Write first chunk at end of buffer
 				destPtr1 := unsafe.Pointer(uintptr(r.dataPtr()) + uintptr(writePos))
-				copy((*[1 << 30]byte)(destPtr1)[:firstChunkI], data[:firstChunkI])
+				copy(unsafe.Slice((*byte)(destPtr1), firstChunkI), data[:firstChunkI])
 
 				// Write second chunk at beginning of buffer
 				destPtr2 := r.dataPtr()
-				copy((*[1 << 30]byte)(destPtr2)[:len(data)-firstChunkI], data[firstChunkI:])
+				copy(unsafe.Slice((*byte)(destPtr2), len(data)-firstChunkI), data[firstChunkI:])
 			}
 
 			// Advance write index.
@@ -185,13 +192,10 @@ func (r *ShmRing) WriteBlocking(data []byte) error {
 			// 3) Publish the new write index with an atomic store (acts as a release)
 			// 4) Wake only if we actually transitioned empty -> non-empty
 
-			// Check emptiness at commit time to avoid lost wake race
-			emptyBefore := (hdr.ReadIndex() == writeIdx)
-
 			hdr.SetWriteIndex(writeIdx + uint64(len(data))) // release-publish
 
-			// Wake only if we actually transitioned empty -> non-empty
-			if len(data) > 0 && emptyBefore {
+			// Wake on every positive write commit to unblock readers waiting for "at least N bytes"
+			if len(data) > 0 {
 				hdr.IncrementDataSequence()
 				futexWake(&hdr.dataSeq, 1)
 			}
@@ -295,7 +299,7 @@ func (r *ShmRing) ReadBlocking(buf []byte) (int, error) {
 				// Simple case: no wrap
 				srcPtr := unsafe.Pointer(uintptr(r.dataPtr()) + uintptr(readPos))
 				toReadI := int(toRead)
-				bytesRead = copy(buf, (*[1 << 30]byte)(srcPtr)[:toReadI])
+				bytesRead = copy(buf, unsafe.Slice((*byte)(srcPtr), toReadI))
 			} else {
 				// Wrap case: split the read
 				firstChunk := r.capacity - readPos
@@ -303,12 +307,12 @@ func (r *ShmRing) ReadBlocking(buf []byte) (int, error) {
 
 				// Read first chunk from end of buffer
 				srcPtr1 := unsafe.Pointer(uintptr(r.dataPtr()) + uintptr(readPos))
-				bytesRead = copy(buf, (*[1 << 30]byte)(srcPtr1)[:firstChunkI])
+				bytesRead = copy(buf, unsafe.Slice((*byte)(srcPtr1), firstChunkI))
 
 				// Read second chunk from beginning of buffer
 				srcPtr2 := r.dataPtr()
 				secondI := int(toRead - firstChunk)
-				bytesRead += copy(buf[bytesRead:], (*[1 << 30]byte)(srcPtr2)[:secondI])
+				bytesRead += copy(buf[bytesRead:], unsafe.Slice((*byte)(srcPtr2), secondI))
 			}
 
 			// Advance read index.
@@ -357,6 +361,7 @@ func (r *ShmRing) Close() error {
 	hdr.SetClosed(true)
 
 	// Wake up any waiting readers and writers; bump sequences to release waiters.
+	hdr.IncrementDataSequence()
 	hdr.IncrementSpaceSequence()
 	hdr.IncrementContigSequence()
 	futexWake(&hdr.dataSeq, 1)
@@ -436,7 +441,7 @@ func (r *ShmRing) WriteBlockingContext(ctx context.Context, data []byte) error {
 			if writePos+uint64(len(data)) <= r.capacity {
 				// Simple case: no wrap
 				destPtr := unsafe.Pointer(uintptr(r.dataPtr()) + uintptr(writePos))
-				copy((*[1 << 30]byte)(destPtr)[:len(data)], data)
+				copy(unsafe.Slice((*byte)(destPtr), len(data)), data)
 			} else {
 				// Wrap case: split the write
 				firstChunk := r.capacity - writePos
@@ -444,21 +449,17 @@ func (r *ShmRing) WriteBlockingContext(ctx context.Context, data []byte) error {
 
 				// Write first chunk at end of buffer
 				destPtr1 := unsafe.Pointer(uintptr(r.dataPtr()) + uintptr(writePos))
-				copy((*[1 << 30]byte)(destPtr1)[:firstChunkI], data[:firstChunkI])
+				copy(unsafe.Slice((*byte)(destPtr1), firstChunkI), data[:firstChunkI])
 
 				// Write second chunk at beginning of buffer
 				destPtr2 := r.dataPtr()
-				copy((*[1 << 30]byte)(destPtr2)[:len(data)-firstChunkI], data[firstChunkI:])
+				copy(unsafe.Slice((*byte)(destPtr2), len(data)-firstChunkI), data[firstChunkI:])
 			}
-
-			// Advance write index.
-			// Check emptiness right before publishing to avoid lost wake race
-			emptyBefore := (hdr.ReadIndex() == writeIdx)
 
 			hdr.SetWriteIndex(writeIdx + uint64(len(data))) // release-publish
 
-			// Wake only if we actually transitioned empty -> non-empty
-			if len(data) > 0 && emptyBefore {
+			// Wake on every positive write commit to unblock readers waiting for "at least N bytes"
+			if len(data) > 0 {
 				hdr.IncrementDataSequence()
 				futexWake(&hdr.dataSeq, 1)
 			}
@@ -601,7 +602,7 @@ func (r *ShmRing) ReadBlockingContext(ctx context.Context, buf []byte) (int, err
 				// Simple case: no wrap
 				srcPtr := unsafe.Pointer(uintptr(r.dataPtr()) + uintptr(readPos))
 				toReadI := int(toRead)
-				bytesRead = copy(buf, (*[1 << 30]byte)(srcPtr)[:toReadI])
+				bytesRead = copy(buf, unsafe.Slice((*byte)(srcPtr), toReadI))
 			} else {
 				// Wrap case: split the read
 				firstChunk := r.capacity - readPos
@@ -609,12 +610,12 @@ func (r *ShmRing) ReadBlockingContext(ctx context.Context, buf []byte) (int, err
 
 				// Read first chunk from end of buffer
 				srcPtr1 := unsafe.Pointer(uintptr(r.dataPtr()) + uintptr(readPos))
-				bytesRead = copy(buf, (*[1 << 30]byte)(srcPtr1)[:firstChunkI])
+				bytesRead = copy(buf, unsafe.Slice((*byte)(srcPtr1), firstChunkI))
 
 				// Read second chunk from beginning of buffer
 				srcPtr2 := r.dataPtr()
 				secondChunkI := int(toRead - firstChunk)
-				bytesRead += copy(buf[bytesRead:], (*[1 << 30]byte)(srcPtr2)[:secondChunkI])
+				bytesRead += copy(buf[bytesRead:], unsafe.Slice((*byte)(srcPtr2), secondChunkI))
 			}
 
 			// Advance read index.
@@ -774,18 +775,18 @@ func (r *ShmRing) ReserveWrite(n int, ctx context.Context) (WriteReservation, er
 			if writePos+uint64(n) <= r.capacity {
 				// Simple case: no wrap needed
 				firstPtr := unsafe.Pointer(uintptr(r.dataPtr()) + uintptr(writePos))
-				first = (*[1 << 30]byte)(firstPtr)[:n:n]
+				first = unsafe.Slice((*byte)(firstPtr), n)
 			} else {
 				// Wrap case: split across end and beginning (header can straddle)
 				firstLen := r.capacity - writePos
 				firstPtr := unsafe.Pointer(uintptr(r.dataPtr()) + uintptr(writePos))
 				firstLenI := int(firstLen)
-				first = (*[1 << 30]byte)(firstPtr)[:firstLenI:firstLenI]
+				first = unsafe.Slice((*byte)(firstPtr), firstLenI)
 
 				secondLen := uint64(n) - firstLen
 				secondPtr := r.dataPtr()
 				secondLenI := int(secondLen)
-				second = (*[1 << 30]byte)(secondPtr)[:secondLenI:secondLenI]
+				second = unsafe.Slice((*byte)(secondPtr), secondLenI)
 			}
 
 			// Create commit function that captures the current write state.
@@ -797,14 +798,11 @@ func (r *ShmRing) ReserveWrite(n int, ctx context.Context) (WriteReservation, er
 					return fmt.Errorf("invalid written count %d, expected 0-%d", written, n)
 				}
 
-				// Check emptiness at commit time to avoid lost wake race
-				emptyBefore := (hdr.ReadIndex() == writeIdx)
-
 				// Publish new write index and wake any waiting readers.
 				hdr.SetWriteIndex(writeIdx + uint64(written)) // release-publish
 
-				// Wake readers only if we actually transitioned empty -> non-empty
-				if written > 0 && emptyBefore {
+				// Wake on every positive write commit to unblock readers waiting for "at least N bytes"
+				if written > 0 {
 					hdr.IncrementDataSequence()
 					futexWake(&hdr.dataSeq, 1)
 				}
@@ -907,18 +905,18 @@ func (r *ShmRing) ReadSlices(n int, ctx context.Context) (first, second []byte, 
 			if readPos+uint64(n) <= r.capacity {
 				// Simple case: no wrap needed
 				srcPtr := unsafe.Pointer(uintptr(r.dataPtr()) + uintptr(readPos))
-				firstSlice = (*[1 << 30]byte)(srcPtr)[:n:n]
+				firstSlice = unsafe.Slice((*byte)(srcPtr), n)
 			} else {
 				// Wrap case: split across end and beginning
 				firstLen := r.capacity - readPos
 				firstPtr := unsafe.Pointer(uintptr(r.dataPtr()) + uintptr(readPos))
 				firstLenI := int(firstLen)
-				firstSlice = (*[1 << 30]byte)(firstPtr)[:firstLenI:firstLenI]
+				firstSlice = unsafe.Slice((*byte)(firstPtr), firstLenI)
 
 				secondLen := uint64(n) - firstLen
 				secondPtr := r.dataPtr()
 				secondLenI := int(secondLen)
-				secondSlice = (*[1 << 30]byte)(secondPtr)[:secondLenI:secondLenI]
+				secondSlice = unsafe.Slice((*byte)(secondPtr), secondLenI)
 			}
 
 			// Create commit function
