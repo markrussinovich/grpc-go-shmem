@@ -419,10 +419,8 @@ func (r *ShmRing) WriteBlockingContext(ctx context.Context, data []byte) error {
 		}
 
 		// Check context cancellation/deadline
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
+		if err := ctx.Err(); err != nil {
+			return err
 		}
 
 		// Load current indices to check available space
@@ -574,10 +572,8 @@ func (r *ShmRing) ReadBlockingContext(ctx context.Context, buf []byte) (int, err
 	// Consumer side: read data and signal producer
 	for {
 		// Check context cancellation/deadline
-		select {
-		case <-ctx.Done():
-			return 0, ctx.Err()
-		default:
+		if err := ctx.Err(); err != nil {
+			return 0, err
 		}
 
 		// Load current indices to check available data
@@ -746,10 +742,8 @@ func (r *ShmRing) ReserveWrite(n int, ctx context.Context) (WriteReservation, er
 
 	for {
 		// Check context cancellation first
-		select {
-		case <-ctx.Done():
-			return WriteReservation{}, ctx.Err()
-		default:
+		if err := ctx.Err(); err != nil {
+			return WriteReservation{}, err
 		}
 
 		// Check for closure - do this after context check to avoid race with segment cleanup
@@ -831,8 +825,24 @@ func (r *ShmRing) ReserveWrite(n int, ctx context.Context) (WriteReservation, er
 				hdr.DecSpaceWaiters()
 				continue
 			}
-			_ = futexWait(&hdr.spaceSeq, exp)
+			var err error
+			if deadline, has := ctx.Deadline(); has {
+				rem := time.Until(deadline)
+				if rem <= 0 {
+					hdr.DecSpaceWaiters()
+					return WriteReservation{}, context.DeadlineExceeded
+				}
+				err = futexWaitTimeout(&hdr.spaceSeq, exp, rem.Nanoseconds())
+			} else {
+				err = futexWait(&hdr.spaceSeq, exp)
+			}
 			hdr.DecSpaceWaiters()
+			if err != nil {
+				if errors.Is(err, ErrFutexTimeout) {
+					return WriteReservation{}, context.DeadlineExceeded
+				}
+				// else spurious wake: continue loop
+			}
 			// Re-check closure after wake to avoid infinite loop
 			if hdr.Closed() {
 				return WriteReservation{}, ErrRingClosed
@@ -849,8 +859,23 @@ func (r *ShmRing) ReserveWrite(n int, ctx context.Context) (WriteReservation, er
 			hdr.DecContigWaiters()
 			continue
 		}
-		_ = futexWait(&hdr.contigSeq, exp)
+		var err error
+		if deadline, has := ctx.Deadline(); has {
+			rem := time.Until(deadline)
+			if rem <= 0 {
+				hdr.DecContigWaiters()
+				return WriteReservation{}, context.DeadlineExceeded
+			}
+			err = futexWaitTimeout(&hdr.contigSeq, exp, rem.Nanoseconds())
+		} else {
+			err = futexWait(&hdr.contigSeq, exp)
+		}
 		hdr.DecContigWaiters()
+		if err != nil {
+			if errors.Is(err, ErrFutexTimeout) {
+				return WriteReservation{}, context.DeadlineExceeded
+			}
+		}
 		// Re-check closure after wake to avoid infinite loop
 		if hdr.Closed() {
 			return WriteReservation{}, ErrRingClosed
@@ -870,10 +895,8 @@ func (r *ShmRing) ReadSlices(n int, ctx context.Context) (first, second []byte, 
 
 	for {
 		// Check context cancellation first
-		select {
-		case <-ctx.Done():
-			return nil, nil, nil, ctx.Err()
-		default:
+		if err := ctx.Err(); err != nil {
+			return nil, nil, nil, err
 		}
 
 		// Check for closure - do this after context check to avoid race with segment cleanup
@@ -949,16 +972,31 @@ func (r *ShmRing) ReadSlices(n int, ctx context.Context) (first, second []byte, 
 		}
 
 		// No data available - wait for producer with context check
-		select {
-		case <-ctx.Done():
-			return nil, nil, nil, ctx.Err()
-		default:
+		if err := ctx.Err(); err != nil {
+			return nil, nil, nil, err
 		}
 
 		if !hdr.Closed() {
 			dataSeq := hdr.DataSequence()
-			if err := futexWait(&hdr.dataSeq, dataSeq); err != nil {
-				// Continue loop for spurious wake or other wake reasons
+
+			// If ctx has a deadline, wait with timeout; otherwise, infinite wait.
+			var err error
+			if deadline, has := ctx.Deadline(); has {
+				rem := time.Until(deadline)
+				if rem <= 0 {
+					return nil, nil, nil, context.DeadlineExceeded
+				}
+				err = futexWaitTimeout(&hdr.dataSeq, dataSeq, rem.Nanoseconds())
+			} else {
+				err = futexWait(&hdr.dataSeq, dataSeq)
+			}
+
+			if err != nil {
+				// Translate futex timeout to context timeout; keep going on spurious wake.
+				if errors.Is(err, ErrFutexTimeout) {
+					return nil, nil, nil, context.DeadlineExceeded
+				}
+				// Other errors: fall through and reloop (spurious wake/etc.)
 			}
 		} else {
 			// Closed and insufficient data - return EOF

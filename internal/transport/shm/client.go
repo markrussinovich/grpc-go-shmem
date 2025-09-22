@@ -1,4 +1,4 @@
-//go:build linux && (amd64 || arm64)
+//go:build linux
 
 /*
  *
@@ -23,8 +23,10 @@ package shm
 import (
 	"context"
 	"errors"
+	"log"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // ShmUnaryClient is a minimal unary client built over SMF v1 and ShmRings.
@@ -44,7 +46,6 @@ type ShmUnaryClient struct {
 	readerOnce sync.Once
 	readerDone chan struct{}
 	closed     atomic.Bool
-	cancelOnce sync.Once
 }
 
 type unaryStream struct {
@@ -92,31 +93,40 @@ func (c *ShmUnaryClient) startReader() {
 			// Single-threaded demux of frames.
 			// Use background context since reader should run until client is closed
 			ctx := context.Background()
+			log.Printf("Client: reader goroutine starting")
 			for !c.closed.Load() {
+				log.Printf("Client: reader attempting to read frame...")
 				fh, payload, err := readFrame(c.rx, ctx)
 				if err != nil {
+					log.Printf("Client: reader got error: %v", err)
 					// Context cancelled or ring closed
 					return
 				}
+				log.Printf("Client: reader got frame type %d, streamID %d, payloadLen %d", fh.Type, fh.StreamID, len(payload))
 				switch fh.Type {
 				case FrameTypeHEADERS:
+					log.Printf("Client: reader dispatching HEADERS for stream %d", fh.StreamID)
 					hdr, err := decodeHeaders(payload)
 					c.dispatchHeaders(fh.StreamID, hdr, err)
 				case FrameTypeMESSAGE:
+					log.Printf("Client: reader dispatching MESSAGE for stream %d", fh.StreamID)
 					// Deliver raw bytes (includes 5-byte gRPC prefix)
 					c.dispatchMessage(fh.StreamID, payload)
 				case FrameTypeTRAILERS:
+					log.Printf("Client: reader dispatching TRAILERS for stream %d", fh.StreamID)
 					tr, err := decodeTrailers(payload)
 					c.dispatchTrailers(fh.StreamID, tr, err)
 				case FrameTypePING:
+					log.Printf("Client: reader handling PING for stream %d", fh.StreamID)
 					// Immediately reply with PONG
 					c.writeMu.Lock()
 					_ = writeFrame(c.tx, FrameHeader{StreamID: fh.StreamID, Type: FrameTypePONG}, payload, ctx)
 					c.writeMu.Unlock()
 				case FrameTypeGOAWAY:
+					log.Printf("Client: reader ignoring GOAWAY")
 					// Ignore in unary bring-up
 				default:
-					// Ignore unknown for now
+					log.Printf("Client: reader ignoring unknown frame type %d", fh.Type)
 				}
 			}
 		}()
@@ -124,22 +134,28 @@ func (c *ShmUnaryClient) startReader() {
 }
 
 func (c *ShmUnaryClient) dispatchHeaders(id uint32, h HeadersV1, err error) {
+	log.Printf("Client: dispatchHeaders called for stream %d, err=%v", id, err)
 	c.streamsM.Lock()
 	s := c.streams[id]
 	c.streamsM.Unlock()
 	if s == nil {
+		log.Printf("Client: dispatchHeaders - no stream found for id %d", id)
 		return
 	}
 	if err != nil {
+		log.Printf("Client: dispatchHeaders - sending error to errCh: %v", err)
 		select {
 		case s.errCh <- err:
 		default:
 		}
 		return
 	}
+	log.Printf("Client: dispatchHeaders - sending headers to hdrCh")
 	select {
 	case s.hdrCh <- h:
+		log.Printf("Client: dispatchHeaders - headers sent successfully")
 	default:
+		log.Printf("Client: dispatchHeaders - hdrCh was full or closed")
 	}
 }
 
@@ -203,49 +219,32 @@ func (c *ShmUnaryClient) UnaryCall(ctx context.Context, method, authority string
 	c.streams[id] = s
 	c.streamsM.Unlock()
 
-	// Send HEADERS. Populate deadline hint if present.
-	hdr := HeadersV1{Version: 1, HdrType: 0, Method: method, Authority: authority, Metadata: md}
-	if dl, ok := ctx.Deadline(); ok {
-		hdr.DeadlineUnixNano = uint64(dl.UnixNano())
-	}
-	hbytes := encodeHeaders(hdr)
-	c.writeMu.Lock()
-	if err := writeFrame(c.tx, FrameHeader{StreamID: id, Type: FrameTypeHEADERS, Flags: HeadersFlagINITIAL}, hbytes, ctx); err != nil {
-		c.writeMu.Unlock()
-		return HeadersV1{}, nil, TrailersV1{}, err
-	}
-	// Send MESSAGE (single frame for unary)
-	if err := writeFrame(c.tx, FrameHeader{StreamID: id, Type: FrameTypeMESSAGE}, payload, ctx); err != nil {
-		c.writeMu.Unlock()
-		return HeadersV1{}, nil, TrailersV1{}, err
-	}
-	c.writeMu.Unlock()
+	// === BEGIN NEW: per-call CANCEL sender goroutine ===
+	var sendCancelOnce sync.Once
+	done := make(chan struct{})
 
-	// Wait for HEADERS, MESSAGE, TRAILERS or ctx done.
-	var rh HeadersV1
-	var rm []byte
-	var rt TrailersV1
-	_, haveMsg, haveTr := false, false, false
-
-	for {
-		// If we have both message and trailers, we can return.
-		if haveMsg && haveTr {
-			return rh, rm, rt, nil
-		}
-		select {
-		case <-ctx.Done():
-			// Best-effort CANCEL with non-cancellable context to ensure delivery
+	sendCancel := func(reason error) {
+		sendCancelOnce.Do(func() {
+			// Bounded, event-driven write to avoid indefinite blocking
 			c.writeMu.Lock()
-			_ = writeFrame(c.tx, FrameHeader{StreamID: id, Type: FrameTypeCANCEL}, []byte{1}, context.Background())
+			cancelCtx, cancelFn := context.WithTimeout(context.Background(), 200*time.Millisecond)
+			errCancel := writeFrame(c.tx, FrameHeader{StreamID: id, Type: FrameTypeCANCEL}, []byte{1}, cancelCtx)
+			cancelFn()
 			c.writeMu.Unlock()
 
-			// Remove stream from map and signal all channels to unblock any waiters
+			if errCancel != nil {
+				// Wake the server reader if we couldn't write CANCEL
+				_ = c.tx.Close()
+			}
+
+			// Remove the stream so late dispatch is ignored
 			c.streamsM.Lock()
 			delete(c.streams, id)
 			c.streamsM.Unlock()
-			// Non-blocking send to all channels (in case anyone is waiting)
+
+			// Unblock any waiters
 			select {
-			case s.errCh <- ctx.Err():
+			case s.errCh <- reason:
 			default:
 			}
 			select {
@@ -260,16 +259,86 @@ func (c *ShmUnaryClient) UnaryCall(ctx context.Context, method, authority string
 			case s.trCh <- TrailersV1{}:
 			default:
 			}
+		})
+	}
 
-			return HeadersV1{}, nil, TrailersV1{}, ctx.Err()
+	go func() {
+		select {
+		case <-ctx.Done():
+			sendCancel(ctx.Err())
+		case <-done:
+			return
+		}
+	}()
+	// === END NEW ===
+
+	// Send HEADERS. Populate deadline hint if present.
+	hdr := HeadersV1{Version: 1, HdrType: 0, Method: method, Authority: authority, Metadata: md}
+	if dl, ok := ctx.Deadline(); ok {
+		hdr.DeadlineUnixNano = uint64(dl.UnixNano())
+	}
+	hbytes := encodeHeaders(hdr)
+	log.Printf("Client: about to send HEADERS frame for stream %d", id)
+	c.writeMu.Lock()
+	if err := writeFrame(c.tx, FrameHeader{StreamID: id, Type: FrameTypeHEADERS, Flags: HeadersFlagINITIAL}, hbytes, ctx); err != nil {
+		c.writeMu.Unlock()
+		log.Printf("Client: HEADERS write failed for stream %d: %v", id, err)
+		close(done) // tell cancel goroutine to exit
+		return HeadersV1{}, nil, TrailersV1{}, err
+	}
+	log.Printf("Client: HEADERS sent successfully for stream %d", id)
+	// Send MESSAGE (single frame for unary)
+	log.Printf("Client: about to send MESSAGE frame for stream %d", id)
+	if err := writeFrame(c.tx, FrameHeader{StreamID: id, Type: FrameTypeMESSAGE}, payload, ctx); err != nil {
+		c.writeMu.Unlock()
+		log.Printf("Client: MESSAGE write failed for stream %d: %v", id, err)
+		close(done)
+		return HeadersV1{}, nil, TrailersV1{}, err
+	}
+	log.Printf("Client: MESSAGE sent successfully for stream %d", id)
+	c.writeMu.Unlock()
+
+	// FAST-PATH: if ctx is already done, send CANCEL immediately
+	if err := ctx.Err(); err != nil {
+		log.Printf("Client: context already done after sending frames for stream %d: %v", id, err)
+		close(done) // tell cancel goroutine to exit immediately
+		sendCancel(err)
+		return HeadersV1{}, nil, TrailersV1{}, err
+	}
+
+	log.Printf("Client: starting response wait loop for stream %d", id)
+	var rh HeadersV1
+	var rm []byte
+	var rt TrailersV1
+	haveMsg, haveTr := false, false
+
+	for {
+		// Check for context cancellation first before processing any channels
+		if err := ctx.Err(); err != nil {
+			log.Printf("Client: context cancelled in response wait loop for stream %d: %v", id, err)
+			close(done)
+			return HeadersV1{}, nil, TrailersV1{}, err
+		}
+		
+		if haveMsg && haveTr {
+			log.Printf("Client: success path - have both message and trailers for stream %d", id)
+			close(done) // success path: stop the cancel goroutine
+			return rh, rm, rt, nil
+		}
+		select {
 		case e := <-s.errCh:
+			log.Printf("Client: received error from errCh for stream %d: %v", id, e)
+			close(done)
 			return HeadersV1{}, nil, TrailersV1{}, e
 		case h := <-s.hdrCh:
+			log.Printf("Client: received headers for stream %d", id)
 			rh = h
 		case m := <-s.msgCh:
+			log.Printf("Client: received message for stream %d (len=%d)", id, len(m))
 			rm = append([]byte(nil), m...)
 			haveMsg = true
 		case tr := <-s.trCh:
+			log.Printf("Client: received trailers for stream %d", id)
 			rt = tr
 			haveTr = true
 		}

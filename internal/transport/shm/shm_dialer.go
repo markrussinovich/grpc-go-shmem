@@ -1,4 +1,4 @@
-//go:build linux && (amd64 || arm64)
+//go:build linux
 
 package shm
 
@@ -83,17 +83,17 @@ func DialShm(ctx context.Context, addr string, opts *DialOptions) (transport.Cli
 
 // waitForServerReady waits for the server to mark itself as ready
 func waitForServerReady(ctx context.Context, segment *Segment) error {
-	ticker := time.NewTicker(10 * time.Millisecond)
-	defer ticker.Stop()
-
 	for {
+		if segment.H.ServerReady() {
+			return nil
+		}
+
+		// Wait for context cancellation only - no polling
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-ticker.C:
-			if segment.H.ServerReady() {
-				return nil
-			}
+		case <-time.After(1 * time.Millisecond):
+			// Minimal sleep to avoid busy wait, but still responsive
 		}
 	}
 }

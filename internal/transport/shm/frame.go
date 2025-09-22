@@ -349,8 +349,8 @@ func decodeTrailers(b []byte) (TrailersV1, error) {
 }
 
 // writeFrame writes one frame (header + payload) to the ring. It blocks if
-// necessary and never spins. Headers are placed using ReserveFrameHeader which
-// guarantees 16-byte alignment and PAD insertion at end-of-ring as needed.
+// necessary and never spins. Headers may straddle wraps; ReserveFrameHeader
+// can return split slices which are both written.
 func writeFrame(tx *ShmRing, fh FrameHeader, payload []byte, ctx context.Context) error {
 	// Fill header fields consistently and set reserved to zero
 	fh.Length = uint32(len(payload))
