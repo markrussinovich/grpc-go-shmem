@@ -13,182 +13,194 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-// TestUnary_Cancellation verifies client sends a single CANCEL and server observes
-// cancellation; client returns an error consistent with grpc-go (codes.Canceled).
-func TestUnary_Cancellation(t *testing.T) {
-	t.Logf("=== Starting TestUnary_Cancellation ===")
-	name := fmt.Sprintf("cancel-unary-%d", time.Now().UnixNano())
+// / TestUnary_CancellationWithSlowServer verifies that when a client cancels
+// while waiting for a slow server, it properly sends a CANCEL frame and returns
+// codes.Canceled error.
+func TestUnary_CancellationWithSlowServer(t *testing.T) {
+	t.Logf("=== Starting TestUnary_CancellationWithSlowServer ===")
+
+	name := fmt.Sprintf("cancel-slow-server-%d", time.Now().UnixNano())
 	seg, err := CreateSegment(name, 65536, 65536)
 	if err != nil {
 		t.Fatalf("CreateSegment: %v", err)
 	}
 	defer seg.Close()
 
-	// Server goroutine: read HEADERS and MESSAGE, send HEADERS response, then expect a CANCEL frame.
-	canceledSeen := make(chan struct{}, 1)
-	serverDone := make(chan struct{}, 1)
+	// Channels for test coordination
+	serverReady := make(chan struct{})
+	serverReceivedRequest := make(chan struct{})
+	cancelFrameSeen := make(chan struct{})
+	serverDone := make(chan struct{})
+
+	// Start slow server FIRST and let it get ready
 	go func() {
 		defer close(serverDone)
-		log.Printf("Server: Starting goroutine")
+
+		log.Printf("Server: Starting slow server")
 		srvRx := NewShmRingFromSegment(seg.A, seg.Mem)
 		srvTx := NewShmRingFromSegment(seg.B, seg.Mem)
 
-		// Read request HEADERS with timeout to avoid race detector hangs
-		log.Printf("Server: About to read HEADERS frame...")
-		headersCtx, headersCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer headersCancel()
-		if fh, _, err := readFrame(srvRx, headersCtx); err == nil && fh.Type == FrameTypeHEADERS {
-			log.Printf("Server: Successfully read HEADERS frame (streamID=%d)", fh.StreamID)
+		// Signal that server is ready to receive
+		close(serverReady)
 
-			// Read MESSAGE frame with timeout
-			log.Printf("Server: About to read MESSAGE frame...")
-			messageCtx, messageCancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer messageCancel()
-			if fh2, _, err2 := readFrame(srvRx, messageCtx); err2 == nil && fh2.Type == FrameTypeMESSAGE {
-				log.Printf("Server: Successfully read MESSAGE frame (streamID=%d)", fh2.StreamID)
-
-				// Send HEADERS response to unblock client reader
-				log.Printf("Server: Sending HEADERS response...")
-				respHdr := HeadersV1{Version: 1, HdrType: 1} // Response headers
-				hdrBytes := encodeHeaders(respHdr)
-				err3 := writeFrame(srvTx, FrameHeader{StreamID: fh.StreamID, Type: FrameTypeHEADERS}, hdrBytes, context.Background())
-				if err3 != nil {
-					log.Printf("Server: Failed to send HEADERS response: %v", err3)
-				} else {
-					log.Printf("Server: HEADERS response sent successfully")
-				}
-
-				// Now wait for CANCEL frame
-				for i := 0; i < 10; i++ {
-					log.Printf("Server: Attempting to read CANCEL frame %d...", i+1)
-
-					ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-					fh3, payload, err := readFrame(srvRx, ctx)
-					cancel()
-
-					if err != nil {
-						log.Printf("Server: ReadFrame error on attempt %d: %v", i+1, err)
-						if ctx.Err() == context.DeadlineExceeded {
-							log.Printf("Server: Timeout waiting for CANCEL frame, continuing...")
-							continue
-						}
-						break
-					}
-
-					log.Printf("Server: Got frame type %d (streamID=%d, payloadLen=%d)", fh3.Type, fh3.StreamID, len(payload))
-
-					if fh3.Type == FrameTypeCANCEL {
-						log.Printf("Server: SUCCESS - Received CANCEL frame!")
-						canceledSeen <- struct{}{}
-						return
-					} else {
-						log.Printf("Server: Received unexpected frame type %d, continuing...", fh3.Type)
-					}
-				}
-			} else {
-				log.Printf("Server: Failed to read MESSAGE: err=%v", err2)
-			}
-		} else {
-			log.Printf("Server: Failed to read HEADERS: err=%v", err)
+		// Read HEADERS frame with a timeout in case client never sends
+		log.Printf("Server: Reading HEADERS...")
+		ctx1, cancel1 := context.WithTimeout(context.Background(), 5*time.Second)
+		fh, _, err := readFrame(srvRx, ctx1)
+		cancel1()
+		if err != nil {
+			log.Printf("Server: Failed to read HEADERS: %v", err)
+			return
 		}
-		log.Printf("Server: Exiting without seeing CANCEL frame")
+		if fh.Type != FrameTypeHEADERS {
+			log.Printf("Server: Expected HEADERS, got type %d", fh.Type)
+			return
+		}
+		streamID := fh.StreamID
+		log.Printf("Server: Received HEADERS for stream %d", streamID)
+
+		// Read MESSAGE frame with timeout
+		log.Printf("Server: Reading MESSAGE...")
+		ctx2, cancel2 := context.WithTimeout(context.Background(), 5*time.Second)
+		fh2, msgPayload, err2 := readFrame(srvRx, ctx2)
+		cancel2()
+		if err2 != nil {
+			log.Printf("Server: Failed to read MESSAGE: %v", err2)
+			return
+		}
+		if fh2.Type != FrameTypeMESSAGE {
+			log.Printf("Server: Expected MESSAGE, got type %d", fh2.Type)
+			return
+		}
+		log.Printf("Server: Received MESSAGE (len=%d) for stream %d", len(msgPayload), fh2.StreamID)
+
+		// Signal that request was received
+		close(serverReceivedRequest)
+
+		// Simulate slow processing
+		log.Printf("Server: Starting slow processing (500ms)...")
+		time.Sleep(500 * time.Millisecond)
+		log.Printf("Server: Finished slow processing")
+
+		// Try to send response (client should have cancelled by now)
+		log.Printf("Server: Attempting to send HEADERS response...")
+		respHdr := HeadersV1{Version: 1, HdrType: 1}
+		hdrBytes := encodeHeaders(respHdr)
+		err3 := writeFrame(srvTx, FrameHeader{
+			StreamID: streamID,
+			Type:     FrameTypeHEADERS,
+		}, hdrBytes, context.Background())
+
+		if err3 != nil {
+			log.Printf("Server: Failed to write HEADERS response: %v", err3)
+		} else {
+			log.Printf("Server: Sent HEADERS response")
+		}
+
+		// Check for CANCEL frame
+		log.Printf("Server: Checking for CANCEL frame...")
+		ctx3, cancel3 := context.WithTimeout(context.Background(), 1*time.Second)
+		defer cancel3()
+
+		fh3, _, err4 := readFrame(srvRx, ctx3)
+		if err4 != nil {
+			log.Printf("Server: Error reading next frame: %v", err4)
+			return
+		}
+
+		if fh3.Type == FrameTypeCANCEL {
+			log.Printf("Server: SUCCESS - Received CANCEL frame for stream %d", fh3.StreamID)
+			close(cancelFrameSeen)
+		} else {
+			log.Printf("Server: Expected CANCEL, got frame type %d", fh3.Type)
+		}
 	}()
 
+	// Wait for server to be ready
+	<-serverReady
+	log.Printf("Test: Server is ready")
+
+	// Small delay to ensure server is in read state
+	time.Sleep(50 * time.Millisecond)
+
+	// Create client
 	client := NewShmUnaryClient(seg)
+
+	// Create payload
 	payload := make([]byte, 5+3)
-	payload[0] = 0
-	payload[1] = 3
+	payload[0] = 0 // compression flag
+	payload[1] = 0 // length (MSB)
 	payload[2] = 0
 	payload[3] = 0
-	payload[4] = 0
+	payload[4] = 3 // length (LSB) - 3 bytes
 	copy(payload[5:], []byte("abc"))
 
 	log.Printf("Client: Created client and payload")
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second) // Increased timeout
+	// Use WithCancel for explicit cancellation
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Invoke in a goroutine to allow early cancel
-	errCh := make(chan error, 1)
-	resultCh := make(chan struct{}, 1)
-
+	// Start a goroutine that will cancel after 200ms
 	go func() {
-		log.Printf("Client: Starting UnaryCall goroutine")
-		_, _, _, err := client.UnaryCall(ctx, "/svc.X/Unary", "example.com", nil, payload)
-		log.Printf("Client: UnaryCall returned with error: %v", err)
-		errCh <- err
-		resultCh <- struct{}{}
+		time.Sleep(200 * time.Millisecond)
+		log.Printf("Test: Explicitly cancelling context after 200ms")
+		cancel()
 	}()
 
-	// Allow client to send initial frames before canceling
-	// Under race detector, operations are much slower, so wait longer
-	delay := 100 * time.Millisecond
-	if testing.Short() {
-		delay = 50 * time.Millisecond
+	// Make the call
+	log.Printf("Client: Starting UnaryCall (will be cancelled after 200ms)")
+	startTime := time.Now()
+	_, _, _, err = client.UnaryCall(ctx, "/svc.X/SlowMethod", "example.com", nil, payload)
+	elapsed := time.Since(startTime)
+	log.Printf("Client: UnaryCall returned after %v with error: %v", elapsed, err)
+
+	// Verify client returned the expected cancellation error
+	if err == nil {
+		t.Fatal("Expected cancellation error, got nil")
+	}
+
+	statusCode := status.FromContextError(err).Code()
+	if statusCode != codes.Canceled {
+		t.Errorf("Expected codes.Canceled, got %v (err=%v)", statusCode, err)
 	} else {
-		// Assume we might be under race detector or other slow conditions
-		delay = 500 * time.Millisecond
-	}
-
-	log.Printf("Client: Waiting %v before cancel...", delay)
-	time.Sleep(delay)
-	log.Printf("Client: Sleep completed")
-
-	log.Printf("Client: About to cancel context...")
-	cancel()
-	log.Printf("Client: Context cancelled")
-
-	// Client should return with codes.Canceled
-	log.Printf("Client: Waiting for UnaryCall to complete...")
-	select {
-	case err := <-errCh:
-		log.Printf("Client: UnaryCall completed with result: %v", err)
-		if err == nil {
-			t.Fatal("expected cancellation error, got nil")
-		}
-		// Map to gRPC status code Canceled
-		statusCode := status.FromContextError(err).Code()
-		log.Printf("Client: Error mapped to gRPC status code: %v", statusCode)
-		if statusCode != codes.Canceled {
-			t.Fatalf("expected codes.Canceled, got %v (err=%v)", statusCode, err)
-		}
 		log.Printf("Client: SUCCESS - Got expected codes.Canceled")
-	case <-time.After(8 * time.Second): // Increased timeout
-		log.Printf("Client: ERROR - UnaryCall did not return after cancel within timeout")
-		t.Fatal("client did not return after cancel")
 	}
 
-	// Server observed CANCEL
-	log.Printf("Checking if server observed CANCEL frame...")
+	// Verify timing
+	if elapsed > 300*time.Millisecond {
+		t.Errorf("Client took too long to cancel: %v", elapsed)
+	}
+
+	// Verify server received request
 	select {
-	case <-canceledSeen:
-		log.Printf("Server: SUCCESS - Observed CANCEL frame")
-	case <-time.After(5 * time.Second): // Increased timeout
-		log.Printf("Server: ERROR - Did not observe CANCEL frame within timeout")
-
-		// Check if server goroutine is still running
-		select {
-		case <-serverDone:
-			log.Printf("Server: Server goroutine has completed")
-		default:
-			log.Printf("Server: Server goroutine is still running")
-		}
-
-		t.Fatal("server did not observe CANCEL frame")
+	case <-serverReceivedRequest:
+		log.Printf("Test: Server confirmed it received the request")
+	case <-time.After(1 * time.Second):
+		t.Error("Server didn't receive request")
 	}
 
-	// Clean up resources
-	log.Printf("Test: Cleaning up...")
-	closeErr := client.Close()
-	log.Printf("Test: Client.Close() returned: %v", closeErr)
+	// Verify server saw CANCEL
+	select {
+	case <-cancelFrameSeen:
+		log.Printf("Test: SUCCESS - Server confirmed it received CANCEL frame")
+	case <-time.After(2 * time.Second):
+		t.Error("Server never saw CANCEL frame")
+	}
 
-	// Wait for server goroutine to complete
+	// Clean up
+	log.Printf("Test: Cleaning up...")
+	if err := client.Close(); err != nil {
+		log.Printf("Test: client.Close() error: %v", err)
+	}
+
+	// Wait for server to complete
 	select {
 	case <-serverDone:
-		log.Printf("Test: Server goroutine completed successfully")
+		log.Printf("Test: Server goroutine completed")
 	case <-time.After(2 * time.Second):
-		log.Printf("Test: WARNING - Server goroutine did not complete within 2s")
+		log.Printf("Test: Warning - server didn't complete within 2s")
 	}
 
-	log.Printf("=== TestUnary_Cancellation completed ===")
+	log.Printf("=== TestUnary_CancellationWithSlowServer completed successfully ===")
 }

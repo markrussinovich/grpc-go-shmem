@@ -23,6 +23,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"time"
 	"unsafe"
 )
@@ -419,8 +420,10 @@ func (r *ShmRing) WriteBlockingContext(ctx context.Context, data []byte) error {
 		}
 
 		// Check context cancellation/deadline
-		if err := ctx.Err(); err != nil {
-			return err
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
 		}
 
 		// Load current indices to check available space
@@ -572,8 +575,10 @@ func (r *ShmRing) ReadBlockingContext(ctx context.Context, buf []byte) (int, err
 	// Consumer side: read data and signal producer
 	for {
 		// Check context cancellation/deadline
-		if err := ctx.Err(); err != nil {
-			return 0, err
+		select {
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		default:
 		}
 
 		// Load current indices to check available data
@@ -742,8 +747,10 @@ func (r *ShmRing) ReserveWrite(n int, ctx context.Context) (WriteReservation, er
 
 	for {
 		// Check context cancellation first
-		if err := ctx.Err(); err != nil {
-			return WriteReservation{}, err
+		select {
+		case <-ctx.Done():
+			return WriteReservation{}, ctx.Err()
+		default:
 		}
 
 		// Check for closure - do this after context check to avoid race with segment cleanup
@@ -811,6 +818,12 @@ func (r *ShmRing) ReserveWrite(n int, ctx context.Context) (WriteReservation, er
 			}, nil
 		}
 
+		if dl, ok := ctx.Deadline(); ok {
+			log.Printf("ReserveWrite: waiting with timeout=%s", time.Until(dl))
+		} else {
+			log.Printf("ReserveWrite: waiting WITHOUT timeout") // <- should NOT happen for CANCEL
+		}
+
 		// Insufficient space - choose wait type based on fullness
 		writeIdx = hdr.WriteIndex()
 		readIdx = hdr.ReadIndex()
@@ -840,6 +853,9 @@ func (r *ShmRing) ReserveWrite(n int, ctx context.Context) (WriteReservation, er
 			if err != nil {
 				if errors.Is(err, ErrFutexTimeout) {
 					return WriteReservation{}, context.DeadlineExceeded
+				}
+				if ctx.Err() != nil {
+					return WriteReservation{}, ctx.Err()
 				}
 				// else spurious wake: continue loop
 			}
@@ -875,6 +891,10 @@ func (r *ShmRing) ReserveWrite(n int, ctx context.Context) (WriteReservation, er
 			if errors.Is(err, ErrFutexTimeout) {
 				return WriteReservation{}, context.DeadlineExceeded
 			}
+			if ctx.Err() != nil {
+				return WriteReservation{}, ctx.Err()
+			}
+			// else spurious wake: continue loop
 		}
 		// Re-check closure after wake to avoid infinite loop
 		if hdr.Closed() {
@@ -895,8 +915,10 @@ func (r *ShmRing) ReadSlices(n int, ctx context.Context) (first, second []byte, 
 
 	for {
 		// Check context cancellation first
-		if err := ctx.Err(); err != nil {
-			return nil, nil, nil, err
+		select {
+		case <-ctx.Done():
+			return nil, nil, nil, ctx.Err()
+		default:
 		}
 
 		// Check for closure - do this after context check to avoid race with segment cleanup
@@ -972,8 +994,16 @@ func (r *ShmRing) ReadSlices(n int, ctx context.Context) (first, second []byte, 
 		}
 
 		// No data available - wait for producer with context check
-		if err := ctx.Err(); err != nil {
-			return nil, nil, nil, err
+		select {
+		case <-ctx.Done():
+			return nil, nil, nil, ctx.Err()
+		default:
+		}
+
+		if dl, ok := ctx.Deadline(); ok {
+			log.Printf("ReadSlices: waiting with timeout=%s", time.Until(dl))
+		} else {
+			log.Printf("ReadSlices: waiting WITHOUT timeout") // server’s readFrameT should never hit this
 		}
 
 		if !hdr.Closed() {

@@ -224,50 +224,101 @@ func (c *ShmUnaryClient) UnaryCall(ctx context.Context, method, authority string
 	done := make(chan struct{})
 
 	sendCancel := func(reason error) {
+		// Only send once
 		sendCancelOnce.Do(func() {
-			// Bounded, event-driven write to avoid indefinite blocking
+			log.Printf("Client: sendCancel called with reason: %v", reason)
+			
+			// Check if client is already closed to avoid use-after-free
+			if c.closed.Load() {
+				log.Printf("Client: sendCancel - client already closed, returning")
+				return
+			}
+
+			log.Printf("Client: sendCancel - acquiring write mutex")
+			// Best-effort CANCEL write with a bounded context
 			c.writeMu.Lock()
+			defer c.writeMu.Unlock()
+
+			// Double-check after acquiring lock
+			if c.closed.Load() {
+				log.Printf("Client: sendCancel - client closed after acquiring lock, returning")
+				return
+			}
+
+			log.Printf("Client: sendCancel - attempting to write CANCEL frame for stream %d", id)
 			cancelCtx, cancelFn := context.WithTimeout(context.Background(), 200*time.Millisecond)
 			errCancel := writeFrame(c.tx, FrameHeader{StreamID: id, Type: FrameTypeCANCEL}, []byte{1}, cancelCtx)
 			cancelFn()
-			c.writeMu.Unlock()
 
 			if errCancel != nil {
-				// Wake the server reader if we couldn't write CANCEL
-				_ = c.tx.Close()
+				log.Printf("Client: sendCancel - writeFrame failed: %v, closing tx ring as fallback", errCancel)
+				// As a last resort, close the client->server ring to wake the server
+				closeErr := c.tx.Close()
+				log.Printf("Client: sendCancel - tx.Close() returned: %v", closeErr)
+			} else {
+				log.Printf("Client: sendCancel - CANCEL frame written successfully")
 			}
 
-			// Remove the stream so late dispatch is ignored
+			log.Printf("Client: sendCancel - removing stream %d from streams map", id)
+			// Remove this stream so any late dispatches are ignored
 			c.streamsM.Lock()
 			delete(c.streams, id)
 			c.streamsM.Unlock()
 
-			// Unblock any waiters
+			log.Printf("Client: sendCancel - signaling error channels")
+			// Unblock any waiters on this client-side unary future
 			select {
 			case s.errCh <- reason:
+				log.Printf("Client: sendCancel - sent reason to errCh")
 			default:
+				log.Printf("Client: sendCancel - errCh was full or closed")
 			}
 			select {
 			case s.hdrCh <- HeadersV1{}:
+				log.Printf("Client: sendCancel - sent empty headers to hdrCh")
 			default:
+				log.Printf("Client: sendCancel - hdrCh was full or closed")
 			}
 			select {
 			case s.msgCh <- nil:
+				log.Printf("Client: sendCancel - sent nil to msgCh")
 			default:
+				log.Printf("Client: sendCancel - msgCh was full or closed")
 			}
 			select {
 			case s.trCh <- TrailersV1{}:
+				log.Printf("Client: sendCancel - sent empty trailers to trCh")
 			default:
+				log.Printf("Client: sendCancel - trCh was full or closed")
 			}
+			log.Printf("Client: sendCancel - completed successfully")
 		})
 	}
 
 	go func() {
-		select {
-		case <-ctx.Done():
-			sendCancel(ctx.Err())
-		case <-done:
-			return
+		log.Printf("Client: cancel goroutine started for stream %d", id)
+		
+		// Add a ticker to periodically check if context is done
+		ticker := time.NewTicker(50 * time.Millisecond)
+		defer ticker.Stop()
+		
+		for {
+			select {
+			case <-done:
+				log.Printf("Client: cancel goroutine - received done signal for stream %d", id)
+				return
+			case <-ctx.Done():
+				log.Printf("Client: cancel goroutine - context cancelled for stream %d: %v", id, ctx.Err())
+				sendCancel(ctx.Err())
+				return
+			case <-ticker.C:
+				log.Printf("Client: cancel goroutine - periodic check for stream %d, ctx.Err()=%v", id, ctx.Err())
+				if ctx.Err() != nil {
+					log.Printf("Client: cancel goroutine - context is done via polling for stream %d: %v", id, ctx.Err())
+					sendCancel(ctx.Err())
+					return
+				}
+			}
 		}
 	}()
 	// === END NEW ===
@@ -313,19 +364,17 @@ func (c *ShmUnaryClient) UnaryCall(ctx context.Context, method, authority string
 	haveMsg, haveTr := false, false
 
 	for {
-		// Check for context cancellation first before processing any channels
-		if err := ctx.Err(); err != nil {
-			log.Printf("Client: context cancelled in response wait loop for stream %d: %v", id, err)
-			close(done)
-			return HeadersV1{}, nil, TrailersV1{}, err
-		}
-		
 		if haveMsg && haveTr {
 			log.Printf("Client: success path - have both message and trailers for stream %d", id)
 			close(done) // success path: stop the cancel goroutine
 			return rh, rm, rt, nil
 		}
 		select {
+		case <-ctx.Done():
+			log.Printf("Client: context done in wait loop for stream %d: %v", id, ctx.Err())
+			sendCancel(ctx.Err())
+			close(done)
+			return HeadersV1{}, nil, TrailersV1{}, ctx.Err()
 		case e := <-s.errCh:
 			log.Printf("Client: received error from errCh for stream %d: %v", id, e)
 			close(done)
