@@ -146,6 +146,11 @@ func (l *ShmListener) Close() error {
 		l.closed.Store(true)
 		l.cancel()
 		close(l.acceptCh)
+		
+		// Clean up the segment to remove the shared memory file
+		if l.segment != nil {
+			l.segment.Close()
+		}
 	})
 	return nil
 }

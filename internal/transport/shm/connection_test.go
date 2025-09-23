@@ -5,13 +5,14 @@ package shm
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 )
 
 func TestShmListener(t *testing.T) {
-	// Create a listener
-	addr := &ShmAddr{Name: "test_listener"}
+	// Create a listener with a unique name to avoid conflicts
+	addr := &ShmAddr{Name: fmt.Sprintf("test_listener_%d", time.Now().UnixNano())}
 	listener, err := NewShmListener(addr, DefaultSegmentSize, DefaultRingASize, DefaultRingBSize)
 	if err != nil {
 		t.Fatalf("Failed to create listener: %v", err)
@@ -23,8 +24,8 @@ func TestShmListener(t *testing.T) {
 		t.Errorf("Expected network 'shm', got %s", listener.Addr().Network())
 	}
 
-	if listener.Addr().String() != "test_listener" {
-		t.Errorf("Expected address 'test_listener', got %s", listener.Addr().String())
+	if !strings.HasPrefix(listener.Addr().String(), "test_listener_") {
+		t.Errorf("Expected address to start with 'test_listener_', got %s", listener.Addr().String())
 	}
 
 	// Test that we can close the listener
