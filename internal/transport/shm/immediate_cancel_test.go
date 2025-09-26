@@ -21,6 +21,7 @@ func TestImmediateCancellation(t *testing.T) {
 	defer seg.Close()
 
 	client := NewShmUnaryClient(seg)
+	defer client.Close() // Ensure client is properly closed
 	payload := make([]byte, 5+3)
 	payload[0] = 0
 	payload[1] = 3

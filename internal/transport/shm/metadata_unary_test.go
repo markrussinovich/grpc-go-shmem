@@ -92,6 +92,7 @@ func TestUnary_MetadataAndStatus(t *testing.T) {
 	}()
 
 	client := NewShmUnaryClient(seg)
+	defer client.Close() // Ensure client is properly closed
 	// Prepare a message (5-byte prefix + body)
 	payload := make([]byte, 5+4)
 	payload[0] = 0

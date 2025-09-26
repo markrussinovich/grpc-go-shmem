@@ -3,15 +3,15 @@
 package shm
 
 import (
-    "context"
-    "errors"
-    "fmt"
-    "net"
-    "sync"
-    "sync/atomic"
-    "time"
+	"context"
+	"errors"
+	"fmt"
+	"net"
+	"sync"
+	"sync/atomic"
+	"time"
 
-    "google.golang.org/grpc/internal/transport"
+	"google.golang.org/grpc/internal/transport"
 )
 
 // ShmAddr represents a shared memory network address
@@ -31,10 +31,10 @@ func (a *ShmAddr) String() string {
 
 // ShmListener implements net.Listener for shared memory connections
 type ShmListener struct {
-    addr     *ShmAddr
-    baseName string // Base name for segment creation
-    connID   uint64 // Atomic counter for connection IDs
-    segment  *Segment
+	addr     *ShmAddr
+	baseName string // Base name for segment creation
+	connID   uint64 // Atomic counter for connection IDs
+	segment  *Segment
 
 	// Lifecycle management
 	ctx       context.Context
@@ -86,16 +86,16 @@ func NewShmListener(addr *ShmAddr, segmentSize, ringASize, ringBSize uint64) (*S
 		ringBSize:   ringBSize,
 	}
 
-    // Server owns lifetime: create a single segment now and mark server ready.
-    seg, err := CreateSegment(addr.Name, ringASize, ringBSize)
-    if err != nil {
-        cancel()
-        return nil, fmt.Errorf("create segment: %w", err)
-    }
-    l.segment = seg
-    l.segment.H.SetServerReady(true)
+	// Server owns lifetime: create a single segment now and mark server ready.
+	seg, err := CreateSegment(addr.Name, ringASize, ringBSize)
+	if err != nil {
+		cancel()
+		return nil, fmt.Errorf("create segment: %w", err)
+	}
+	l.segment = seg
+	l.segment.H.SetServerReady(true)
 
-    return l, nil
+	return l, nil
 }
 
 // acceptLoop continuously monitors for new connection requests
@@ -106,38 +106,38 @@ func (l *ShmListener) checkForConnections() error { return nil }
 
 // handlePotentialConnection processes a potential new connection
 func (l *ShmListener) handlePotentialConnection(segmentName string) (*shmConn, error) {
-    // Single-connection mode: wait for client to set ClientReady on our precreated segment.
-    segment := l.segment
-    // Block event-driven until client ready.
-    if err := segment.WaitForClient(l.ctx); err != nil {
-        return nil, err
-    }
-    conn := &shmConn{
-        segment:    segment,
-        localAddr:  l.addr,
-        remoteAddr: &ShmAddr{Name: segmentName + "_client"},
-    }
-    serverTransport, err := NewShmServerTransport(segment, l.addr, conn.remoteAddr)
-    if err != nil {
-        return nil, fmt.Errorf("failed to create server transport: %v", err)
-    }
+	// Single-connection mode: wait for client to set ClientReady on our precreated segment.
+	segment := l.segment
+	// Block event-driven until client ready.
+	if err := segment.WaitForClient(l.ctx); err != nil {
+		return nil, err
+	}
+	conn := &shmConn{
+		segment:    segment,
+		localAddr:  l.addr,
+		remoteAddr: &ShmAddr{Name: segmentName + "_client"},
+	}
+	serverTransport, err := NewShmServerTransport(segment, l.addr, conn.remoteAddr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create server transport: %v", err)
+	}
 
-    conn.transport = serverTransport
-    conn.established.Store(true)
-    return conn, nil
+	conn.transport = serverTransport
+	conn.established.Store(true)
+	return conn, nil
 }
 
 // Accept waits for and returns the next connection to the listener
 func (l *ShmListener) Accept() (net.Conn, error) {
-    if l.closed.Load() {
-        return nil, errors.New("listener closed")
-    }
-    // Use single-connection blocking accept using event-driven handshake.
-    conn, err := l.handlePotentialConnection(l.addr.Name)
-    if err != nil {
-        return nil, err
-    }
-    return conn, nil
+	if l.closed.Load() {
+		return nil, errors.New("listener closed")
+	}
+	// Use single-connection blocking accept using event-driven handshake.
+	conn, err := l.handlePotentialConnection(l.addr.Name)
+	if err != nil {
+		return nil, err
+	}
+	return conn, nil
 }
 
 // Close closes the listener
@@ -146,7 +146,7 @@ func (l *ShmListener) Close() error {
 		l.closed.Store(true)
 		l.cancel()
 		close(l.acceptCh)
-		
+
 		// Clean up the segment to remove the shared memory file
 		if l.segment != nil {
 			l.segment.Close()

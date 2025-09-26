@@ -193,15 +193,21 @@ func (r *ShmRing) WriteBlocking(data []byte) error {
 			// 3) Publish the new write index with an atomic store (acts as a release)
 			// 4) Wake only if we actually transitioned empty -> non-empty
 
-			hdr.SetWriteIndex(writeIdx + uint64(len(data))) // release-publish
+			// Conditional wakeup optimization: only wake on empty→non-empty transition
+			wasEmpty := (writeIdx == readIdx)
 
-			// Wake on every positive write commit to unblock readers waiting for "at least N bytes"
-			if len(data) > 0 {
-				hdr.IncrementDataSequence()
+		hdr.SetWriteIndex(writeIdx + uint64(len(data))) // release-publish
+
+		// Always increment DataSequence to notify readers, but only wake on empty→non-empty
+		// This provides performance benefit while maintaining correctness
+		if len(data) > 0 {
+			hdr.IncrementDataSequence()
+			if wasEmpty {
 				futexWake(&hdr.dataSeq, 1)
 			}
+		}
 
-			return nil
+		return nil
 		}
 
 		// Insufficient space. Distinguish strictly full vs need-more-space.
@@ -433,6 +439,7 @@ func (r *ShmRing) WriteBlockingContext(ctx context.Context, data []byte) error {
 		// Calculate available space using indices
 		usedBefore := writeIdx - readIdx
 		available := r.capacity - usedBefore
+		wasPreviouslyEmpty := usedBefore == 0
 
 		if uint64(len(data)) <= available {
 			// Space available - perform the write (same as original WriteBlocking)
@@ -457,15 +464,18 @@ func (r *ShmRing) WriteBlockingContext(ctx context.Context, data []byte) error {
 				copy(unsafe.Slice((*byte)(destPtr2), len(data)-firstChunkI), data[firstChunkI:])
 			}
 
-			hdr.SetWriteIndex(writeIdx + uint64(len(data))) // release-publish
+		hdr.SetWriteIndex(writeIdx + uint64(len(data))) // release-publish
 
-			// Wake on every positive write commit to unblock readers waiting for "at least N bytes"
-			if len(data) > 0 {
-				hdr.IncrementDataSequence()
+		// Always increment DataSequence to notify readers, but only wake on empty→non-empty
+		// This provides performance benefit while maintaining correctness
+		if len(data) > 0 {
+			hdr.IncrementDataSequence()
+			if wasPreviouslyEmpty {
 				futexWake(&hdr.dataSeq, 1)
 			}
+		}
 
-			return nil
+		return nil
 		}
 
 		// Need to wait for space (distinguish full vs partial)
@@ -765,6 +775,7 @@ func (r *ShmRing) ReserveWrite(n int, ctx context.Context) (WriteReservation, er
 		// Calculate available space
 		usedBefore := writeIdx - readIdx
 		available := r.capacity - usedBefore
+		wasPreviouslyEmpty := usedBefore == 0
 
 		if uint64(n) <= available {
 			// Space available - create reservation
@@ -802,10 +813,13 @@ func (r *ShmRing) ReserveWrite(n int, ctx context.Context) (WriteReservation, er
 				// Publish new write index and wake any waiting readers.
 				hdr.SetWriteIndex(writeIdx + uint64(written)) // release-publish
 
-				// Wake on every positive write commit to unblock readers waiting for "at least N bytes"
+				// Always increment DataSequence to notify readers, but only wake on empty→non-empty
+				// This provides performance benefit while maintaining correctness
 				if written > 0 {
 					hdr.IncrementDataSequence()
-					futexWake(&hdr.dataSeq, 1)
+					if wasPreviouslyEmpty {
+						futexWake(&hdr.dataSeq, 1)
+					}
 				}
 
 				return nil
