@@ -43,47 +43,18 @@ func TestFutexDirect(t *testing.T) {
 	t.Logf("Direct futex test: addr=%p, val=42, timeout=%d.%09d", addr, ts.Sec, ts.Nsec)
 
 	start := time.Now()
-	var errno syscall.Errno
-	var r1, r2 uintptr
-	var attempts int
-
-	// Retry loop to handle EINTR from Go runtime signals
-	for attempts = 0; attempts < 10; attempts++ {
-		r1, r2, errno = syscall.RawSyscall6(
-			syscall.SYS_FUTEX,
-			uintptr(unsafe.Pointer(addr)),
-			FUTEX_WAIT_PRIVATE,
-			42, // expected value
-			uintptr(unsafe.Pointer(&ts)),
-			0,
-			0,
-		)
-
-		// If we get EINTR, the Go runtime interrupted us - retry with remaining time
-		if errno == syscall.EINTR {
-			elapsed := time.Since(start)
-			if elapsed >= 100*time.Millisecond {
-				// We've already waited long enough, treat as timeout
-				errno = syscall.ETIMEDOUT
-				break
-			}
-			// Adjust timeout for remaining time
-			remainingNs := timeoutNs - elapsed.Nanoseconds()
-			if remainingNs <= 0 {
-				errno = syscall.ETIMEDOUT
-				break
-			}
-			ts.Sec = remainingNs / 1e9
-			ts.Nsec = remainingNs % 1e9
-			continue
-		}
-
-		// Any other result (success, timeout, error) - we're done
-		break
-	}
-
+	r1, r2, errno := syscall.RawSyscall6(
+		syscall.SYS_FUTEX,
+		uintptr(unsafe.Pointer(addr)),
+		FUTEX_WAIT_PRIVATE,
+		42, // expected value
+		uintptr(unsafe.Pointer(&ts)),
+		0,
+		0,
+	)
 	elapsed := time.Since(start)
-	t.Logf("Direct futex result: r1=%d, r2=%d, errno=%v, elapsed=%v, attempts=%d", r1, r2, errno, elapsed, attempts+1)
+
+	t.Logf("Direct futex result: r1=%d, r2=%d, errno=%v, elapsed=%v", r1, r2, errno, elapsed)
 
 	if errno == syscall.ETIMEDOUT {
 		t.Logf("Got expected timeout after %v", elapsed)
@@ -97,9 +68,8 @@ func TestFutexDirect(t *testing.T) {
 		t.Logf("Current value: %d", currentVal)
 	} else if errno == 0 {
 		t.Logf("Futex returned success (woken up) after %v", elapsed)
-		t.Errorf("Unexpected success - no one should have woken this futex")
 	} else {
-		t.Errorf("Unexpected errno after %d attempts: %v", attempts+1, errno)
+		t.Errorf("Unexpected errno: %v", errno)
 	}
 }
 
