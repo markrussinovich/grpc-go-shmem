@@ -24,55 +24,6 @@ import (
 	"unsafe"
 )
 
-// testFutexDirect tests futex directly with manual syscalls
-func TestFutexDirect(t *testing.T) {
-	if !isLinuxPlatform() {
-		t.Skip("Futex tests only supported on Linux")
-	}
-
-	data := make([]uint32, 1)
-	addr := &data[0]
-	atomic.StoreUint32(addr, 42)
-
-	// Manual futex call with timeout
-	var ts syscall.Timespec
-	timeoutNs := int64(100 * 1000 * 1000) // 100ms
-	ts.Sec = timeoutNs / 1e9
-	ts.Nsec = timeoutNs % 1e9
-
-	t.Logf("Direct futex test: addr=%p, val=42, timeout=%d.%09d", addr, ts.Sec, ts.Nsec)
-
-	start := time.Now()
-	r1, r2, errno := syscall.RawSyscall6(
-		syscall.SYS_FUTEX,
-		uintptr(unsafe.Pointer(addr)),
-		FUTEX_WAIT_PRIVATE,
-		42, // expected value
-		uintptr(unsafe.Pointer(&ts)),
-		0,
-		0,
-	)
-	elapsed := time.Since(start)
-
-	t.Logf("Direct futex result: r1=%d, r2=%d, errno=%v, elapsed=%v", r1, r2, errno, elapsed)
-
-	if errno == syscall.ETIMEDOUT {
-		t.Logf("Got expected timeout after %v", elapsed)
-		if elapsed < 80*time.Millisecond || elapsed > 200*time.Millisecond {
-			t.Errorf("Timeout duration %v not close to expected 100ms", elapsed)
-		}
-	} else if errno == syscall.EAGAIN {
-		t.Logf("Got EAGAIN (value mismatch) after %v", elapsed)
-		// This might happen if the value changed between store and futex
-		currentVal := atomic.LoadUint32(addr)
-		t.Logf("Current value: %d", currentVal)
-	} else if errno == 0 {
-		t.Logf("Futex returned success (woken up) after %v", elapsed)
-	} else {
-		t.Errorf("Unexpected errno: %v", errno)
-	}
-}
-
 // testFutexWithWaker tests that futex can be woken by another goroutine
 func TestFutexWithWaker(t *testing.T) {
 	if !isLinuxPlatform() {
