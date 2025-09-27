@@ -227,7 +227,7 @@ func (c *ShmUnaryClient) UnaryCall(ctx context.Context, method, authority string
 		// Only send once
 		sendCancelOnce.Do(func() {
 			log.Printf("Client: sendCancel called with reason: %v", reason)
-			
+
 			// Check if client is already closed to avoid use-after-free
 			if c.closed.Load() {
 				log.Printf("Client: sendCancel - client already closed, returning")
@@ -297,11 +297,11 @@ func (c *ShmUnaryClient) UnaryCall(ctx context.Context, method, authority string
 
 	go func() {
 		log.Printf("Client: cancel goroutine started for stream %d", id)
-		
+
 		// Add a ticker to periodically check if context is done
 		ticker := time.NewTicker(50 * time.Millisecond)
 		defer ticker.Stop()
-		
+
 		for {
 			select {
 			case <-done:

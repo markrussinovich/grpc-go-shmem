@@ -20,6 +20,5 @@ package shm
 
 // ClientOptions holds configuration knobs for the shared-memory client.
 type ClientOptions struct {
-    // Future options: compression, ping intervals, etc.
+	// Future options: compression, ping intervals, etc.
 }
-

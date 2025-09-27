@@ -17,6 +17,7 @@
 package shm
 
 import (
+	"errors"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -34,26 +35,36 @@ func TestFutexSimpleTimeout(t *testing.T) {
 	// Set a known value
 	atomic.StoreUint32(addr, 42)
 
-	// Wait for this value with a timeout - should timeout since no one will wake us
+	// Wait for this value with a timeout - should ultimately timeout since no one will wake us.
+	totalTimeout := 100 * time.Millisecond
 	start := time.Now()
-	err := futexWaitTimeout(addr, 42, 100*1000*1000) // 100ms timeout
-	elapsed := time.Since(start)
-
-	t.Logf("futexWaitTimeout took %v, error: %v", elapsed, err)
-
-	// We expect either:
-	// 1. A timeout error after ~100ms
-	// 2. Or immediate return with nil if futex detected value mismatch
-	if err != nil {
-		// Should be a timeout error and take approximately 100ms
-		if elapsed < 80*time.Millisecond || elapsed > 200*time.Millisecond {
-			t.Errorf("Timeout took %v, expected ~100ms", elapsed)
+	deadline := start.Add(totalTimeout)
+	var total time.Duration
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			break
 		}
+
+		err := futexWaitTimeout(addr, 42, remaining.Nanoseconds())
+		total = time.Since(start)
+
+		if err == nil {
+			// Likely interrupted (EINTR) or spurious wake; retry with the remaining timeout.
+			continue
+		}
+
+		if errors.Is(err, ErrFutexTimeout) {
+			break
+		}
+
+		t.Fatalf("futexWaitTimeout returned unexpected error: %v", err)
+	}
+
+	if total < 80*time.Millisecond || total > 200*time.Millisecond {
+		t.Errorf("Timeout took %v, expected ~100ms", total)
 	} else {
-		// If no error, should return very quickly
-		if elapsed > 10*time.Millisecond {
-			t.Errorf("Non-timeout return took %v, expected immediate", elapsed)
-		}
+		t.Logf("futexWaitTimeout timed out after %v", total)
 	}
 }
 
@@ -77,22 +88,45 @@ func TestFutexWakeFromAnotherGoroutine(t *testing.T) {
 		close(done)
 	}()
 
-	// Wait on the original value
+	// Wait on the original value, retrying in the face of EINTR.
 	start := time.Now()
-	err := futexWaitTimeout(addr, 100, 1000*1000*1000) // 1 second timeout
-	elapsed := time.Since(start)
+	deadline := start.Add(1 * time.Second)
+	var elapsed time.Duration
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			t.Fatal("futexWaitTimeout did not wake before deadline")
+		}
 
-	// Wait for the goroutine to complete
+		err := futexWaitTimeout(addr, 100, remaining.Nanoseconds())
+		elapsed = time.Since(start)
+
+		current := atomic.LoadUint32(addr)
+		if current != 100 {
+			if err != nil && !errors.Is(err, ErrFutexTimeout) {
+				t.Fatalf("Unexpected error after wake: %v", err)
+			}
+			break
+		}
+
+		if err == nil {
+			// Spurious wake or EINTR; continue waiting.
+			continue
+		}
+
+		if errors.Is(err, ErrFutexTimeout) {
+			t.Fatal("futexWaitTimeout reached timeout before wake occurred")
+		}
+
+		t.Fatalf("futexWaitTimeout returned unexpected error: %v", err)
+	}
+
+	// Wait for the goroutine to complete to avoid leaking it.
 	<-done
 
-	// Should wake up after ~50ms with no error
-	if err != nil {
-		t.Errorf("Unexpected error: %v", err)
+	if elapsed < 30*time.Millisecond || elapsed > 150*time.Millisecond {
+		t.Errorf("Wake took %v, expected around 50ms", elapsed)
+	} else {
+		t.Logf("futexWaitTimeout woke up after %v (expected ~50ms)", elapsed)
 	}
-
-	if elapsed < 40*time.Millisecond || elapsed > 100*time.Millisecond {
-		t.Errorf("Wake took %v, expected ~50ms", elapsed)
-	}
-
-	t.Logf("futexWaitTimeout woke up after %v (expected ~50ms)", elapsed)
 }

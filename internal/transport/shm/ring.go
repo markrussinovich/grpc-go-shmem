@@ -196,18 +196,18 @@ func (r *ShmRing) WriteBlocking(data []byte) error {
 			// Conditional wakeup optimization: only wake on empty→non-empty transition
 			wasEmpty := (writeIdx == readIdx)
 
-		hdr.SetWriteIndex(writeIdx + uint64(len(data))) // release-publish
+			hdr.SetWriteIndex(writeIdx + uint64(len(data))) // release-publish
 
-		// Always increment DataSequence to notify readers, but only wake on empty→non-empty
-		// This provides performance benefit while maintaining correctness
-		if len(data) > 0 {
-			hdr.IncrementDataSequence()
-			if wasEmpty {
-				futexWake(&hdr.dataSeq, 1)
+			// Always increment DataSequence to notify readers, but only wake on empty→non-empty
+			// This provides performance benefit while maintaining correctness
+			if len(data) > 0 {
+				hdr.IncrementDataSequence()
+				if wasEmpty {
+					futexWake(&hdr.dataSeq, 1)
+				}
 			}
-		}
 
-		return nil
+			return nil
 		}
 
 		// Insufficient space. Distinguish strictly full vs need-more-space.
@@ -464,18 +464,18 @@ func (r *ShmRing) WriteBlockingContext(ctx context.Context, data []byte) error {
 				copy(unsafe.Slice((*byte)(destPtr2), len(data)-firstChunkI), data[firstChunkI:])
 			}
 
-		hdr.SetWriteIndex(writeIdx + uint64(len(data))) // release-publish
+			hdr.SetWriteIndex(writeIdx + uint64(len(data))) // release-publish
 
-		// Always increment DataSequence to notify readers, but only wake on empty→non-empty
-		// This provides performance benefit while maintaining correctness
-		if len(data) > 0 {
-			hdr.IncrementDataSequence()
-			if wasPreviouslyEmpty {
-				futexWake(&hdr.dataSeq, 1)
+			// Always increment DataSequence to notify readers, but only wake on empty→non-empty
+			// This provides performance benefit while maintaining correctness
+			if len(data) > 0 {
+				hdr.IncrementDataSequence()
+				if wasPreviouslyEmpty {
+					futexWake(&hdr.dataSeq, 1)
+				}
 			}
-		}
 
-		return nil
+			return nil
 		}
 
 		// Need to wait for space (distinguish full vs partial)

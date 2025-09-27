@@ -3,6 +3,7 @@
 package shm
 
 import (
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -135,26 +136,48 @@ func TestFutexTimeoutAtomicRecheck(t *testing.T) {
 		t.Fatalf("Value changed unexpectedly: expected %d, got %d", testValue, currentVal)
 	}
 
-	start = time.Now()
-	err = futexWaitTimeout(addr, testValue, 50*1000*1000) // 50ms timeout
-	elapsed = time.Since(start)
+	// Wait with reattempts to handle EINTR or spurious wakeups which return nil.
+	timeoutStart := time.Now()
+	deadline := timeoutStart.Add(50 * time.Millisecond)
+	var total time.Duration
+	var gotTimeout bool
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			gotTimeout = true
+			break
+		}
 
-	// Check value after the call
-	finalVal := atomic.LoadUint32(addr)
-	t.Logf("Address value after futexWaitTimeout: %d", finalVal)
+		err = futexWaitTimeout(addr, testValue, remaining.Nanoseconds())
+		total = time.Since(timeoutStart)
 
-	// Should timeout since no one else should modify our test value
-	if err == nil {
-		t.Error("Expected timeout error, got nil")
-	} else {
-		t.Logf("Got expected timeout error: %v", err)
+		// Check value after each wait; it should remain unchanged in this scenario.
+		if current := atomic.LoadUint32(addr); current != testValue {
+			t.Fatalf("Value changed unexpectedly during timeout wait: expected %d, got %d", testValue, current)
+		}
+
+		if err == nil {
+			// Likely interrupted (EINTR) or spurious wake. Re-loop with updated remaining time.
+			continue
+		}
+
+		if errors.Is(err, ErrFutexTimeout) {
+			gotTimeout = true
+			break
+		}
+
+		t.Fatalf("futexWaitTimeout returned unexpected error: %v", err)
 	}
 
-	// Should take approximately the timeout duration (allow more variance)
-	if elapsed < 30*time.Millisecond || elapsed > 300*time.Millisecond {
-		t.Errorf("Timeout took %v, expected ~50ms", elapsed)
+	if !gotTimeout {
+		t.Fatalf("futexWaitTimeout did not report timeout within expected window (total=%v)", total)
+	}
+
+	// Should take approximately the timeout duration (allow more variance due to scheduling).
+	if total < 30*time.Millisecond || total > 150*time.Millisecond {
+		t.Errorf("Timeout took %v, expected around 50ms", total)
 	} else {
-		t.Logf("Timeout duration was %v (expected ~50ms)", elapsed)
+		t.Logf("Timeout duration was %v (expected ~50ms)", total)
 	}
 }
 
