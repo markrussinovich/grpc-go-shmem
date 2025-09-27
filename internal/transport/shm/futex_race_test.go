@@ -11,7 +11,7 @@ import (
 
 // TestFutexBasicWakeLogic tests the basic futex wake/wait interaction.
 // Note: The original "lost-wake race" test was removed because it tested for a
-// non-issue. Proper futex usage (like in ring.go) always re-checks conditions 
+// non-issue. Proper futex usage (like in ring.go) always re-checks conditions
 // in a loop after futex returns, making "lost wakes" harmless.
 func TestFutexBasicWakeLogic(t *testing.T) {
 	if !isLinuxPlatform() {
@@ -19,7 +19,7 @@ func TestFutexBasicWakeLogic(t *testing.T) {
 	}
 
 	var counter uint32 = 100
-	
+
 	// Start a waiter
 	done := make(chan struct{})
 	go func() {
