@@ -298,10 +298,8 @@ func (c *ShmUnaryClient) UnaryCall(ctx context.Context, method, authority string
 	go func() {
 		log.Printf("Client: cancel goroutine started for stream %d", id)
 
-		// Add a ticker to periodically check if context is done
-		ticker := time.NewTicker(50 * time.Millisecond)
-		defer ticker.Stop()
-
+		// Event-driven: block on done or ctx.Done() channels
+		// No polling needed - ctx.Done() unblocks immediately when context is cancelled
 		for {
 			select {
 			case <-done:
@@ -311,13 +309,6 @@ func (c *ShmUnaryClient) UnaryCall(ctx context.Context, method, authority string
 				log.Printf("Client: cancel goroutine - context cancelled for stream %d: %v", id, ctx.Err())
 				sendCancel(ctx.Err())
 				return
-			case <-ticker.C:
-				log.Printf("Client: cancel goroutine - periodic check for stream %d, ctx.Err()=%v", id, ctx.Err())
-				if ctx.Err() != nil {
-					log.Printf("Client: cancel goroutine - context is done via polling for stream %d: %v", id, ctx.Err())
-					sendCancel(ctx.Err())
-					return
-				}
 			}
 		}
 	}()
