@@ -159,22 +159,27 @@ func (t *ShmClientTransport) GracefulClose() {
 }
 
 // NewStream creates a Stream for an RPC.
+// 
+// Note: Full implementation is blocked by transport.ClientStream having unexported fields.
+// The ClientStream type can only be properly constructed within the internal/transport package.
+// Current workaround: Use ShmUnaryClient or ShmStreamingClient directly for functional transport.
+//
+// TODO: Options to unblock:
+// 1. Add internal constructor in transport package for external transports
+// 2. Move shm transport into internal/transport for package-level access
+// 3. Use wrapper pattern with existing ShmUnaryClient/ShmStreamingClient
 func (t *ShmClientTransport) NewStream(ctx context.Context, callHdr *transport.CallHdr) (*transport.ClientStream, error) {
 	if t.closed.Load() {
 		return nil, transport.ErrConnClosing
 	}
 
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	// Assign stream ID
-	streamID := t.streamID
-	t.streamID++
-
-	// TODO: Create actual client stream
-	// For now, return a placeholder
-	_ = streamID // Use the variable to avoid compiler error
-	return nil, errors.New("NewStream not fully implemented yet")
+	// TODO: Cannot directly construct transport.ClientStream due to unexported fields.
+	// This requires either:
+	// - Internal constructor in transport package, or
+	// - Moving shm into internal/transport, or  
+	// - Using wrapper approach with existing working implementations
+	
+	return nil, errors.New("NewStream: transport.ClientStream construction blocked by unexported fields - use ShmUnaryClient/ShmStreamingClient directly")
 }
 
 // Error returns a channel that is closed when some I/O error
