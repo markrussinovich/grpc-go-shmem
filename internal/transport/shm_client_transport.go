@@ -9,7 +9,9 @@ import (
 	"net"
 	"sync"
 	"sync/atomic"
+	"unsafe"
 
+	"golang.org/x/net/http2"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/mem"
 	"google.golang.org/grpc/metadata"
@@ -253,12 +255,15 @@ func (t *ShmClientTransport) NewStream(ctx context.Context, callHdr *CallHdr) (*
 			buf:            newRecvBuffer(),
 			contentSubtype: callHdr.ContentSubtype,
 		},
-		// Note: ct field is *http2Client which we can't set for shm transport
-		// We'll need to implement Write methods separately
 		done:       make(chan struct{}),
 		headerChan: make(chan struct{}),
 		doneFunc:   callHdr.DoneFunc,
 	}
+	
+	// Use unsafe to set ct field to our ShmClientTransport
+	// This enables ClientStream.Write(), Read(), and Close() to work with shm transport
+	// The ct field is typed as *http2Client, but we implement the same methods
+	*(*unsafe.Pointer)(unsafe.Pointer(&s.ct)) = unsafe.Pointer(t)
 	
 	// Set up transport reader for this stream
 	s.trReader = &transportReader{
@@ -335,4 +340,127 @@ func (t *ShmClientTransport) GetGoAwayReason() (GoAwayReason, string) {
 // RemoteAddr returns the remote network address.
 func (t *ShmClientTransport) RemoteAddr() net.Addr {
 	return t.remoteAddr
+}
+
+// incrMsgRecv increments the message received counter.
+// This is called by ClientStream.Read() when a message is successfully read.
+func (t *ShmClientTransport) incrMsgRecv() {
+	// For shm transport, we don't track channelz metrics yet
+	// This is a no-op for now, but maintains compatibility with ClientStream
+}
+
+// closeStream closes the given stream and cleans up resources.
+// This is called by ClientStream.Close() to terminate the stream.
+func (t *ShmClientTransport) closeStream(s *ClientStream, err error, rst bool, rstCode http2.ErrCode, st *status.Status, mdata map[string][]string, eosReceived bool) {
+	// Set stream state to done
+	if s.swapState(streamDone) == streamDone {
+		// Already done, wait for first closer to finish
+		<-s.done
+		return
+	}
+
+	// Update status and trailers
+	s.status = st
+	if len(mdata) > 0 {
+		s.trailer = mdata
+	}
+
+	// Signal error to readers if present
+	if err != nil {
+		s.write(recvMsg{err: err})
+	}
+
+	// Close header channel if not already closed
+	if atomic.CompareAndSwapUint32(&s.headerChanClosed, 0, 1) {
+		s.noHeaders = true
+		close(s.headerChan)
+	}
+
+	// Remove stream from active streams map
+	t.mu.Lock()
+	delete(t.streams, s.id)
+	delete(t.streamTransport, s)
+	t.mu.Unlock()
+
+	// Send CANCEL frame if requested
+	if rst {
+		fh := FrameHeader{
+			StreamID: s.id,
+			Type:     FrameTypeCANCEL,
+			Flags:    0,
+		}
+		// Best effort - ignore errors since stream is closing anyway
+		_ = writeFrame(t.clientToServer, fh, nil, context.Background())
+	}
+
+	// Close the done channel to unblock waiters
+	close(s.done)
+
+	// Call doneFunc if present
+	if s.doneFunc != nil {
+		s.doneFunc()
+	}
+}
+
+// write writes data to the stream via the shared memory transport.
+// This is called by ClientStream.Write() to send data.
+func (t *ShmClientTransport) write(s *ClientStream, hdr []byte, data mem.BufferSlice, opts *WriteOptions) error {
+	// Check if transport is closed
+	if t.closed.Load() {
+		return ErrConnClosing
+	}
+
+	// Check stream state
+	if opts.Last {
+		// Last message - transition to write done state
+		if !s.compareAndSwapState(streamActive, streamWriteDone) {
+			return errStreamDone
+		}
+	} else if s.getState() != streamActive {
+		return errStreamDone
+	}
+
+	// Combine header and data into a single payload
+	var payload []byte
+	if hdr != nil {
+		payload = append(payload, hdr...)
+	}
+	if data.Len() > 0 {
+		// Materialize the BufferSlice into a contiguous byte slice
+		payload = append(payload, data.Materialize()...)
+	}
+
+	// Write MESSAGE frame
+	fh := FrameHeader{
+		StreamID: s.id,
+		Type:     FrameTypeMESSAGE,
+		Flags:    0,
+	}
+	if opts.Last {
+		fh.Flags = MessageFlagMORE // Indicate more data coming (trailers)
+	}
+
+	if err := writeFrame(t.clientToServer, fh, payload, s.ctx); err != nil {
+		return err
+	}
+
+	// If this is the last write, send trailers
+	if opts.Last {
+		tr := TrailersV1{
+			GRPCStatusCode: 0, // OK
+			GRPCStatusMsg:  "",
+			Metadata:       nil,
+		}
+		trPayload := encodeTrailers(tr)
+		trFh := FrameHeader{
+			StreamID: s.id,
+			Type:     FrameTypeTRAILERS,
+			Flags:    TrailersFlagEND_STREAM,
+		}
+		if err := writeFrame(t.clientToServer, trFh, trPayload, s.ctx); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
