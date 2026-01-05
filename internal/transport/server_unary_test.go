@@ -63,7 +63,8 @@ func TestShmServerUnary_Echo(t *testing.T) {
 		// Send server HEADERS, then echo MESSAGE, then TRAILERS OK
 		h := HeadersV1{Version: 1, HdrType: 1, Metadata: []KV{{Key: "x-srv", Values: [][]byte{[]byte("ok")}}}}
 		if err := writeFrame(st.serverToClient, FrameHeader{StreamID: fh.StreamID, Type: FrameTypeHEADERS, Flags: HeadersFlagINITIAL}, encodeHeaders(h), context.Background()); err != nil {
-			t.Fatalf("writeFrame headers: %v", err)
+			t.Errorf("writeFrame headers: %v", err)
+			return
 		}
 		// Send MESSAGE
 		if err := writeFrame(st.serverToClient, FrameHeader{StreamID: fh.StreamID, Type: FrameTypeMESSAGE}, msg, context.Background()); err != nil {
