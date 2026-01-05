@@ -9,14 +9,14 @@ import (
 
 func main() {
 	// Create a segment just like in the tests
-	seg, err := shm.CreateSegment("debug-capacity", 65536, 65536)
+	seg, err := transport.CreateSegment("debug-capacity", 65536, 65536)
 	if err != nil {
 		log.Fatalf("Failed to create segment: %v", err)
 	}
 	defer seg.Close()
 
 	// Create a ring and check its capacity
-	ring := shm.NewShmRingFromSegment(seg.A, seg.Mem)
+	ring := transport.NewShmRingFromSegment(seg.A, seg.Mem)
 
 	fmt.Printf("Configured capacity: 65536 bytes\n")
 	fmt.Printf("Actual ring capacity: %d bytes\n", ring.Capacity())
