@@ -9,6 +9,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/mem"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/peer"
@@ -119,17 +120,173 @@ func (t *ShmServerTransport) processIncomingData(ctx context.Context) {
 			}
 			continue
 		}
-		_ = fh
-		_ = payload
-		// TODO: dispatch frames to stream handlers in future step.
+
+		// Dispatch frames based on type
+		switch fh.Type {
+		case FrameTypeHEADERS:
+			if err := t.handleHeaders(ctx, fh.StreamID, payload); err != nil {
+				// Log error but continue processing
+				continue
+			}
+		case FrameTypeMESSAGE:
+			t.handleMessage(fh.StreamID, payload)
+		case FrameTypeTRAILERS:
+			t.handleTrailers(fh.StreamID, payload)
+		case FrameTypeCANCEL:
+			t.handleCancel(fh.StreamID)
+		default:
+			// Unknown frame type, ignore
+		}
 	}
 }
 
-// processFrameData processes incoming gRPC frame data
-func (t *ShmServerTransport) processFrameData(data []byte) error {
-	// TODO: Implement gRPC frame parsing and routing to streams
-	// For now, this is a placeholder that will be implemented in the next step
+// handleHeaders processes a HEADERS frame and creates a new ServerStream
+func (t *ShmServerTransport) handleHeaders(ctx context.Context, streamID uint32, payload []byte) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if t.closed.Load() {
+		return errors.New("transport closed")
+	}
+
+	// Check if stream already exists
+	if _, exists := t.streams[streamID]; exists {
+		return errors.New("stream already exists")
+	}
+
+	// Validate stream ID (client uses odd numbers)
+	if streamID%2 != 1 {
+		return errors.New("invalid stream ID: must be odd for client-initiated streams")
+	}
+
+	// Decode headers using the proper frame format
+	hdr, err := decodeHeaders(payload)
+	if err != nil {
+		return err
+	}
+
+	// Convert KV metadata to metadata.MD
+	md := make(metadata.MD)
+	for _, kv := range hdr.Metadata {
+		var vals []string
+		for _, v := range kv.Values {
+			vals = append(vals, string(v))
+		}
+		md[kv.Key] = vals
+	}
+
+	// Create receive buffer for the stream
+	buf := newRecvBuffer()
+
+	// Create the ServerStream
+	s := &ServerStream{
+		Stream: &Stream{
+			id:             streamID,
+			method:         hdr.Method,
+			buf:            buf,
+			sendCompress:   "",
+			recvCompress:   "",
+			contentSubtype: "",
+		},
+		st: t,
+	}
+
+	// Create context for the stream
+	s.ctx, s.cancel = context.WithCancel(ctx)
+	s.ctxDone = s.ctx.Done()
+
+	// Attach metadata to context if present
+	if len(md) > 0 {
+		s.ctx = metadata.NewIncomingContext(s.ctx, md)
+	}
+
+	// Create transport reader for the stream
+	s.trReader = &transportReader{
+		reader: &recvBufferReader{
+			ctx:     s.ctx,
+			ctxDone: s.ctxDone,
+			recv:    s.buf,
+		},
+		windowHandler: func(n int) {
+			// For shm transport, window handling is implicit via ring buffer
+		},
+	}
+
+	// Register the stream
+	t.streams[streamID] = s
+
+	// Call the handler in a new goroutine
+	if t.handleFunc != nil {
+		go t.handleFunc(s)
+	}
+
 	return nil
+}
+
+// handleMessage processes a MESSAGE frame
+func (t *ShmServerTransport) handleMessage(streamID uint32, payload []byte) {
+	t.mu.RLock()
+	s, exists := t.streams[streamID]
+	t.mu.RUnlock()
+
+	if !exists {
+		// Stream doesn't exist, drop the message
+		return
+	}
+
+	// Write the message data to the stream's receive buffer
+	// Use mem.Copy to create a buffer from the payload
+	buf := mem.Copy(payload, mem.DefaultBufferPool())
+	s.write(recvMsg{buffer: buf})
+}
+
+// handleTrailers processes a TRAILERS frame
+func (t *ShmServerTransport) handleTrailers(streamID uint32, payload []byte) {
+	t.mu.RLock()
+	s, exists := t.streams[streamID]
+	t.mu.RUnlock()
+
+	if !exists {
+		return
+	}
+
+	// Decode trailers using the proper frame format
+	trailers, err := decodeTrailers(payload)
+	if err != nil {
+		// Send error to stream
+		s.write(recvMsg{err: err})
+		return
+	}
+
+	// Create status from trailers
+	st := status.New(codes.Code(trailers.GRPCStatusCode), trailers.GRPCStatusMsg)
+
+	// Signal EOF to the stream
+	s.write(recvMsg{err: st.Err()})
+
+	// Remove stream from active streams
+	t.mu.Lock()
+	delete(t.streams, streamID)
+	t.mu.Unlock()
+}
+
+// handleCancel processes a CANCEL frame
+func (t *ShmServerTransport) handleCancel(streamID uint32) {
+	t.mu.RLock()
+	s, exists := t.streams[streamID]
+	t.mu.RUnlock()
+
+	if !exists {
+		return
+	}
+
+	// Cancel the stream context
+	s.cancel()
+
+	// Remove from active streams
+	t.mu.Lock()
+	delete(t.streams, streamID)
+	t.mu.Unlock()
 }
 
 // Close tears down the transport. Once it is called, the transport
@@ -187,7 +344,40 @@ func (t *ShmServerTransport) writeHeader(s *ServerStream, md metadata.MD) error 
 		return ErrConnClosing
 	}
 
-	// TODO: Implement header frame writing
+	// Convert metadata.MD to []KV format
+	var kvs []KV
+	for k, vals := range md {
+		var byteVals [][]byte
+		for _, v := range vals {
+			byteVals = append(byteVals, []byte(v))
+		}
+		kvs = append(kvs, KV{Key: k, Values: byteVals})
+	}
+
+	// Create HEADERS frame with server-initial type
+	hdr := HeadersV1{
+		Version:          1,
+		HdrType:          1, // server-initial
+		Method:           "",
+		Authority:        "",
+		DeadlineUnixNano: 0,
+		Metadata:         kvs,
+	}
+
+	payload := encodeHeaders(hdr)
+
+	// Create frame header
+	fh := FrameHeader{
+		Type:     FrameTypeHEADERS,
+		StreamID: s.id,
+		Length:   uint32(len(payload)),
+	}
+
+	// Write frame to server->client ring
+	if err := writeFrame(t.serverToClient, fh, payload, context.Background()); err != nil {
+		return err
+	}
+
 	return nil
 }
 
@@ -197,17 +387,68 @@ func (t *ShmServerTransport) write(s *ServerStream, hdr []byte, data mem.BufferS
 		return ErrConnClosing
 	}
 
-	// TODO: Implement data frame writing
+	// Materialize the BufferSlice into a contiguous []byte
+	var payload []byte
+	if len(hdr) > 0 {
+		payload = append(payload, hdr...)
+	}
+	for _, buf := range data {
+		payload = append(payload, buf.ReadOnlyData()...)
+	}
+
+	// Create MESSAGE frame
+	fh := FrameHeader{
+		Type:     FrameTypeMESSAGE,
+		StreamID: s.id,
+		Length:   uint32(len(payload)),
+	}
+
+	// Write frame to server->client ring
+	if err := writeFrame(t.serverToClient, fh, payload, context.Background()); err != nil {
+		return err
+	}
+
+	// If this is the last message, send trailers
+	if opts != nil && opts.Last {
+		return t.writeStatus(s, status.New(codes.OK, ""))
+	}
+
 	return nil
 }
 
-// writeStatus writes status for a stream
+// writeStatus writes status for a stream (trailers)
 func (t *ShmServerTransport) writeStatus(s *ServerStream, st *status.Status) error {
 	if t.closed.Load() {
 		return ErrConnClosing
 	}
 
-	// TODO: Implement status frame writing
+	// Create trailers frame
+	trailers := TrailersV1{
+		Version:        1,
+		GRPCStatusCode: uint32(st.Code()),
+		GRPCStatusMsg:  st.Message(),
+		Metadata:       nil, // TODO: support trailer metadata
+	}
+
+	payload := encodeTrailers(trailers)
+
+	// Create frame header
+	fh := FrameHeader{
+		Type:     FrameTypeTRAILERS,
+		StreamID: s.id,
+		Length:   uint32(len(payload)),
+	}
+
+	// Write frame to server->client ring
+	if err := writeFrame(t.serverToClient, fh, payload, context.Background()); err != nil {
+		return err
+	}
+
+	// Remove stream from active streams
+	t.mu.Lock()
+	delete(t.streams, s.id)
+	t.mu.Unlock()
+
 	return nil
 }
 
