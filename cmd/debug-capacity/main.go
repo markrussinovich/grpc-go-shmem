@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"log"
 
-	"google.golang.org/grpc/internal/transport/shm"
+	"google.golang.org/grpc/internal/transport"
 )
 
 func main() {
