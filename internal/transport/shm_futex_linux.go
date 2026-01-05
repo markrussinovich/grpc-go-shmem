@@ -100,8 +100,8 @@ func futexWaitTimeout(addr *uint32, val uint32, timeoutNs int64) error {
 
 	// Convert nanoseconds to timespec
 	var ts syscall.Timespec
-	ts.Sec = timeoutNs / 1e9
-	ts.Nsec = timeoutNs % 1e9
+	ts.Sec = int64(timeoutNs / 1e9)
+	ts.Nsec = int64(timeoutNs % 1e9)
 
 	// Use syscall.RawSyscall6 for the futex system call with timeout
 	r1, r2, errno := syscall.RawSyscall6(
