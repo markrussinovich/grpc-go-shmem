@@ -5,10 +5,15 @@ package transport
 import (
 	"context"
 	"errors"
+	"io"
 	"net"
 	"sync"
 	"sync/atomic"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/mem"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 )
 
 // ShmClientTransport implements the gRPC ClientTransport interface
@@ -30,8 +35,9 @@ type ShmClientTransport struct {
 	mu     sync.RWMutex
 
 	// Stream management
-	streams  map[uint32]*ClientStream
-	streamID uint32 // next stream ID to assign
+	streams         map[uint32]*ClientStream
+	streamTransport map[*ClientStream]*ShmClientTransport // Track transport for each stream
+	streamID        uint32                                // next stream ID to assign
 
 	// Error handling
 	closeOnce sync.Once
@@ -59,16 +65,17 @@ func NewShmClientTransport(segment *Segment, localAddr, remoteAddr net.Addr) (*S
 	ctx, cancel := context.WithCancel(context.Background())
 
 	t := &ShmClientTransport{
-		segment:        segment,
-		clientToServer: clientToServer,
-		serverToClient: serverToClient,
-		localAddr:      localAddr,
-		remoteAddr:     remoteAddr,
-		ctx:            ctx,
-		cancel:         cancel,
-		streams:        make(map[uint32]*ClientStream),
-		errCh:          make(chan struct{}),
-		goAwayCh:       make(chan struct{}),
+		segment:         segment,
+		clientToServer:  clientToServer,
+		serverToClient:  serverToClient,
+		localAddr:       localAddr,
+		remoteAddr:      remoteAddr,
+		ctx:             ctx,
+		cancel:          cancel,
+		streams:         make(map[uint32]*ClientStream),
+		streamTransport: make(map[*ClientStream]*ShmClientTransport),
+		errCh:           make(chan struct{}),
+		goAwayCh:        make(chan struct{}),
 	}
 
 	// Start processing incoming data from the server (test hook guarded)
@@ -99,9 +106,69 @@ func (t *ShmClientTransport) processIncomingData(ctx context.Context) {
 			}
 			continue
 		}
-		_ = fh
-		_ = payload
-		// TODO: dispatch to streams once stream management is in place.
+		
+		// Dispatch frame to appropriate stream
+		t.mu.RLock()
+		stream, ok := t.streams[fh.StreamID]
+		t.mu.RUnlock()
+		
+		if !ok {
+			// Stream not found - might have been closed
+			continue
+		}
+		
+		// Handle different frame types
+		switch fh.Type {
+		case FrameTypeHEADERS:
+			// Server sent headers (response headers)
+			_, err := decodeHeaders(payload)
+			if err != nil {
+				stream.write(recvMsg{err: err})
+				continue
+			}
+			
+			// Signal that headers have been received
+			if atomic.CompareAndSwapUint32(&stream.headerChanClosed, 0, 1) {
+				close(stream.headerChan)
+			}
+			
+		case FrameTypeMESSAGE:
+			// Server sent a message
+			// Wrap payload in mem.Buffer
+			buf := mem.NewBuffer(&payload, nil)
+			stream.write(recvMsg{buffer: buf})
+			
+		case FrameTypeTRAILERS:
+			// Server sent trailers (end of stream)
+			tr, err := decodeTrailers(payload)
+			if err != nil {
+				stream.write(recvMsg{err: err})
+			} else {
+				// Store trailer metadata
+				stream.trailer = metadata.MD{}
+				for _, kv := range tr.Metadata {
+					stream.trailer[kv.Key] = make([]string, len(kv.Values))
+					for i, v := range kv.Values {
+						stream.trailer[kv.Key][i] = string(v)
+					}
+				}
+				
+				// Convert status to error if not OK
+				if tr.GRPCStatusCode != 0 {
+					err = status.Error(codes.Code(tr.GRPCStatusCode), tr.GRPCStatusMsg)
+				} else {
+					err = io.EOF
+				}
+				stream.write(recvMsg{err: err})
+			}
+			
+		case FrameTypeCANCEL:
+			// Server cancelled the stream
+			stream.write(recvMsg{err: context.Canceled})
+			
+		default:
+			// Unknown frame type - ignore
+		}
 	}
 }
 
@@ -134,12 +201,17 @@ func (t *ShmClientTransport) Close(err error) {
 		// Terminate all active streams
 		t.mu.Lock()
 		for _, stream := range t.streams {
-			// Signal stream termination
 			if stream != nil {
-				// TODO: Properly terminate streams
+				// Close the stream with the transport error
+				stream.write(recvMsg{err: err})
+				close(stream.done)
+				if atomic.CompareAndSwapUint32(&stream.headerChanClosed, 0, 1) {
+					close(stream.headerChan)
+				}
 			}
 		}
 		t.streams = make(map[uint32]*ClientStream)
+		t.streamTransport = make(map[*ClientStream]*ShmClientTransport)
 		t.mu.Unlock()
 
 		// Signal closure
@@ -158,27 +230,83 @@ func (t *ShmClientTransport) GracefulClose() {
 }
 
 // NewStream creates a Stream for an RPC.
-// 
-// Note: Full implementation is blocked by ClientStream having unexported fields.
-// The ClientStream type can only be properly constructed within the internal/transport package.
-// Current workaround: Use ShmUnaryClient or ShmStreamingClient directly for functional transport.
-//
-// TODO: Options to unblock:
-// 1. Add internal constructor in transport package for external transports
-// 2. Move shm transport into internal/transport for package-level access
-// 3. Use wrapper pattern with existing ShmUnaryClient/ShmStreamingClient
 func (t *ShmClientTransport) NewStream(ctx context.Context, callHdr *CallHdr) (*ClientStream, error) {
 	if t.closed.Load() {
 		return nil, ErrConnClosing
 	}
 
-	// TODO: Cannot directly construct ClientStream due to unexported fields.
-	// This requires either:
-	// - Internal constructor in transport package, or
-	// - Moving shm into internal/transport, or  
-	// - Using wrapper approach with existing working implementations
+	t.mu.Lock()
+	// Assign stream ID (client uses odd IDs, starting from 1)
+	streamID := t.streamID
+	if streamID == 0 {
+		streamID = 1
+	}
+	t.streamID = streamID + 2 // Increment by 2 to maintain odd IDs
+
+	// Create the client stream
+	s := &ClientStream{
+		Stream: &Stream{
+			id:             streamID,
+			ctx:            ctx,
+			method:         callHdr.Method,
+			sendCompress:   callHdr.SendCompress,
+			buf:            newRecvBuffer(),
+			contentSubtype: callHdr.ContentSubtype,
+		},
+		// Note: ct field is *http2Client which we can't set for shm transport
+		// We'll need to implement Write methods separately
+		done:       make(chan struct{}),
+		headerChan: make(chan struct{}),
+		doneFunc:   callHdr.DoneFunc,
+	}
 	
-	return nil, errors.New("NewStream: ClientStream construction blocked by unexported fields - use ShmUnaryClient/ShmStreamingClient directly")
+	// Set up transport reader for this stream
+	s.trReader = &transportReader{
+		reader: &recvBufferReader{
+			ctx:     s.ctx,
+			ctxDone: s.ctx.Done(),
+			recv:    s.buf,
+			closeStream: func(err error) {
+				s.Close(err)
+			},
+		},
+		windowHandler: func(n int) {
+			// Flow control: for shm transport, we don't need traditional flow control
+			// as the ring buffer already provides backpressure
+		},
+	}
+	
+	// Register the stream
+	t.streams[streamID] = s
+	t.streamTransport[s] = t
+	t.mu.Unlock()
+
+	// Send HEADERS frame to initiate the stream
+	hdr := HeadersV1{
+		Version:          1,
+		HdrType:          0, // client-initial
+		Method:           callHdr.Method,
+		Authority:        callHdr.Host,
+		DeadlineUnixNano: 0, // TODO: extract from ctx if present
+		Metadata:         nil, // TODO: extract metadata from context
+	}
+
+	payload := encodeHeaders(hdr)
+	fh := FrameHeader{
+		StreamID: streamID,
+		Type:     FrameTypeHEADERS,
+		Flags:    HeadersFlagINITIAL,
+	}
+
+	if err := writeFrame(t.clientToServer, fh, payload, ctx); err != nil {
+		t.mu.Lock()
+		delete(t.streams, streamID)
+		delete(t.streamTransport, s)
+		t.mu.Unlock()
+		return nil, err
+	}
+
+	return s, nil
 }
 
 // Error returns a channel that is closed when some I/O error
