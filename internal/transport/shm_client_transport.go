@@ -9,7 +9,6 @@ import (
 	"net"
 	"sync"
 	"sync/atomic"
-	"unsafe"
 
 	"golang.org/x/net/http2"
 	"google.golang.org/grpc/codes"
@@ -255,15 +254,11 @@ func (t *ShmClientTransport) NewStream(ctx context.Context, callHdr *CallHdr) (*
 			buf:            newRecvBuffer(),
 			contentSubtype: callHdr.ContentSubtype,
 		},
+		ct:         t, // Set the client transport (now an interface, no unsafe needed)
 		done:       make(chan struct{}),
 		headerChan: make(chan struct{}),
 		doneFunc:   callHdr.DoneFunc,
 	}
-	
-	// Use unsafe to set ct field to our ShmClientTransport
-	// This enables ClientStream.Write(), Read(), and Close() to work with shm transport
-	// The ct field is typed as *http2Client, but we implement the same methods
-	*(*unsafe.Pointer)(unsafe.Pointer(&s.ct)) = unsafe.Pointer(t)
 	
 	// Set up transport reader for this stream
 	s.trReader = &transportReader{
@@ -464,3 +459,7 @@ func (t *ShmClientTransport) write(s *ClientStream, hdr []byte, data mem.BufferS
 
 	return nil
 }
+
+// Compile-time check to ensure ShmClientTransport implements clientTransport.
+var _ clientTransport = (*ShmClientTransport)(nil)
+

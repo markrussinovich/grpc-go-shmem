@@ -27,11 +27,23 @@ import (
 	"google.golang.org/grpc/status"
 )
 
+// clientTransport defines the interface for client transport operations needed by ClientStream.
+// This interface allows ClientStream to work with different transport implementations
+// (e.g., http2Client, ShmClientTransport) without hardcoding a specific type.
+type clientTransport interface {
+	incrMsgRecv()
+	closeStream(s *ClientStream, err error, rst bool, rstCode http2.ErrCode, st *status.Status, mdata map[string][]string, eosReceived bool)
+	write(s *ClientStream, hdr []byte, data mem.BufferSlice, opts *WriteOptions) error
+}
+
+// Compile-time check to ensure http2Client implements clientTransport.
+var _ clientTransport = (*http2Client)(nil)
+
 // ClientStream implements streaming functionality for a gRPC client.
 type ClientStream struct {
 	*Stream // Embed for common stream functionality.
 
-	ct       *http2Client
+	ct       clientTransport
 	done     chan struct{} // closed at the end of stream to unblock writers.
 	doneFunc func()        // invoked at the end of stream.
 
