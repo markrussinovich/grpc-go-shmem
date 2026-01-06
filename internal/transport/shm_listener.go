@@ -42,9 +42,10 @@ type ShmListener struct {
 	closeOnce sync.Once
 
 	// Connection handling
-	connCh   chan net.Conn
-	acceptCh chan *shmConn
-	mu       sync.RWMutex
+	connCh      chan net.Conn
+	acceptCh    chan *shmConn
+	mu          sync.RWMutex
+	acceptCount atomic.Uint64 // Track number of accepted connections
 
 	// Configuration
 	segmentSize uint64
@@ -127,13 +128,26 @@ func (l *ShmListener) handlePotentialConnection(segmentName string) (*shmConn, e
 }
 
 // Accept waits for and returns the next connection to the listener
+// Note: Current implementation supports single connection per listener.
+// After one connection is accepted, subsequent Accept() calls will return an error.
 func (l *ShmListener) Accept() (net.Conn, error) {
 	if l.closed.Load() {
 		return nil, errors.New("listener closed")
 	}
+	
+	// Check if we've already accepted a connection
+	// The current design uses a single pre-created segment
+	count := l.acceptCount.Add(1)
+	if count > 1 {
+		// Already accepted one connection, return error to signal server to stop
+		// This prevents segfaults from trying to reuse the segment
+		return nil, errors.New("shared memory listener supports single connection only")
+	}
+	
 	// Use single-connection blocking accept using event-driven handshake.
 	conn, err := l.handlePotentialConnection(l.addr.Name)
 	if err != nil {
+		l.acceptCount.Add(^uint64(0)) // Decrement on error
 		return nil, err
 	}
 	return conn, nil
