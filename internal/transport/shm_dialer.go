@@ -49,25 +49,50 @@ func DialShm(ctx context.Context, addr string, opts *DialOptions) (ClientTranspo
 		defer cancel()
 	}
 
-	// The addr is the segment name that the server created.
-	// Open the existing segment created by the server.
-	segment, err := OpenSegment(addr)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open segment %q: %v", addr, err)
+	// The server pre-creates segments as <addr>_conn_<id>
+	// Try to connect to the next available segment
+	// Start with conn_1 and increment until we find one
+	
+	var segment *Segment
+	var segmentName string
+	var err error
+	
+	// Try sequential segment names
+	maxAttempts := 10
+	for attempt := uint64(1); attempt <= uint64(maxAttempts); attempt++ {
+		segmentName = fmt.Sprintf("%s_conn_%d", addr, attempt)
+		segment, err = OpenSegment(segmentName)
+		if err == nil {
+			// Successfully opened a segment
+			break
+		}
+		
+		// Check if context is cancelled
+		select {
+		case <-ctx.Done():
+			return nil, fmt.Errorf("dial timeout: %v", ctx.Err())
+		default:
+			// Wait a bit before retrying (server may be creating the segment)
+			time.Sleep(50 * time.Millisecond)
+		}
+	}
+	
+	if segment == nil {
+		return nil, fmt.Errorf("failed to find available segment for %s after %d attempts: %v", addr, maxAttempts, err)
 	}
 
 	// Mark client as ready
 	segment.H.SetClientReady(true)
 
-	// Wait for server to be ready
+	// Wait for server to be ready (it should already be ready since server pre-creates segments)
 	if err := waitForServerReady(ctx, segment); err != nil {
 		segment.Close()
 		return nil, fmt.Errorf("failed to establish connection: %v", err)
 	}
 
 	// Create client transport
-	localAddr := &ShmAddr{Name: addr + "_client"}
-	remoteAddr := &ShmAddr{Name: addr}
+	localAddr := &ShmAddr{Name: segmentName + "_client"}
+	remoteAddr := &ShmAddr{Name: segmentName}
 
 	clientTransport, err := NewShmClientTransport(segment, localAddr, remoteAddr)
 	if err != nil {

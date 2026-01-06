@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"strconv"
 	"sync/atomic"
+	"time"
 )
 
 // Instrumentation counters for selection tests.
@@ -75,18 +76,16 @@ func newShmClientFactory(ctx context.Context, raw string) (ClientTransport, erro
 	if err != nil {
 		return nil, err
 	}
-	// Open existing server segment and handshake.
-	seg, err := OpenSegment(addr.Name)
-	if err != nil {
-		return nil, fmt.Errorf("open segment: %w", err)
+	
+	// Use DialShm which handles the new multi-segment pattern
+	opts := &DialOptions{
+		SegmentSize:    DefaultSegmentSize,
+		RingASize:      addr.Cap,
+		RingBSize:      addr.Cap,
+		ConnectTimeout: 5 * time.Second,
 	}
-	// Signal client attached and wait for server ready (should already be set by listener).
-	seg.H.SetClientReady(true)
-	if err := seg.WaitForServer(ctx); err != nil {
-		seg.Close()
-		return nil, fmt.Errorf("wait server: %w", err)
-	}
-	ct, err := NewShmClientTransport(seg, &ShmAddr{Name: addr.Name + "_client"}, &ShmAddr{Name: addr.Name})
+	
+	ct, err := DialShm(ctx, addr.Name, opts)
 	if err == nil {
 		shmClientConnectCount.Add(1)
 	}

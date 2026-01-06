@@ -41,7 +41,7 @@ func TestShmPingPongSizes(t *testing.T) {
 
 			// Server responder goroutine (HEADERS→echo MESSAGE→TRAILERS OK)
 			go func() {
-				seg := lis.segment
+				seg := lis.GetNextSegment()
 				srvRx := NewShmRingFromSegment(seg.A, seg.Mem)
 				srvTx := NewShmRingFromSegment(seg.B, seg.Mem)
 				
@@ -142,7 +142,7 @@ func TestShmConcurrentStreams(t *testing.T) {
 
 	// Server responder goroutine - handles multiple requests sequentially
 	go func() {
-		seg := lis.segment
+		seg := lis.GetNextSegment()
 		srvRx := NewShmRingFromSegment(seg.A, seg.Mem)
 		srvTx := NewShmRingFromSegment(seg.B, seg.Mem)
 		
@@ -259,7 +259,7 @@ func TestShmStreamError(t *testing.T) {
 
 	// Server responder - return error status
 	go func() {
-		seg := lis.segment
+		seg := lis.GetNextSegment()
 		srvRx := NewShmRingFromSegment(seg.A, seg.Mem)
 		srvTx := NewShmRingFromSegment(seg.B, seg.Mem)
 		
