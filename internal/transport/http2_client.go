@@ -200,6 +200,12 @@ func isTemporary(err error) bool {
 	return true
 }
 
+// ClientTransportProvider is an interface for connections that provide their own ClientTransport.
+// This allows custom transports (like shared memory) to be used with gRPC's standard APIs.
+type ClientTransportProvider interface {
+	GetClientTransport() ClientTransport
+}
+
 // NewHTTP2Client constructs a connected ClientTransport to addr based on HTTP2
 // and starts to receive messages on it. Non-nil error returns if construction
 // fails.
@@ -224,6 +230,12 @@ func NewHTTP2Client(connectCtx, ctx context.Context, addr resolver.Address, opts
 			return nil, connectionErrorf(isTemporary(err), err, "transport: error while dialing: %v", err)
 		}
 		return nil, connectionErrorf(true, err, "transport: Error while dialing: %v", err)
+	}
+
+	// Check if the connection provides its own transport (e.g., shared memory transport)
+	if provider, ok := conn.(ClientTransportProvider); ok {
+		// Use the custom transport directly instead of wrapping in HTTP2
+		return provider.GetClientTransport(), nil
 	}
 
 	// Any further errors will close the underlying connection
