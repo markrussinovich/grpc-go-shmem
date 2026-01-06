@@ -200,6 +200,13 @@ func (t *ShmServerTransport) handleHeaders(ctx context.Context, streamID uint32,
 		s.ctx = metadata.NewIncomingContext(s.ctx, md)
 	}
 
+	// Set requestRead callback for the stream
+	// For shared memory, no explicit flow control is needed
+	s.requestRead = func(n int) {
+		// No-op for shared memory transport
+		// Flow control is handled implicitly by the ring buffer
+	}
+
 	// Create transport reader for the stream
 	s.trReader = &transportReader{
 		reader: &recvBufferReader{
