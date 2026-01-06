@@ -36,7 +36,7 @@ func main() {
 	// Example 1: Basic usage with default options
 	fmt.Println("Example 1: Creating client with default shared memory transport options")
 	
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	_, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	
 	// This creates a client that will use shared memory transport when connecting to shm:// addresses

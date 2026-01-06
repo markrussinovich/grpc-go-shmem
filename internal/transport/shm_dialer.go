@@ -49,13 +49,11 @@ func DialShm(ctx context.Context, addr string, opts *DialOptions) (ClientTranspo
 		defer cancel()
 	}
 
-	// Generate a unique segment name for this connection
-	segmentName := fmt.Sprintf("grpc_shm_%s_%d", addr, time.Now().UnixNano())
-
-	// Create the shared memory segment
-	segment, err := CreateSegment(segmentName, opts.RingASize, opts.RingBSize)
+	// The addr is the segment name that the server created.
+	// Open the existing segment created by the server.
+	segment, err := OpenSegment(addr)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create segment: %v", err)
+		return nil, fmt.Errorf("failed to open segment %q: %v", addr, err)
 	}
 
 	// Mark client as ready
@@ -68,7 +66,7 @@ func DialShm(ctx context.Context, addr string, opts *DialOptions) (ClientTranspo
 	}
 
 	// Create client transport
-	localAddr := &ShmAddr{Name: segmentName + "_client"}
+	localAddr := &ShmAddr{Name: addr + "_client"}
 	remoteAddr := &ShmAddr{Name: addr}
 
 	clientTransport, err := NewShmClientTransport(segment, localAddr, remoteAddr)

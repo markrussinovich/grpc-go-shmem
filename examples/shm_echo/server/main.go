@@ -23,9 +23,6 @@ package main
 import (
 	"flag"
 	"fmt"
-	"log"
-
-	"google.golang.org/grpc/internal/transport/shm"
 )
 
 var (

@@ -22,6 +22,7 @@ package transport
 
 import (
 	"fmt"
+	"net/url"
 	"testing"
 
 	"google.golang.org/grpc/resolver"
@@ -167,26 +168,16 @@ func TestShmResolverResolveNow(t *testing.T) {
 }
 
 // parseTarget is a helper to parse a target string into resolver.Target.
+// It uses real URL parsing to match how gRPC actually parses targets.
 func parseTarget(t *testing.T, targetStr string) resolver.Target {
 	t.Helper()
 
-	// Simple parsing for test purposes
-	// Format: shm://segment_name
-	var target resolver.Target
-	if len(targetStr) > 6 && targetStr[:6] == "shm://" {
-		endpoint := targetStr[6:]
-		target.URL.Scheme = "shm"
-		target.URL.Path = endpoint
-	} else if len(targetStr) >= 4 && targetStr[:4] == "shm:" {
-		// Handle "shm:" without "//"
-		endpoint := targetStr[4:]
-		target.URL.Scheme = "shm"
-		target.URL.Path = endpoint
-	} else {
-		t.Fatalf("Invalid target format: %s", targetStr)
+	// Use real URL parsing like gRPC does
+	u, err := url.Parse(targetStr)
+	if err != nil {
+		t.Fatalf("Failed to parse target %q: %v", targetStr, err)
 	}
-
-	return target
+	return resolver.Target{URL: *u}
 }
 
 // TestShmResolverIntegration tests the resolver with a more realistic scenario.

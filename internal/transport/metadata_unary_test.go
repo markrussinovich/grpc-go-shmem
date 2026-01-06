@@ -136,9 +136,9 @@ func TestUnary_MetadataAndStatus(t *testing.T) {
 	if !mdContains(tr.Metadata, []KV{{Key: "x-tr-bin", Values: [][]byte{{0xEE, 0xFF}}}}) {
 		t.Fatalf("missing trailer x-tr-bin in %v", tr.Metadata)
 	}
-	_ = client.Close()
 
 	<-done
+	_ = client.Close()
 }
 
 func mdEqual(a, b []KV) bool {

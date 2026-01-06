@@ -1,0 +1,130 @@
+=========================================
+Shared Memory gRPC Examples - Test Run
+Date: Tue Jan  6 18:25:41 UTC 2026
+=========================================
+
+=== Test 1: shm_echo client demo ===
+=========================================
+Running: shm_echo_client
+=========================================
+╔══════════════════════════════════════════════════════════╗
+║    Shared Memory Echo Client - Direct Transport Demo    ║
+╚══════════════════════════════════════════════════════════╝
+
+NOTE: This example demonstrates the shared memory transport
+working at the transport layer. Standard gRPC examples require
+additional integration work to use grpc.NewClient()/NewServer().
+
+The transport layer is fully functional with:
+  ✓ Futex-based synchronization
+  ✓ Zero-copy shared memory ring buffers
+  ✓ Bidirectional streaming without deadlocks
+  ✓ HTTP/2-style frame protocol
+
+What's missing for standard gRPC examples:
+  ✗ Integration with grpc.NewClient()
+  ✗ Integration with grpc.NewServer()
+  ✗ Custom resolver for shm:// URLs
+  ✗ Transport interface bridge layer
+
+For working demos, see the test files:
+  - internal/transport/shm/client_unary_test.go
+  - internal/transport/shm/cancel_unary_test.go
+  - internal/transport/shm/streaming_test.go
+
+Run tests with:
+  go test -v ./internal/transport/shm -run TestUnary
+
+
+✅ shm_echo_client: SUCCESS
+
+
+=== Test 2: shm_client_usage demo ===
+=========================================
+Running: shm_client_usage
+=========================================
+Example 1: Creating client with default shared memory transport options
+Client created successfully with shared memory transport
+
+Example 2: Creating client with custom shared memory transport options
+Client created successfully with custom options
+
+To use this client for actual RPC calls:
+1. Start a server using grpc.NewServer().Serve(shmListener)
+2. Generate protobuf stubs for your service
+3. Call methods like: client.MyMethod(ctx, request)
+
+See examples/helloworld for a complete working example
+
+✅ shm_client_usage: SUCCESS
+
+
+=== Test 3: shm_server_usage demo ===
+=========================================
+Running: shm_server_usage
+=========================================
+gRPC Shared Memory Transport - Server Example
+==============================================
+
+Configuration:
+  Segment Name: my_segment
+  Segment Size: 2097152 bytes (2.0 MB)
+  Ring A Size:  524288 bytes (512.0 KB)
+  Ring B Size:  524288 bytes (512.0 KB)
+
+Creating shared memory listener...
+✓ Listener created and ready
+  Address: my_segment
+
+Creating gRPC server...
+✓ gRPC server created
+
+Server is now ready to accept connections
+Waiting for client to connect...
+
+To connect, run a client with:
+  grpc.NewClient("shm://my_segment", grpc.WithShmTransport(), ...)
+
+Calling Accept() (will timeout after 10 seconds if no client connects)...
+✗ Timeout waiting for client connection
+
+This is expected - no client connected within 10 seconds.
+
+Server Example Complete
+
+In a production server:
+1. Create listener with NewShmListener()
+2. Create gRPC server with grpc.NewServer()
+3. Register your service implementations
+4. Call server.Serve(listener) - blocks handling RPCs
+5. Accept() will be called internally for each client
+
+✅ shm_server_usage: SUCCESS
+
+
+=== Test 4: helloworld_shm client-server test ===
+Starting helloworld_shm server...
+Running helloworld_shm client...
+2026/01/06 18:25:54 Connecting to shared memory segment: helloworld_shm
+2026/01/06 18:25:54 Calling SayHello with name: ShmTest
+2026/01/06 18:25:54 could not greet: rpc error: code = Unavailable desc = connection error: desc = "transport: failed to write client preface: direct write not supported on shared memory connection"
+exit status 1
+
+❌ helloworld_shm: FAILED
+
+=== Test 5: route_guide_shm client-server test ===
+Starting route_guide_shm server...
+Running route_guide_shm client...
+2026/01/06 18:25:56 Getting feature for point (409146138, -746188906)
+2026/01/06 18:25:56 client.GetFeature failed: rpc error: code = Unavailable desc = connection error: desc = "transport: failed to write client preface: direct write not supported on shared memory connection"
+exit status 1
+
+❌ route_guide_shm: FAILED
+
+=========================================
+SUMMARY
+=========================================
+Passed: 3
+Failed: 2
+
+⚠️  Some examples failed. Check the log for details.
