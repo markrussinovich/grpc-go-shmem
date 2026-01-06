@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"sync/atomic"
 	"time"
 	"unsafe"
 )
@@ -55,6 +56,7 @@ type ShmRing struct {
 	hdrOff   uintptr // base address of RingHeader in mmapped bytes
 	dataOff  uintptr // base address of data area
 	mem      []byte  // the mmapped region (no copying)
+	closed   uint32  // atomic flag: 1 if this ring has been closed locally
 	// No Go pointers into shared memory stored here; compute addresses on demand
 }
 
@@ -364,6 +366,9 @@ func (r *ShmRing) ReadBlocking(buf []byte) (int, error) {
 
 // Close closes the ring for writing. Readers can still read remaining data.
 func (r *ShmRing) Close() error {
+	// Set local closed flag first
+	atomic.StoreUint32(&r.closed, 1)
+
 	hdr := r.header()
 	hdr.SetClosed(true)
 
@@ -935,8 +940,13 @@ func (r *ShmRing) ReadSlices(n int, ctx context.Context) (first, second []byte, 
 		default:
 		}
 
-		// Check for closure - do this after context check to avoid race with segment cleanup
-		if hdr.Closed() {
+		// Check closed state - but always allow reading remaining data first.
+		// The local closed flag (r.closed) is set when this ring is closed,
+		// but we should still drain any remaining data before returning EOF.
+		localClosed := atomic.LoadUint32(&r.closed) != 0
+		headerClosed := hdr.Closed()
+
+		if localClosed || headerClosed {
 			// Check if data is still available even when closed
 			writeIdx := hdr.WriteIndex()
 			readIdx := hdr.ReadIndex()
@@ -1020,31 +1030,42 @@ func (r *ShmRing) ReadSlices(n int, ctx context.Context) (first, second []byte, 
 			log.Printf("ReadSlices: waiting WITHOUT timeout") // server’s readFrameT should never hit this
 		}
 
-		if !hdr.Closed() {
-			dataSeq := hdr.DataSequence()
+		// Check local closed flag before accessing header
+		// If closed, re-check for data - producer may have written before closing
+		localClosed = atomic.LoadUint32(&r.closed) != 0
+		headerClosed = hdr.Closed()
 
-			// If ctx has a deadline, wait with timeout; otherwise, infinite wait.
-			var err error
-			if deadline, has := ctx.Deadline(); has {
-				rem := time.Until(deadline)
-				if rem <= 0 {
-					return nil, nil, nil, context.DeadlineExceeded
-				}
-				err = futexWaitTimeout(&hdr.dataSeq, dataSeq, rem.Nanoseconds())
-			} else {
-				err = futexWait(&hdr.dataSeq, dataSeq)
+		if localClosed || headerClosed {
+			// Re-check if data appeared (race with producer)
+			writeIdx := hdr.WriteIndex()
+			readIdx := hdr.ReadIndex()
+			if writeIdx == readIdx {
+				return nil, nil, nil, io.EOF
 			}
+			// Data appeared, loop back to read it
+			continue
+		}
 
-			if err != nil {
-				// Translate futex timeout to context timeout; keep going on spurious wake.
-				if errors.Is(err, ErrFutexTimeout) {
-					return nil, nil, nil, context.DeadlineExceeded
-				}
-				// Other errors: fall through and reloop (spurious wake/etc.)
+		dataSeq := hdr.DataSequence()
+
+		// If ctx has a deadline, wait with timeout; otherwise, infinite wait.
+		var err error
+		if deadline, has := ctx.Deadline(); has {
+			rem := time.Until(deadline)
+			if rem <= 0 {
+				return nil, nil, nil, context.DeadlineExceeded
 			}
+			err = futexWaitTimeout(&hdr.dataSeq, dataSeq, rem.Nanoseconds())
 		} else {
-			// Closed and insufficient data - return EOF
-			return nil, nil, nil, io.EOF
+			err = futexWait(&hdr.dataSeq, dataSeq)
+		}
+
+		if err != nil {
+			// Translate futex timeout to context timeout; keep going on spurious wake.
+			if errors.Is(err, ErrFutexTimeout) {
+				return nil, nil, nil, context.DeadlineExceeded
+			}
+			// Other errors: fall through and reloop (spurious wake/etc.)
 		}
 	}
 }
