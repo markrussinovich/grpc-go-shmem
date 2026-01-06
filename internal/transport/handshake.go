@@ -60,7 +60,11 @@ func (s *Segment) WaitForClient(ctx context.Context) error {
 			timeoutNs = remaining.Nanoseconds()
 		}
 		if timeoutNs > 0 {
-			if err := futexWaitTimeout(addr, 0, timeoutNs); err != nil && err.Error() != "futex wait timed out" {
+			if err := futexWaitTimeout(addr, 0, timeoutNs); err != nil {
+				// Translate futex timeout to context deadline exceeded
+				if errors.Is(err, ErrFutexTimeout) {
+					return context.DeadlineExceeded
+				}
 				return err
 			}
 		} else {
@@ -96,7 +100,11 @@ func (s *Segment) WaitForServer(ctx context.Context) error {
 			timeoutNs = remaining.Nanoseconds()
 		}
 		if timeoutNs > 0 {
-			if err := futexWaitTimeout(addr, 0, timeoutNs); err != nil && err.Error() != "futex wait timed out" {
+			if err := futexWaitTimeout(addr, 0, timeoutNs); err != nil {
+				// Translate futex timeout to context deadline exceeded
+				if errors.Is(err, ErrFutexTimeout) {
+					return context.DeadlineExceeded
+				}
 				return err
 			}
 		} else {
