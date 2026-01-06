@@ -128,6 +128,15 @@ func (l *ShmListener) handlePotentialConnection() (*shmConn, error) {
 	l.nextSegment = nil
 	l.nextSegmentName = ""
 
+	// Pre-create the next segment for the next connection BEFORE waiting for client
+	// This ensures it's ready when the next client tries to connect
+	go func() {
+		if err := l.prepareNextSegment(); err != nil {
+			// Log error but don't fail - listener can still serve existing connections
+			fmt.Printf("Warning: failed to prepare next segment: %v\n", err)
+		}
+	}()
+
 	// Wait for client to connect (event-driven, no polling)
 	if err := segment.WaitForClient(l.ctx); err != nil {
 		segment.Close()
@@ -160,15 +169,6 @@ func (l *ShmListener) handlePotentialConnection() (*shmConn, error) {
 
 	conn.transport = serverTransport
 	conn.established.Store(true)
-
-	// Pre-create the next segment for the next connection
-	// Do this asynchronously to not block Accept()
-	go func() {
-		if err := l.prepareNextSegment(); err != nil {
-			// Log error but don't fail - listener can still serve existing connections
-			fmt.Printf("Warning: failed to prepare next segment: %v\n", err)
-		}
-	}()
 
 	return conn, nil
 }
