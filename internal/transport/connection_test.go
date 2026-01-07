@@ -94,22 +94,30 @@ func TestShmConnectionEstablishment(t *testing.T) {
 		t.Errorf("Listener address mismatch: expected %s, got %s", testAddr, listener.Addr().String())
 	}
 
-	// 3. Test dialer creation with timeout (should fail since no server)
+	// 3. Test dialer connection (should succeed because listener pre-creates segments)
 	dialer := NewShmDialer(&DialOptions{
 		SegmentSize:    DefaultSegmentSize,
 		RingASize:      DefaultRingASize,
 		RingBSize:      DefaultRingBSize,
-		ConnectTimeout: 50 * time.Millisecond, // Short timeout for test
+		ConnectTimeout: 50 * time.Millisecond,
 	})
 
 	ctx := context.Background()
 	conn, err := dialer.Dial(ctx, testAddr)
-	if err == nil {
-		conn.Close()
-		t.Error("Expected dial to fail since no server is accepting connections")
-	} else {
-		t.Logf("Dial correctly failed: %v", err)
+	if err != nil {
+		t.Fatalf("Expected dial to succeed with pre-created segment: %v", err)
 	}
+	defer conn.Close()
+	
+	// Verify connection properties
+	if conn.LocalAddr() == nil {
+		t.Error("Expected non-nil local address")
+	}
+	if conn.RemoteAddr() == nil {
+		t.Error("Expected non-nil remote address")
+	}
+	
+	t.Logf("Successfully connected to pre-created segment")
 }
 
 func TestShmConnectionProperties(t *testing.T) {
