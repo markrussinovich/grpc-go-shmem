@@ -5,6 +5,7 @@ package transport
 import (
 	"context"
 	"errors"
+	"log"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -351,6 +352,8 @@ func (t *ShmServerTransport) writeHeader(s *ServerStream, md metadata.MD) error 
 		return ErrConnClosing
 	}
 
+	log.Printf("[DEBUG] ShmServerTransport.writeHeader: stream=%d, metadata keys=%v", s.id, len(md))
+
 	// Convert metadata.MD to []KV format
 	var kvs []KV
 	for k, vals := range md {
@@ -380,11 +383,15 @@ func (t *ShmServerTransport) writeHeader(s *ServerStream, md metadata.MD) error 
 		Length:   uint32(len(payload)),
 	}
 
+	log.Printf("[DEBUG] ShmServerTransport.writeHeader: Writing HEADERS frame, streamID=%d, length=%d", s.id, fh.Length)
+
 	// Write frame to server->client ring
 	if err := writeFrame(t.serverToClient, fh, payload, context.Background()); err != nil {
+		log.Printf("[ERROR] ShmServerTransport.writeHeader: Failed to write frame: %v", err)
 		return err
 	}
 
+	log.Printf("[DEBUG] ShmServerTransport.writeHeader: Successfully wrote HEADERS frame")
 	return nil
 }
 
@@ -393,6 +400,8 @@ func (t *ShmServerTransport) write(s *ServerStream, hdr []byte, data mem.BufferS
 	if t.closed.Load() {
 		return ErrConnClosing
 	}
+
+	log.Printf("[DEBUG] ShmServerTransport.write: stream=%d, hdr_len=%d, data_slices=%d", s.id, len(hdr), len(data))
 
 	// Materialize the BufferSlice into a contiguous []byte
 	var payload []byte
@@ -403,6 +412,8 @@ func (t *ShmServerTransport) write(s *ServerStream, hdr []byte, data mem.BufferS
 		payload = append(payload, buf.ReadOnlyData()...)
 	}
 
+	log.Printf("[DEBUG] ShmServerTransport.write: total payload=%d bytes", len(payload))
+
 	// Create MESSAGE frame
 	fh := FrameHeader{
 		Type:     FrameTypeMESSAGE,
@@ -412,11 +423,15 @@ func (t *ShmServerTransport) write(s *ServerStream, hdr []byte, data mem.BufferS
 
 	// Write frame to server->client ring
 	if err := writeFrame(t.serverToClient, fh, payload, context.Background()); err != nil {
+		log.Printf("[ERROR] ShmServerTransport.write: Failed to write frame: %v", err)
 		return err
 	}
 
+	log.Printf("[DEBUG] ShmServerTransport.write: Successfully wrote MESSAGE frame")
+
 	// If this is the last message, send trailers
 	if opts != nil && opts.Last {
+		log.Printf("[DEBUG] ShmServerTransport.write: Last message, sending trailers")
 		return t.writeStatus(s, status.New(codes.OK, ""))
 	}
 
@@ -428,6 +443,8 @@ func (t *ShmServerTransport) writeStatus(s *ServerStream, st *status.Status) err
 	if t.closed.Load() {
 		return ErrConnClosing
 	}
+
+	log.Printf("[DEBUG] ShmServerTransport.writeStatus: stream=%d, code=%v, msg=%s", s.id, st.Code(), st.Message())
 
 	// Create trailers frame
 	trailers := TrailersV1{
@@ -446,11 +463,16 @@ func (t *ShmServerTransport) writeStatus(s *ServerStream, st *status.Status) err
 		Length:   uint32(len(payload)),
 	}
 
+	log.Printf("[DEBUG] ShmServerTransport.writeStatus: Writing TRAILERS frame, streamID=%d, length=%d", s.id, fh.Length)
+
 	// Write frame to server->client ring
 	if err := writeFrame(t.serverToClient, fh, payload, context.Background()); err != nil {
+		log.Printf("[ERROR] ShmServerTransport.writeStatus: Failed to write frame: %v", err)
 		return err
 	}
 
+	log.Printf("[DEBUG] ShmServerTransport.writeStatus: Successfully wrote TRAILERS frame")
+	
 	// Remove stream from active streams
 	t.mu.Lock()
 	delete(t.streams, s.id)

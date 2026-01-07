@@ -780,7 +780,6 @@ func (r *ShmRing) ReserveWrite(n int, ctx context.Context) (WriteReservation, er
 		// Calculate available space
 		usedBefore := writeIdx - readIdx
 		available := r.capacity - usedBefore
-		wasPreviouslyEmpty := usedBefore == 0
 
 		if uint64(n) <= available {
 			// Space available - create reservation
@@ -818,13 +817,15 @@ func (r *ShmRing) ReserveWrite(n int, ctx context.Context) (WriteReservation, er
 				// Publish new write index and wake any waiting readers.
 				hdr.SetWriteIndex(writeIdx + uint64(written)) // release-publish
 
-				// Always increment DataSequence to notify readers, but only wake on empty→non-empty
-				// This provides performance benefit while maintaining correctness
+				// Always increment DataSequence and wake readers when data is written
+				// This ensures readers that are waiting on futex get woken up
 				if written > 0 {
-					hdr.IncrementDataSequence()
-					if wasPreviouslyEmpty {
-						futexWake(&hdr.dataSeq, 1)
-					}
+					oldSeq := hdr.DataSequence()
+					newSeq := hdr.IncrementDataSequence()
+					log.Printf("[DEBUG] Ring write: incremented DataSequence from %d to %d, waking readers", oldSeq, newSeq)
+					// Always wake readers - the futex call is cheap if no one is waiting
+					futexWake(&hdr.dataSeq, 1)
+					log.Printf("[DEBUG] Ring write: futexWake called")
 				}
 
 				return nil
@@ -1047,6 +1048,7 @@ func (r *ShmRing) ReadSlices(n int, ctx context.Context) (first, second []byte, 
 		}
 
 		dataSeq := hdr.DataSequence()
+		log.Printf("[DEBUG] Ring read: no data available, dataSeq=%d, waiting on futex...", dataSeq)
 
 		// If ctx has a deadline, wait with timeout; otherwise, infinite wait.
 		var err error
@@ -1055,10 +1057,13 @@ func (r *ShmRing) ReadSlices(n int, ctx context.Context) (first, second []byte, 
 			if rem <= 0 {
 				return nil, nil, nil, context.DeadlineExceeded
 			}
+			log.Printf("[DEBUG] Ring read: calling futexWaitTimeout with timeout=%v", rem)
 			err = futexWaitTimeout(&hdr.dataSeq, dataSeq, rem.Nanoseconds())
 		} else {
+			log.Printf("[DEBUG] Ring read: calling futexWait (no timeout)")
 			err = futexWait(&hdr.dataSeq, dataSeq)
 		}
+		log.Printf("[DEBUG] Ring read: futex returned, err=%v", err)
 
 		if err != nil {
 			// Translate futex timeout to context timeout; keep going on spurious wake.

@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"log"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -89,7 +90,9 @@ func NewShmClientTransport(segment *Segment, localAddr, remoteAddr net.Addr) (*S
 
 // processIncomingData reads data from the server->client ring and processes gRPC frames
 func (t *ShmClientTransport) processIncomingData(ctx context.Context) {
+	log.Printf("[DEBUG] ShmClientTransport.processIncomingData: STARTED")
 	defer func() {
+		log.Printf("[DEBUG] ShmClientTransport.processIncomingData: EXITING")
 		if !t.closed.Load() {
 			t.Close(errors.New("incoming data processing ended"))
 		}
@@ -97,16 +100,20 @@ func (t *ShmClientTransport) processIncomingData(ctx context.Context) {
 
 	for {
 		if t.closed.Load() {
+			log.Printf("[DEBUG] ShmClientTransport.processIncomingData: transport closed, exiting")
 			return
 		}
+		log.Printf("[DEBUG] ShmClientTransport.processIncomingData: waiting for frame from server...")
 		// Event-driven: block on next frame from rx ring.
 		fh, payload, err := readFrame(t.serverToClient, ctx)
 		if err != nil {
+			log.Printf("[DEBUG] ShmClientTransport.processIncomingData: readFrame error: %v", err)
 			if errors.Is(err, ErrRingClosed) || t.closed.Load() {
 				return
 			}
 			continue
 		}
+		log.Printf("[DEBUG] ShmClientTransport.processIncomingData: received frame type=%d, streamID=%d, length=%d", fh.Type, fh.StreamID, fh.Length)
 		
 		// Dispatch frame to appropriate stream
 		t.mu.RLock()
@@ -135,8 +142,8 @@ func (t *ShmClientTransport) processIncomingData(ctx context.Context) {
 			
 		case FrameTypeMESSAGE:
 			// Server sent a message
-			// Wrap payload in mem.Buffer
-			buf := mem.NewBuffer(&payload, nil)
+			// Copy payload to avoid using stale buffer data
+			buf := mem.Copy(payload, mem.DefaultBufferPool())
 			stream.write(recvMsg{buffer: buf})
 			
 		case FrameTypeTRAILERS:
