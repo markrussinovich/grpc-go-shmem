@@ -276,6 +276,12 @@ func (t *ShmClientTransport) NewStream(ctx context.Context, callHdr *CallHdr) (*
 		},
 	}
 	
+	// Set requestRead callback (required by Stream.ReadMessageHeader)
+	// For shared memory transport, flow control is handled by the ring buffer
+	s.requestRead = func(n int) {
+		// No-op: shared memory transport doesn't need explicit flow control
+	}
+	
 	// Register the stream
 	t.streams[streamID] = s
 	t.streamTransport[s] = t
