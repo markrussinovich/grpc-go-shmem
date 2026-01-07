@@ -14,7 +14,6 @@ import (
 	"golang.org/x/net/http2"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/mem"
-	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 )
 
@@ -150,24 +149,29 @@ func (t *ShmClientTransport) processIncomingData(ctx context.Context) {
 			// Server sent trailers (end of stream)
 			tr, err := decodeTrailers(payload)
 			if err != nil {
-				stream.write(recvMsg{err: err})
+				t.closeStream(stream, err, false, 0, nil, nil, false)
 			} else {
-				// Store trailer metadata
-				stream.trailer = metadata.MD{}
+				// Convert metadata from protocol format to map
+				trailerMap := make(map[string][]string)
 				for _, kv := range tr.Metadata {
-					stream.trailer[kv.Key] = make([]string, len(kv.Values))
+					trailerMap[kv.Key] = make([]string, len(kv.Values))
 					for i, v := range kv.Values {
-						stream.trailer[kv.Key][i] = string(v)
+						trailerMap[kv.Key][i] = string(v)
 					}
 				}
 				
-				// Convert status to error if not OK
+				// Convert status
+				var st *status.Status
 				if tr.GRPCStatusCode != 0 {
-					err = status.Error(codes.Code(tr.GRPCStatusCode), tr.GRPCStatusMsg)
+					st = status.New(codes.Code(tr.GRPCStatusCode), tr.GRPCStatusMsg)
+					err = st.Err()
 				} else {
+					st = status.New(codes.OK, "")
 					err = io.EOF
 				}
-				stream.write(recvMsg{err: err})
+				
+				// Close the stream with trailers
+				t.closeStream(stream, err, false, 0, st, trailerMap, true)
 			}
 			
 		case FrameTypeCANCEL:
