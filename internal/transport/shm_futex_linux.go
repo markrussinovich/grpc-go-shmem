@@ -55,9 +55,9 @@ func futexWait(addr *uint32, val uint32) error {
 
 	log.Printf("[FUTEX] futexWait: addr=%p, val=%d", addr, val)
 
-	// Use syscall.RawSyscall6 for the futex system call
-	// syscall number, uaddr, futex_op, val, timeout, uaddr2, val3
-	r1, _, errno := syscall.RawSyscall6(
+	// Use syscall.Syscall6 instead of RawSyscall6 to allow Go runtime scheduling
+	// This is important for cross-process futex
+	r1, _, errno := syscall.Syscall6(
 		syscall.SYS_FUTEX,
 		uintptr(unsafe.Pointer(addr)), // uaddr - address to wait on
 		FUTEX_WAIT,                    // futex_op - wait operation (shared, for cross-process)
@@ -110,8 +110,8 @@ func futexWaitTimeout(addr *uint32, val uint32, timeoutNs int64) error {
 	ts.Sec = int64(timeoutNs / 1e9)
 	ts.Nsec = int64(timeoutNs % 1e9)
 
-	// Use syscall.RawSyscall6 for the futex system call with timeout
-	r1, r2, errno := syscall.RawSyscall6(
+	// Use syscall.Syscall6 instead of RawSyscall6 for cross-process futex
+	r1, _, errno := syscall.Syscall6(
 		syscall.SYS_FUTEX,
 		uintptr(unsafe.Pointer(addr)), // uaddr - address to wait on
 		FUTEX_WAIT,                    // futex_op - wait operation (shared, for cross-process)
@@ -120,9 +120,6 @@ func futexWaitTimeout(addr *uint32, val uint32, timeoutNs int64) error {
 		0,                             // uaddr2 - unused
 		0,                             // val3 - unused
 	)
-
-	// Debug: Check what we got back
-	_ = r2 // not used but let's acknowledge it
 
 	if errno != 0 {
 		// EAGAIN means the value didn't match - not an error
@@ -150,8 +147,8 @@ func futexWaitTimeout(addr *uint32, val uint32, timeoutNs int64) error {
 func futexWake(addr *uint32, n int) (int, error) {
 	log.Printf("[FUTEX] futexWake: addr=%p, n=%d, current_val=%d", addr, n, atomic.LoadUint32(addr))
 	
-	// Use syscall.RawSyscall6 for the futex system call
-	r1, _, errno := syscall.RawSyscall6(
+	// Use syscall.Syscall6 instead of RawSyscall6 for cross-process futex
+	r1, _, errno := syscall.Syscall6(
 		syscall.SYS_FUTEX,
 		uintptr(unsafe.Pointer(addr)), // uaddr - address to wake on
 		FUTEX_WAKE,                    // futex_op - wake operation (shared, for cross-process)

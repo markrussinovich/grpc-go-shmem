@@ -100,6 +100,7 @@ func (l *ShmListener) prepareNextSegment() error {
 	connID := l.connID.Add(1)
 	segmentName := fmt.Sprintf("%s_conn_%d", l.baseName, connID)
 
+	fmt.Printf("[SERVER] Creating segment: %s\n", segmentName)
 	segment, err := CreateSegment(segmentName, l.ringASize, l.ringBSize)
 	if err != nil {
 		return fmt.Errorf("create segment: %w", err)
@@ -110,6 +111,8 @@ func (l *ShmListener) prepareNextSegment() error {
 
 	l.nextSegment = segment
 	l.nextSegmentName = segmentName
+	
+	fmt.Printf("[SERVER] Segment %s created and server marked ready\n", segmentName)
 
 	return nil
 }

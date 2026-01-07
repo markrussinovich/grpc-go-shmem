@@ -64,6 +64,7 @@ func DialShm(ctx context.Context, addr string, opts *DialOptions) (ClientTranspo
 		segment, err = OpenSegment(segmentName)
 		if err == nil {
 			// Successfully opened a segment
+			fmt.Printf("[CLIENT] Successfully opened segment: %s\n", segmentName)
 			break
 		}
 		

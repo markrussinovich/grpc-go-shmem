@@ -57,7 +57,7 @@ func main() {
 
 	// Contact the server and print out its response.
 	log.Printf("Connecting to shared memory segment: %s", *segmentName)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	
 	log.Printf("Calling SayHello with name: %s", *name)
