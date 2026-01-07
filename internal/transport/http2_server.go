@@ -138,6 +138,14 @@ type http2Server struct {
 	setResetPingStrikes func()
 }
 
+// ServerTransportProvider is an interface that net.Conn implementations can
+// implement to provide their own ServerTransport instead of using HTTP2.
+// This enables custom transports (like shared memory) to integrate seamlessly
+// with gRPC's server-side APIs.
+type ServerTransportProvider interface {
+	GetServerTransport() ServerTransport
+}
+
 // NewServerTransport creates a http2 transport with conn and configuration
 // options from config.
 //
@@ -146,6 +154,11 @@ type http2Server struct {
 // underlying conn gets closed before the client preface could be read, it
 // returns a nil transport and a nil error.
 func NewServerTransport(conn net.Conn, config *ServerConfig) (_ ServerTransport, err error) {
+	// Check if the connection provides its own server transport
+	if provider, ok := conn.(ServerTransportProvider); ok {
+		return provider.GetServerTransport(), nil
+	}
+	
 	var authInfo credentials.AuthInfo
 	rawConn := conn
 	if config.Credentials != nil {
