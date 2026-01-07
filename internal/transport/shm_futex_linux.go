@@ -22,6 +22,7 @@ package transport
 
 import (
 	"fmt"
+	"log"
 	"sync/atomic"
 	"syscall"
 	"unsafe"
@@ -29,6 +30,8 @@ import (
 
 // Linux futex constants
 const (
+	FUTEX_WAIT         = 0   // FUTEX_WAIT (shared, for cross-process)
+	FUTEX_WAKE         = 1   // FUTEX_WAKE (shared, for cross-process)
 	FUTEX_WAIT_PRIVATE = 128 // FUTEX_WAIT | FUTEX_PRIVATE_FLAG
 	FUTEX_WAKE_PRIVATE = 129 // FUTEX_WAKE | FUTEX_PRIVATE_FLAG
 )
@@ -50,17 +53,21 @@ func futexWait(addr *uint32, val uint32) error {
 		return nil // Value already changed, no need to wait
 	}
 
+	log.Printf("[FUTEX] futexWait: addr=%p, val=%d", addr, val)
+
 	// Use syscall.RawSyscall6 for the futex system call
 	// syscall number, uaddr, futex_op, val, timeout, uaddr2, val3
 	r1, _, errno := syscall.RawSyscall6(
 		syscall.SYS_FUTEX,
 		uintptr(unsafe.Pointer(addr)), // uaddr - address to wait on
-		FUTEX_WAIT_PRIVATE,            // futex_op - wait operation with private flag
+		FUTEX_WAIT,                    // futex_op - wait operation (shared, for cross-process)
 		uintptr(val),                  // val - expected value
 		0,                             // timeout - infinite (NULL)
 		0,                             // uaddr2 - unused
 		0,                             // val3 - unused
 	)
+
+	log.Printf("[FUTEX] futexWait returned: r1=%d, errno=%d", r1, errno)
 
 	if errno != 0 {
 		// EAGAIN means the value didn't match - this is expected and not an error
@@ -107,7 +114,7 @@ func futexWaitTimeout(addr *uint32, val uint32, timeoutNs int64) error {
 	r1, r2, errno := syscall.RawSyscall6(
 		syscall.SYS_FUTEX,
 		uintptr(unsafe.Pointer(addr)), // uaddr - address to wait on
-		FUTEX_WAIT_PRIVATE,            // futex_op - wait operation with private flag
+		FUTEX_WAIT,                    // futex_op - wait operation (shared, for cross-process)
 		uintptr(val),                  // val - expected value
 		uintptr(unsafe.Pointer(&ts)),  // timeout - timespec pointer
 		0,                             // uaddr2 - unused
@@ -141,16 +148,20 @@ func futexWaitTimeout(addr *uint32, val uint32, timeoutNs int64) error {
 // futexWake wakes up to n threads waiting on addr.
 // Returns the number of threads actually woken up.
 func futexWake(addr *uint32, n int) (int, error) {
+	log.Printf("[FUTEX] futexWake: addr=%p, n=%d, current_val=%d", addr, n, atomic.LoadUint32(addr))
+	
 	// Use syscall.RawSyscall6 for the futex system call
 	r1, _, errno := syscall.RawSyscall6(
 		syscall.SYS_FUTEX,
 		uintptr(unsafe.Pointer(addr)), // uaddr - address to wake on
-		FUTEX_WAKE_PRIVATE,            // futex_op - wake operation with private flag
+		FUTEX_WAKE,                    // futex_op - wake operation (shared, for cross-process)
 		uintptr(n),                    // val - number of threads to wake
 		0,                             // timeout - unused for wake
 		0,                             // uaddr2 - unused
 		0,                             // val3 - unused
 	)
+
+	log.Printf("[FUTEX] futexWake returned: r1=%d (threads woken), errno=%d", r1, errno)
 
 	if errno != 0 {
 		return 0, fmt.Errorf("futex wake failed: %w", errno)
