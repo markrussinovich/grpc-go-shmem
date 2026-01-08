@@ -582,3 +582,70 @@ func TestShmServerDrain(t *testing.T) {
 		t.Fatalf("Timed out waiting for drained stream to finish: %v", ctx.Err())
 	}
 }
+
+func TestShmTrailerMetadataPropagation(t *testing.T) {
+	segmentName := fmt.Sprintf("test_trailer_%d", time.Now().UnixNano())
+	defer RemoveSegment(segmentName)
+
+	serverSeg, err := CreateSegment(segmentName, 128*1024, 128*1024)
+	if err != nil {
+		t.Fatalf("Failed to create segment: %v", err)
+	}
+	serverSeg.H.SetServerReady(true)
+
+	clientSeg, err := OpenSegment(segmentName)
+	if err != nil {
+		t.Fatalf("Failed to open segment for client: %v", err)
+	}
+
+	clientAddr := &ShmAddr{Name: segmentName + "_client"}
+	serverAddr := &ShmAddr{Name: segmentName + "_server"}
+
+	clientTransport, err := NewShmClientTransport(clientSeg, clientAddr, serverAddr)
+	if err != nil {
+		t.Fatalf("Failed to create client transport: %v", err)
+	}
+	defer clientTransport.Close(nil)
+
+	serverTransport, err := NewShmServerTransport(serverSeg, serverAddr, clientAddr)
+	if err != nil {
+		t.Fatalf("Failed to create server transport: %v", err)
+	}
+	defer serverTransport.Close(nil)
+
+	serverSaw := make(chan struct{}, 1)
+
+	go serverTransport.HandleStreams(context.Background(), func(s *ServerStream) {
+		serverSaw <- struct{}{}
+		if err := s.SetTrailer(metadata.Pairs("x-trailer", "tv")); err != nil {
+			t.Errorf("Server SetTrailer failed: %v", err)
+			return
+		}
+		_ = serverTransport.writeStatus(s, status.New(codes.OK, ""))
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	stream, err := clientTransport.NewStream(ctx, &CallHdr{Host: "testhost", Method: "/test.Service/Trailer"})
+	if err != nil {
+		t.Fatalf("Client: NewStream failed: %v", err)
+	}
+
+	select {
+	case <-serverSaw:
+	case <-ctx.Done():
+		t.Fatalf("Timed out waiting for server to receive stream: %v", ctx.Err())
+	}
+
+	select {
+	case <-stream.Done():
+	case <-ctx.Done():
+		t.Fatalf("Timed out waiting for stream to finish: %v", ctx.Err())
+	}
+
+	md := stream.Trailer()
+	if got := md.Get("x-trailer"); len(got) != 1 || got[0] != "tv" {
+		t.Fatalf("Client trailer x-trailer=%v, want [tv]", got)
+	}
+}

@@ -614,12 +614,26 @@ func (t *ShmServerTransport) writeStatus(s *ServerStream, st *status.Status) err
 
 	log.Printf("[DEBUG] ShmServerTransport.writeStatus: stream=%d, code=%v, msg=%s", s.id, st.Code(), st.Message())
 
+	// Snapshot trailer metadata.
+	s.hdrMu.Lock()
+	trMD := s.trailer.Copy()
+	s.hdrMu.Unlock()
+
+	var kvs []KV
+	for k, vals := range trMD {
+		var byteVals [][]byte
+		for _, v := range vals {
+			byteVals = append(byteVals, []byte(v))
+		}
+		kvs = append(kvs, KV{Key: k, Values: byteVals})
+	}
+
 	// Create trailers frame
 	trailers := TrailersV1{
 		Version:        1,
 		GRPCStatusCode: uint32(st.Code()),
 		GRPCStatusMsg:  st.Message(),
-		Metadata:       nil, // TODO: support trailer metadata
+		Metadata:       kvs,
 	}
 
 	payload := encodeTrailers(trailers)
