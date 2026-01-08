@@ -262,3 +262,86 @@ func TestFullRPC_Integration(t *testing.T) {
 	t.Log("=== Full RPC Integration Test COMPLETED ===")
 	t.Log("Note: Full end-to-end verification requires complete ServerStream implementation")
 }
+
+func TestShmDeadlinePropagation(t *testing.T) {
+	// Create shared memory segment
+	segmentName := fmt.Sprintf("test_deadline_%d", time.Now().UnixNano())
+	defer RemoveSegment(segmentName)
+
+	serverSeg, err := CreateSegment(segmentName, 128*1024, 128*1024)
+	if err != nil {
+		t.Fatalf("Failed to create segment: %v", err)
+	}
+	serverSeg.H.SetServerReady(true)
+
+	clientSeg, err := OpenSegment(segmentName)
+	if err != nil {
+		t.Fatalf("Failed to open segment for client: %v", err)
+	}
+
+	clientAddr := &ShmAddr{Name: segmentName + "_client"}
+	serverAddr := &ShmAddr{Name: segmentName + "_server"}
+
+	clientTransport, err := NewShmClientTransport(clientSeg, clientAddr, serverAddr)
+	if err != nil {
+		t.Fatalf("Failed to create client transport: %v", err)
+	}
+	defer clientTransport.Close(nil)
+
+	serverTransport, err := NewShmServerTransport(serverSeg, serverAddr, clientAddr)
+	if err != nil {
+		t.Fatalf("Failed to create server transport: %v", err)
+	}
+	defer serverTransport.Close(nil)
+
+	type deadlineResult struct {
+		ok       bool
+		unixNano int64
+		ctxErr   error
+	}
+	gotCh := make(chan deadlineResult, 1)
+
+	go serverTransport.HandleStreams(context.Background(), func(s *ServerStream) {
+		d, ok := s.Context().Deadline()
+		<-s.Context().Done()
+		gotCh <- deadlineResult{ok: ok, unixNano: d.UnixNano(), ctxErr: s.Context().Err()}
+	})
+
+	deadline := time.Now().Add(200 * time.Millisecond)
+	ctx, cancel := context.WithDeadline(context.Background(), deadline)
+	defer cancel()
+
+	callHdr := &CallHdr{Host: "testhost", Method: "/test.Service/Deadline"}
+	_, err = clientTransport.NewStream(ctx, callHdr)
+	if err != nil {
+		t.Fatalf("Client: NewStream failed: %v", err)
+	}
+
+	// Wait for the server to observe the deadline and for it to fire.
+	var wait time.Duration
+	if until := time.Until(deadline); until > 0 {
+		wait = until + 500*time.Millisecond
+	} else {
+		wait = 500 * time.Millisecond
+	}
+
+	select {
+	case res := <-gotCh:
+		if !res.ok {
+			t.Fatalf("Server stream context missing deadline")
+		}
+		wantUnix := deadline.UnixNano()
+		diff := res.unixNano - wantUnix
+		if diff < 0 {
+			diff = -diff
+		}
+		if diff > int64(5*time.Millisecond) {
+			t.Fatalf("Deadline mismatch: got %d want %d (diff=%dns)", res.unixNano, wantUnix, diff)
+		}
+		if res.ctxErr != context.DeadlineExceeded {
+			t.Fatalf("Server context err=%v, want %v", res.ctxErr, context.DeadlineExceeded)
+		}
+	case <-time.After(wait):
+		t.Fatalf("Timed out waiting for server to observe/cancel deadline")
+	}
+}

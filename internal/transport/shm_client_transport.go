@@ -374,12 +374,18 @@ func (t *ShmClientTransport) NewStream(ctx context.Context, callHdr *CallHdr) (*
 	t.mu.Unlock()
 
 	// Send HEADERS frame to initiate the stream
+	var deadlineUnixNano uint64
+	if deadline, ok := ctx.Deadline(); ok {
+		if unixNano := deadline.UnixNano(); unixNano > 0 {
+			deadlineUnixNano = uint64(unixNano)
+		}
+	}
 	hdr := HeadersV1{
 		Version:          1,
 		HdrType:          0, // client-initial
 		Method:           callHdr.Method,
 		Authority:        callHdr.Host,
-		DeadlineUnixNano: 0,   // TODO: extract from ctx if present
+		DeadlineUnixNano: deadlineUnixNano,
 		Metadata:         nil, // TODO: extract metadata from context
 	}
 

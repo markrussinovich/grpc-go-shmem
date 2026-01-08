@@ -10,6 +10,7 @@ import (
 	"net"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/mem"
@@ -199,8 +200,18 @@ func (t *ShmServerTransport) handleHeaders(ctx context.Context, streamID uint32,
 		st: t,
 	}
 
-	// Create context for the stream
-	s.ctx, s.cancel = context.WithCancel(ctx)
+	// Create context for the stream. If the client provided an RPC deadline,
+	// honor it by creating a context with that deadline.
+	if hdr.DeadlineUnixNano != 0 {
+		const maxInt64AsUint64 = uint64(^uint64(0) >> 1)
+		if hdr.DeadlineUnixNano > maxInt64AsUint64 {
+			return errors.New("invalid deadline: too large")
+		}
+		deadline := time.Unix(0, int64(hdr.DeadlineUnixNano))
+		s.ctx, s.cancel = context.WithDeadline(ctx, deadline)
+	} else {
+		s.ctx, s.cancel = context.WithCancel(ctx)
+	}
 	s.ctxDone = s.ctx.Done()
 
 	// Attach metadata to context if present
