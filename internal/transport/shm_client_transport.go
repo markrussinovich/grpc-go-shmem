@@ -51,7 +51,24 @@ type ShmClientTransport struct {
 	errCh     chan struct{}
 	goAwayCh  chan struct{}
 
+	goAwayOnce         sync.Once
+	goAwayReason       GoAwayReason
+	goAwayDebugMessage string
+
 	readerWG sync.WaitGroup
+}
+
+func (t *ShmClientTransport) setGoAwayReason(flags uint8) {
+	t.goAwayOnce.Do(func() {
+		// Shmem GOAWAY frames do not carry an HTTP/2 error code or debug data.
+		// Mirror the http2 client default when a GOAWAY is received.
+		t.goAwayReason = GoAwayNoReason
+		if flags&GoAwayFlagIMMEDIATE != 0 {
+			t.goAwayDebugMessage = "received GOAWAY (immediate)"
+			return
+		}
+		t.goAwayDebugMessage = "received GOAWAY (draining)"
+	})
 }
 
 // test hook: allow disabling the background reader in tests to avoid
@@ -137,6 +154,7 @@ func (t *ShmClientTransport) processIncomingData(ctx context.Context) {
 		case FrameTypeGOAWAY:
 			// Server is draining or closing the connection.
 			// Treat this as a signal to stop creating new streams.
+			t.setGoAwayReason(fh.Flags)
 			t.draining.Store(true)
 			select {
 			case <-t.goAwayCh:
@@ -499,8 +517,10 @@ func (t *ShmClientTransport) GoAway() <-chan struct{} {
 // GetGoAwayReason returns the reason why GoAway frame was received, along
 // with a human readable string with debug info.
 func (t *ShmClientTransport) GetGoAwayReason() (GoAwayReason, string) {
-	// TODO: Implement proper GoAway reason tracking
-	return GoAwayInvalid, "shared memory transport closed"
+	if !t.draining.Load() {
+		return GoAwayInvalid, ""
+	}
+	return t.goAwayReason, t.goAwayDebugMessage
 }
 
 // RemoteAddr returns the remote network address.

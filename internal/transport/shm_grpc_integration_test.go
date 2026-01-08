@@ -561,6 +561,13 @@ func TestShmServerDrain(t *testing.T) {
 	case <-ctx.Done():
 		t.Fatalf("Timed out waiting for GOAWAY after Drain: %v", ctx.Err())
 	}
+	reason, debugMsg := clientTransport.GetGoAwayReason()
+	if reason != GoAwayNoReason {
+		t.Fatalf("GetGoAwayReason()=%v, want %v (debug=%q)", reason, GoAwayNoReason, debugMsg)
+	}
+	if debugMsg == "" {
+		t.Fatalf("GetGoAwayReason() debug message empty")
+	}
 
 	if _, err := clientTransport.NewStream(ctx, &CallHdr{Host: "testhost", Method: "/test.Service/AfterDrain"}); err == nil {
 		t.Fatalf("NewStream succeeded after Drain, want error")
