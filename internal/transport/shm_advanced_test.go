@@ -4,7 +4,9 @@ package transport
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
+	"io"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -498,6 +500,124 @@ func TestShmContextCanceledOnClose(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatal("stream context was not canceled on connection close")
+}
+
+// TestShmGracefulClose ensures that GracefulClose allows in-flight streams to
+// proceed until they complete naturally, while not allowing creation of new
+// streams during this window.
+func TestShmGracefulClose(t *testing.T) {
+	segName := fmt.Sprintf("test-graceful-close-%d", time.Now().UnixNano())
+	defer RemoveSegment(segName)
+
+	serverSeg, err := CreateSegment(segName, 65536, 65536)
+	if err != nil {
+		t.Fatalf("failed to create segment: %v", err)
+	}
+	defer serverSeg.Close()
+
+	clientSeg, err := OpenSegment(segName)
+	if err != nil {
+		t.Fatalf("failed to open segment: %v", err)
+	}
+	defer clientSeg.Close()
+
+	serverTransport, err := NewShmServerTransport(serverSeg, testAddr{"shm", "server"}, testAddr{"shm", "client"})
+	if err != nil {
+		t.Fatalf("failed to create server transport: %v", err)
+	}
+	defer serverTransport.Close(nil)
+
+	// Start server stream handler: echo one message, then wait for client
+	// half-close and send OK trailers.
+	go serverTransport.HandleStreams(context.Background(), func(s *ServerStream) {
+		// Send initial headers.
+		_ = serverTransport.writeHeader(s, metadata.MD{"content-type": []string{"application/grpc"}})
+
+		incomingHeader := make([]byte, 5)
+		if _, err := s.readTo(incomingHeader); err != nil {
+			return
+		}
+		sz := binary.BigEndian.Uint32(incomingHeader[1:])
+		msg := make([]byte, int(sz))
+		if _, err := s.readTo(msg); err != nil {
+			return
+		}
+
+		// Echo back.
+		_ = s.Write(incomingHeader, newBufferSlice(msg), &WriteOptions{})
+
+		// Wait for client half-close.
+		if _, err := s.Read(1); err != io.EOF {
+			return
+		}
+		_ = s.WriteStatus(status.New(codes.OK, ""))
+	})
+
+	clientTransport, err := NewShmClientTransport(clientSeg, testAddr{"shm", "client"}, testAddr{"shm", "server"})
+	if err != nil {
+		t.Fatalf("failed to create client transport: %v", err)
+	}
+	defer clientTransport.Close(nil)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	cs, err := clientTransport.NewStream(ctx, &CallHdr{Method: "/test/GracefulClose"})
+	if err != nil {
+		t.Fatalf("NewStream(_, _) = _, %v, want _, <nil>", err)
+	}
+
+	// Confirm basic stream functionality.
+	msg := make([]byte, 1024)
+	outgoingHeader := make([]byte, 5)
+	outgoingHeader[0] = byte(0)
+	binary.BigEndian.PutUint32(outgoingHeader[1:], uint32(len(msg)))
+	incomingHeader := make([]byte, 5)
+	if err := cs.Write(outgoingHeader, newBufferSlice(msg), &WriteOptions{}); err != nil {
+		t.Fatalf("Error while writing: %v", err)
+	}
+	if _, err := cs.readTo(incomingHeader); err != nil {
+		t.Fatalf("Error while reading: %v", err)
+	}
+	sz := binary.BigEndian.Uint32(incomingHeader[1:])
+	recvMsg := make([]byte, int(sz))
+	if _, err := cs.readTo(recvMsg); err != nil {
+		t.Fatalf("Error while reading: %v", err)
+	}
+
+	// Gracefully close the transport; existing stream should remain usable.
+	clientTransport.GracefulClose()
+
+	var wg sync.WaitGroup
+	for i := 0; i < 200; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := clientTransport.NewStream(ctx, &CallHdr{Method: "/test/NewStreamAfterGracefulClose"})
+			if err != nil {
+				if nse, ok := err.(*NewStreamError); ok && nse.Err == ErrConnClosing && nse.AllowTransparentRetry {
+					return
+				}
+			}
+			t.Errorf("NewStream(_, _) = _, %v, want _, %v", err, ErrConnClosing)
+		}()
+	}
+
+	// Confirm existing stream can still complete.
+	cs.Write(nil, nil, &WriteOptions{Last: true})
+	if _, err := cs.readTo(incomingHeader); err != io.EOF {
+		t.Fatalf("Client expected EOF from the server. Got: %v", err)
+	}
+	
+	wg.Wait()
+
+	// Server should close after the last stream completes when it receives GOAWAY.
+	select {
+	case <-serverTransport.errCh:
+		// closed
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for server transport to close after client GracefulClose")
+	}
 }
 
 func TestShmServerHandlesClientGoAwayDraining(t *testing.T) {
