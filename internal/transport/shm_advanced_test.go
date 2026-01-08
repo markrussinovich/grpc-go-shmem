@@ -12,6 +12,8 @@ import (
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/mem"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 )
 
 // TestShmPingPongSizes tests various message sizes (1B, 1KB, 64KB, 1MB)
@@ -482,4 +484,62 @@ func TestShmContextCanceledOnClose(t *testing.T) {
 	}
 
 	t.Log("Context properly canceled on close")
+}
+
+func TestShmServerHandlesClientGoAwayDraining(t *testing.T) {
+	segName := fmt.Sprintf("test-client-goaway-%d", time.Now().UnixNano())
+	serverSeg, err := CreateSegment(segName, 65536, 65536)
+	if err != nil {
+		t.Fatalf("failed to create segment: %v", err)
+	}
+	defer serverSeg.Close()
+
+	clientSeg, err := OpenSegment(segName)
+	if err != nil {
+		t.Fatalf("failed to open segment: %v", err)
+	}
+	defer clientSeg.Close()
+
+	serverTransport, err := NewShmServerTransport(serverSeg, testAddr{"shm", "server"}, testAddr{"shm", "client"})
+	if err != nil {
+		t.Fatalf("failed to create server transport: %v", err)
+	}
+	defer serverTransport.Close(nil)
+
+	// Start server stream handler: respond OK immediately.
+	go serverTransport.HandleStreams(context.Background(), func(s *ServerStream) {
+		_ = serverTransport.writeHeader(s, metadata.MD{"content-type": []string{"application/grpc"}})
+		_ = serverTransport.writeStatus(s, status.New(codes.OK, ""))
+	})
+
+	clientTransport, err := NewShmClientTransport(clientSeg, testAddr{"shm", "client"}, testAddr{"shm", "server"})
+	if err != nil {
+		t.Fatalf("failed to create client transport: %v", err)
+	}
+	defer clientTransport.Close(nil)
+
+	// Create one active stream, then send GOAWAY via GracefulClose.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	cs, err := clientTransport.NewStream(ctx, &CallHdr{Method: "/test/GoAway"})
+	if err != nil {
+		t.Fatalf("NewStream failed: %v", err)
+	}
+	clientTransport.GracefulClose()
+
+	// Wait for stream to complete from server side.
+	select {
+	case <-cs.Done():
+		// stream finished
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for client stream to finish")
+	}
+
+	// Server should close after the last stream completes when it receives GOAWAY.
+	select {
+	case <-serverTransport.errCh:
+		// closed
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for server transport to close after client GOAWAY")
+	}
 }

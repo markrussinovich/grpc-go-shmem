@@ -188,6 +188,28 @@ func (t *ShmServerTransport) processIncomingData(ctx context.Context) {
 				// Log error but continue processing
 				continue
 			}
+		case FrameTypeGOAWAY:
+			// Client is draining or closing the connection.
+			// Enter draining mode so we stop accepting new streams, and close once
+			// all active streams complete.
+			if fh.Flags&GoAwayFlagIMMEDIATE != 0 {
+				go t.Close(errors.New("received GOAWAY (immediate)"))
+				return
+			}
+
+			// Record draining state once.
+			if t.draining.CompareAndSwap(false, true) {
+				t.mu.Lock()
+				t.drainDebugData = "received GOAWAY (draining)"
+				active := len(t.streams)
+				t.mu.Unlock()
+
+				if active == 0 {
+					go t.Close(errors.New("transport drained: received GOAWAY (draining)"))
+					return
+				}
+			}
+			continue
 		case FrameTypeMESSAGE:
 			t.handleMessage(fh.StreamID, fh.Flags, payload)
 		case FrameTypeTRAILERS:
