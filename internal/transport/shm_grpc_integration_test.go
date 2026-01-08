@@ -10,6 +10,7 @@ import (
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/mem"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 )
 
@@ -344,4 +345,79 @@ func TestShmDeadlinePropagation(t *testing.T) {
 	case <-time.After(wait):
 		t.Fatalf("Timed out waiting for server to observe/cancel deadline")
 	}
+}
+
+func TestShmMetadataPropagation(t *testing.T) {
+	segmentName := fmt.Sprintf("test_metadata_%d", time.Now().UnixNano())
+	defer RemoveSegment(segmentName)
+
+	serverSeg, err := CreateSegment(segmentName, 128*1024, 128*1024)
+	if err != nil {
+		t.Fatalf("Failed to create segment: %v", err)
+	}
+	serverSeg.H.SetServerReady(true)
+
+	clientSeg, err := OpenSegment(segmentName)
+	if err != nil {
+		t.Fatalf("Failed to open segment for client: %v", err)
+	}
+
+	clientAddr := &ShmAddr{Name: segmentName + "_client"}
+	serverAddr := &ShmAddr{Name: segmentName + "_server"}
+
+	clientTransport, err := NewShmClientTransport(clientSeg, clientAddr, serverAddr)
+	if err != nil {
+		t.Fatalf("Failed to create client transport: %v", err)
+	}
+	defer clientTransport.Close(nil)
+
+	serverTransport, err := NewShmServerTransport(serverSeg, serverAddr, clientAddr)
+	if err != nil {
+		t.Fatalf("Failed to create server transport: %v", err)
+	}
+	defer serverTransport.Close(nil)
+
+	serverSawOutgoing := make(chan struct{}, 1)
+
+	go serverTransport.HandleStreams(context.Background(), func(s *ServerStream) {
+		inMD, _ := metadata.FromIncomingContext(s.Context())
+		if got := inMD.Get("x-test"); len(got) != 1 || got[0] != "abc" {
+			t.Errorf("Server incoming metadata x-test=%v, want [abc]", got)
+			return
+		}
+		serverSawOutgoing <- struct{}{}
+
+		// Respond with header metadata.
+		if err := serverTransport.writeHeader(s, metadata.Pairs("x-resp", "def")); err != nil {
+			t.Errorf("Server writeHeader failed: %v", err)
+			return
+		}
+		_ = serverTransport.writeStatus(s, status.New(codes.OK, ""))
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	ctx = metadata.NewOutgoingContext(ctx, metadata.Pairs("x-test", "abc"))
+
+	stream, err := clientTransport.NewStream(ctx, &CallHdr{Host: "testhost", Method: "/test.Service/Metadata"})
+	if err != nil {
+		t.Fatalf("Client: NewStream failed: %v", err)
+	}
+
+	select {
+	case <-serverSawOutgoing:
+	case <-ctx.Done():
+		t.Fatalf("Timed out waiting for server to observe outgoing metadata: %v", ctx.Err())
+	}
+
+	md, err := stream.Header()
+	if err != nil {
+		t.Fatalf("Client Header() error: %v", err)
+	}
+	if got := md.Get("x-resp"); len(got) != 1 || got[0] != "def" {
+		t.Fatalf("Client header x-resp=%v, want [def]", got)
+	}
+
+	// Ensure the stream finishes cleanly.
+	<-stream.Done()
 }

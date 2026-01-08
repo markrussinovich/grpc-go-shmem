@@ -14,6 +14,7 @@ import (
 	"golang.org/x/net/http2"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/mem"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 )
 
@@ -172,11 +173,24 @@ func (t *ShmClientTransport) processIncomingData(ctx context.Context) {
 		switch fh.Type {
 		case FrameTypeHEADERS:
 			// Server sent headers (response headers)
-			_, err := decodeHeaders(payload)
+			h, err := decodeHeaders(payload)
 			if err != nil {
 				stream.write(recvMsg{err: err})
 				continue
 			}
+
+			// Populate the received header metadata.
+			md := make(metadata.MD)
+			for _, kv := range h.Metadata {
+				vals := make([]string, 0, len(kv.Values))
+				for _, v := range kv.Values {
+					vals = append(vals, string(v))
+				}
+				md[kv.Key] = vals
+			}
+			stream.header = md
+			stream.headerValid = true
+			stream.noHeaders = false
 
 			// Signal that headers have been received
 			if atomic.CompareAndSwapUint32(&stream.headerChanClosed, 0, 1) {
@@ -380,13 +394,23 @@ func (t *ShmClientTransport) NewStream(ctx context.Context, callHdr *CallHdr) (*
 			deadlineUnixNano = uint64(unixNano)
 		}
 	}
+	var kvs []KV
+	if md, ok := metadata.FromOutgoingContext(ctx); ok {
+		for k, vals := range md {
+			byteVals := make([][]byte, 0, len(vals))
+			for _, v := range vals {
+				byteVals = append(byteVals, []byte(v))
+			}
+			kvs = append(kvs, KV{Key: k, Values: byteVals})
+		}
+	}
 	hdr := HeadersV1{
 		Version:          1,
 		HdrType:          0, // client-initial
 		Method:           callHdr.Method,
 		Authority:        callHdr.Host,
 		DeadlineUnixNano: deadlineUnixNano,
-		Metadata:         nil, // TODO: extract metadata from context
+		Metadata:         kvs,
 	}
 
 	payload := encodeHeaders(hdr)
