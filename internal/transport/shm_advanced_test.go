@@ -141,9 +141,10 @@ func TestShmPingPongSizes(t *testing.T) {
 
 // TestShmConcurrentStreams tests multiple concurrent streams
 func TestShmConcurrentStreams(t *testing.T) {
-	t.Skip("Test needs refactoring for per-connection architecture - low-level concurrent operations not yet supported")
 	name := fmt.Sprintf("concurrent-%d", time.Now().UnixNano())
 	raw := fmt.Sprintf("shm://%s?cap=131072", name)
+
+	numCalls := 10
 
 	// Server factory
 	lis, err := newShmServerFactory(raw)
@@ -152,7 +153,8 @@ func TestShmConcurrentStreams(t *testing.T) {
 	}
 	defer lis.Close()
 
-	// Server responder goroutine - handles multiple requests sequentially
+	// Server responder goroutine - read all requests first, then respond. This
+	// ensures multiple client streams are in-flight concurrently.
 	go func() {
 		c, err := lis.Accept()
 		if err != nil {
@@ -164,36 +166,46 @@ func TestShmConcurrentStreams(t *testing.T) {
 		srvRx := NewShmRingFromSegment(seg.A, seg.Mem)
 		srvTx := NewShmRingFromSegment(seg.B, seg.Mem)
 
-		for i := 0; i < 10; i++ { // Handle 10 requests
-			// Read headers
+		type req struct {
+			streamID uint32
+			msg      []byte
+		}
+		reqs := make([]req, 0, numCalls)
+		for i := 0; i < numCalls; i++ {
 			fh, pl, err := readFrame(srvRx, context.Background())
 			if err != nil {
 				t.Errorf("server read headers: %v", err)
 				return
 			}
 			if fh.Type != FrameTypeHEADERS {
-				continue
+				t.Errorf("server expected HEADERS, got %v", fh.Type)
+				return
 			}
 			if _, err := decodeHeaders(pl); err != nil {
-				continue
+				t.Errorf("decode headers: %v", err)
+				return
 			}
 
-			// Read message
 			fh2, msg, err := readFrame(srvRx, context.Background())
 			if err != nil {
 				t.Errorf("server read msg: %v", err)
 				return
 			}
 			if fh2.Type != FrameTypeMESSAGE {
-				continue
+				t.Errorf("server expected MESSAGE, got %v", fh2.Type)
+				return
 			}
+			reqs = append(reqs, req{streamID: fh.StreamID, msg: msg})
+		}
 
-			// Echo back
+		// Respond out-of-order to ensure client demux by stream ID works.
+		for i := len(reqs) - 1; i >= 0; i-- {
+			r := reqs[i]
 			h := HeadersV1{Version: 1, HdrType: 1}
-			_ = writeFrame(srvTx, FrameHeader{StreamID: fh.StreamID, Type: FrameTypeHEADERS, Flags: HeadersFlagINITIAL}, encodeHeaders(h), context.Background())
-			_ = writeFrame(srvTx, FrameHeader{StreamID: fh.StreamID, Type: FrameTypeMESSAGE}, msg, context.Background())
+			_ = writeFrame(srvTx, FrameHeader{StreamID: r.streamID, Type: FrameTypeHEADERS, Flags: HeadersFlagINITIAL}, encodeHeaders(h), context.Background())
+			_ = writeFrame(srvTx, FrameHeader{StreamID: r.streamID, Type: FrameTypeMESSAGE}, r.msg, context.Background())
 			tr := TrailersV1{Version: 1, GRPCStatusCode: 0}
-			_ = writeFrame(srvTx, FrameHeader{StreamID: fh.StreamID, Type: FrameTypeTRAILERS, Flags: TrailersFlagEND_STREAM}, encodeTrailers(tr), context.Background())
+			_ = writeFrame(srvTx, FrameHeader{StreamID: r.streamID, Type: FrameTypeTRAILERS, Flags: TrailersFlagEND_STREAM}, encodeTrailers(tr), context.Background())
 		}
 	}()
 
@@ -205,25 +217,27 @@ func TestShmConcurrentStreams(t *testing.T) {
 		t.Fatalf("client factory: %v", err)
 	}
 
-	// Create multiple concurrent calls
-	time.Sleep(10 * time.Millisecond)
+	// Create multiple concurrent calls.
 	seg := ct.(*ShmClientTransport).segment
+	cli := NewShmUnaryClient(seg)
+	defer cli.Close()
 
-	numCalls := 10
 	var wg sync.WaitGroup
-	errors := make(chan error, numCalls)
+	errCh := make(chan error, numCalls)
+	start := make(chan struct{})
 
 	for i := 0; i < numCalls; i++ {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
-
-			cli := NewShmUnaryClient(seg)
-			defer cli.Close()
+			<-start
 
 			payload := []byte(fmt.Sprintf("call-%d", id))
 			fullPayload := make([]byte, 5+len(payload))
 			fullPayload[0] = 0
+			fullPayload[1] = byte(len(payload) >> 24)
+			fullPayload[2] = byte(len(payload) >> 16)
+			fullPayload[3] = byte(len(payload) >> 8)
 			fullPayload[4] = byte(len(payload))
 			copy(fullPayload[5:], payload)
 
@@ -232,26 +246,26 @@ func TestShmConcurrentStreams(t *testing.T) {
 
 			_, msg, tr, err := cli.UnaryCall(ctx, "/test/Concurrent", name, nil, fullPayload)
 			if err != nil {
-				errors <- fmt.Errorf("call %d: %v", id, err)
+				errCh <- fmt.Errorf("call %d: %v", id, err)
 				return
 			}
 			if tr.GRPCStatusCode != 0 {
-				errors <- fmt.Errorf("call %d: bad status %d", id, tr.GRPCStatusCode)
+				errCh <- fmt.Errorf("call %d: bad status %d", id, tr.GRPCStatusCode)
 				return
 			}
 			if len(msg) == 0 {
-				errors <- fmt.Errorf("call %d: empty response", id)
+				errCh <- fmt.Errorf("call %d: empty response", id)
 			}
 		}(i)
-		time.Sleep(10 * time.Millisecond) // Stagger requests slightly
 	}
+	close(start)
 
 	wg.Wait()
-	close(errors)
+	close(errCh)
 
 	// Check for errors
 	var errCount int
-	for err := range errors {
+	for err := range errCh {
 		t.Error(err)
 		errCount++
 	}

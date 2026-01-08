@@ -33,7 +33,11 @@ type ShmClientTransport struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	closed atomic.Bool
-	mu     sync.RWMutex
+	// draining indicates GracefulClose or server GOAWAY has been initiated.
+	// When draining, NewStream must fail and the transport should close once all
+	// active streams finish.
+	draining atomic.Bool
+	mu       sync.RWMutex
 
 	// Stream management
 	streams         map[uint32]*ClientStream
@@ -125,6 +129,34 @@ func (t *ShmClientTransport) processIncomingData(ctx context.Context) {
 			continue
 		}
 		log.Printf("[DEBUG] ShmClientTransport.processIncomingData: received frame type=%d, streamID=%d, length=%d", fh.Type, fh.StreamID, fh.Length)
+
+		// Transport-level frames are not associated with a particular stream.
+		switch fh.Type {
+		case FrameTypeGOAWAY:
+			// Server is draining or closing the connection.
+			// Treat this as a signal to stop creating new streams.
+			t.draining.Store(true)
+			select {
+			case <-t.goAwayCh:
+				// already closed
+			default:
+				close(t.goAwayCh)
+			}
+			// If server requests immediate close, tear down the transport.
+			if fh.Flags&GoAwayFlagIMMEDIATE != 0 {
+				go t.Close(errors.New("received GOAWAY (immediate)"))
+				return
+			}
+			// Otherwise, close when the last active stream completes.
+			t.mu.RLock()
+			active := len(t.streams)
+			t.mu.RUnlock()
+			if active == 0 {
+				go t.Close(errors.New("received GOAWAY (draining) with no active streams"))
+				return
+			}
+			continue
+		}
 
 		// Dispatch frame to appropriate stream
 		t.mu.RLock()
@@ -256,17 +288,41 @@ func (t *ShmClientTransport) Close(err error) {
 //
 // It does not block.
 func (t *ShmClientTransport) GracefulClose() {
-	// TODO: Implement graceful close signaling
-	t.Close(errors.New("graceful close requested"))
+	// Mirror http2 client semantics: move into draining, which prevents new
+	// streams from being created. Close the transport only after the last active
+	// stream completes.
+	if t.closed.Load() {
+		return
+	}
+	if !t.draining.CompareAndSwap(false, true) {
+		return
+	}
+
+	// Best-effort notify the peer we're draining.
+	if t.clientToServer != nil {
+		_ = writeFrame(t.clientToServer, FrameHeader{Type: FrameTypeGOAWAY, Flags: GoAwayFlagDRAINING}, nil, context.Background())
+	}
+
+	// If there are no active streams, close immediately.
+	t.mu.RLock()
+	active := len(t.streams)
+	t.mu.RUnlock()
+	if active == 0 {
+		t.Close(errors.New("no active streams left to process while draining"))
+	}
 }
 
 // NewStream creates a Stream for an RPC.
 func (t *ShmClientTransport) NewStream(ctx context.Context, callHdr *CallHdr) (*ClientStream, error) {
-	if t.closed.Load() {
-		return nil, ErrConnClosing
+	if t.closed.Load() || t.draining.Load() {
+		return nil, &NewStreamError{Err: ErrConnClosing, AllowTransparentRetry: true}
 	}
 
 	t.mu.Lock()
+	if t.closed.Load() || t.draining.Load() {
+		t.mu.Unlock()
+		return nil, &NewStreamError{Err: ErrConnClosing, AllowTransparentRetry: true}
+	}
 	// Assign stream ID (client uses odd IDs, starting from 1)
 	streamID := t.streamID
 	if streamID == 0 {
@@ -339,7 +395,17 @@ func (t *ShmClientTransport) NewStream(ctx context.Context, callHdr *CallHdr) (*
 		delete(t.streams, streamID)
 		delete(t.streamTransport, s)
 		t.mu.Unlock()
-		return nil, err
+		// If draining was initiated concurrently and there are no streams left,
+		// ensure the transport completes draining.
+		if t.draining.Load() {
+			t.mu.RLock()
+			active := len(t.streams)
+			t.mu.RUnlock()
+			if active == 0 {
+				go t.Close(errors.New("draining with no active streams"))
+			}
+		}
+		return nil, &NewStreamError{Err: err, AllowTransparentRetry: true}
 	}
 
 	return s, nil
@@ -408,9 +474,11 @@ func (t *ShmClientTransport) closeStream(s *ClientStream, err error, rst bool, r
 	}
 
 	// Remove stream from active streams map
+	var shouldClose bool
 	t.mu.Lock()
 	delete(t.streams, s.id)
 	delete(t.streamTransport, s)
+	shouldClose = t.draining.Load() && len(t.streams) == 0 && !t.closed.Load()
 	t.mu.Unlock()
 
 	// Send CANCEL frame if requested
@@ -426,6 +494,10 @@ func (t *ShmClientTransport) closeStream(s *ClientStream, err error, rst bool, r
 
 	// Close the done channel to unblock waiters
 	close(s.done)
+
+	if shouldClose {
+		go t.Close(errors.New("transport drained"))
+	}
 
 	// Call doneFunc if present
 	if s.doneFunc != nil {
