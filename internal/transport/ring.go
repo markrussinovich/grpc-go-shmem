@@ -205,24 +205,13 @@ func (r *ShmRing) WriteBlocking(data []byte) error {
 			// 3) Publish the new write index with an atomic store (acts as a release)
 			// 4) Wake only if we actually transitioned empty -> non-empty
 
-			// Conditional wakeup optimization: only wake on empty→non-empty transition.
-			//
-			// IMPORTANT: compute emptiness as close as possible to publishing the
-			// new write index. The reader may have advanced readIdx while we were
-			// copying, turning the ring empty. If we used the earlier snapshot
-			// (readIdx loaded above), we could miss waking a reader already blocked
-			// in futexWait on dataSeq.
-			wasEmpty := (writeIdx == hdr.ReadIndex())
-
 			hdr.SetWriteIndex(writeIdx + uint64(len(data))) // release-publish
 
-			// Always increment DataSequence to notify readers, but only wake on empty→non-empty
-			// This provides performance benefit while maintaining correctness
+			// Readers may block waiting for N bytes, not just “ring is empty”, so wake
+			// after any successful write commit.
 			if len(data) > 0 {
 				hdr.IncrementDataSequence()
-				if wasEmpty {
-					futexWake(&hdr.dataSeq, 1)
-				}
+				futexWake(&hdr.dataSeq, 1)
 			}
 
 			return nil
@@ -488,19 +477,13 @@ func (r *ShmRing) WriteBlockingContext(ctx context.Context, data []byte) error {
 				copy(unsafe.Slice((*byte)(destPtr2), len(data)-firstChunkI), data[firstChunkI:])
 			}
 
-			// Conditional wakeup optimization: only wake on empty→non-empty transition.
-			// See WriteBlocking for the rationale.
-			wasEmpty := (writeIdx == hdr.ReadIndex())
-
 			hdr.SetWriteIndex(writeIdx + uint64(len(data))) // release-publish
 
-			// Always increment DataSequence to notify readers, but only wake on empty→non-empty
-			// This provides performance benefit while maintaining correctness
+			// Readers may block waiting for N bytes, not just “ring is empty”, so wake
+			// after any successful write commit.
 			if len(data) > 0 {
 				hdr.IncrementDataSequence()
-				if wasEmpty {
-					futexWake(&hdr.dataSeq, 1)
-				}
+				futexWake(&hdr.dataSeq, 1)
 			}
 
 			return nil
@@ -837,19 +820,12 @@ func (r *ShmRing) ReserveWrite(n int, ctx context.Context) (WriteReservation, er
 					return fmt.Errorf("invalid written count %d, expected 0-%d", written, n)
 				}
 
-				// Conditional wakeup optimization (matches WriteBlocking): only wake on
-				// empty→non-empty transition. Always bump DataSequence so readers waiting
-				// on a changed value can re-check.
-				wasEmpty := (hdr.WriteIndex() == hdr.ReadIndex())
-
 				// Publish new write index.
 				hdr.SetWriteIndex(writeIdx + uint64(written)) // release-publish
 
 				if written > 0 {
 					hdr.IncrementDataSequence()
-					if wasEmpty {
-						futexWake(&hdr.dataSeq, 1)
-					}
+					futexWake(&hdr.dataSeq, 1)
 				}
 
 				return nil
