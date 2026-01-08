@@ -133,11 +133,23 @@ func (t *ShmServerTransport) HandleStreams(ctx context.Context, handle func(*Ser
 	t.handleFunc = handle
 	t.mu.Unlock()
 
+	// The reader and all stream contexts should be canceled when either the
+	// HandleStreams context is canceled or the transport is closed.
+	procCtx, procCancel := context.WithCancel(ctx)
+	defer procCancel()
+	go func() {
+		select {
+		case <-t.ctx.Done():
+			procCancel()
+		case <-procCtx.Done():
+		}
+	}()
+
 	// Start processing incoming data from the client
 	t.readerWG.Add(1)
 	go func() {
 		defer t.readerWG.Done()
-		t.processIncomingData(ctx)
+		t.processIncomingData(procCtx)
 	}()
 
 	// Wait for context cancellation or transport closure
@@ -426,6 +438,27 @@ func (t *ShmServerTransport) handleCancel(streamID uint32) {
 func (t *ShmServerTransport) Close(err error) {
 	t.closeOnce.Do(func() {
 		t.closed.Store(true)
+		if err == nil {
+			err = ErrConnClosing
+		}
+
+		// Snapshot and terminate all active streams.
+		var streams []*ServerStream
+		t.mu.Lock()
+		for _, s := range t.streams {
+			streams = append(streams, s)
+		}
+		t.streams = make(map[uint32]*ServerStream)
+		t.mu.Unlock()
+		for _, s := range streams {
+			if s == nil {
+				continue
+			}
+			if s.cancel != nil {
+				s.cancel()
+			}
+			s.write(recvMsg{err: err})
+		}
 
 		// Cancel context to stop all goroutines
 		t.cancel()
@@ -441,17 +474,6 @@ func (t *ShmServerTransport) Close(err error) {
 		if t.segment != nil {
 			t.segment.Close()
 		}
-
-		// Terminate all active streams
-		t.mu.Lock()
-		for _, stream := range t.streams {
-			// Signal stream termination
-			if stream != nil {
-				// TODO: Properly terminate streams
-			}
-		}
-		t.streams = make(map[uint32]*ServerStream)
-		t.mu.Unlock()
 
 		// Signal closure
 		close(t.errCh)

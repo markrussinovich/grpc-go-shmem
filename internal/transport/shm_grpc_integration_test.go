@@ -649,3 +649,68 @@ func TestShmTrailerMetadataPropagation(t *testing.T) {
 		t.Fatalf("Client trailer x-trailer=%v, want [tv]", got)
 	}
 }
+
+func TestShmServerCloseTerminatesActiveStreams(t *testing.T) {
+	segmentName := fmt.Sprintf("test_server_close_%d", time.Now().UnixNano())
+	defer RemoveSegment(segmentName)
+
+	serverSeg, err := CreateSegment(segmentName, 128*1024, 128*1024)
+	if err != nil {
+		t.Fatalf("Failed to create segment: %v", err)
+	}
+	serverSeg.H.SetServerReady(true)
+
+	clientSeg, err := OpenSegment(segmentName)
+	if err != nil {
+		t.Fatalf("Failed to open segment for client: %v", err)
+	}
+
+	clientAddr := &ShmAddr{Name: segmentName + "_client"}
+	serverAddr := &ShmAddr{Name: segmentName + "_server"}
+
+	clientTransport, err := NewShmClientTransport(clientSeg, clientAddr, serverAddr)
+	if err != nil {
+		t.Fatalf("Failed to create client transport: %v", err)
+	}
+	defer clientTransport.Close(nil)
+
+	serverTransport, err := NewShmServerTransport(serverSeg, serverAddr, clientAddr)
+	if err != nil {
+		t.Fatalf("Failed to create server transport: %v", err)
+	}
+	defer serverTransport.Close(nil)
+
+	started := make(chan struct{})
+	readErrCh := make(chan error, 1)
+
+	go serverTransport.HandleStreams(context.Background(), func(s *ServerStream) {
+		close(started)
+		_, err := s.Read(1)
+		readErrCh <- err
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	_, err = clientTransport.NewStream(ctx, &CallHdr{Host: "testhost", Method: "/test.Service/Close"})
+	if err != nil {
+		t.Fatalf("Client: NewStream failed: %v", err)
+	}
+
+	select {
+	case <-started:
+	case <-ctx.Done():
+		t.Fatalf("Timed out waiting for server handler to start: %v", ctx.Err())
+	}
+
+	serverTransport.Close(status.Error(codes.Unavailable, "server closing"))
+
+	select {
+	case err := <-readErrCh:
+		if err == nil {
+			t.Fatalf("Server stream Read returned nil error after Close")
+		}
+	case <-ctx.Done():
+		t.Fatalf("Timed out waiting for server stream Read to unblock: %v", ctx.Err())
+	}
+}
