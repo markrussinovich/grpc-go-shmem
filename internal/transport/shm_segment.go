@@ -520,6 +520,8 @@ type Segment struct {
 	A    *ringView // Typed view of ring A
 	B    *ringView // Typed view of ring B
 	Path string    // File path
+
+	closed atomic.Bool
 }
 
 // hdrView provides typed access to the segment header via pointer arithmetic
@@ -535,7 +537,19 @@ type ringView struct {
 
 // Close unmaps the memory and closes the file
 func (s *Segment) Close() error {
+	if !s.closed.CompareAndSwap(false, true) {
+		return nil
+	}
+
 	var firstErr error
+
+	// IMPORTANT: Do not implicitly close rings here.
+	//
+	// Segment.Close() is used by multiple processes which may share the same
+	// underlying shared memory object (e.g. the listener control segment). Closing
+	// a ring mutates shared state (sets the closed flag and wakes futex waiters)
+	// and must be done explicitly by the logical owner of that communication
+	// channel. Segment.Close() only tears down this process's mapping.
 
 	// Unmap the memory
 	if s.Mem != nil {

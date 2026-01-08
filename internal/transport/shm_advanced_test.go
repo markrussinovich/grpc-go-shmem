@@ -46,10 +46,16 @@ func TestShmPingPongSizes(t *testing.T) {
 
 			// Server responder goroutine (HEADERS→echo MESSAGE→TRAILERS OK)
 			go func() {
-				seg := lis.GetNextSegment()
+				c, err := lis.Accept()
+				if err != nil {
+					t.Errorf("server accept: %v", err)
+					return
+				}
+				defer c.Close()
+				seg := c.(*shmConn).segment
 				srvRx := NewShmRingFromSegment(seg.A, seg.Mem)
 				srvTx := NewShmRingFromSegment(seg.B, seg.Mem)
-				
+
 				// Read headers
 				fh, pl, err := readFrame(srvRx, context.Background())
 				if err != nil {
@@ -64,7 +70,7 @@ func TestShmPingPongSizes(t *testing.T) {
 					t.Errorf("decode headers: %v", err)
 					return
 				}
-				
+
 				// Read message
 				fh2, msg, err := readFrame(srvRx, context.Background())
 				if err != nil {
@@ -75,7 +81,7 @@ func TestShmPingPongSizes(t *testing.T) {
 					t.Errorf("expected MESSAGE, got %v", fh2.Type)
 					return
 				}
-				
+
 				// Echo back: HEADERS + MESSAGE + TRAILERS
 				h := HeadersV1{Version: 1, HdrType: 1}
 				_ = writeFrame(srvTx, FrameHeader{StreamID: fh.StreamID, Type: FrameTypeHEADERS, Flags: HeadersFlagINITIAL}, encodeHeaders(h), context.Background())
@@ -96,7 +102,7 @@ func TestShmPingPongSizes(t *testing.T) {
 			time.Sleep(10 * time.Millisecond)
 			seg := ct.(*ShmClientTransport).segment
 			cli := NewShmUnaryClient(seg)
-			
+
 			// Create payload
 			payload := make([]byte, 5+tc.size)
 			payload[0] = 0 // not compressed
@@ -107,7 +113,7 @@ func TestShmPingPongSizes(t *testing.T) {
 			for i := 0; i < tc.size; i++ {
 				payload[5+i] = byte(i % 256)
 			}
-			
+
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 			_, msg, tr, err := cli.UnaryCall(ctx, "/test/Echo", name, nil, payload)
@@ -127,7 +133,7 @@ func TestShmPingPongSizes(t *testing.T) {
 				}
 			}
 			_ = cli.Close()
-			
+
 			t.Logf("Successfully ping-ponged %d bytes", tc.size)
 		})
 	}
@@ -148,10 +154,16 @@ func TestShmConcurrentStreams(t *testing.T) {
 
 	// Server responder goroutine - handles multiple requests sequentially
 	go func() {
-		seg := lis.GetNextSegment()
+		c, err := lis.Accept()
+		if err != nil {
+			t.Errorf("server accept: %v", err)
+			return
+		}
+		defer c.Close()
+		seg := c.(*shmConn).segment
 		srvRx := NewShmRingFromSegment(seg.A, seg.Mem)
 		srvTx := NewShmRingFromSegment(seg.B, seg.Mem)
-		
+
 		for i := 0; i < 10; i++ { // Handle 10 requests
 			// Read headers
 			fh, pl, err := readFrame(srvRx, context.Background())
@@ -165,7 +177,7 @@ func TestShmConcurrentStreams(t *testing.T) {
 			if _, err := decodeHeaders(pl); err != nil {
 				continue
 			}
-			
+
 			// Read message
 			fh2, msg, err := readFrame(srvRx, context.Background())
 			if err != nil {
@@ -175,7 +187,7 @@ func TestShmConcurrentStreams(t *testing.T) {
 			if fh2.Type != FrameTypeMESSAGE {
 				continue
 			}
-			
+
 			// Echo back
 			h := HeadersV1{Version: 1, HdrType: 1}
 			_ = writeFrame(srvTx, FrameHeader{StreamID: fh.StreamID, Type: FrameTypeHEADERS, Flags: HeadersFlagINITIAL}, encodeHeaders(h), context.Background())
@@ -196,7 +208,7 @@ func TestShmConcurrentStreams(t *testing.T) {
 	// Create multiple concurrent calls
 	time.Sleep(10 * time.Millisecond)
 	seg := ct.(*ShmClientTransport).segment
-	
+
 	numCalls := 10
 	var wg sync.WaitGroup
 	errors := make(chan error, numCalls)
@@ -208,16 +220,16 @@ func TestShmConcurrentStreams(t *testing.T) {
 
 			cli := NewShmUnaryClient(seg)
 			defer cli.Close()
-			
+
 			payload := []byte(fmt.Sprintf("call-%d", id))
 			fullPayload := make([]byte, 5+len(payload))
 			fullPayload[0] = 0
 			fullPayload[4] = byte(len(payload))
 			copy(fullPayload[5:], payload)
-			
+
 			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 			defer cancel()
-			
+
 			_, msg, tr, err := cli.UnaryCall(ctx, "/test/Concurrent", name, nil, fullPayload)
 			if err != nil {
 				errors <- fmt.Errorf("call %d: %v", id, err)
@@ -265,24 +277,30 @@ func TestShmStreamError(t *testing.T) {
 
 	// Server responder - return error status
 	go func() {
-		seg := lis.GetNextSegment()
+		c, err := lis.Accept()
+		if err != nil {
+			t.Errorf("server accept: %v", err)
+			return
+		}
+		defer c.Close()
+		seg := c.(*shmConn).segment
 		srvRx := NewShmRingFromSegment(seg.A, seg.Mem)
 		srvTx := NewShmRingFromSegment(seg.B, seg.Mem)
-		
+
 		// Read headers
 		fh, _, err := readFrame(srvRx, context.Background())
 		if err != nil {
 			t.Errorf("server read: %v", err)
 			return
 		}
-		
-		// Read message  
+
+		// Read message
 		_, _, err = readFrame(srvRx, context.Background())
 		if err != nil {
 			t.Errorf("server read msg: %v", err)
 			return
 		}
-		
+
 		// Send error TRAILERS
 		tr := TrailersV1{Version: 1, GRPCStatusCode: uint32(codes.Internal), GRPCStatusMsg: "test error"}
 		_ = writeFrame(srvTx, FrameHeader{StreamID: fh.StreamID, Type: FrameTypeTRAILERS, Flags: TrailersFlagEND_STREAM}, encodeTrailers(tr), context.Background())
@@ -300,23 +318,23 @@ func TestShmStreamError(t *testing.T) {
 	seg := ct.(*ShmClientTransport).segment
 	cli := NewShmUnaryClient(seg)
 	defer cli.Close()
-	
+
 	payload := make([]byte, 8)
 	payload[4] = 3
 	copy(payload[5:], []byte("err"))
-	
+
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	
+
 	_, _, tr, err := cli.UnaryCall(ctx, "/test/Error", name, nil, payload)
 	if err == nil && tr.GRPCStatusCode == 0 {
 		t.Fatal("expected error status, got OK")
 	}
-	
+
 	if tr.GRPCStatusCode != uint32(codes.Internal) {
 		t.Logf("Got status code %d (expected %d)", tr.GRPCStatusCode, codes.Internal)
 	}
-	
+
 	t.Log("Stream error handling verified")
 }
 
@@ -451,4 +469,3 @@ func TestShmContextCanceledOnClose(t *testing.T) {
 
 	t.Log("Context properly canceled on close")
 }
-

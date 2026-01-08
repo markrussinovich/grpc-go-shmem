@@ -62,8 +62,9 @@ type streamingServerStream struct {
 	errCh chan error
 
 	// Send coordination
-	sendQueue chan []byte // buffered queue for outgoing messages
-	sendMu    sync.Mutex
+	sendQueue  chan []byte // buffered queue for outgoing messages
+	sendMu     sync.Mutex
+	senderDone chan struct{}
 
 	// Lifecycle
 	recvDone atomic.Bool // set when client closes send
@@ -94,7 +95,7 @@ func (s *ShmStreamingServer) Serve(ctx context.Context, handler func(*streamingS
 
 	// Wait for context cancellation
 	<-ctx.Done()
-	
+
 	// Close
 	return s.Close()
 }
@@ -127,7 +128,7 @@ func (s *ShmStreamingServer) startReader() {
 		go func() {
 			defer close(s.readerDone)
 			ctx := context.Background()
-			
+
 			log.Printf("StreamingServer: reader goroutine starting")
 			for !s.closed.Load() {
 				fh, payload, err := readFrame(s.rx, ctx)
@@ -151,6 +152,8 @@ func (s *ShmStreamingServer) startReader() {
 					s.handleNewStream(fh.StreamID, hdr)
 				case FrameTypeMESSAGE:
 					s.dispatchMessage(fh.StreamID, payload)
+				case FrameTypeHALFCLOSE:
+					s.dispatchHalfClose(fh.StreamID)
 				case FrameTypeCANCEL:
 					s.dispatchCancel(fh.StreamID)
 				case FrameTypePING:
@@ -181,16 +184,17 @@ func (s *ShmStreamingServer) handleNewStream(streamID uint32, hdr HeadersV1) {
 
 	// Create stream
 	stream := &streamingServerStream{
-		id:        streamID,
-		method:    hdr.Method,
-		ctx:       streamCtx,
-		cancel:    cancel,
-		hdrCh:     make(chan HeadersV1, 1),
-		msgCh:     make(chan []byte, 16), // buffer multiple messages
-		errCh:     make(chan error, 1),
-		sendQueue: make(chan []byte, 16), // buffer outgoing messages
-		done:      make(chan struct{}),
-		server:    s,
+		id:         streamID,
+		method:     hdr.Method,
+		ctx:        streamCtx,
+		cancel:     cancel,
+		hdrCh:      make(chan HeadersV1, 1),
+		msgCh:      make(chan []byte, 16), // buffer multiple messages
+		errCh:      make(chan error, 1),
+		sendQueue:  make(chan []byte, 16), // buffer outgoing messages
+		senderDone: make(chan struct{}),
+		done:       make(chan struct{}),
+		server:     s,
 	}
 
 	// Store initial headers
@@ -216,13 +220,17 @@ func (s *ShmStreamingServer) handleNewStream(streamID uint32, hdr HeadersV1) {
 // runStreamSender runs a dedicated sender goroutine for a stream.
 // This prevents write operations from blocking the main flow.
 func (s *ShmStreamingServer) runStreamSender(stream *streamingServerStream) {
+	defer close(stream.senderDone)
 	for {
 		select {
 		case <-stream.ctx.Done():
 			return
 		case <-stream.done:
 			return
-		case msg := <-stream.sendQueue:
+		case msg, ok := <-stream.sendQueue:
+			if !ok {
+				return
+			}
 			// Send message frame
 			fh := FrameHeader{
 				StreamID: stream.id,
@@ -257,9 +265,11 @@ func (s *ShmStreamingServer) dispatchMessage(id uint32, p []byte) {
 	msg := append([]byte(nil), p...)
 	select {
 	case stream.msgCh <- msg:
-	default:
-		// Drop message if buffer full (shouldn't happen with large buffer)
-		log.Printf("StreamingServer: dropped message on stream %d (buffer full)", id)
+		return
+	case <-stream.ctx.Done():
+		return
+	case <-stream.done:
+		return
 	}
 }
 
@@ -272,6 +282,16 @@ func (s *ShmStreamingServer) dispatchCancel(id uint32) {
 		return
 	}
 	stream.closeWithError(errors.New("stream cancelled by client"))
+}
+
+func (s *ShmStreamingServer) dispatchHalfClose(id uint32) {
+	s.streamsM.Lock()
+	stream := s.streams[id]
+	s.streamsM.Unlock()
+	if stream == nil {
+		return
+	}
+	stream.recvDone.Store(true)
 }
 
 // Stream methods
@@ -313,6 +333,9 @@ func (s *streamingServerStream) SendTrailers(statusCode uint32, statusMsg string
 	if !s.sendDone.CompareAndSwap(false, true) {
 		return errors.New("send already closed")
 	}
+	// Preserve ordering: ensure all queued messages are flushed before trailers.
+	close(s.sendQueue)
+	<-s.senderDone
 
 	tr := TrailersV1{
 		Version:        1,
@@ -329,7 +352,7 @@ func (s *streamingServerStream) SendTrailers(statusCode uint32, statusMsg string
 	}
 
 	err := s.server.writeFrameSafe(fh, payload, s.ctx)
-	
+
 	// Remove from server's stream map
 	s.server.streamsM.Lock()
 	delete(s.server.streams, s.id)
@@ -344,14 +367,20 @@ func (s *streamingServerStream) RecvMsg() ([]byte, error) {
 	select {
 	case msg := <-s.msgCh:
 		return msg, nil
+	default:
+	}
+	if s.recvDone.Load() && len(s.msgCh) == 0 {
+		return nil, io.EOF
+	}
+
+	select {
+	case msg := <-s.msgCh:
+		return msg, nil
 	case err := <-s.errCh:
 		return nil, err
 	case <-s.ctx.Done():
 		return nil, s.ctx.Err()
 	case <-s.done:
-		if s.recvDone.Load() {
-			return nil, io.EOF
-		}
 		return nil, errors.New("stream closed")
 	}
 }

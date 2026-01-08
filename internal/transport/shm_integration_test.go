@@ -228,7 +228,8 @@ func TestCrossProcessEcho(t *testing.T) {
 		t.Skip("linux-only for now")
 	}
 
-	segmentName := fmt.Sprintf("test-echo-%d", os.Getpid())
+	segmentName := fmt.Sprintf("test-echo-%d-%d", os.Getpid(), time.Now().UnixNano())
+	defer RemoveSegment(segmentName)
 
 	// Create segment with small capacities (64 KiB per ring)
 	seg, err := CreateSegment(segmentName, 65536, 65536)
@@ -252,10 +253,10 @@ func TestCrossProcessEcho(t *testing.T) {
 	}()
 
 	// Wait for server to be ready
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
+	readyCtx, cancelReady := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelReady()
 
-	if err := seg.WaitForServer(ctx); err != nil {
+	if err := seg.WaitForServer(readyCtx); err != nil {
 		t.Fatalf("Failed to wait for server: %v", err)
 	}
 
@@ -280,6 +281,9 @@ func TestCrossProcessEcho(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+
 			// Use concurrent read/write to avoid "dueling full buffers" deadlock
 			// The server echoes immediately, so client must read concurrently
 			wg := &sync.WaitGroup{}

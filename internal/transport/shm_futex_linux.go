@@ -23,10 +23,20 @@ package transport
 import (
 	"fmt"
 	"log"
+	"os"
 	"sync/atomic"
 	"syscall"
 	"unsafe"
 )
+
+var futexDebugEnabled = os.Getenv("GRPC_SHM_FUTEX_DEBUG") != ""
+
+func futexLogf(format string, args ...any) {
+	if !futexDebugEnabled {
+		return
+	}
+	log.Printf(format, args...)
+}
 
 // Linux futex constants
 const (
@@ -53,7 +63,7 @@ func futexWait(addr *uint32, val uint32) error {
 		return nil // Value already changed, no need to wait
 	}
 
-	log.Printf("[FUTEX] futexWait: addr=%p, val=%d", addr, val)
+	futexLogf("[FUTEX] futexWait: addr=%p, val=%d", addr, val)
 
 	// Use syscall.Syscall6 instead of RawSyscall6 to allow Go runtime scheduling
 	// This is important for cross-process futex
@@ -67,7 +77,7 @@ func futexWait(addr *uint32, val uint32) error {
 		0,                             // val3 - unused
 	)
 
-	log.Printf("[FUTEX] futexWait returned: r1=%d, errno=%d", r1, errno)
+	futexLogf("[FUTEX] futexWait returned: r1=%d, errno=%d", r1, errno)
 
 	if errno != 0 {
 		// EAGAIN means the value didn't match - this is expected and not an error
@@ -145,8 +155,8 @@ func futexWaitTimeout(addr *uint32, val uint32, timeoutNs int64) error {
 // futexWake wakes up to n threads waiting on addr.
 // Returns the number of threads actually woken up.
 func futexWake(addr *uint32, n int) (int, error) {
-	log.Printf("[FUTEX] futexWake: addr=%p, n=%d, current_val=%d", addr, n, atomic.LoadUint32(addr))
-	
+	futexLogf("[FUTEX] futexWake: addr=%p, n=%d, current_val=%d", addr, n, atomic.LoadUint32(addr))
+
 	// Use syscall.Syscall6 instead of RawSyscall6 for cross-process futex
 	r1, _, errno := syscall.Syscall6(
 		syscall.SYS_FUTEX,
@@ -158,7 +168,7 @@ func futexWake(addr *uint32, n int) (int, error) {
 		0,                             // val3 - unused
 	)
 
-	log.Printf("[FUTEX] futexWake returned: r1=%d (threads woken), errno=%d", r1, errno)
+	futexLogf("[FUTEX] futexWake returned: r1=%d (threads woken), errno=%d", r1, errno)
 
 	if errno != 0 {
 		return 0, fmt.Errorf("futex wake failed: %w", errno)

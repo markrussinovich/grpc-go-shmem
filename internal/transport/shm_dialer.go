@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"net"
 	"time"
-
 )
 
 // DialOptions contains options for dialing a shared memory connection
@@ -49,75 +48,60 @@ func DialShm(ctx context.Context, addr string, opts *DialOptions) (ClientTranspo
 		defer cancel()
 	}
 
-	// The server pre-creates segments as <addr>_conn_<id>
-	// Try to connect to the next available segment
-	// Start with conn_1 and increment until we find one
-	
-	var segment *Segment
-	var segmentName string
-	var err error
-	
-	// Try sequential segment names
-	maxAttempts := 10
-	for attempt := uint64(1); attempt <= uint64(maxAttempts); attempt++ {
-		segmentName = fmt.Sprintf("%s_conn_%d", addr, attempt)
-		segment, err = OpenSegment(segmentName)
-		if err == nil {
-			// Successfully opened a segment
-			fmt.Printf("[CLIENT] Successfully opened segment: %s\n", segmentName)
-			break
-		}
-		
-		// Check if context is cancelled
-		select {
-		case <-ctx.Done():
-			return nil, fmt.Errorf("dial timeout: %v", ctx.Err())
-		default:
-			// Wait a bit before retrying (server may be creating the segment)
-			time.Sleep(50 * time.Millisecond)
-		}
-	}
-	
-	if segment == nil {
-		return nil, fmt.Errorf("failed to find available segment for %s after %d attempts: %v", addr, maxAttempts, err)
-	}
-
-	// Mark client as ready
-	segment.H.SetClientReady(true)
-
-	// Wait for server to be ready (it should already be ready since server pre-creates segments)
-	if err := waitForServerReady(ctx, segment); err != nil {
-		segment.Close()
-		return nil, fmt.Errorf("failed to establish connection: %v", err)
-	}
-
-	// Create client transport
-	localAddr := &ShmAddr{Name: segmentName + "_client"}
-	remoteAddr := &ShmAddr{Name: segmentName}
-
-	clientTransport, err := NewShmClientTransport(segment, localAddr, remoteAddr)
+	// Establish the data segment to use via the server's control segment.
+	ctlName := addr + shmControlSuffix
+	ctlSeg, err := OpenSegment(ctlName)
 	if err != nil {
-		segment.Close()
-		return nil, fmt.Errorf("failed to create client transport: %v", err)
+		return nil, fmt.Errorf("open control segment %q: %w", ctlName, err)
+	}
+	defer ctlSeg.Close()
+	if err := ctlSeg.WaitForServer(ctx); err != nil {
+		return nil, fmt.Errorf("wait for control server: %w", err)
 	}
 
-	return clientTransport, nil
-}
+	ctlTx := NewShmRingFromSegment(ctlSeg.A, ctlSeg.Mem)
+	ctlRx := NewShmRingFromSegment(ctlSeg.B, ctlSeg.Mem)
 
-// waitForServerReady waits for the server to mark itself as ready
-func waitForServerReady(ctx context.Context, segment *Segment) error {
-	for {
-		if segment.H.ServerReady() {
-			return nil
+	if err := writeFrame(ctlTx, FrameHeader{Type: FrameTypeCONNECT}, encodeConnectRequest(connectRequest{}), ctx); err != nil {
+		return nil, fmt.Errorf("send connect request: %w", err)
+	}
+	respFH, respPayload, err := readFrame(ctlRx, ctx)
+	if err != nil {
+		return nil, fmt.Errorf("read connect response: %w", err)
+	}
+	switch respFH.Type {
+	case FrameTypeACCEPT:
+		resp, err := decodeConnectResponse(respPayload)
+		if err != nil {
+			return nil, fmt.Errorf("decode accept: %w", err)
+		}
+		segName := resp.segmentName
+		segment, err := OpenSegment(segName)
+		if err != nil {
+			return nil, fmt.Errorf("open data segment %q: %w", segName, err)
+		}
+		// Wait for server readiness via futex (event-driven).
+		if err := segment.WaitForServer(ctx); err != nil {
+			segment.Close()
+			return nil, fmt.Errorf("wait for server ready: %w", err)
 		}
 
-		// Wait for context cancellation only - no polling
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(1 * time.Millisecond):
-			// Minimal sleep to avoid busy wait, but still responsive
+		localAddr := &ShmAddr{Name: segName + "_client"}
+		remoteAddr := &ShmAddr{Name: segName}
+		clientTransport, err := NewShmClientTransport(segment, localAddr, remoteAddr)
+		if err != nil {
+			segment.Close()
+			return nil, fmt.Errorf("failed to create client transport: %v", err)
 		}
+		return clientTransport, nil
+	case FrameTypeREJECT:
+		r, err := decodeConnectReject(respPayload)
+		if err != nil {
+			return nil, fmt.Errorf("connect rejected (decode): %w", err)
+		}
+		return nil, fmt.Errorf("connect rejected: %s", r.message)
+	default:
+		return nil, fmt.Errorf("unexpected control frame type %d", respFH.Type)
 	}
 }
 

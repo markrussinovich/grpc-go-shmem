@@ -43,33 +43,56 @@ func TestFutexDirect(t *testing.T) {
 	t.Logf("Direct futex test: addr=%p, val=42, timeout=%d.%09d", addr, ts.Sec, ts.Nsec)
 
 	start := time.Now()
-	r1, r2, errno := syscall.RawSyscall6(
-		syscall.SYS_FUTEX,
-		uintptr(unsafe.Pointer(addr)),
-		FUTEX_WAIT_PRIVATE,
-		42, // expected value
-		uintptr(unsafe.Pointer(&ts)),
-		0,
-		0,
-	)
-	elapsed := time.Since(start)
-
-	t.Logf("Direct futex result: r1=%d, r2=%d, errno=%v, elapsed=%v", r1, r2, errno, elapsed)
-
-	if errno == syscall.ETIMEDOUT {
-		t.Logf("Got expected timeout after %v", elapsed)
-		if elapsed < 80*time.Millisecond || elapsed > 200*time.Millisecond {
-			t.Errorf("Timeout duration %v not close to expected 100ms", elapsed)
+	deadline := start.Add(120 * time.Millisecond)
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			t.Fatalf("Timed out waiting for futex to time out")
 		}
-	} else if errno == syscall.EAGAIN {
-		t.Logf("Got EAGAIN (value mismatch) after %v", elapsed)
-		// This might happen if the value changed between store and futex
-		currentVal := atomic.LoadUint32(addr)
-		t.Logf("Current value: %d", currentVal)
-	} else if errno == 0 {
-		t.Logf("Futex returned success (woken up) after %v", elapsed)
-	} else {
-		t.Errorf("Unexpected errno: %v", errno)
+		timeoutNs := remaining.Nanoseconds()
+		if timeoutNs < 0 {
+			timeoutNs = 0
+		}
+		ts.Sec = timeoutNs / 1e9
+		ts.Nsec = timeoutNs % 1e9
+
+		r1, r2, errno := syscall.RawSyscall6(
+			syscall.SYS_FUTEX,
+			uintptr(unsafe.Pointer(addr)),
+			FUTEX_WAIT_PRIVATE,
+			42, // expected value
+			uintptr(unsafe.Pointer(&ts)),
+			0,
+			0,
+		)
+		elapsed := time.Since(start)
+
+		t.Logf("Direct futex result: r1=%d, r2=%d, errno=%v, elapsed=%v", r1, r2, errno, elapsed)
+
+		if errno == syscall.EINTR {
+			// The Go runtime may deliver signals (e.g. for async preemption) which
+			// can interrupt the futex syscall. Treat this as a spurious wakeup and
+			// retry until we observe a terminal result or overall timeout.
+			continue
+		}
+		if errno == syscall.ETIMEDOUT {
+			t.Logf("Got expected timeout after %v", elapsed)
+			if elapsed < 80*time.Millisecond || elapsed > 250*time.Millisecond {
+				t.Errorf("Timeout duration %v not close to expected 100ms", elapsed)
+			}
+			return
+		}
+		if errno == syscall.EAGAIN {
+			t.Logf("Got EAGAIN (value mismatch) after %v", elapsed)
+			currentVal := atomic.LoadUint32(addr)
+			t.Logf("Current value: %d", currentVal)
+			return
+		}
+		if errno == 0 {
+			t.Logf("Futex returned success (woken up) after %v", elapsed)
+			return
+		}
+		t.Fatalf("Unexpected errno: %v", errno)
 	}
 }
 

@@ -5,6 +5,7 @@ package transport
 import (
 	"context"
 	"errors"
+	"io"
 	"log"
 	"net"
 	"sync"
@@ -44,6 +45,8 @@ type ShmServerTransport struct {
 	// Error handling
 	closeOnce sync.Once
 	errCh     chan struct{}
+
+	readerWG sync.WaitGroup
 }
 
 // NewShmServerTransport creates a new shared memory server transport.
@@ -91,7 +94,11 @@ func (t *ShmServerTransport) HandleStreams(ctx context.Context, handle func(*Ser
 	t.mu.Unlock()
 
 	// Start processing incoming data from the client
-	go t.processIncomingData(ctx)
+	t.readerWG.Add(1)
+	go func() {
+		defer t.readerWG.Done()
+		t.processIncomingData(ctx)
+	}()
 
 	// Wait for context cancellation or transport closure
 	select {
@@ -106,7 +113,7 @@ func (t *ShmServerTransport) HandleStreams(ctx context.Context, handle func(*Ser
 func (t *ShmServerTransport) processIncomingData(ctx context.Context) {
 	defer func() {
 		if !t.closed.Load() {
-			t.Close(errors.New("incoming data processing ended"))
+			go t.Close(errors.New("incoming data processing ended"))
 		}
 	}()
 
@@ -130,7 +137,7 @@ func (t *ShmServerTransport) processIncomingData(ctx context.Context) {
 				continue
 			}
 		case FrameTypeMESSAGE:
-			t.handleMessage(fh.StreamID, payload)
+			t.handleMessage(fh.StreamID, fh.Flags, payload)
 		case FrameTypeTRAILERS:
 			t.handleTrailers(fh.StreamID, payload)
 		case FrameTypeCANCEL:
@@ -231,8 +238,9 @@ func (t *ShmServerTransport) handleHeaders(ctx context.Context, streamID uint32,
 	return nil
 }
 
-// handleMessage processes a MESSAGE frame
-func (t *ShmServerTransport) handleMessage(streamID uint32, payload []byte) {
+// handleMessage processes a MESSAGE frame.
+// For client->server, the final MESSAGE is indicated by MessageFlagMORE being unset.
+func (t *ShmServerTransport) handleMessage(streamID uint32, flags uint8, payload []byte) {
 	t.mu.RLock()
 	s, exists := t.streams[streamID]
 	t.mu.RUnlock()
@@ -246,6 +254,11 @@ func (t *ShmServerTransport) handleMessage(streamID uint32, payload []byte) {
 	// Use mem.Copy to create a buffer from the payload
 	buf := mem.Copy(payload, mem.DefaultBufferPool())
 	s.write(recvMsg{buffer: buf})
+
+	// If this is the final client message, signal client half-close.
+	if flags&MessageFlagMORE == 0 {
+		s.write(recvMsg{err: io.EOF})
+	}
 }
 
 // handleTrailers processes a TRAILERS frame
@@ -266,11 +279,19 @@ func (t *ShmServerTransport) handleTrailers(streamID uint32, payload []byte) {
 		return
 	}
 
-	// Create status from trailers
+	// Create status from trailers. For OK, gRPC expects server-side RecvMsg to
+	// return io.EOF to indicate client half-close. A nil error here would enqueue
+	// an empty recvMsg and can crash downstream readers.
 	st := status.New(codes.Code(trailers.GRPCStatusCode), trailers.GRPCStatusMsg)
+	var endErr error
+	if st.Code() == codes.OK {
+		endErr = io.EOF
+	} else {
+		endErr = st.Err()
+	}
 
-	// Signal EOF to the stream
-	s.write(recvMsg{err: st.Err()})
+	// Signal end-of-client-stream to the stream.
+	s.write(recvMsg{err: endErr})
 
 	// Remove stream from active streams
 	t.mu.Lock()
@@ -311,6 +332,9 @@ func (t *ShmServerTransport) Close(err error) {
 		t.serverToClient.Close()
 		t.clientToServer.Close()
 
+		// Wait for reader goroutine to exit before unmapping.
+		t.readerWG.Wait()
+
 		// Close the segment
 		if t.segment != nil {
 			t.segment.Close()
@@ -350,6 +374,12 @@ func (t *ShmServerTransport) Drain(debugData string) {
 func (t *ShmServerTransport) writeHeader(s *ServerStream, md metadata.MD) error {
 	if t.closed.Load() {
 		return ErrConnClosing
+	}
+	// gRPC may call SendHeader explicitly, and the transport may also need to
+	// send implicit headers before the first message. Ensure we only send
+	// headers once per stream.
+	if s.updateHeaderSent() {
+		return nil
 	}
 
 	log.Printf("[DEBUG] ShmServerTransport.writeHeader: stream=%d, metadata keys=%v", s.id, len(md))
@@ -395,10 +425,25 @@ func (t *ShmServerTransport) writeHeader(s *ServerStream, md metadata.MD) error 
 	return nil
 }
 
+func (t *ShmServerTransport) maybeWriteHeader(s *ServerStream) error {
+	// If headers were already sent, nothing to do.
+	if s.isHeaderSent() {
+		return nil
+	}
+	// Snapshot current outgoing headers under lock.
+	s.hdrMu.Lock()
+	md := s.header.Copy()
+	s.hdrMu.Unlock()
+	return t.writeHeader(s, md)
+}
+
 // write writes header and data for a stream
 func (t *ShmServerTransport) write(s *ServerStream, hdr []byte, data mem.BufferSlice, opts *WriteOptions) error {
 	if t.closed.Load() {
 		return ErrConnClosing
+	}
+	if err := t.maybeWriteHeader(s); err != nil {
+		return err
 	}
 
 	log.Printf("[DEBUG] ShmServerTransport.write: stream=%d, hdr_len=%d, data_slices=%d", s.id, len(hdr), len(data))
@@ -428,13 +473,6 @@ func (t *ShmServerTransport) write(s *ServerStream, hdr []byte, data mem.BufferS
 	}
 
 	log.Printf("[DEBUG] ShmServerTransport.write: Successfully wrote MESSAGE frame")
-
-	// If this is the last message, send trailers
-	if opts != nil && opts.Last {
-		log.Printf("[DEBUG] ShmServerTransport.write: Last message, sending trailers")
-		return t.writeStatus(s, status.New(codes.OK, ""))
-	}
-
 	return nil
 }
 
@@ -442,6 +480,13 @@ func (t *ShmServerTransport) write(s *ServerStream, hdr []byte, data mem.BufferS
 func (t *ShmServerTransport) writeStatus(s *ServerStream, st *status.Status) error {
 	if t.closed.Load() {
 		return ErrConnClosing
+	}
+	// Ensure idempotence: gRPC may race multiple WriteStatus calls.
+	if s.swapState(streamDone) == streamDone {
+		return nil
+	}
+	if err := t.maybeWriteHeader(s); err != nil {
+		return err
 	}
 
 	log.Printf("[DEBUG] ShmServerTransport.writeStatus: stream=%d, code=%v, msg=%s", s.id, st.Code(), st.Message())
@@ -472,7 +517,7 @@ func (t *ShmServerTransport) writeStatus(s *ServerStream, st *status.Status) err
 	}
 
 	log.Printf("[DEBUG] ShmServerTransport.writeStatus: Successfully wrote TRAILERS frame")
-	
+
 	// Remove stream from active streams
 	t.mu.Lock()
 	delete(t.streams, s.id)

@@ -31,19 +31,26 @@ import (
 // TestBidirectionalStreamingNoDeadlock verifies that bidirectional streaming
 // works without deadlocking even when both sides are actively sending and receiving.
 func TestBidirectionalStreamingNoDeadlock(t *testing.T) {
+	segmentName := fmt.Sprintf("%s_%d", t.Name(), time.Now().UnixNano())
+
 	// Create segment
-	seg, err := CreateSegment("test_bidir", DefaultRingASize, DefaultRingBSize)
+	serverSeg, err := CreateSegment(segmentName, DefaultRingASize, DefaultRingBSize)
 	if err != nil {
 		t.Fatalf("Failed to create segment: %v", err)
 	}
-	defer RemoveSegment("test_bidir")
-	defer seg.Close()
+	defer RemoveSegment(segmentName)
 
-	// Create client and server
-	client := NewShmStreamingClient(seg)
+	clientSeg, err := OpenSegment(segmentName)
+	if err != nil {
+		serverSeg.Close()
+		t.Fatalf("Failed to open segment: %v", err)
+	}
+
+	// Create client and server using separate mappings (simulate cross-process).
+	client := NewShmStreamingClient(clientSeg)
 	defer client.Close()
 
-	server := NewShmStreamingServer(seg)
+	server := NewShmStreamingServer(serverSeg)
 	defer server.Close()
 
 	// Server handler: echo messages back to client
@@ -64,7 +71,7 @@ func TestBidirectionalStreamingNoDeadlock(t *testing.T) {
 				// End of stream
 				break
 			}
-			
+
 			// Echo back
 			if err := stream.SendMsg(msg); err != nil {
 				t.Errorf("Server failed to send message: %v", err)
@@ -82,9 +89,6 @@ func TestBidirectionalStreamingNoDeadlock(t *testing.T) {
 	serverCtx, serverCancel := context.WithCancel(context.Background())
 	defer serverCancel()
 	go server.Serve(serverCtx, server.handler)
-
-	// Give server a moment to start
-	time.Sleep(50 * time.Millisecond)
 
 	// Start client reader
 	client.Start()
@@ -104,7 +108,7 @@ func TestBidirectionalStreamingNoDeadlock(t *testing.T) {
 	// Send multiple messages concurrently
 	numMessages := 100
 	var wg sync.WaitGroup
-	
+
 	// Sender goroutine
 	wg.Add(1)
 	sendErrors := make(chan error, numMessages)
@@ -147,6 +151,14 @@ func TestBidirectionalStreamingNoDeadlock(t *testing.T) {
 	case <-done:
 		// Success
 		t.Logf("Successfully sent and received %d messages", receivedCount)
+		// Ensure the server handler finishes (including trailers) before the test
+		// returns and deferred closes/cancels run.
+		select {
+		case <-serverDone:
+			// Server completed.
+		case <-time.After(2 * time.Second):
+			t.Fatal("Server handler did not finish in time")
+		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("Test timed out - possible deadlock!")
 	case err := <-sendErrors:
@@ -165,17 +177,23 @@ func TestBidirectionalStreamingNoDeadlock(t *testing.T) {
 func TestBidirectionalStreamingFullBuffers(t *testing.T) {
 	// Create segment with smaller rings to trigger buffer full condition
 	smallRingSize := uint64(32 * 1024) // 32KB
-	seg, err := CreateSegment("test_full_buffers", smallRingSize, smallRingSize)
+	segmentName := fmt.Sprintf("%s_%d", t.Name(), time.Now().UnixNano())
+	serverSeg, err := CreateSegment(segmentName, smallRingSize, smallRingSize)
 	if err != nil {
 		t.Fatalf("Failed to create segment: %v", err)
 	}
-	defer RemoveSegment("test_full_buffers")
-	defer seg.Close()
+	defer RemoveSegment(segmentName)
 
-	client := NewShmStreamingClient(seg)
+	clientSeg, err := OpenSegment(segmentName)
+	if err != nil {
+		serverSeg.Close()
+		t.Fatalf("Failed to open segment: %v", err)
+	}
+
+	client := NewShmStreamingClient(clientSeg)
 	defer client.Close()
 
-	server := NewShmStreamingServer(seg)
+	server := NewShmStreamingServer(serverSeg)
 	defer server.Close()
 
 	// Server handler: sends large messages while receiving
@@ -187,7 +205,7 @@ func TestBidirectionalStreamingFullBuffers(t *testing.T) {
 
 		// Concurrently send and receive
 		var wg sync.WaitGroup
-		
+
 		// Receiver
 		wg.Add(1)
 		go func() {
@@ -238,7 +256,7 @@ func TestBidirectionalStreamingFullBuffers(t *testing.T) {
 
 	// Concurrently send and receive large messages
 	var wg sync.WaitGroup
-	
+
 	// Sender
 	wg.Add(1)
 	go func() {
@@ -284,17 +302,23 @@ func TestBidirectionalStreamingFullBuffers(t *testing.T) {
 
 // TestConcurrentStreams verifies that multiple concurrent streams work correctly
 func TestConcurrentStreams(t *testing.T) {
-	seg, err := CreateSegment("test_concurrent", DefaultRingASize, DefaultRingBSize)
+	segmentName := fmt.Sprintf("%s_%d", t.Name(), time.Now().UnixNano())
+	serverSeg, err := CreateSegment(segmentName, DefaultRingASize, DefaultRingBSize)
 	if err != nil {
 		t.Fatalf("Failed to create segment: %v", err)
 	}
-	defer RemoveSegment("test_concurrent")
-	defer seg.Close()
+	defer RemoveSegment(segmentName)
 
-	client := NewShmStreamingClient(seg)
+	clientSeg, err := OpenSegment(segmentName)
+	if err != nil {
+		serverSeg.Close()
+		t.Fatalf("Failed to open segment: %v", err)
+	}
+
+	client := NewShmStreamingClient(clientSeg)
 	defer client.Close()
 
-	server := NewShmStreamingServer(seg)
+	server := NewShmStreamingServer(serverSeg)
 	defer server.Close()
 
 	// Server handler: echo with stream ID in response

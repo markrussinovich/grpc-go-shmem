@@ -24,10 +24,20 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"os"
 	"sync/atomic"
 	"time"
 	"unsafe"
 )
+
+var shmDebugEnabled = os.Getenv("GRPC_SHM_DEBUG") != ""
+
+func shmDebugf(format string, args ...any) {
+	if !shmDebugEnabled {
+		return
+	}
+	log.Printf(format, args...)
+}
 
 // ErrRingClosed indicates that the ring has been closed for writing
 var ErrRingClosed = errors.New("ring closed")
@@ -195,8 +205,14 @@ func (r *ShmRing) WriteBlocking(data []byte) error {
 			// 3) Publish the new write index with an atomic store (acts as a release)
 			// 4) Wake only if we actually transitioned empty -> non-empty
 
-			// Conditional wakeup optimization: only wake on empty→non-empty transition
-			wasEmpty := (writeIdx == readIdx)
+			// Conditional wakeup optimization: only wake on empty→non-empty transition.
+			//
+			// IMPORTANT: compute emptiness as close as possible to publishing the
+			// new write index. The reader may have advanced readIdx while we were
+			// copying, turning the ring empty. If we used the earlier snapshot
+			// (readIdx loaded above), we could miss waking a reader already blocked
+			// in futexWait on dataSeq.
+			wasEmpty := (writeIdx == hdr.ReadIndex())
 
 			hdr.SetWriteIndex(writeIdx + uint64(len(data))) // release-publish
 
@@ -366,8 +382,12 @@ func (r *ShmRing) ReadBlocking(buf []byte) (int, error) {
 
 // Close closes the ring for writing. Readers can still read remaining data.
 func (r *ShmRing) Close() error {
-	// Set local closed flag first
-	atomic.StoreUint32(&r.closed, 1)
+	// Make Close idempotent. This is important because multiple higher-level
+	// objects may try to close the same ring during shutdown, and a late Close
+	// must not touch shared memory if the segment has already been unmapped.
+	if !atomic.CompareAndSwapUint32(&r.closed, 0, 1) {
+		return nil
+	}
 
 	hdr := r.header()
 	hdr.SetClosed(true)
@@ -444,7 +464,6 @@ func (r *ShmRing) WriteBlockingContext(ctx context.Context, data []byte) error {
 		// Calculate available space using indices
 		usedBefore := writeIdx - readIdx
 		available := r.capacity - usedBefore
-		wasPreviouslyEmpty := usedBefore == 0
 
 		if uint64(len(data)) <= available {
 			// Space available - perform the write (same as original WriteBlocking)
@@ -469,13 +488,17 @@ func (r *ShmRing) WriteBlockingContext(ctx context.Context, data []byte) error {
 				copy(unsafe.Slice((*byte)(destPtr2), len(data)-firstChunkI), data[firstChunkI:])
 			}
 
+			// Conditional wakeup optimization: only wake on empty→non-empty transition.
+			// See WriteBlocking for the rationale.
+			wasEmpty := (writeIdx == hdr.ReadIndex())
+
 			hdr.SetWriteIndex(writeIdx + uint64(len(data))) // release-publish
 
 			// Always increment DataSequence to notify readers, but only wake on empty→non-empty
 			// This provides performance benefit while maintaining correctness
 			if len(data) > 0 {
 				hdr.IncrementDataSequence()
-				if wasPreviouslyEmpty {
+				if wasEmpty {
 					futexWake(&hdr.dataSeq, 1)
 				}
 			}
@@ -814,18 +837,19 @@ func (r *ShmRing) ReserveWrite(n int, ctx context.Context) (WriteReservation, er
 					return fmt.Errorf("invalid written count %d, expected 0-%d", written, n)
 				}
 
-				// Publish new write index and wake any waiting readers.
+				// Conditional wakeup optimization (matches WriteBlocking): only wake on
+				// empty→non-empty transition. Always bump DataSequence so readers waiting
+				// on a changed value can re-check.
+				wasEmpty := (hdr.WriteIndex() == hdr.ReadIndex())
+
+				// Publish new write index.
 				hdr.SetWriteIndex(writeIdx + uint64(written)) // release-publish
 
-				// Always increment DataSequence and wake readers when data is written
-				// This ensures readers that are waiting on futex get woken up
 				if written > 0 {
-					oldSeq := hdr.DataSequence()
-					newSeq := hdr.IncrementDataSequence()
-					log.Printf("[DEBUG] Ring write: incremented DataSequence from %d to %d, waking readers", oldSeq, newSeq)
-					// Always wake readers - the futex call is cheap if no one is waiting
-					futexWake(&hdr.dataSeq, 1)
-					log.Printf("[DEBUG] Ring write: futexWake called")
+					hdr.IncrementDataSequence()
+					if wasEmpty {
+						futexWake(&hdr.dataSeq, 1)
+					}
 				}
 
 				return nil
@@ -839,9 +863,9 @@ func (r *ShmRing) ReserveWrite(n int, ctx context.Context) (WriteReservation, er
 		}
 
 		if dl, ok := ctx.Deadline(); ok {
-			log.Printf("ReserveWrite: waiting with timeout=%s", time.Until(dl))
+			shmDebugf("ReserveWrite: waiting with timeout=%s", time.Until(dl))
 		} else {
-			log.Printf("ReserveWrite: waiting WITHOUT timeout") // <- should NOT happen for CANCEL
+			shmDebugf("ReserveWrite: waiting WITHOUT timeout")
 		}
 
 		// Insufficient space - choose wait type based on fullness
@@ -1026,9 +1050,9 @@ func (r *ShmRing) ReadSlices(n int, ctx context.Context) (first, second []byte, 
 		}
 
 		if dl, ok := ctx.Deadline(); ok {
-			log.Printf("ReadSlices: waiting with timeout=%s", time.Until(dl))
+			shmDebugf("ReadSlices: waiting with timeout=%s", time.Until(dl))
 		} else {
-			log.Printf("ReadSlices: waiting WITHOUT timeout") // server’s readFrameT should never hit this
+			shmDebugf("ReadSlices: waiting WITHOUT timeout")
 		}
 
 		// Check local closed flag before accessing header
@@ -1047,8 +1071,18 @@ func (r *ShmRing) ReadSlices(n int, ctx context.Context) (first, second []byte, 
 			continue
 		}
 
+		// Snapshot the producer's wake-up sequence, then re-check indices before
+		// sleeping to avoid a lost-wake race where the producer commits data after
+		// our availability check but before we enter futexWait.
 		dataSeq := hdr.DataSequence()
-		log.Printf("[DEBUG] Ring read: no data available, dataSeq=%d, waiting on futex...", dataSeq)
+		writeIdx = hdr.WriteIndex()
+		readIdx = hdr.ReadIndex()
+		if writeIdx-readIdx >= uint64(n) {
+			// Data became available; loop back to return slices.
+			continue
+		}
+
+		shmDebugf("[DEBUG] Ring read: no data available, dataSeq=%d, waiting on futex...", dataSeq)
 
 		// If ctx has a deadline, wait with timeout; otherwise, infinite wait.
 		var err error
@@ -1057,13 +1091,13 @@ func (r *ShmRing) ReadSlices(n int, ctx context.Context) (first, second []byte, 
 			if rem <= 0 {
 				return nil, nil, nil, context.DeadlineExceeded
 			}
-			log.Printf("[DEBUG] Ring read: calling futexWaitTimeout with timeout=%v", rem)
+			shmDebugf("[DEBUG] Ring read: calling futexWaitTimeout with timeout=%v", rem)
 			err = futexWaitTimeout(&hdr.dataSeq, dataSeq, rem.Nanoseconds())
 		} else {
-			log.Printf("[DEBUG] Ring read: calling futexWait (no timeout)")
+			shmDebugf("[DEBUG] Ring read: calling futexWait (no timeout)")
 			err = futexWait(&hdr.dataSeq, dataSeq)
 		}
-		log.Printf("[DEBUG] Ring read: futex returned, err=%v", err)
+		shmDebugf("[DEBUG] Ring read: futex returned, err=%v", err)
 
 		if err != nil {
 			// Translate futex timeout to context timeout; keep going on spurious wake.

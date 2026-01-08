@@ -158,7 +158,7 @@ func NewServerTransport(conn net.Conn, config *ServerConfig) (_ ServerTransport,
 	if provider, ok := conn.(ServerTransportProvider); ok {
 		return provider.GetServerTransport(), nil
 	}
-	
+
 	var authInfo credentials.AuthInfo
 	rawConn := conn
 	if config.Credentials != nil {

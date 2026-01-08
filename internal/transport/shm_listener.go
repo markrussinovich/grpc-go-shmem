@@ -10,7 +10,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-
 )
 
 // ShmAddr represents a shared memory network address
@@ -31,8 +30,12 @@ func (a *ShmAddr) String() string {
 // ShmListener implements net.Listener for shared memory connections
 type ShmListener struct {
 	addr     *ShmAddr
-	baseName string // Base name for segment creation
+	baseName string        // Base name for segment creation
 	connID   atomic.Uint64 // Atomic counter for connection IDs
+
+	ctlSegment *Segment
+	ctlRx      *ShmRing // client->server control
+	ctlTx      *ShmRing // server->client control
 
 	// Lifecycle management
 	ctx       context.Context
@@ -41,10 +44,8 @@ type ShmListener struct {
 	closeOnce sync.Once
 
 	// Connection handling
-	mu sync.RWMutex
+	mu             sync.RWMutex
 	activeSegments map[string]*Segment // Track active segments for cleanup
-	nextSegment    *Segment            // Pre-created segment waiting for next client
-	nextSegmentName string
 
 	// Configuration
 	segmentSize uint64
@@ -86,94 +87,28 @@ func NewShmListener(addr *ShmAddr, segmentSize, ringASize, ringBSize uint64) (*S
 		ringBSize:      ringBSize,
 	}
 
-	// Pre-create the first segment so it's ready when client connects
-	if err := l.prepareNextSegment(); err != nil {
-		cancel()
-		return nil, err
+	// Create the control-plane segment used to establish connections without any
+	// dial-side polling.
+	ctlName := l.baseName + shmControlSuffix
+	ctlSeg, err := CreateSegment(ctlName, MinRingCapacity, MinRingCapacity)
+	if err != nil {
+		// If a previous run crashed and left the file behind, clean it up once and retry.
+		if SegmentExists(ctlName) {
+			_ = RemoveSegment(ctlName)
+			ctlSeg, err = CreateSegment(ctlName, MinRingCapacity, MinRingCapacity)
+		}
 	}
+	if err != nil {
+		cancel()
+		return nil, fmt.Errorf("create control segment: %w", err)
+	}
+	ctlSeg.H.SetServerReady(true)
+	// Ring A is client->server; ring B is server->client.
+	l.ctlSegment = ctlSeg
+	l.ctlRx = NewShmRingFromSegment(ctlSeg.A, ctlSeg.Mem)
+	l.ctlTx = NewShmRingFromSegment(ctlSeg.B, ctlSeg.Mem)
 
 	return l, nil
-}
-
-// prepareNextSegment pre-creates a segment for the next incoming connection
-func (l *ShmListener) prepareNextSegment() error {
-	connID := l.connID.Add(1)
-	segmentName := fmt.Sprintf("%s_conn_%d", l.baseName, connID)
-
-	fmt.Printf("[SERVER] Creating segment: %s\n", segmentName)
-	segment, err := CreateSegment(segmentName, l.ringASize, l.ringBSize)
-	if err != nil {
-		return fmt.Errorf("create segment: %w", err)
-	}
-
-	// Mark server ready immediately
-	segment.H.SetServerReady(true)
-
-	l.nextSegment = segment
-	l.nextSegmentName = segmentName
-	
-	fmt.Printf("[SERVER] Segment %s created and server marked ready\n", segmentName)
-
-	return nil
-}
-
-// handlePotentialConnection processes a potential new connection
-func (l *ShmListener) handlePotentialConnection() (*shmConn, error) {
-	// Use the pre-created segment
-	segment := l.nextSegment
-	segmentName := l.nextSegmentName
-
-	if segment == nil {
-		return nil, errors.New("no segment available")
-	}
-
-	// Clear the next segment so we don't reuse it
-	l.nextSegment = nil
-	l.nextSegmentName = ""
-
-	// Pre-create the next segment for the next connection BEFORE waiting for client
-	// This ensures it's ready when the next client tries to connect
-	go func() {
-		if err := l.prepareNextSegment(); err != nil {
-			// Log error but don't fail - listener can still serve existing connections
-			fmt.Printf("Warning: failed to prepare next segment: %v\n", err)
-		}
-	}()
-
-	// Wait for client to connect (event-driven, no polling)
-	if err := segment.WaitForClient(l.ctx); err != nil {
-		segment.Close()
-		return nil, err
-	}
-
-	// Track the segment
-	l.mu.Lock()
-	l.activeSegments[segmentName] = segment
-	l.mu.Unlock()
-
-	// Create connection with this segment
-	conn := &shmConn{
-		segment:     segment,
-		segmentName: segmentName,
-		listener:    l,
-		localAddr:   l.addr,
-		remoteAddr:  &ShmAddr{Name: segmentName + "_client"},
-	}
-
-	// Create server transport for this connection
-	serverTransport, err := NewShmServerTransport(segment, l.addr, conn.remoteAddr)
-	if err != nil {
-		l.mu.Lock()
-		delete(l.activeSegments, segmentName)
-		l.mu.Unlock()
-		segment.Close()
-		return nil, fmt.Errorf("failed to create server transport: %v", err)
-	}
-
-	conn.transport = serverTransport
-	conn.established.Store(true)
-
-	return conn, nil
 }
 
 // Accept waits for and returns the next connection to the listener
@@ -183,13 +118,70 @@ func (l *ShmListener) Accept() (net.Conn, error) {
 		return nil, errors.New("listener closed")
 	}
 
-	// Create new segment and wait for client connection
-	conn, err := l.handlePotentialConnection()
-	if err != nil {
-		return nil, err
-	}
+	// Read a CONNECT request from the control ring.
+	for {
+		fh, payload, err := readFrame(l.ctlRx, l.ctx)
+		if err != nil {
+			return nil, err
+		}
+		if fh.Type != FrameTypeCONNECT {
+			continue
+		}
+		if _, err := decodeConnectRequest(payload); err != nil {
+			_ = writeFrame(l.ctlTx, FrameHeader{Type: FrameTypeREJECT}, encodeConnectReject(connectReject{message: err.Error()}), l.ctx)
+			continue
+		}
 
-	return conn, nil
+		connID := l.connID.Add(1)
+		segmentName := fmt.Sprintf("%s_conn_%d", l.baseName, connID)
+		segment, err := CreateSegment(segmentName, l.ringASize, l.ringBSize)
+		if err != nil {
+			if SegmentExists(segmentName) {
+				_ = RemoveSegment(segmentName)
+				segment, err = CreateSegment(segmentName, l.ringASize, l.ringBSize)
+			}
+		}
+		if err != nil {
+			_ = writeFrame(l.ctlTx, FrameHeader{Type: FrameTypeREJECT}, encodeConnectReject(connectReject{message: err.Error()}), l.ctx)
+			continue
+		}
+		segment.H.SetServerReady(true)
+
+		if err := writeFrame(l.ctlTx, FrameHeader{Type: FrameTypeACCEPT}, encodeConnectResponse(connectResponse{segmentName: segmentName}), l.ctx); err != nil {
+			segment.Close()
+			return nil, err
+		}
+
+		// Wait for client to map the segment.
+		if err := segment.WaitForClient(l.ctx); err != nil {
+			segment.Close()
+			return nil, err
+		}
+
+		l.mu.Lock()
+		l.activeSegments[segmentName] = segment
+		l.mu.Unlock()
+
+		conn := &shmConn{
+			segment:     segment,
+			segmentName: segmentName,
+			listener:    l,
+			localAddr:   l.addr,
+			remoteAddr:  &ShmAddr{Name: segmentName + "_client"},
+		}
+
+		serverTransport, err := NewShmServerTransport(segment, l.addr, conn.remoteAddr)
+		if err != nil {
+			l.mu.Lock()
+			delete(l.activeSegments, segmentName)
+			l.mu.Unlock()
+			segment.Close()
+			return nil, fmt.Errorf("failed to create server transport: %v", err)
+		}
+		conn.transport = serverTransport
+		conn.established.Store(true)
+		return conn, nil
+	}
 }
 
 // Close closes the listener
@@ -198,16 +190,32 @@ func (l *ShmListener) Close() error {
 		l.closed.Store(true)
 		l.cancel()
 
-		// Clean up the next segment if it exists
-		if l.nextSegment != nil {
-			l.nextSegment.Close()
-			l.nextSegment = nil
+		if l.ctlSegment != nil {
+			// Wake any goroutine blocked in Accept() waiting for a CONNECT frame.
+			// The listener context cancellation alone cannot interrupt a futex wait
+			// without a deadline, so we must explicitly close the rings (which bumps
+			// sequences and futex-wakes waiters) before unmapping the segment.
+			if l.ctlRx != nil {
+				_ = l.ctlRx.Close()
+				l.ctlRx = nil
+			}
+			if l.ctlTx != nil {
+				_ = l.ctlTx.Close()
+				l.ctlTx = nil
+			}
+
+			l.ctlSegment.Close()
+			_ = RemoveSegment(l.baseName + shmControlSuffix)
+			l.ctlSegment = nil
 		}
 
 		// Clean up all active segments
 		l.mu.Lock()
 		for _, segment := range l.activeSegments {
 			segment.Close()
+		}
+		for name := range l.activeSegments {
+			_ = RemoveSegment(name)
 		}
 		l.activeSegments = make(map[string]*Segment)
 		l.mu.Unlock()
@@ -218,11 +226,6 @@ func (l *ShmListener) Close() error {
 // Addr returns the listener's network address
 func (l *ShmListener) Addr() net.Addr {
 	return l.addr
-}
-
-// GetNextSegment returns the pre-created segment waiting for next client (for testing)
-func (l *ShmListener) GetNextSegment() *Segment {
-	return l.nextSegment
 }
 
 // shmConn net.Conn implementation

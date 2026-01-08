@@ -76,7 +76,7 @@ func newShmClientFactory(ctx context.Context, raw string) (ClientTransport, erro
 	if err != nil {
 		return nil, err
 	}
-	
+
 	// Use DialShm which handles the new multi-segment pattern
 	opts := &DialOptions{
 		SegmentSize:    DefaultSegmentSize,
@@ -84,7 +84,7 @@ func newShmClientFactory(ctx context.Context, raw string) (ClientTransport, erro
 		RingBSize:      addr.Cap,
 		ConnectTimeout: 5 * time.Second,
 	}
-	
+
 	ct, err := DialShm(ctx, addr.Name, opts)
 	if err == nil {
 		shmClientConnectCount.Add(1)

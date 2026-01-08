@@ -20,11 +20,11 @@ func TestClientTransport_NewStream_Integration(t *testing.T) {
 
 	// Create shared memory segment
 	segmentName := fmt.Sprintf("test_integration_%d", time.Now().UnixNano())
+	defer RemoveSegment(segmentName)
 	segment, err := CreateSegment(segmentName, 64*1024, 64*1024)
 	if err != nil {
 		t.Fatalf("Failed to create segment: %v", err)
 	}
-	defer segment.Close()
 
 	// Mark both sides as ready
 	segment.H.SetClientReady(true)
@@ -33,19 +33,17 @@ func TestClientTransport_NewStream_Integration(t *testing.T) {
 	// Create client transport
 	localAddr := &ShmAddr{Name: segmentName + "_client"}
 	remoteAddr := &ShmAddr{Name: segmentName + "_server"}
-	
+
 	clientTransport, err := NewShmClientTransport(segment, localAddr, remoteAddr)
 	if err != nil {
 		t.Fatalf("Failed to create client transport: %v", err)
 	}
 	defer clientTransport.Close(nil)
 
-	// Start the client transport reader
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go clientTransport.processIncomingData(ctx)
 
-	t.Log("Client transport created and reader started")
+	t.Log("Client transport created")
 
 	// Create a new stream using NewStream
 	callHdr := &CallHdr{
@@ -102,11 +100,11 @@ func TestServerTransport_HandleStreams_Placeholder(t *testing.T) {
 
 	// Create shared memory segment
 	segmentName := fmt.Sprintf("test_server_%d", time.Now().UnixNano())
+	defer RemoveSegment(segmentName)
 	segment, err := CreateSegment(segmentName, 64*1024, 64*1024)
 	if err != nil {
 		t.Fatalf("Failed to create segment: %v", err)
 	}
-	defer segment.Close()
 
 	// Mark both sides as ready
 	segment.H.SetClientReady(true)
@@ -115,7 +113,7 @@ func TestServerTransport_HandleStreams_Placeholder(t *testing.T) {
 	// Create server transport
 	localAddr := &ShmAddr{Name: segmentName + "_server"}
 	remoteAddr := &ShmAddr{Name: segmentName + "_client"}
-	
+
 	serverTransport, err := NewShmServerTransport(segment, localAddr, remoteAddr)
 	if err != nil {
 		t.Fatalf("Failed to create server transport: %v", err)
@@ -154,85 +152,78 @@ func TestFullRPC_Integration(t *testing.T) {
 
 	// Create shared memory segment
 	segmentName := fmt.Sprintf("test_full_rpc_%d", time.Now().UnixNano())
-	segment, err := CreateSegment(segmentName, 128*1024, 128*1024)
+	defer RemoveSegment(segmentName)
+	serverSeg, err := CreateSegment(segmentName, 128*1024, 128*1024)
 	if err != nil {
 		t.Fatalf("Failed to create segment: %v", err)
 	}
-	defer segment.Close()
+	serverSeg.H.SetServerReady(true)
 
-	// Mark both sides as ready
-	segment.H.SetClientReady(true)
-	segment.H.SetServerReady(true)
+	clientSeg, err := OpenSegment(segmentName)
+	if err != nil {
+		t.Fatalf("Failed to open segment for client: %v", err)
+	}
 
 	// Create client transport
 	clientAddr := &ShmAddr{Name: segmentName + "_client"}
 	serverAddr := &ShmAddr{Name: segmentName + "_server"}
-	
-	clientTransport, err := NewShmClientTransport(segment, clientAddr, serverAddr)
+
+	clientTransport, err := NewShmClientTransport(clientSeg, clientAddr, serverAddr)
 	if err != nil {
 		t.Fatalf("Failed to create client transport: %v", err)
 	}
 	defer clientTransport.Close(nil)
 
-	// Create server transport  
-	serverTransport, err := NewShmServerTransport(segment, serverAddr, clientAddr)
+	// Create server transport
+	serverTransport, err := NewShmServerTransport(serverSeg, serverAddr, clientAddr)
 	if err != nil {
 		t.Fatalf("Failed to create server transport: %v", err)
 	}
 	defer serverTransport.Close(nil)
 
-	// Start both readers
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	go clientTransport.processIncomingData(ctx)
-	go serverTransport.processIncomingData(ctx)
+	t.Log("Both transports created")
 
-	t.Log("Both transports created and readers started")
+	// Start server handler (HandleStreams starts the server reader)
+	go serverTransport.HandleStreams(ctx, func(s *ServerStream) {
+		t.Logf("Server: Received stream %d, method: %s", s.id, s.method)
 
-	// Start server handler
-	go func() {
-		serverTransport.HandleStreams(ctx, func(s *ServerStream) {
-			t.Logf("Server: Received stream %d, method: %s", s.id, s.method)
+		// Send response headers
+		err := serverTransport.writeHeader(s, nil)
+		if err != nil {
+			t.Errorf("Server: writeHeader failed: %v", err)
+			return
+		}
 
-			// Send response headers
-			err := serverTransport.writeHeader(s, nil)
-			if err != nil {
-				t.Errorf("Server: writeHeader failed: %v", err)
-				return
-			}
+		// Send response message
+		responseData := []byte("Hello from server!")
+		hdr := make([]byte, 5)
+		hdr[0] = 0 // no compression
+		msgLen := uint32(len(responseData))
+		hdr[1] = byte(msgLen >> 24)
+		hdr[2] = byte(msgLen >> 16)
+		hdr[3] = byte(msgLen >> 8)
+		hdr[4] = byte(msgLen)
 
-			// Send response message
-			responseData := []byte("Hello from server!")
-			hdr := make([]byte, 5)
-			hdr[0] = 0 // no compression
-			msgLen := uint32(len(responseData))
-			hdr[1] = byte(msgLen >> 24)
-			hdr[2] = byte(msgLen >> 16)
-			hdr[3] = byte(msgLen >> 8)
-			hdr[4] = byte(msgLen)
+		data := mem.BufferSlice{mem.SliceBuffer(responseData)}
+		err = serverTransport.write(s, hdr, data, &WriteOptions{})
+		if err != nil {
+			t.Errorf("Server: write failed: %v", err)
+			return
+		}
 
-			data := mem.BufferSlice{mem.SliceBuffer(responseData)}
-			err = serverTransport.write(s, hdr, data, &WriteOptions{})
-			if err != nil {
-				t.Errorf("Server: write failed: %v", err)
-				return
-			}
+		// Send status
+		st := status.New(codes.OK, "success")
+		err = serverTransport.writeStatus(s, st)
+		if err != nil {
+			t.Errorf("Server: writeStatus failed: %v", err)
+			return
+		}
 
-			// Send status
-			st := status.New(codes.OK, "success")
-			err = serverTransport.writeStatus(s, st)
-			if err != nil {
-				t.Errorf("Server: writeStatus failed: %v", err)
-				return
-			}
-
-			t.Log("Server: Sent complete response")
-		})
-	}()
-
-	// Give server time to start
-	time.Sleep(50 * time.Millisecond)
+		t.Log("Server: Sent complete response")
+	})
 
 	// Client makes RPC
 	callHdr := &CallHdr{

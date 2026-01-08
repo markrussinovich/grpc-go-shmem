@@ -4,6 +4,7 @@ package transport
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -13,12 +14,14 @@ import (
 // TestClientTransportNewStreamAndWrite tests that NewStream creates a stream
 // and that the stream's Write method works via the transport.
 func TestClientTransportNewStreamAndWrite(t *testing.T) {
+	segmentName := fmt.Sprintf("test-client-write-%d", time.Now().UnixNano())
+	defer RemoveSegment(segmentName)
+
 	// Create a segment for testing
-	seg, err := CreateSegment("test-client-write", 64*1024, 64*1024)
+	seg, err := CreateSegment(segmentName, 64*1024, 64*1024)
 	if err != nil {
 		t.Fatalf("Failed to create segment: %v", err)
 	}
-	defer seg.Close()
 
 	// Create client transport
 	transport, err := NewShmClientTransport(seg, &shmAddr{s: "client"}, &shmAddr{s: "server"})

@@ -54,16 +54,21 @@ type streamingClientStream struct {
 	id     uint32
 	ctx    context.Context
 	cancel context.CancelFunc
+	client *ShmStreamingClient
 
 	// Channels for receiving data from server
 	hdrCh chan HeadersV1
-	msgCh chan []byte      // buffered to allow multiple messages
+	msgCh chan []byte // buffered to allow multiple messages
 	trCh  chan TrailersV1
-	errCh chan error
+	// trailers holds the received trailers (once). It allows RecvMsg to drain any
+	// buffered messages before returning EOF/status.
+	trailers *TrailersV1
+	errCh    chan error
 
 	// Send coordination
-	sendMu    sync.Mutex
-	sendQueue chan []byte // buffered queue for outgoing messages
+	sendMu     sync.Mutex
+	sendQueue  chan []byte // buffered queue for outgoing messages
+	senderDone chan struct{}
 
 	// Lifecycle
 	recvDone atomic.Bool // set when TRAILERS received
@@ -118,7 +123,7 @@ func (c *ShmStreamingClient) startReader() {
 		go func() {
 			defer close(c.readerDone)
 			ctx := context.Background()
-			
+
 			log.Printf("StreamingClient: reader goroutine starting")
 			for !c.closed.Load() {
 				fh, payload, err := readFrame(c.rx, ctx)
@@ -175,15 +180,17 @@ func (c *ShmStreamingClient) NewStream(ctx context.Context, method, authority st
 
 	// Create stream
 	s := &streamingClientStream{
-		id:        streamID,
-		ctx:       streamCtx,
-		cancel:    cancel,
-		hdrCh:     make(chan HeadersV1, 1),
-		msgCh:     make(chan []byte, 16), // buffer multiple messages
-		trCh:      make(chan TrailersV1, 1),
-		errCh:     make(chan error, 1),
-		sendQueue: make(chan []byte, 16), // buffer outgoing messages
-		done:      make(chan struct{}),
+		id:         streamID,
+		ctx:        streamCtx,
+		cancel:     cancel,
+		client:     c,
+		hdrCh:      make(chan HeadersV1, 1),
+		msgCh:      make(chan []byte, 16), // buffer multiple messages
+		trCh:       make(chan TrailersV1, 1),
+		errCh:      make(chan error, 1),
+		sendQueue:  make(chan []byte, 16), // buffer outgoing messages
+		senderDone: make(chan struct{}),
+		done:       make(chan struct{}),
 	}
 
 	c.streams[streamID] = s
@@ -230,13 +237,17 @@ func metadataToKV(md []KV) []KV {
 // runStreamSender runs a dedicated sender goroutine for a stream.
 // This prevents write operations from blocking the main flow.
 func (c *ShmStreamingClient) runStreamSender(s *streamingClientStream) {
+	defer close(s.senderDone)
 	for {
 		select {
 		case <-s.ctx.Done():
 			return
 		case <-s.done:
 			return
-		case msg := <-s.sendQueue:
+		case msg, ok := <-s.sendQueue:
+			if !ok {
+				return
+			}
 			// Send message frame
 			fh := FrameHeader{
 				StreamID: s.id,
@@ -290,9 +301,11 @@ func (c *ShmStreamingClient) dispatchMessage(id uint32, p []byte) {
 	msg := append([]byte(nil), p...)
 	select {
 	case s.msgCh <- msg:
-	default:
-		// Drop message if buffer full (shouldn't happen with large buffer)
-		log.Printf("StreamingClient: dropped message on stream %d (buffer full)", id)
+		return
+	case <-s.ctx.Done():
+		return
+	case <-s.done:
+		return
 	}
 }
 
@@ -312,6 +325,7 @@ func (c *ShmStreamingClient) dispatchTrailers(id uint32, tr TrailersV1, err erro
 		return
 	}
 	s.recvDone.Store(true)
+	s.trailers = &tr
 	select {
 	case s.trCh <- tr:
 	default:
@@ -351,28 +365,46 @@ func (s *streamingClientStream) CloseSend() error {
 	if !s.sendDone.CompareAndSwap(false, true) {
 		return errors.New("send already closed")
 	}
-	// Note: In a full implementation, we'd send end-of-stream indicator
-	// For now, trailers from server will close the stream
-	return nil
+	if s.client == nil {
+		return errors.New("client is nil")
+	}
+	// Preserve ordering: ensure all queued messages are sent before half-closing.
+	close(s.sendQueue)
+	<-s.senderDone
+	fh := FrameHeader{StreamID: s.id, Type: FrameTypeHALFCLOSE}
+	return s.client.writeFrameSafe(fh, nil, s.ctx)
 }
 
 // RecvMsg receives a message from the stream (blocking)
 func (s *streamingClientStream) RecvMsg() ([]byte, error) {
-	select {
-	case msg := <-s.msgCh:
-		return msg, nil
-	case tr := <-s.trCh:
-		// Stream ended
-		if tr.GRPCStatusCode != 0 {
-			return nil, fmt.Errorf("stream ended with status %d: %s", tr.GRPCStatusCode, tr.GRPCStatusMsg)
+	for {
+		// Prefer draining buffered messages before observing trailers.
+		select {
+		case msg := <-s.msgCh:
+			return msg, nil
+		default:
 		}
-		return nil, io.EOF
-	case err := <-s.errCh:
-		return nil, err
-	case <-s.ctx.Done():
-		return nil, s.ctx.Err()
-	case <-s.done:
-		return nil, errors.New("stream closed")
+
+		if s.trailers != nil && len(s.msgCh) == 0 {
+			if s.trailers.GRPCStatusCode != 0 {
+				return nil, fmt.Errorf("stream ended with status %d: %s", s.trailers.GRPCStatusCode, s.trailers.GRPCStatusMsg)
+			}
+			return nil, io.EOF
+		}
+
+		select {
+		case msg := <-s.msgCh:
+			return msg, nil
+		case tr := <-s.trCh:
+			s.trailers = &tr
+			continue
+		case err := <-s.errCh:
+			return nil, err
+		case <-s.ctx.Done():
+			return nil, s.ctx.Err()
+		case <-s.done:
+			return nil, errors.New("stream closed")
+		}
 	}
 }
 

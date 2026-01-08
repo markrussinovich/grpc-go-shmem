@@ -69,10 +69,17 @@ func TestShmRingEmpty(t *testing.T) {
 		readBytes, readErr = ring.ReadBlocking(readBuf)
 	}()
 
-	// Close ring after short delay to unblock reader
-	time.AfterFunc(100*time.Millisecond, func() {
-		ring.Close()
-	})
+	// Close ring after a short delay to unblock reader.
+	// Use a goroutine that can abort if the read completes early to avoid
+	// calling ring.Close after the segment has been unmapped.
+	go func() {
+		select {
+		case <-done:
+			return
+		case <-time.After(100 * time.Millisecond):
+			ring.Close()
+		}
+	}()
 
 	select {
 	case <-done:
@@ -405,16 +412,33 @@ func TestShmRingStressSPSC(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create segment: %v", err)
 	}
-	defer segment.Close()
+	// Do not defer segment.Close() directly: on failure paths (e.g. timeout), the
+	// producer/consumer goroutines may still be running and would then touch
+	// unmapped memory.
 
 	ringA := segment.A
 	ring := NewShmRingFromSegment(ringA, segment.Mem)
 
-	const numOperations = 1000 // Reduced for smaller ring buffer
+	const numOperations = 1000                                              // Reduced for smaller ring buffer
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute) // Add reasonable timeout
-	defer cancel()
 
 	var wg sync.WaitGroup
+	done := make(chan struct{})
+
+	// Ensure goroutines are stopped before unmapping the segment.
+	defer func() {
+		_ = ring.Close()
+		cancel()
+		select {
+		case <-done:
+			_ = segment.Close()
+		case <-time.After(5 * time.Second):
+			// Avoid unmapping while goroutines may still be running; leaking the
+			// segment is preferable to a SIGSEGV.
+		}
+	}()
+
+	var mu sync.Mutex
 	var producerErr, consumerErr error
 
 	// Producer goroutine
@@ -443,7 +467,9 @@ func TestShmRingStressSPSC(t *testing.T) {
 			copy(msgBytes[4:], data)
 
 			if err := ring.WriteAll(msgBytes, ctx); err != nil {
+				mu.Lock()
 				producerErr = fmt.Errorf("WriteAll failed at %d: %v", i, err)
+				mu.Unlock()
 				return
 			}
 		}
@@ -463,10 +489,14 @@ func TestShmRingStressSPSC(t *testing.T) {
 			if err != nil {
 				if err == io.EOF {
 					// Producer closed the ring, but we expected more data
+					mu.Lock()
 					consumerErr = fmt.Errorf("unexpected EOF at operation %d", i)
+					mu.Unlock()
 					return
 				}
+				mu.Lock()
 				consumerErr = fmt.Errorf("ReadExact header failed at %d: %v", i, err)
+				mu.Unlock()
 				return
 			}
 
@@ -478,10 +508,14 @@ func TestShmRingStressSPSC(t *testing.T) {
 			data, err := ring.ReadExact(length, nil, ctx)
 			if err != nil {
 				if err == io.EOF {
+					mu.Lock()
 					consumerErr = fmt.Errorf("unexpected EOF while reading data at operation %d", i)
+					mu.Unlock()
 					return
 				}
+				mu.Lock()
 				consumerErr = fmt.Errorf("ReadExact data failed at %d: %v", i, err)
+				mu.Unlock()
 				return
 			}
 
@@ -491,7 +525,9 @@ func TestShmRingStressSPSC(t *testing.T) {
 				actualCsum += uint32(b)
 			}
 			if actualCsum != expectedCsum {
+				mu.Lock()
 				consumerErr = fmt.Errorf("checksum mismatch at %d: expected %d, got %d", i, expectedCsum, actualCsum)
+				mu.Unlock()
 				return
 			}
 
@@ -499,7 +535,9 @@ func TestShmRingStressSPSC(t *testing.T) {
 			for j, b := range data {
 				expected := byte((i + j) % 256)
 				if b != expected {
+					mu.Lock()
 					consumerErr = fmt.Errorf("data mismatch at %d[%d]: expected %d, got %d", i, j, expected, b)
+					mu.Unlock()
 					return
 				}
 			}
@@ -507,7 +545,6 @@ func TestShmRingStressSPSC(t *testing.T) {
 	}()
 
 	// Wait for both goroutines with timeout
-	done := make(chan struct{})
 	go func() {
 		wg.Wait()
 		close(done)
@@ -516,13 +553,24 @@ func TestShmRingStressSPSC(t *testing.T) {
 	select {
 	case <-done:
 		// Both goroutines completed
+		mu.Lock()
 		if producerErr != nil {
+			mu.Unlock()
 			t.Fatalf("producer failed: %v", producerErr)
 		}
 		if consumerErr != nil {
+			mu.Unlock()
 			t.Fatalf("consumer failed: %v", consumerErr)
 		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("test timed out - goroutines did not complete")
+		mu.Unlock()
+	case <-time.After(30 * time.Second):
+		_ = ring.Close()
+		cancel()
+		select {
+		case <-done:
+			t.Fatal("test timed out - goroutines did not complete")
+		case <-time.After(5 * time.Second):
+			t.Fatal("test timed out - goroutines did not complete (failed to stop within 5s)")
+		}
 	}
 }

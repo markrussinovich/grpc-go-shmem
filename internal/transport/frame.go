@@ -39,14 +39,15 @@ const frameHeaderSize = 16
 type FrameType uint8
 
 const (
-	FrameTypePAD      FrameType = 0x00
-	FrameTypeHEADERS  FrameType = 0x01
-	FrameTypeMESSAGE  FrameType = 0x02
-	FrameTypeTRAILERS FrameType = 0x03
-	FrameTypeCANCEL   FrameType = 0x04
-	FrameTypeGOAWAY   FrameType = 0x05
-	FrameTypePING     FrameType = 0x06
-	FrameTypePONG     FrameType = 0x07
+	FrameTypePAD       FrameType = 0x00
+	FrameTypeHEADERS   FrameType = 0x01
+	FrameTypeMESSAGE   FrameType = 0x02
+	FrameTypeTRAILERS  FrameType = 0x03
+	FrameTypeCANCEL    FrameType = 0x04
+	FrameTypeGOAWAY    FrameType = 0x05
+	FrameTypePING      FrameType = 0x06
+	FrameTypePONG      FrameType = 0x07
+	FrameTypeHALFCLOSE FrameType = 0x08
 )
 
 // Flags
@@ -357,31 +358,49 @@ func writeFrame(tx *ShmRing, fh FrameHeader, payload []byte, ctx context.Context
 	fh.Reserved = 0
 	fh.Reserved2 = 0
 
-	// Reserve and write the 16-byte header
-	res, err := tx.ReserveFrameHeader(ctx)
+	// Atomically write header+payload in a single reservation/commit.
+	//
+	// This is critical for correctness under backpressure: if we commit the header
+	// first and later block writing the payload, a reader can observe the header
+	// and then block waiting for the full payload length, preventing it from
+	// consuming any bytes and freeing space for the writer.
+	total := frameHeaderSize + len(payload)
+	res, err := tx.ReserveWrite(total, ctx)
 	if err != nil {
 		return err
 	}
 	var hdr [frameHeaderSize]byte
 	encodeFrameHeaderTo(&hdr, fh)
-	n := copy(res.First, hdr[:])
-	if n < frameHeaderSize && len(res.Second) > 0 {
-		n += copy(res.Second, hdr[n:])
-	}
-	if n != frameHeaderSize {
-		return errors.New("failed to copy frame header")
-	}
-	if err := res.Commit(frameHeaderSize); err != nil {
-		return err
+
+	writeAt := func(off int, src []byte) error {
+		if len(src) == 0 {
+			return nil
+		}
+		// First segment
+		if off < len(res.First) {
+			n := copy(res.First[off:], src)
+			src = src[n:]
+			off = 0
+		} else {
+			off -= len(res.First)
+		}
+		if len(src) == 0 {
+			return nil
+		}
+		if off > len(res.Second) {
+			return errors.New("failed to copy frame bytes")
+		}
+		copy(res.Second[off:], src)
+		return nil
 	}
 
-	// Write payload
-	if len(payload) > 0 {
-		if err := tx.WriteAll(payload, ctx); err != nil {
-			return err
-		}
+	if err := writeAt(0, hdr[:]); err != nil {
+		return err
 	}
-	return nil
+	if err := writeAt(frameHeaderSize, payload); err != nil {
+		return err
+	}
+	return res.Commit(total)
 }
 
 // readFrame reads one non-PAD frame (skipping any PAD frames). It blocks if

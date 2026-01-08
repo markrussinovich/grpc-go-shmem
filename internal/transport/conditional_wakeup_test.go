@@ -215,16 +215,15 @@ func TestConditionalWakeupPerformance(t *testing.T) {
 		elapsed := time.Since(start)
 		finalDataSeq := hdr.DataSequence()
 
-		// Only one wakeup should have occurred (first write: empty→non-empty)
-		expectedWakeups := uint32(1)
-		actualWakeups := finalDataSeq - initialDataSeq
+		// DataSeq semantics: every positive write increments dataSeq.
+		expectedIncrements := uint32(numWrites)
+		actualIncrements := finalDataSeq - initialDataSeq
 
-		if actualWakeups != expectedWakeups {
-			t.Errorf("Expected %d wakeups, got %d", expectedWakeups, actualWakeups)
+		if actualIncrements != expectedIncrements {
+			t.Errorf("Expected %d dataSeq increments, got %d", expectedIncrements, actualIncrements)
 		}
 
-		t.Logf("Performed %d writes in %v with %d wakeups (should be 1)",
-			numWrites, elapsed, actualWakeups)
+		t.Logf("Performed %d writes in %v with %d dataSeq increments", numWrites, elapsed, actualIncrements)
 
 		// With conditional wakeups, this should be much faster than unconditional
 		// (though we can't easily test the old behavior for comparison)

@@ -23,9 +23,13 @@ func TestSelection_ChoosesSHM_and_ExecutesUnary(t *testing.T) {
 
 	// Server responder goroutine (HEADERS→MESSAGE→TRAILERS OK)
 	go func() {
-		// Use rings directly from listener's next segment; server factory already
-		// created the segment and marked server ready.
-		seg := lis.GetNextSegment()
+		c, err := lis.Accept()
+		if err != nil {
+			t.Errorf("server accept: %v", err)
+			return
+		}
+		defer c.Close()
+		seg := c.(*shmConn).segment
 		srvRx := NewShmRingFromSegment(seg.A, seg.Mem)
 		srvTx := NewShmRingFromSegment(seg.B, seg.Mem)
 		fh, pl, err := readFrame(srvRx, context.Background())

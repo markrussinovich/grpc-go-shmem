@@ -44,6 +44,8 @@ type ShmClientTransport struct {
 	closeOnce sync.Once
 	errCh     chan struct{}
 	goAwayCh  chan struct{}
+
+	readerWG sync.WaitGroup
 }
 
 // test hook: allow disabling the background reader in tests to avoid
@@ -81,7 +83,11 @@ func NewShmClientTransport(segment *Segment, localAddr, remoteAddr net.Addr) (*S
 
 	// Start processing incoming data from the server (test hook guarded)
 	if enableClientReader.Load() {
-		go t.processIncomingData(context.Background())
+		t.readerWG.Add(1)
+		go func() {
+			defer t.readerWG.Done()
+			t.processIncomingData(t.ctx)
+		}()
 	}
 
 	return t, nil
@@ -93,7 +99,7 @@ func (t *ShmClientTransport) processIncomingData(ctx context.Context) {
 	defer func() {
 		log.Printf("[DEBUG] ShmClientTransport.processIncomingData: EXITING")
 		if !t.closed.Load() {
-			t.Close(errors.New("incoming data processing ended"))
+			go t.Close(errors.New("incoming data processing ended"))
 		}
 	}()
 
@@ -107,23 +113,29 @@ func (t *ShmClientTransport) processIncomingData(ctx context.Context) {
 		fh, payload, err := readFrame(t.serverToClient, ctx)
 		if err != nil {
 			log.Printf("[DEBUG] ShmClientTransport.processIncomingData: readFrame error: %v", err)
+			if errors.Is(err, io.EOF) {
+				return
+			}
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return
+			}
 			if errors.Is(err, ErrRingClosed) || t.closed.Load() {
 				return
 			}
 			continue
 		}
 		log.Printf("[DEBUG] ShmClientTransport.processIncomingData: received frame type=%d, streamID=%d, length=%d", fh.Type, fh.StreamID, fh.Length)
-		
+
 		// Dispatch frame to appropriate stream
 		t.mu.RLock()
 		stream, ok := t.streams[fh.StreamID]
 		t.mu.RUnlock()
-		
+
 		if !ok {
 			// Stream not found - might have been closed
 			continue
 		}
-		
+
 		// Handle different frame types
 		switch fh.Type {
 		case FrameTypeHEADERS:
@@ -133,18 +145,18 @@ func (t *ShmClientTransport) processIncomingData(ctx context.Context) {
 				stream.write(recvMsg{err: err})
 				continue
 			}
-			
+
 			// Signal that headers have been received
 			if atomic.CompareAndSwapUint32(&stream.headerChanClosed, 0, 1) {
 				close(stream.headerChan)
 			}
-			
+
 		case FrameTypeMESSAGE:
 			// Server sent a message
 			// Copy payload to avoid using stale buffer data
 			buf := mem.Copy(payload, mem.DefaultBufferPool())
 			stream.write(recvMsg{buffer: buf})
-			
+
 		case FrameTypeTRAILERS:
 			// Server sent trailers (end of stream)
 			tr, err := decodeTrailers(payload)
@@ -159,7 +171,7 @@ func (t *ShmClientTransport) processIncomingData(ctx context.Context) {
 						trailerMap[kv.Key][i] = string(v)
 					}
 				}
-				
+
 				// Convert status
 				var st *status.Status
 				if tr.GRPCStatusCode != 0 {
@@ -169,15 +181,15 @@ func (t *ShmClientTransport) processIncomingData(ctx context.Context) {
 					st = status.New(codes.OK, "")
 					err = io.EOF
 				}
-				
+
 				// Close the stream with trailers
 				t.closeStream(stream, err, false, 0, st, trailerMap, true)
 			}
-			
+
 		case FrameTypeCANCEL:
 			// Server cancelled the stream
 			stream.write(recvMsg{err: context.Canceled})
-			
+
 		default:
 			// Unknown frame type - ignore
 		}
@@ -196,35 +208,42 @@ func (t *ShmClientTransport) processFrameData(data []byte) error {
 // is called only once.
 func (t *ShmClientTransport) Close(err error) {
 	t.closeOnce.Do(func() {
+		// Mark closed early so late closeStream calls won't attempt to write to the
+		// rings while teardown is in progress.
 		t.closed.Store(true)
 
-		// Cancel context to stop all goroutines
+		// Cancel context to stop background reader goroutine.
 		t.cancel()
 
-		// Close the rings
-		t.clientToServer.Close()
-		t.serverToClient.Close()
-
-		// Close the segment
-		if t.segment != nil {
-			t.segment.Close()
-		}
-
-		// Terminate all active streams
+		// Terminate all active streams before closing/unmapping the segment.
+		// This prevents concurrent stream Close paths from touching unmapped ring
+		// memory.
 		t.mu.Lock()
+		streams := make([]*ClientStream, 0, len(t.streams))
 		for _, stream := range t.streams {
 			if stream != nil {
-				// Close the stream with the transport error
-				stream.write(recvMsg{err: err})
-				close(stream.done)
-				if atomic.CompareAndSwapUint32(&stream.headerChanClosed, 0, 1) {
-					close(stream.headerChan)
-				}
+				streams = append(streams, stream)
 			}
 		}
-		t.streams = make(map[uint32]*ClientStream)
-		t.streamTransport = make(map[*ClientStream]*ShmClientTransport)
 		t.mu.Unlock()
+		for _, stream := range streams {
+			t.closeStream(stream, err, false, 0, status.Convert(err), nil, false)
+		}
+
+		// Close the rings and wait for the background reader to exit before
+		// unmapping.
+		if t.clientToServer != nil {
+			_ = t.clientToServer.Close()
+		}
+		if t.serverToClient != nil {
+			_ = t.serverToClient.Close()
+		}
+		t.readerWG.Wait()
+
+		// Close the segment last.
+		if t.segment != nil {
+			_ = t.segment.Close()
+		}
 
 		// Signal closure
 		close(t.errCh)
@@ -270,7 +289,7 @@ func (t *ShmClientTransport) NewStream(ctx context.Context, callHdr *CallHdr) (*
 		headerChan: make(chan struct{}),
 		doneFunc:   callHdr.DoneFunc,
 	}
-	
+
 	// Set up transport reader for this stream
 	s.trReader = &transportReader{
 		reader: &recvBufferReader{
@@ -286,13 +305,13 @@ func (t *ShmClientTransport) NewStream(ctx context.Context, callHdr *CallHdr) (*
 			// as the ring buffer already provides backpressure
 		},
 	}
-	
+
 	// Set requestRead callback (required by Stream.ReadMessageHeader)
 	// For shared memory transport, flow control is handled by the ring buffer
 	s.requestRead = func(n int) {
 		// No-op: shared memory transport doesn't need explicit flow control
 	}
-	
+
 	// Register the stream
 	t.streams[streamID] = s
 	t.streamTransport[s] = t
@@ -304,7 +323,7 @@ func (t *ShmClientTransport) NewStream(ctx context.Context, callHdr *CallHdr) (*
 		HdrType:          0, // client-initial
 		Method:           callHdr.Method,
 		Authority:        callHdr.Host,
-		DeadlineUnixNano: 0, // TODO: extract from ctx if present
+		DeadlineUnixNano: 0,   // TODO: extract from ctx if present
 		Metadata:         nil, // TODO: extract metadata from context
 	}
 
@@ -395,7 +414,7 @@ func (t *ShmClientTransport) closeStream(s *ClientStream, err error, rst bool, r
 	t.mu.Unlock()
 
 	// Send CANCEL frame if requested
-	if rst {
+	if rst && !t.closed.Load() {
 		fh := FrameHeader{
 			StreamID: s.id,
 			Type:     FrameTypeCANCEL,
@@ -442,36 +461,18 @@ func (t *ShmClientTransport) write(s *ClientStream, hdr []byte, data mem.BufferS
 		payload = append(payload, data.Materialize()...)
 	}
 
-	// Write MESSAGE frame
+	// Write MESSAGE frame. MessageFlagMORE indicates more data will follow.
 	fh := FrameHeader{
 		StreamID: s.id,
 		Type:     FrameTypeMESSAGE,
 		Flags:    0,
 	}
-	if opts.Last {
-		fh.Flags = MessageFlagMORE // Indicate more data coming (trailers)
+	if opts != nil && !opts.Last {
+		fh.Flags = MessageFlagMORE
 	}
 
 	if err := writeFrame(t.clientToServer, fh, payload, s.ctx); err != nil {
 		return err
-	}
-
-	// If this is the last write, send trailers
-	if opts.Last {
-		tr := TrailersV1{
-			GRPCStatusCode: 0, // OK
-			GRPCStatusMsg:  "",
-			Metadata:       nil,
-		}
-		trPayload := encodeTrailers(tr)
-		trFh := FrameHeader{
-			StreamID: s.id,
-			Type:     FrameTypeTRAILERS,
-			Flags:    TrailersFlagEND_STREAM,
-		}
-		if err := writeFrame(t.clientToServer, trFh, trPayload, s.ctx); err != nil {
-			return err
-		}
 	}
 
 	return nil
@@ -479,4 +480,3 @@ func (t *ShmClientTransport) write(s *ClientStream, hdr []byte, data mem.BufferS
 
 // Compile-time check to ensure ShmClientTransport implements clientTransport.
 var _ clientTransport = (*ShmClientTransport)(nil)
-
