@@ -13,6 +13,7 @@ import (
 
 	"golang.org/x/net/http2"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/internal/grpcutil"
 	"google.golang.org/grpc/mem"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
@@ -187,6 +188,17 @@ func (t *ShmClientTransport) processIncomingData(ctx context.Context) {
 					vals = append(vals, string(v))
 				}
 				md[kv.Key] = vals
+			}
+			if v := md.Get("grpc-encoding"); len(v) > 0 {
+				stream.recvCompress = v[0]
+			}
+			if v := md.Get("content-type"); len(v) > 0 {
+				if contentSubtype, ok := grpcutil.ContentSubtype(v[0]); ok {
+					stream.contentSubtype = contentSubtype
+				} else {
+					stream.write(recvMsg{err: errors.New("transport: received unexpected content-type")})
+					continue
+				}
 			}
 			stream.header = md
 			stream.headerValid = true
@@ -395,6 +407,14 @@ func (t *ShmClientTransport) NewStream(ctx context.Context, callHdr *CallHdr) (*
 		}
 	}
 	var kvs []KV
+	hasKey := func(key string) bool {
+		for _, kv := range kvs {
+			if kv.Key == key {
+				return true
+			}
+		}
+		return false
+	}
 	if md, ok := metadata.FromOutgoingContext(ctx); ok {
 		for k, vals := range md {
 			byteVals := make([][]byte, 0, len(vals))
@@ -403,6 +423,25 @@ func (t *ShmClientTransport) NewStream(ctx context.Context, callHdr *CallHdr) (*
 			}
 			kvs = append(kvs, KV{Key: k, Values: byteVals})
 		}
+	}
+	// Add gRPC-required/expected metadata fields if not already present.
+	if !hasKey("content-type") {
+		kvs = append(kvs, KV{Key: "content-type", Values: [][]byte{[]byte(grpcutil.ContentType(callHdr.ContentSubtype))}})
+	}
+	registeredCompressors := grpcutil.RegisteredCompressors()
+	if callHdr.SendCompress != "" {
+		if !hasKey("grpc-encoding") {
+			kvs = append(kvs, KV{Key: "grpc-encoding", Values: [][]byte{[]byte(callHdr.SendCompress)}})
+		}
+		if !grpcutil.IsCompressorNameRegistered(callHdr.SendCompress) {
+			if registeredCompressors != "" {
+				registeredCompressors += ","
+			}
+			registeredCompressors += callHdr.SendCompress
+		}
+	}
+	if registeredCompressors != "" && !hasKey("grpc-accept-encoding") {
+		kvs = append(kvs, KV{Key: "grpc-accept-encoding", Values: [][]byte{[]byte(registeredCompressors)}})
 	}
 	hdr := HeadersV1{
 		Version:          1,

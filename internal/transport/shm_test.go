@@ -701,6 +701,11 @@ func TestFutexMultipleWaiters(t *testing.T) {
 	// Give waiters a chance to start waiting
 	time.Sleep(10 * time.Millisecond)
 
+	// Change the value before waking. This avoids a lost-wake race where a waiter
+	// starts waiting after the wake and would otherwise block forever because the
+	// futex word never changes.
+	atomic.StoreUint32(&addr, 43)
+
 	// Wake all waiters
 	n, err := futexWake(&addr, numWaiters)
 	if err != nil {

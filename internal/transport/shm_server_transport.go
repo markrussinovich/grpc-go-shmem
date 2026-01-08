@@ -8,11 +8,13 @@ import (
 	"io"
 	"log"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/internal/grpcutil"
 	"google.golang.org/grpc/mem"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/peer"
@@ -217,6 +219,21 @@ func (t *ShmServerTransport) handleHeaders(ctx context.Context, streamID uint32,
 	// Attach metadata to context if present
 	if len(md) > 0 {
 		s.ctx = metadata.NewIncomingContext(s.ctx, md)
+	}
+	// Populate stream fields derived from incoming headers.
+	if v := md.Get("grpc-encoding"); len(v) > 0 {
+		s.recvCompress = v[0]
+	}
+	if v := md.Get("grpc-accept-encoding"); len(v) > 0 {
+		s.clientAdvertisedCompressors = v[0]
+	}
+	if v := md.Get("content-type"); len(v) > 0 {
+		contentType := strings.ToLower(v[0])
+		if contentSubtype, ok := grpcutil.ContentSubtype(contentType); ok {
+			s.contentSubtype = contentSubtype
+		} else {
+			return errors.New("invalid gRPC request content-type")
+		}
 	}
 
 	// Set requestRead callback for the stream

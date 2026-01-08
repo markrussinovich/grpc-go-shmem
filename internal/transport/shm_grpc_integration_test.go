@@ -421,3 +421,77 @@ func TestShmMetadataPropagation(t *testing.T) {
 	// Ensure the stream finishes cleanly.
 	<-stream.Done()
 }
+
+func TestShmContentTypeAndEncodingNegotiation(t *testing.T) {
+	segmentName := fmt.Sprintf("test_ct_enc_%d", time.Now().UnixNano())
+	defer RemoveSegment(segmentName)
+
+	serverSeg, err := CreateSegment(segmentName, 128*1024, 128*1024)
+	if err != nil {
+		t.Fatalf("Failed to create segment: %v", err)
+	}
+	serverSeg.H.SetServerReady(true)
+
+	clientSeg, err := OpenSegment(segmentName)
+	if err != nil {
+		t.Fatalf("Failed to open segment for client: %v", err)
+	}
+
+	clientAddr := &ShmAddr{Name: segmentName + "_client"}
+	serverAddr := &ShmAddr{Name: segmentName + "_server"}
+
+	clientTransport, err := NewShmClientTransport(clientSeg, clientAddr, serverAddr)
+	if err != nil {
+		t.Fatalf("Failed to create client transport: %v", err)
+	}
+	defer clientTransport.Close(nil)
+
+	serverTransport, err := NewShmServerTransport(serverSeg, serverAddr, clientAddr)
+	if err != nil {
+		t.Fatalf("Failed to create server transport: %v", err)
+	}
+	defer serverTransport.Close(nil)
+
+	serverSaw := make(chan struct{}, 1)
+
+	go serverTransport.HandleStreams(context.Background(), func(s *ServerStream) {
+		if got := s.ContentSubtype(); got != "proto" {
+			t.Errorf("Server ContentSubtype=%q, want %q", got, "proto")
+			return
+		}
+		if got := s.RecvCompress(); got != "gzip" {
+			t.Errorf("Server RecvCompress=%q, want %q", got, "gzip")
+			return
+		}
+		serverSaw <- struct{}{}
+
+		// Respond with content-type and grpc-encoding.
+		if err := serverTransport.writeHeader(s, metadata.Pairs("content-type", "application/grpc+proto", "grpc-encoding", "gzip")); err != nil {
+			t.Errorf("Server writeHeader failed: %v", err)
+			return
+		}
+		_ = serverTransport.writeStatus(s, status.New(codes.OK, ""))
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	stream, err := clientTransport.NewStream(ctx, &CallHdr{Host: "testhost", Method: "/test.Service/Negotiation", ContentSubtype: "proto", SendCompress: "gzip"})
+	if err != nil {
+		t.Fatalf("Client: NewStream failed: %v", err)
+	}
+
+	select {
+	case <-serverSaw:
+	case <-ctx.Done():
+		t.Fatalf("Timed out waiting for server to receive stream: %v", ctx.Err())
+	}
+
+	if _, err := stream.Header(); err != nil {
+		t.Fatalf("Client Header() error: %v", err)
+	}
+	if got := stream.RecvCompress(); got != "gzip" {
+		t.Fatalf("Client RecvCompress=%q, want %q", got, "gzip")
+	}
+	<-stream.Done()
+}
