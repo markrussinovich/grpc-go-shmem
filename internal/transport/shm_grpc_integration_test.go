@@ -495,3 +495,90 @@ func TestShmContentTypeAndEncodingNegotiation(t *testing.T) {
 	}
 	<-stream.Done()
 }
+
+func TestShmServerDrain(t *testing.T) {
+	segmentName := fmt.Sprintf("test_server_drain_%d", time.Now().UnixNano())
+	defer RemoveSegment(segmentName)
+
+	serverSeg, err := CreateSegment(segmentName, 128*1024, 128*1024)
+	if err != nil {
+		t.Fatalf("Failed to create segment: %v", err)
+	}
+	serverSeg.H.SetServerReady(true)
+
+	clientSeg, err := OpenSegment(segmentName)
+	if err != nil {
+		t.Fatalf("Failed to open segment for client: %v", err)
+	}
+
+	clientAddr := &ShmAddr{Name: segmentName + "_client"}
+	serverAddr := &ShmAddr{Name: segmentName + "_server"}
+
+	clientTransport, err := NewShmClientTransport(clientSeg, clientAddr, serverAddr)
+	if err != nil {
+		t.Fatalf("Failed to create client transport: %v", err)
+	}
+	defer clientTransport.Close(nil)
+
+	serverTransport, err := NewShmServerTransport(serverSeg, serverAddr, clientAddr)
+	if err != nil {
+		t.Fatalf("Failed to create server transport: %v", err)
+	}
+	defer serverTransport.Close(nil)
+
+	serverSaw := make(chan *ServerStream, 1)
+	allowReply := make(chan struct{})
+
+	go serverTransport.HandleStreams(context.Background(), func(s *ServerStream) {
+		serverSaw <- s
+		<-allowReply
+
+		if err := serverTransport.writeHeader(s, metadata.Pairs("x-drain", "ok")); err != nil {
+			t.Errorf("Server writeHeader failed: %v", err)
+			return
+		}
+		_ = serverTransport.writeStatus(s, status.New(codes.OK, ""))
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	stream, err := clientTransport.NewStream(ctx, &CallHdr{Host: "testhost", Method: "/test.Service/Drain"})
+	if err != nil {
+		t.Fatalf("Client: NewStream failed: %v", err)
+	}
+
+	select {
+	case <-serverSaw:
+	case <-ctx.Done():
+		t.Fatalf("Timed out waiting for server to receive stream: %v", ctx.Err())
+	}
+
+	serverTransport.Drain("test")
+
+	select {
+	case <-clientTransport.GoAway():
+	case <-ctx.Done():
+		t.Fatalf("Timed out waiting for GOAWAY after Drain: %v", ctx.Err())
+	}
+
+	if _, err := clientTransport.NewStream(ctx, &CallHdr{Host: "testhost", Method: "/test.Service/AfterDrain"}); err == nil {
+		t.Fatalf("NewStream succeeded after Drain, want error")
+	}
+
+	close(allowReply)
+
+	md, err := stream.Header()
+	if err != nil {
+		t.Fatalf("Client Header() error: %v", err)
+	}
+	if got := md.Get("x-drain"); len(got) != 1 || got[0] != "ok" {
+		t.Fatalf("Client header x-drain=%v, want [ok]", got)
+	}
+
+	select {
+	case <-stream.Done():
+	case <-ctx.Done():
+		t.Fatalf("Timed out waiting for drained stream to finish: %v", ctx.Err())
+	}
+}

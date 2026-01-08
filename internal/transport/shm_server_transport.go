@@ -38,7 +38,14 @@ type ShmServerTransport struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	closed atomic.Bool
-	mu     sync.RWMutex
+	// draining indicates the transport has entered a graceful shutdown mode.
+	// When draining, new streams are rejected but existing ones may complete.
+	draining atomic.Bool
+	// drainDebugData is used for error reporting when draining completes.
+	drainDebugData string
+	// writeMu serializes writes to the server->client ring.
+	writeMu sync.Mutex
+	mu      sync.RWMutex
 
 	// Stream management
 	streams    map[uint32]*ServerStream
@@ -50,6 +57,36 @@ type ShmServerTransport struct {
 	errCh     chan struct{}
 
 	readerWG sync.WaitGroup
+}
+
+func (t *ShmServerTransport) sendGoAway(flags uint8) {
+	if t.closed.Load() || t.serverToClient == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	t.writeMu.Lock()
+	defer t.writeMu.Unlock()
+	_ = writeFrame(t.serverToClient, FrameHeader{Type: FrameTypeGOAWAY, Flags: flags}, nil, ctx)
+}
+
+func (t *ShmServerTransport) rejectNewStream(streamID uint32, msg string) {
+	if t.closed.Load() || t.serverToClient == nil {
+		return
+	}
+	// Best-effort send GOAWAY as a signal to stop creating new streams.
+	t.sendGoAway(GoAwayFlagDRAINING)
+
+	trailers := encodeTrailers(TrailersV1{Version: 1, GRPCStatusCode: uint32(codes.Unavailable), GRPCStatusMsg: msg})
+	fh := FrameHeader{Type: FrameTypeTRAILERS, StreamID: streamID, Length: uint32(len(trailers))}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	t.writeMu.Lock()
+	defer t.writeMu.Unlock()
+	_ = writeFrame(t.serverToClient, fh, trailers, ctx)
 }
 
 // NewShmServerTransport creates a new shared memory server transport.
@@ -153,24 +190,31 @@ func (t *ShmServerTransport) processIncomingData(ctx context.Context) {
 
 // handleHeaders processes a HEADERS frame and creates a new ServerStream
 func (t *ShmServerTransport) handleHeaders(ctx context.Context, streamID uint32, payload []byte) error {
+	// Fast-path checks under lock.
 	t.mu.Lock()
-	defer t.mu.Unlock()
-
 	if t.closed.Load() {
+		t.mu.Unlock()
 		return errors.New("transport closed")
 	}
-
-	// Check if stream already exists
+	if t.draining.Load() {
+		msg := "transport is draining"
+		t.mu.Unlock()
+		t.rejectNewStream(streamID, msg)
+		return nil
+	}
+	// Check if stream already exists.
 	if _, exists := t.streams[streamID]; exists {
+		t.mu.Unlock()
 		return errors.New("stream already exists")
 	}
-
-	// Validate stream ID (client uses odd numbers)
+	// Validate stream ID (client uses odd numbers).
 	if streamID%2 != 1 {
+		t.mu.Unlock()
 		return errors.New("invalid stream ID: must be odd for client-initiated streams")
 	}
+	t.mu.Unlock()
 
-	// Decode headers using the proper frame format
+	// Decode headers using the proper frame format.
 	hdr, err := decodeHeaders(payload)
 	if err != nil {
 		return err
@@ -255,12 +299,24 @@ func (t *ShmServerTransport) handleHeaders(ctx context.Context, streamID uint32,
 		},
 	}
 
-	// Register the stream
+	// Register the stream (re-check draining/closed).
+	t.mu.Lock()
+	if t.closed.Load() {
+		t.mu.Unlock()
+		return errors.New("transport closed")
+	}
+	if t.draining.Load() {
+		t.mu.Unlock()
+		t.rejectNewStream(streamID, "transport is draining")
+		return nil
+	}
 	t.streams[streamID] = s
+	h := t.handleFunc
+	t.mu.Unlock()
 
-	// Call the handler in a new goroutine
-	if t.handleFunc != nil {
-		go t.handleFunc(s)
+	// Call the handler in a new goroutine.
+	if h != nil {
+		go h(s)
 	}
 
 	return nil
@@ -321,10 +377,19 @@ func (t *ShmServerTransport) handleTrailers(streamID uint32, payload []byte) {
 	// Signal end-of-client-stream to the stream.
 	s.write(recvMsg{err: endErr})
 
-	// Remove stream from active streams
+	// Remove stream from active streams and finish draining if needed.
+	var shouldClose bool
+	var dbg string
 	t.mu.Lock()
 	delete(t.streams, streamID)
+	if t.draining.Load() && len(t.streams) == 0 && !t.closed.Load() {
+		shouldClose = true
+		dbg = t.drainDebugData
+	}
 	t.mu.Unlock()
+	if shouldClose {
+		go t.Close(errors.New("transport drained: " + dbg))
+	}
 }
 
 // handleCancel processes a CANCEL frame
@@ -340,10 +405,19 @@ func (t *ShmServerTransport) handleCancel(streamID uint32) {
 	// Cancel the stream context
 	s.cancel()
 
-	// Remove from active streams
+	// Remove from active streams and finish draining if needed.
+	var shouldClose bool
+	var dbg string
 	t.mu.Lock()
 	delete(t.streams, streamID)
+	if t.draining.Load() && len(t.streams) == 0 && !t.closed.Load() {
+		shouldClose = true
+		dbg = t.drainDebugData
+	}
 	t.mu.Unlock()
+	if shouldClose {
+		go t.Close(errors.New("transport drained: " + dbg))
+	}
 }
 
 // Close tears down the transport. Once it is called, the transport
@@ -391,9 +465,26 @@ func (t *ShmServerTransport) Peer() *peer.Peer {
 
 // Drain notifies the client this ServerTransport stops accepting new RPCs.
 func (t *ShmServerTransport) Drain(debugData string) {
-	// TODO: Implement drain signaling via shared memory
-	// For now, just close the transport
-	t.Close(errors.New("transport drained: " + debugData))
+	if t.closed.Load() {
+		return
+	}
+	if !t.draining.CompareAndSwap(false, true) {
+		return
+	}
+
+	// Record debug data for the eventual close.
+	t.mu.Lock()
+	t.drainDebugData = debugData
+	active := len(t.streams)
+	t.mu.Unlock()
+
+	// Notify peer we're draining.
+	t.sendGoAway(GoAwayFlagDRAINING)
+
+	// If there are no active streams, close immediately.
+	if active == 0 {
+		go t.Close(errors.New("transport drained: " + debugData))
+	}
 }
 
 // internalServerTransport methods
@@ -444,6 +535,8 @@ func (t *ShmServerTransport) writeHeader(s *ServerStream, md metadata.MD) error 
 	log.Printf("[DEBUG] ShmServerTransport.writeHeader: Writing HEADERS frame, streamID=%d, length=%d", s.id, fh.Length)
 
 	// Write frame to server->client ring
+	t.writeMu.Lock()
+	defer t.writeMu.Unlock()
 	if err := writeFrame(t.serverToClient, fh, payload, context.Background()); err != nil {
 		log.Printf("[ERROR] ShmServerTransport.writeHeader: Failed to write frame: %v", err)
 		return err
@@ -495,6 +588,8 @@ func (t *ShmServerTransport) write(s *ServerStream, hdr []byte, data mem.BufferS
 	}
 
 	// Write frame to server->client ring
+	t.writeMu.Lock()
+	defer t.writeMu.Unlock()
 	if err := writeFrame(t.serverToClient, fh, payload, context.Background()); err != nil {
 		log.Printf("[ERROR] ShmServerTransport.write: Failed to write frame: %v", err)
 		return err
@@ -539,6 +634,8 @@ func (t *ShmServerTransport) writeStatus(s *ServerStream, st *status.Status) err
 	log.Printf("[DEBUG] ShmServerTransport.writeStatus: Writing TRAILERS frame, streamID=%d, length=%d", s.id, fh.Length)
 
 	// Write frame to server->client ring
+	t.writeMu.Lock()
+	defer t.writeMu.Unlock()
 	if err := writeFrame(t.serverToClient, fh, payload, context.Background()); err != nil {
 		log.Printf("[ERROR] ShmServerTransport.writeStatus: Failed to write frame: %v", err)
 		return err
@@ -546,10 +643,19 @@ func (t *ShmServerTransport) writeStatus(s *ServerStream, st *status.Status) err
 
 	log.Printf("[DEBUG] ShmServerTransport.writeStatus: Successfully wrote TRAILERS frame")
 
-	// Remove stream from active streams
+	// Remove stream from active streams and finish draining if needed.
+	var shouldClose bool
+	var dbg string
 	t.mu.Lock()
 	delete(t.streams, s.id)
+	if t.draining.Load() && len(t.streams) == 0 && !t.closed.Load() {
+		shouldClose = true
+		dbg = t.drainDebugData
+	}
 	t.mu.Unlock()
+	if shouldClose {
+		go t.Close(errors.New("transport drained: " + dbg))
+	}
 
 	return nil
 }
