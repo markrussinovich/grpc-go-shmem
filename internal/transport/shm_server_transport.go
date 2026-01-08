@@ -175,7 +175,7 @@ func (t *ShmServerTransport) processIncomingData(ctx context.Context) {
 		}
 		fh, payload, err := readFrame(t.clientToServer, ctx)
 		if err != nil {
-			if errors.Is(err, ErrRingClosed) || t.closed.Load() {
+			if errors.Is(err, ErrRingClosed) || errors.Is(err, io.EOF) || errors.Is(err, context.Canceled) || t.closed.Load() {
 				return
 			}
 			continue

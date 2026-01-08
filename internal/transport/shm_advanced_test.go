@@ -429,61 +429,75 @@ func TestShmInflightStreamClosing(t *testing.T) {
 
 // TestShmContextCanceledOnClose tests that stream contexts are canceled on close
 func TestShmContextCanceledOnClose(t *testing.T) {
-	t.Skip("Test needs refactoring - context cancellation needs work")
 	segName := fmt.Sprintf("test-ctx-cancel-%d", time.Now().UnixNano())
-	segment, err := CreateSegment(segName, 65536, 65536)
+	defer RemoveSegment(segName)
+
+	serverSeg, err := CreateSegment(segName, 65536, 65536)
 	if err != nil {
 		t.Fatalf("failed to create segment: %v", err)
 	}
-	defer segment.Close()
+	defer serverSeg.Close()
+	serverSeg.H.SetServerReady(true)
 
-	serverTransport, err := NewShmServerTransport(segment, testAddr{"shm", "server"}, testAddr{"shm", "client"})
+	clientSeg, err := OpenSegment(segName)
+	if err != nil {
+		t.Fatalf("failed to open segment: %v", err)
+	}
+	defer clientSeg.Close()
+
+	serverTransport, err := NewShmServerTransport(serverSeg, testAddr{"shm", "server"}, testAddr{"shm", "client"})
 	if err != nil {
 		t.Fatalf("failed to create server transport: %v", err)
 	}
+	defer serverTransport.Close(nil)
 
 	var ctxCanceled atomic.Bool
 
-	serverTransport.handleFunc = func(s *ServerStream) {
-		streamCtx := s.Context()
-		<-streamCtx.Done()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	started := make(chan struct{}, 1)
+	go serverTransport.HandleStreams(ctx, func(s *ServerStream) {
+		started <- struct{}{}
+		<-s.Context().Done()
 		ctxCanceled.Store(true)
-	}
-
-	go serverTransport.HandleStreams(context.Background(), func(s *ServerStream) {
-		serverTransport.handleFunc(s)
 	})
 
 	// Client creates stream
-	clientTransport, err := NewShmClientTransport(segment, testAddr{"shm", "client"}, testAddr{"shm", "server"})
+	clientTransport, err := NewShmClientTransport(clientSeg, testAddr{"shm", "client"}, testAddr{"shm", "server"})
 	if err != nil {
 		t.Fatalf("failed to create client transport: %v", err)
 	}
+	defer clientTransport.Close(nil)
 
-	ctx := context.Background()
-	s, err := clientTransport.NewStream(ctx, &CallHdr{Method: "/test/CtxCancel"})
+	cs, err := clientTransport.NewStream(context.Background(), &CallHdr{Method: "/test/CtxCancel"})
 	if err != nil {
 		t.Fatalf("NewStream failed: %v", err)
 	}
 
 	// Send initial data
 	hdr := make([]byte, 5)
-	if err := clientTransport.write(s, hdr, mem.BufferSlice{}, &WriteOptions{}); err != nil {
+	if err := clientTransport.write(cs, hdr, mem.BufferSlice{}, &WriteOptions{}); err != nil {
 		t.Fatalf("write error: %v", err)
 	}
 
-	time.Sleep(50 * time.Millisecond)
-
-	// Close connection
-	serverTransport.Close(fmt.Errorf("connection closed"))
-
-	// Verify context was canceled
-	time.Sleep(100 * time.Millisecond)
-	if !ctxCanceled.Load() {
-		t.Fatal("stream context was not canceled on connection close")
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for server handler to start")
 	}
 
-	t.Log("Context properly canceled on close")
+	// Close connection from the client side.
+	clientTransport.Close(fmt.Errorf("connection closed"))
+
+	// Verify context was canceled.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if ctxCanceled.Load() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("stream context was not canceled on connection close")
 }
 
 func TestShmServerHandlesClientGoAwayDraining(t *testing.T) {
