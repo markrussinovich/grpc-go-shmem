@@ -155,7 +155,9 @@ func futexWaitTimeout(addr *uint32, val uint32, timeoutNs int64) error {
 // futexWake wakes up to n threads waiting on addr.
 // Returns the number of threads actually woken up.
 func futexWake(addr *uint32, n int) (int, error) {
-	futexLogf("[FUTEX] futexWake: addr=%p, n=%d, current_val=%d", addr, n, atomic.LoadUint32(addr))
+	if futexDebugEnabled {
+		futexLogf("[FUTEX] futexWake: addr=%p, n=%d, current_val=%d", addr, n, atomic.LoadUint32(addr))
+	}
 
 	// Use syscall.Syscall6 instead of RawSyscall6 for cross-process futex
 	r1, _, errno := syscall.Syscall6(
