@@ -399,13 +399,6 @@ func (t *ShmClientTransport) processIncomingData(ctx context.Context) {
 	}
 }
 
-// processFrameData processes incoming gRPC frame data
-func (t *ShmClientTransport) processFrameData(data []byte) error {
-	// TODO: Implement gRPC frame parsing and routing to streams
-	// For now, this is a placeholder that will be implemented in the next step
-	return nil
-}
-
 // Close tears down this transport. Once it returns, the transport
 // should not be accessed any more. The caller must make sure this
 // is called only once.

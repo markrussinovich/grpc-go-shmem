@@ -878,5 +878,5 @@ func (t *ShmServerTransport) writeStatus(s *ServerStream, st *status.Status) err
 
 // incrMsgRecv increments the message received counter
 func (t *ShmServerTransport) incrMsgRecv() {
-	// TODO: Implement stats tracking
+	// Channelz metrics are not wired for shm transport; keep a no-op to satisfy interface expectations.
 }
