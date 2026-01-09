@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"log"
+	"math"
 	"net"
 	"strings"
 	"sync"
@@ -51,6 +52,7 @@ type ShmServerTransport struct {
 	streams    map[uint32]*ServerStream
 	streamID   uint32 // next stream ID to assign
 	handleFunc func(*ServerStream)
+	maxStreams uint32
 
 	// Error handling
 	closeOnce sync.Once
@@ -59,7 +61,7 @@ type ShmServerTransport struct {
 	readerWG sync.WaitGroup
 }
 
-func (t *ShmServerTransport) sendGoAway(flags uint8) {
+func (t *ShmServerTransport) sendGoAway(flags uint8, debugData string) {
 	if t.closed.Load() || t.serverToClient == nil {
 		return
 	}
@@ -68,7 +70,7 @@ func (t *ShmServerTransport) sendGoAway(flags uint8) {
 
 	t.writeMu.Lock()
 	defer t.writeMu.Unlock()
-	_ = writeFrame(t.serverToClient, FrameHeader{Type: FrameTypeGOAWAY, Flags: flags}, nil, ctx)
+	_ = writeFrame(t.serverToClient, FrameHeader{Type: FrameTypeGOAWAY, Flags: flags}, []byte(debugData), ctx)
 }
 
 func (t *ShmServerTransport) rejectNewStream(streamID uint32, msg string) {
@@ -76,7 +78,7 @@ func (t *ShmServerTransport) rejectNewStream(streamID uint32, msg string) {
 		return
 	}
 	// Best-effort send GOAWAY as a signal to stop creating new streams.
-	t.sendGoAway(GoAwayFlagDRAINING)
+	t.sendGoAway(GoAwayFlagDRAINING, msg)
 
 	trailers := encodeTrailers(TrailersV1{Version: 1, GRPCStatusCode: uint32(codes.Unavailable), GRPCStatusMsg: msg})
 	fh := FrameHeader{Type: FrameTypeTRAILERS, StreamID: streamID, Length: uint32(len(trailers))}
@@ -118,6 +120,11 @@ func NewShmServerTransport(segment *Segment, localAddr, remoteAddr net.Addr) (*S
 		streams: make(map[uint32]*ServerStream),
 		errCh:   make(chan struct{}),
 	}
+	max := segment.H.MaxStreams()
+	if max == 0 {
+		max = uint32(math.MaxUint32)
+	}
+	t.maxStreams = max
 
 	return t, nil
 }
@@ -193,14 +200,21 @@ func (t *ShmServerTransport) processIncomingData(ctx context.Context) {
 			// Enter draining mode so we stop accepting new streams, and close once
 			// all active streams complete.
 			if fh.Flags&GoAwayFlagIMMEDIATE != 0 {
-				go t.Close(errors.New("received GOAWAY (immediate)"))
+				dbg := string(payload)
+				if dbg == "" {
+					dbg = "received GOAWAY (immediate)"
+				}
+				go t.Close(errors.New(dbg))
 				return
 			}
 
 			// Record draining state once.
 			if t.draining.CompareAndSwap(false, true) {
 				t.mu.Lock()
-				t.drainDebugData = "received GOAWAY (draining)"
+				t.drainDebugData = string(payload)
+				if t.drainDebugData == "" {
+					t.drainDebugData = "received GOAWAY (draining)"
+				}
 				active := len(t.streams)
 				t.mu.Unlock()
 
@@ -216,6 +230,20 @@ func (t *ShmServerTransport) processIncomingData(ctx context.Context) {
 			t.handleTrailers(fh.StreamID, payload)
 		case FrameTypeCANCEL:
 			t.handleCancel(fh.StreamID)
+		case FrameTypePING:
+			// Reply with PONG on the same connection.
+			if t.closed.Load() {
+				continue
+			}
+			t.writeMu.Lock()
+			err := writeFrame(t.serverToClient, FrameHeader{Type: FrameTypePONG}, payload, ctx)
+			t.writeMu.Unlock()
+			if err != nil {
+				continue
+			}
+		case FrameTypePONG:
+			// No-op for now; could be used for keepalive bookkeeping.
+			continue
 		default:
 			// Unknown frame type, ignore
 		}
@@ -234,6 +262,11 @@ func (t *ShmServerTransport) handleHeaders(ctx context.Context, streamID uint32,
 		msg := "transport is draining"
 		t.mu.Unlock()
 		t.rejectNewStream(streamID, msg)
+		return nil
+	}
+	if uint32(len(t.streams)) >= t.maxStreams {
+		t.mu.Unlock()
+		t.rejectNewStream(streamID, "max concurrent streams exceeded")
 		return nil
 	}
 	// Check if stream already exists.
@@ -464,6 +497,11 @@ func (t *ShmServerTransport) Close(err error) {
 			err = ErrConnClosing
 		}
 
+		// Best-effort notify peer that we're closing immediately with debug data.
+		if t.serverToClient != nil {
+			_ = writeFrame(t.serverToClient, FrameHeader{Type: FrameTypeGOAWAY, Flags: GoAwayFlagIMMEDIATE}, []byte("server closing"), context.Background())
+		}
+
 		// Snapshot and terminate all active streams.
 		var streams []*ServerStream
 		t.mu.Lock()
@@ -523,7 +561,7 @@ func (t *ShmServerTransport) Drain(debugData string) {
 	t.mu.Unlock()
 
 	// Notify peer we're draining.
-	t.sendGoAway(GoAwayFlagDRAINING)
+	t.sendGoAway(GoAwayFlagDRAINING, debugData)
 
 	// If there are no active streams, close immediately.
 	if active == 0 {

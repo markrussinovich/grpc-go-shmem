@@ -77,7 +77,8 @@ type SegmentHeader struct {
 	clientReady uint32   // 0x44: client mapped flag (0->1)
 	closed      uint32   // 0x48: closed flag (0 open, 1 closed)
 	pad         uint32   // 0x4C: padding
-	reserved    [48]byte // 0x50-0x7F: reserved/padding to 128B
+	maxStreams  uint32   // 0x50: max concurrent streams (0 means unlimited)
+	reserved    [44]byte // 0x54-0x7F: reserved/padding to 128B
 }
 
 // SegmentHeader atomic access methods
@@ -100,6 +101,18 @@ func (h *SegmentHeader) Version() uint32 {
 // SetVersion sets the protocol version
 func (h *SegmentHeader) SetVersion(version uint32) {
 	atomic.StoreUint32(&h.version, version)
+}
+
+// MaxStreams returns the max concurrent streams.
+// A return value of 0 indicates no limit.
+func (h *SegmentHeader) MaxStreams() uint32 {
+	return atomic.LoadUint32(&h.maxStreams)
+}
+
+// SetMaxStreams sets the max concurrent streams.
+// A value of 0 indicates no limit.
+func (h *SegmentHeader) SetMaxStreams(max uint32) {
+	atomic.StoreUint32(&h.maxStreams, max)
 }
 
 // TotalSize returns the total segment size
@@ -665,6 +678,18 @@ func (h *hdrView) ClientPID() uint32 {
 // SetClientPID sets the client process ID
 func (h *hdrView) SetClientPID(pid uint32) {
 	h.header().SetClientPID(pid)
+}
+
+// MaxStreams returns the max concurrent streams.
+// A return value of 0 indicates no limit.
+func (h *hdrView) MaxStreams() uint32 {
+	return h.header().MaxStreams()
+}
+
+// SetMaxStreams sets the max concurrent streams.
+// A value of 0 indicates no limit.
+func (h *hdrView) SetMaxStreams(max uint32) {
+	h.header().SetMaxStreams(max)
 }
 
 // ServerReady returns the server ready flag

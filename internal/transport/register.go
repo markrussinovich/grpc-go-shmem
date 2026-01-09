@@ -5,6 +5,7 @@ package transport
 import (
 	"context"
 	"fmt"
+	"math"
 	"net/url"
 	"strconv"
 	"sync/atomic"
@@ -21,9 +22,12 @@ var (
 type ShmAddress struct {
 	Name string
 	Cap  uint64
+	// MaxStreams limits concurrent streams per transport.
+	// A value of 0 indicates unlimited.
+	MaxStreams uint32
 }
 
-// ParseAddress parses shm URLs of the form: shm://name?cap=262144
+// ParseAddress parses shm URLs of the form: shm://name?cap=262144&maxstreams=1
 func ParseAddress(raw string) (ShmAddress, error) {
 	u, err := url.Parse(raw)
 	if err != nil {
@@ -54,7 +58,21 @@ func ParseAddress(raw string) (ShmAddress, error) {
 		}
 		capVal = uint64(v)
 	}
-	return ShmAddress{Name: name, Cap: capVal}, nil
+
+	maxStreamsVal := uint32(math.MaxUint32)
+	if ms := u.Query().Get("maxstreams"); ms != "" {
+		v, err := strconv.ParseUint(ms, 10, 32)
+		if err != nil {
+			return ShmAddress{}, fmt.Errorf("invalid maxstreams: %w", err)
+		}
+		if v == 0 {
+			maxStreamsVal = uint32(math.MaxUint32)
+		} else {
+			maxStreamsVal = uint32(v)
+		}
+	}
+
+	return ShmAddress{Name: name, Cap: capVal, MaxStreams: maxStreamsVal}, nil
 }
 
 // newShmServerFactory creates a server listener for the given shm address.
@@ -65,6 +83,7 @@ func newShmServerFactory(raw string) (*ShmListener, error) {
 	}
 	l, err := NewShmListener(&ShmAddr{Name: addr.Name}, DefaultSegmentSize, addr.Cap, addr.Cap)
 	if err == nil {
+		l.SetMaxStreams(addr.MaxStreams)
 		shmServerListenCount.Add(1)
 	}
 	return l, err

@@ -22,6 +22,7 @@ package transport
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"syscall"
@@ -98,6 +99,7 @@ func CreateSegment(name string, ringCapA, ringCapB uint64) (*Segment, error) {
 	segment.H.SetRingBOffset(ringBOffset)
 	segment.H.SetRingBCapacity(ringCapB)
 	segment.H.SetServerPID(uint32(os.Getpid()))
+	segment.H.SetMaxStreams(math.MaxUint32)
 	// Note: ServerReady should be set by the actual server, not during segment creation
 
 	// Initialize ring headers

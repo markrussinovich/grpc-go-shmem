@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -51,6 +52,7 @@ type ShmListener struct {
 	segmentSize uint64
 	ringASize   uint64
 	ringBSize   uint64
+	maxStreams  uint32
 }
 
 // shmConn represents a shared memory connection
@@ -85,6 +87,7 @@ func NewShmListener(addr *ShmAddr, segmentSize, ringASize, ringBSize uint64) (*S
 		segmentSize:    segmentSize,
 		ringASize:      ringASize,
 		ringBSize:      ringBSize,
+		maxStreams:     uint32(math.MaxUint32),
 	}
 
 	// Create the control-plane segment used to establish connections without any
@@ -109,6 +112,15 @@ func NewShmListener(addr *ShmAddr, segmentSize, ringASize, ringBSize uint64) (*S
 	l.ctlTx = NewShmRingFromSegment(ctlSeg.B, ctlSeg.Mem)
 
 	return l, nil
+}
+
+// SetMaxStreams configures the max concurrent streams for new connections.
+// A value of 0 indicates unlimited.
+func (l *ShmListener) SetMaxStreams(max uint32) {
+	if max == 0 {
+		max = uint32(math.MaxUint32)
+	}
+	atomic.StoreUint32(&l.maxStreams, max)
 }
 
 // Accept waits for and returns the next connection to the listener
@@ -145,6 +157,7 @@ func (l *ShmListener) Accept() (net.Conn, error) {
 			_ = writeFrame(l.ctlTx, FrameHeader{Type: FrameTypeREJECT}, encodeConnectReject(connectReject{message: err.Error()}), l.ctx)
 			continue
 		}
+		segment.H.SetMaxStreams(atomic.LoadUint32(&l.maxStreams))
 		segment.H.SetServerReady(true)
 
 		if err := writeFrame(l.ctlTx, FrameHeader{Type: FrameTypeACCEPT}, encodeConnectResponse(connectResponse{segmentName: segmentName}), l.ctx); err != nil {

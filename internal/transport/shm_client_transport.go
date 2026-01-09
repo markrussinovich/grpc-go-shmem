@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"log"
+	"math"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -46,6 +47,11 @@ type ShmClientTransport struct {
 	streamTransport map[*ClientStream]*ShmClientTransport // Track transport for each stream
 	streamID        uint32                                // next stream ID to assign
 
+	maxConcurrentStreams  uint32
+	streamQuota           int64
+	streamsQuotaAvailable chan struct{}
+	waitingStreams        uint32
+
 	// Error handling
 	closeOnce sync.Once
 	errCh     chan struct{}
@@ -58,16 +64,21 @@ type ShmClientTransport struct {
 	readerWG sync.WaitGroup
 }
 
-func (t *ShmClientTransport) setGoAwayReason(flags uint8) {
+func (t *ShmClientTransport) setGoAwayReason(flags uint8, debug string) {
 	t.goAwayOnce.Do(func() {
 		// Shmem GOAWAY frames do not carry an HTTP/2 error code or debug data.
 		// Mirror the http2 client default when a GOAWAY is received.
 		t.goAwayReason = GoAwayNoReason
-		if flags&GoAwayFlagIMMEDIATE != 0 {
-			t.goAwayDebugMessage = "received GOAWAY (immediate)"
+		if debug == "" {
+			if flags&GoAwayFlagIMMEDIATE != 0 {
+				t.goAwayDebugMessage = "received GOAWAY (immediate)"
+				return
+			}
+			t.goAwayDebugMessage = "received GOAWAY (draining)"
 			return
 		}
-		t.goAwayDebugMessage = "received GOAWAY (draining)"
+		// Prefer peer-provided debug string when present.
+		t.goAwayDebugMessage = debug
 	})
 }
 
@@ -91,18 +102,25 @@ func NewShmClientTransport(segment *Segment, localAddr, remoteAddr net.Addr) (*S
 	ctx, cancel := context.WithCancel(context.Background())
 
 	t := &ShmClientTransport{
-		segment:         segment,
-		clientToServer:  clientToServer,
-		serverToClient:  serverToClient,
-		localAddr:       localAddr,
-		remoteAddr:      remoteAddr,
-		ctx:             ctx,
-		cancel:          cancel,
-		streams:         make(map[uint32]*ClientStream),
-		streamTransport: make(map[*ClientStream]*ShmClientTransport),
-		errCh:           make(chan struct{}),
-		goAwayCh:        make(chan struct{}),
+		segment:               segment,
+		clientToServer:        clientToServer,
+		serverToClient:        serverToClient,
+		localAddr:             localAddr,
+		remoteAddr:            remoteAddr,
+		ctx:                   ctx,
+		cancel:                cancel,
+		streams:               make(map[uint32]*ClientStream),
+		streamTransport:       make(map[*ClientStream]*ShmClientTransport),
+		errCh:                 make(chan struct{}),
+		goAwayCh:              make(chan struct{}),
+		streamsQuotaAvailable: make(chan struct{}, 1),
 	}
+	max := segment.H.MaxStreams()
+	if max == 0 {
+		max = uint32(math.MaxUint32)
+	}
+	t.maxConcurrentStreams = max
+	t.streamQuota = int64(max)
 
 	// Start processing incoming data from the server (test hook guarded)
 	if enableClientReader.Load() {
@@ -154,7 +172,11 @@ func (t *ShmClientTransport) processIncomingData(ctx context.Context) {
 		case FrameTypeGOAWAY:
 			// Server is draining or closing the connection.
 			// Treat this as a signal to stop creating new streams.
-			t.setGoAwayReason(fh.Flags)
+			var dbg string
+			if len(payload) > 0 {
+				dbg = string(payload)
+			}
+			t.setGoAwayReason(fh.Flags, dbg)
 			t.draining.Store(true)
 			select {
 			case <-t.goAwayCh:
@@ -233,6 +255,14 @@ func (t *ShmClientTransport) processIncomingData(ctx context.Context) {
 			buf := mem.Copy(payload, mem.DefaultBufferPool())
 			stream.write(recvMsg{buffer: buf})
 
+		case FrameTypePING:
+			// Respond with PONG carrying the same opaque data.
+			_ = writeFrame(t.clientToServer, FrameHeader{Type: FrameTypePONG}, payload, context.Background())
+
+		case FrameTypePONG:
+			// No-op for now; keepalive callbacks not yet wired.
+			continue
+
 		case FrameTypeTRAILERS:
 			// Server sent trailers (end of stream)
 			tr, err := decodeTrailers(payload)
@@ -287,6 +317,12 @@ func (t *ShmClientTransport) Close(err error) {
 		// Mark closed early so late closeStream calls won't attempt to write to the
 		// rings while teardown is in progress.
 		t.closed.Store(true)
+
+		// Best-effort GOAWAY before tearing down rings so the peer observes the
+		// shutdown intent (mirrors http2 immediate close behavior).
+		if t.clientToServer != nil {
+			_ = writeFrame(t.clientToServer, FrameHeader{Type: FrameTypeGOAWAY, Flags: GoAwayFlagIMMEDIATE}, []byte("client closing"), context.Background())
+		}
 
 		// Cancel context to stop background reader goroutine.
 		t.cancel()
@@ -344,7 +380,7 @@ func (t *ShmClientTransport) GracefulClose() {
 
 	// Best-effort notify the peer we're draining.
 	if t.clientToServer != nil {
-		_ = writeFrame(t.clientToServer, FrameHeader{Type: FrameTypeGOAWAY, Flags: GoAwayFlagDRAINING}, nil, context.Background())
+		_ = writeFrame(t.clientToServer, FrameHeader{Type: FrameTypeGOAWAY, Flags: GoAwayFlagDRAINING}, []byte("draining"), context.Background())
 	}
 
 	// If there are no active streams, close immediately.
@@ -362,60 +398,97 @@ func (t *ShmClientTransport) NewStream(ctx context.Context, callHdr *CallHdr) (*
 		return nil, &NewStreamError{Err: ErrConnClosing, AllowTransparentRetry: true}
 	}
 
-	t.mu.Lock()
-	if t.closed.Load() || t.draining.Load() {
-		t.mu.Unlock()
-		return nil, &NewStreamError{Err: ErrConnClosing, AllowTransparentRetry: true}
-	}
-	// Assign stream ID (client uses odd IDs, starting from 1)
-	streamID := t.streamID
-	if streamID == 0 {
-		streamID = 1
-	}
-	t.streamID = streamID + 2 // Increment by 2 to maintain odd IDs
+	firstTry := true
+	var ch chan struct{}
+	var s *ClientStream
+	var streamID uint32
+	for {
+		t.mu.Lock()
+		if t.closed.Load() || t.draining.Load() {
+			t.mu.Unlock()
+			return nil, &NewStreamError{Err: ErrConnClosing, AllowTransparentRetry: true}
+		}
+		if t.streamQuota <= 0 {
+			if firstTry {
+				t.waitingStreams++
+			}
+			ch = t.streamsQuotaAvailable
+			t.mu.Unlock()
+			firstTry = false
+			select {
+			case <-ch:
+				continue
+			case <-ctx.Done():
+				return nil, &NewStreamError{Err: ContextErr(ctx.Err())}
+			case <-t.goAwayCh:
+				return nil, &NewStreamError{Err: errStreamDrain, AllowTransparentRetry: true}
+			case <-t.ctx.Done():
+				return nil, &NewStreamError{Err: ErrConnClosing, AllowTransparentRetry: true}
+			}
+		}
+		if !firstTry {
+			t.waitingStreams--
+		}
+		t.streamQuota--
 
-	// Create the client stream
-	s := &ClientStream{
-		Stream: &Stream{
-			id:             streamID,
-			ctx:            ctx,
-			method:         callHdr.Method,
-			sendCompress:   callHdr.SendCompress,
-			buf:            newRecvBuffer(),
-			contentSubtype: callHdr.ContentSubtype,
-		},
-		ct:         t, // Set the client transport (now an interface, no unsafe needed)
-		done:       make(chan struct{}),
-		headerChan: make(chan struct{}),
-		doneFunc:   callHdr.DoneFunc,
-	}
+		// Assign stream ID (client uses odd IDs, starting from 1)
+		streamID = t.streamID
+		if streamID == 0 {
+			streamID = 1
+		}
+		t.streamID = streamID + 2 // Increment by 2 to maintain odd IDs
 
-	// Set up transport reader for this stream
-	s.trReader = &transportReader{
-		reader: &recvBufferReader{
-			ctx:     s.ctx,
-			ctxDone: s.ctx.Done(),
-			recv:    s.buf,
-			closeStream: func(err error) {
-				s.Close(err)
+		// Create the client stream
+		s = &ClientStream{
+			Stream: &Stream{
+				id:             streamID,
+				ctx:            ctx,
+				method:         callHdr.Method,
+				sendCompress:   callHdr.SendCompress,
+				buf:            newRecvBuffer(),
+				contentSubtype: callHdr.ContentSubtype,
 			},
-		},
-		windowHandler: func(n int) {
-			// Flow control: for shm transport, we don't need traditional flow control
-			// as the ring buffer already provides backpressure
-		},
-	}
+			ct:         t, // Set the client transport (now an interface, no unsafe needed)
+			done:       make(chan struct{}),
+			headerChan: make(chan struct{}),
+			doneFunc:   callHdr.DoneFunc,
+		}
 
-	// Set requestRead callback (required by Stream.ReadMessageHeader)
-	// For shared memory transport, flow control is handled by the ring buffer
-	s.requestRead = func(n int) {
-		// No-op: shared memory transport doesn't need explicit flow control
-	}
+		// Set up transport reader for this stream
+		s.trReader = &transportReader{
+			reader: &recvBufferReader{
+				ctx:     s.ctx,
+				ctxDone: s.ctx.Done(),
+				recv:    s.buf,
+				closeStream: func(err error) {
+					s.Close(err)
+				},
+			},
+			windowHandler: func(n int) {
+				// Flow control: for shm transport, we don't need traditional flow control
+				// as the ring buffer already provides backpressure
+			},
+		}
 
-	// Register the stream
-	t.streams[streamID] = s
-	t.streamTransport[s] = t
-	t.mu.Unlock()
+		// Set requestRead callback (required by Stream.ReadMessageHeader)
+		// For shared memory transport, flow control is handled by the ring buffer
+		s.requestRead = func(n int) {
+			// No-op: shared memory transport doesn't need explicit flow control
+		}
+
+		// Register the stream
+		t.streams[streamID] = s
+		t.streamTransport[s] = t
+		if t.streamQuota > 0 && t.waitingStreams > 0 {
+			select {
+			case t.streamsQuotaAvailable <- struct{}{}:
+			default:
+			}
+		}
+		t.mu.Unlock()
+
+		break
+	}
 
 	// Send HEADERS frame to initiate the stream
 	var deadlineUnixNano uint64
@@ -481,6 +554,13 @@ func (t *ShmClientTransport) NewStream(ctx context.Context, callHdr *CallHdr) (*
 		t.mu.Lock()
 		delete(t.streams, streamID)
 		delete(t.streamTransport, s)
+		t.streamQuota++
+		if t.streamQuota > 0 && t.waitingStreams > 0 {
+			select {
+			case t.streamsQuotaAvailable <- struct{}{}:
+			default:
+			}
+		}
 		t.mu.Unlock()
 		// If draining was initiated concurrently and there are no streams left,
 		// ensure the transport completes draining.
@@ -562,11 +642,18 @@ func (t *ShmClientTransport) closeStream(s *ClientStream, err error, rst bool, r
 		close(s.headerChan)
 	}
 
-	// Remove stream from active streams map
+	// Remove stream from active streams map and return stream quota.
 	var shouldClose bool
 	t.mu.Lock()
 	delete(t.streams, s.id)
 	delete(t.streamTransport, s)
+	t.streamQuota++
+	if t.streamQuota > 0 && t.waitingStreams > 0 {
+		select {
+		case t.streamsQuotaAvailable <- struct{}{}:
+		default:
+		}
+	}
 	shouldClose = t.draining.Load() && len(t.streams) == 0 && !t.closed.Load()
 	t.mu.Unlock()
 

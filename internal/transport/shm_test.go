@@ -1,7 +1,4 @@
 /*
- *
- * Copyright 2025 gRPC authors.
- *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
@@ -64,7 +61,8 @@ func TestSegmentHeaderFieldOffsets(t *testing.T) {
 		{"clientReady", unsafe.Offsetof(h.clientReady), 0x44},
 		{"closed", unsafe.Offsetof(h.closed), 0x48},
 		{"pad", unsafe.Offsetof(h.pad), 0x4C},
-		{"reserved", unsafe.Offsetof(h.reserved), 0x50},
+		{"maxStreams", unsafe.Offsetof(h.maxStreams), 0x50},
+		{"reserved", unsafe.Offsetof(h.reserved), 0x54},
 	}
 
 	for _, tt := range tests {

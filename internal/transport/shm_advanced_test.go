@@ -608,7 +608,7 @@ func TestShmGracefulClose(t *testing.T) {
 	if _, err := cs.readTo(incomingHeader); err != io.EOF {
 		t.Fatalf("Client expected EOF from the server. Got: %v", err)
 	}
-	
+
 	wg.Wait()
 
 	// Server should close after the last stream completes when it receives GOAWAY.
@@ -617,6 +617,105 @@ func TestShmGracefulClose(t *testing.T) {
 		// closed
 	case <-time.After(2 * time.Second):
 		t.Fatal("timeout waiting for server transport to close after client GracefulClose")
+	}
+}
+
+func TestShmMaxStreams(t *testing.T) {
+	segName := fmt.Sprintf("test-max-streams-%d", time.Now().UnixNano())
+	defer RemoveSegment(segName)
+
+	serverSeg, err := CreateSegment(segName, 65536, 65536)
+	if err != nil {
+		t.Fatalf("failed to create segment: %v", err)
+	}
+	defer serverSeg.Close()
+	serverSeg.H.SetMaxStreams(1)
+	serverSeg.H.SetServerReady(true)
+
+	clientSeg, err := OpenSegment(segName)
+	if err != nil {
+		t.Fatalf("failed to open segment: %v", err)
+	}
+	defer clientSeg.Close()
+	clientSeg.H.SetClientReady(true)
+
+	serverTransport, err := NewShmServerTransport(serverSeg, testAddr{"shm", "server"}, testAddr{"shm", "client"})
+	if err != nil {
+		t.Fatalf("failed to create server transport: %v", err)
+	}
+	defer serverTransport.Close(nil)
+
+	allowFinishFirst := make(chan struct{})
+	firstStarted := make(chan struct{})
+	var streamCount atomic.Uint32
+	go serverTransport.HandleStreams(context.Background(), func(s *ServerStream) {
+		idx := streamCount.Add(1)
+		if idx == 1 {
+			close(firstStarted)
+			<-allowFinishFirst
+		}
+		_ = serverTransport.writeHeader(s, metadata.MD{"content-type": []string{"application/grpc"}})
+		_ = s.WriteStatus(status.New(codes.OK, ""))
+	})
+
+	clientTransport, err := NewShmClientTransport(clientSeg, testAddr{"shm", "client"}, testAddr{"shm", "server"})
+	if err != nil {
+		t.Fatalf("failed to create client transport: %v", err)
+	}
+	defer clientTransport.Close(nil)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cs1, err := clientTransport.NewStream(ctx, &CallHdr{Method: "/test/MaxStreams"})
+	if err != nil {
+		t.Fatalf("NewStream(_, _) = _, %v, want _, <nil>", err)
+	}
+	defer cs1.Close(nil)
+
+	select {
+	case <-firstStarted:
+	case <-ctx.Done():
+		t.Fatalf("timeout waiting for server to start handling first stream: %v", ctx.Err())
+	}
+
+	// With maxstreams=1, a second NewStream should block until the first stream
+	// completes. With a short context deadline, it should fail.
+	shortCtx, shortCancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer shortCancel()
+	if _, err := clientTransport.NewStream(shortCtx, &CallHdr{Method: "/test/MaxStreamsShort"}); err == nil {
+		t.Fatalf("NewStream(_, _) = _, <nil>, want deadline exceeded")
+	} else if err.Error() != status.Error(codes.DeadlineExceeded, context.DeadlineExceeded.Error()).Error() {
+		t.Fatalf("NewStream(_, _) = _, %v, want _, %v", err, status.Error(codes.DeadlineExceeded, context.DeadlineExceeded.Error()))
+	}
+
+	// Now start a waiting NewStream with a long timeout and verify it unblocks
+	// once the first stream finishes.
+	waitDone := make(chan error, 1)
+	go func() {
+		ctx2, cancel2 := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel2()
+		cs2, err := clientTransport.NewStream(ctx2, &CallHdr{Method: "/test/MaxStreamsWait"})
+		if err == nil {
+			cs2.Close(nil)
+		}
+		waitDone <- err
+	}()
+
+	select {
+	case err := <-waitDone:
+		t.Fatalf("second NewStream unexpectedly returned early: %v", err)
+	case <-time.After(100 * time.Millisecond):
+		// expected to be blocked
+	}
+
+	close(allowFinishFirst)
+	select {
+	case err := <-waitDone:
+		if err != nil {
+			t.Fatalf("second NewStream failed after first finished: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for second NewStream to unblock")
 	}
 }
 
