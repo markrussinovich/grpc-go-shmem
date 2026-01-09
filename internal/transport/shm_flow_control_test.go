@@ -1,0 +1,97 @@
+package transport
+
+import (
+	"context"
+	"encoding/binary"
+	"fmt"
+	"testing"
+	"time"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/mem"
+	"google.golang.org/grpc/status"
+)
+
+// Test that a client write blocks when the outbound flow-control window is
+// exhausted and resumes when WINDOW_UPDATE frames arrive.
+func TestShmFlowControlBlocksUntilWindowUpdate(t *testing.T) {
+	segName := fmt.Sprintf("test-flow-ctrl-%d", time.Now().UnixNano())
+	defer RemoveSegment(segName)
+
+	serverSeg, err := CreateSegment(segName, 65536, 65536)
+	if err != nil {
+		t.Fatalf("create segment: %v", err)
+	}
+	serverSeg.H.SetServerReady(true)
+	defer serverSeg.Close()
+
+	clientSeg, err := OpenSegment(segName)
+	if err != nil {
+		t.Fatalf("open segment: %v", err)
+	}
+	clientSeg.H.SetClientReady(true)
+	defer clientSeg.Close()
+
+	srvTransport, err := NewShmServerTransport(serverSeg, testAddr{"shm", "server"}, testAddr{"shm", "client"})
+	if err != nil {
+		t.Fatalf("server transport: %v", err)
+	}
+	defer srvTransport.Close(nil)
+
+	cliTransport, err := NewShmClientTransport(clientSeg, testAddr{"shm", "client"}, testAddr{"shm", "server"})
+	if err != nil {
+		t.Fatalf("client transport: %v", err)
+	}
+	defer cliTransport.Close(nil)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	go srvTransport.HandleStreams(context.Background(), func(s *ServerStream) {
+		// Read whatever the client sends to consume the window on the receive side.
+		_, _ = s.Read(5)
+		_ = s.WriteStatus(status.New(codes.OK, ""))
+	})
+
+	cs, err := cliTransport.NewStream(ctx, &CallHdr{Method: "/test/FlowControl"})
+	if err != nil {
+		t.Fatalf("NewStream: %v", err)
+	}
+
+	// Exhaust both connection and stream send windows to force a block.
+	cliTransport.sendQuotaMu.Lock()
+	cliTransport.connSendQuota = 0
+	cliTransport.streamSendQuota[cs.id] = 0
+	cliTransport.notifyQuotaChangeLocked()
+	cliTransport.sendQuotaMu.Unlock()
+
+	msg := mem.BufferSlice{mem.Copy([]byte("hello"), mem.DefaultBufferPool())}
+	writeErr := make(chan error, 1)
+	go func() {
+		writeErr <- cs.Write(nil, msg, &WriteOptions{Last: true})
+	}()
+
+	// The write should block until a WINDOW_UPDATE arrives.
+	select {
+	case err := <-writeErr:
+		t.Fatalf("write returned early: %v", err)
+	case <-time.After(50 * time.Millisecond):
+		// still blocked as expected
+	}
+
+	// Send WINDOW_UPDATE for both the connection and the stream to release the writer.
+	delta := uint32(msg.Len())
+	payload := make([]byte, 4)
+	binary.LittleEndian.PutUint32(payload, delta)
+	_ = writeFrame(srvTransport.serverToClient, FrameHeader{Type: FrameTypeWINDOW_UPDATE}, payload, context.Background())
+	_ = writeFrame(srvTransport.serverToClient, FrameHeader{Type: FrameTypeWINDOW_UPDATE, StreamID: cs.id}, payload, context.Background())
+
+	select {
+	case err := <-writeErr:
+		if err != nil {
+			t.Fatalf("write returned error after WINDOW_UPDATE: %v", err)
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatal("write did not unblock after WINDOW_UPDATE")
+	}
+}

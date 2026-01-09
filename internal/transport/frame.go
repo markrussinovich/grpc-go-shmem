@@ -39,15 +39,16 @@ const frameHeaderSize = 16
 type FrameType uint8
 
 const (
-	FrameTypePAD       FrameType = 0x00
-	FrameTypeHEADERS   FrameType = 0x01
-	FrameTypeMESSAGE   FrameType = 0x02
-	FrameTypeTRAILERS  FrameType = 0x03
-	FrameTypeCANCEL    FrameType = 0x04
-	FrameTypeGOAWAY    FrameType = 0x05
-	FrameTypePING      FrameType = 0x06
-	FrameTypePONG      FrameType = 0x07
-	FrameTypeHALFCLOSE FrameType = 0x08
+	FrameTypePAD           FrameType = 0x00
+	FrameTypeHEADERS       FrameType = 0x01
+	FrameTypeMESSAGE       FrameType = 0x02
+	FrameTypeTRAILERS      FrameType = 0x03
+	FrameTypeCANCEL        FrameType = 0x04
+	FrameTypeGOAWAY        FrameType = 0x05
+	FrameTypePING          FrameType = 0x06
+	FrameTypePONG          FrameType = 0x07
+	FrameTypeHALFCLOSE     FrameType = 0x08
+	FrameTypeWINDOW_UPDATE FrameType = 0x09
 )
 
 // Flags

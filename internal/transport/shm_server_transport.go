@@ -4,6 +4,7 @@ package transport
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"io"
 	"log"
@@ -54,6 +55,14 @@ type ShmServerTransport struct {
 	handleFunc func(*ServerStream)
 	maxStreams uint32
 
+	// Flow control
+	sendQuotaMu     sync.Mutex
+	connSendQuota   int64
+	streamSendQuota map[uint32]int64
+	quotaSignal     chan struct{}
+	connInFlow      trInFlow
+	streamInFlow    map[uint32]*inFlow
+
 	// Error handling
 	closeOnce sync.Once
 	errCh     chan struct{}
@@ -71,6 +80,70 @@ func (t *ShmServerTransport) sendGoAway(flags uint8, debugData string) {
 	t.writeMu.Lock()
 	defer t.writeMu.Unlock()
 	_ = writeFrame(t.serverToClient, FrameHeader{Type: FrameTypeGOAWAY, Flags: flags}, []byte(debugData), ctx)
+}
+
+func (t *ShmServerTransport) notifyQuotaChangeLocked() {
+	close(t.quotaSignal)
+	t.quotaSignal = make(chan struct{})
+}
+
+func (t *ShmServerTransport) addSendQuota(streamID uint32, delta uint32) {
+	if delta == 0 {
+		return
+	}
+	t.sendQuotaMu.Lock()
+	if streamID == 0 {
+		t.connSendQuota += int64(delta)
+	} else {
+		if _, ok := t.streamSendQuota[streamID]; ok {
+			t.streamSendQuota[streamID] += int64(delta)
+		}
+	}
+	t.notifyQuotaChangeLocked()
+	t.sendQuotaMu.Unlock()
+}
+
+func (t *ShmServerTransport) acquireSendQuota(streamID uint32, n int, ctx context.Context) error {
+	if n == 0 {
+		return nil
+	}
+	t.sendQuotaMu.Lock()
+	for {
+		if t.closed.Load() {
+			t.sendQuotaMu.Unlock()
+			return ErrConnClosing
+		}
+		connOK := t.connSendQuota >= int64(n)
+		streamOK := false
+		if q, ok := t.streamSendQuota[streamID]; ok && q >= int64(n) {
+			streamOK = true
+		}
+		if connOK && streamOK {
+			t.connSendQuota -= int64(n)
+			t.streamSendQuota[streamID] -= int64(n)
+			t.sendQuotaMu.Unlock()
+			return nil
+		}
+		ch := t.quotaSignal
+		t.sendQuotaMu.Unlock()
+		select {
+		case <-ch:
+		case <-ctx.Done():
+			return ContextErr(ctx.Err())
+		case <-t.ctx.Done():
+			return ErrConnClosing
+		}
+		t.sendQuotaMu.Lock()
+	}
+}
+
+func (t *ShmServerTransport) sendWindowUpdate(streamID uint32, delta uint32) {
+	if delta == 0 || t.closed.Load() {
+		return
+	}
+	buf := make([]byte, 4)
+	binary.LittleEndian.PutUint32(buf, delta)
+	_ = writeFrame(t.serverToClient, FrameHeader{Type: FrameTypeWINDOW_UPDATE, StreamID: streamID}, buf, context.Background())
 }
 
 func (t *ShmServerTransport) rejectNewStream(streamID uint32, msg string) {
@@ -115,11 +188,18 @@ func NewShmServerTransport(segment *Segment, localAddr, remoteAddr net.Addr) (*S
 			LocalAddr: localAddr,
 			AuthInfo:  nil, // No auth for shared memory
 		},
-		ctx:     ctx,
-		cancel:  cancel,
-		streams: make(map[uint32]*ServerStream),
-		errCh:   make(chan struct{}),
+		ctx:             ctx,
+		cancel:          cancel,
+		streams:         make(map[uint32]*ServerStream),
+		streamSendQuota: make(map[uint32]int64),
+		streamInFlow:    make(map[uint32]*inFlow),
+		errCh:           make(chan struct{}),
+		quotaSignal:     make(chan struct{}),
 	}
+	// Initialize flow control windows.
+	t.connSendQuota = int64(maxWindowSize)
+	t.connInFlow = trInFlow{limit: uint32(maxWindowSize)}
+	t.connInFlow.updateEffectiveWindowSize()
 	max := segment.H.MaxStreams()
 	if max == 0 {
 		max = uint32(math.MaxUint32)
@@ -241,6 +321,12 @@ func (t *ShmServerTransport) processIncomingData(ctx context.Context) {
 			if err != nil {
 				continue
 			}
+		case FrameTypeWINDOW_UPDATE:
+			if len(payload) >= 4 {
+				delta := binary.LittleEndian.Uint32(payload[:4])
+				t.addSendQuota(fh.StreamID, delta)
+			}
+			continue
 		case FrameTypePONG:
 			// No-op for now; could be used for keepalive bookkeeping.
 			continue
@@ -309,6 +395,7 @@ func (t *ShmServerTransport) handleHeaders(ctx context.Context, streamID uint32,
 			sendCompress:   "",
 			recvCompress:   "",
 			contentSubtype: "",
+			fc:             &inFlow{limit: uint32(maxWindowSize)},
 		},
 		st: t,
 	}
@@ -350,8 +437,12 @@ func (t *ShmServerTransport) handleHeaders(ctx context.Context, streamID uint32,
 	// Set requestRead callback for the stream
 	// For shared memory, no explicit flow control is needed
 	s.requestRead = func(n int) {
-		// No-op for shared memory transport
-		// Flow control is handled implicitly by the ring buffer
+		if n <= 0 {
+			return
+		}
+		if wu := s.fc.onRead(uint32(n)); wu > 0 {
+			t.sendWindowUpdate(streamID, wu)
+		}
 	}
 
 	// Create transport reader for the stream
@@ -378,6 +469,8 @@ func (t *ShmServerTransport) handleHeaders(ctx context.Context, streamID uint32,
 		return nil
 	}
 	t.streams[streamID] = s
+	t.streamSendQuota[streamID] = int64(maxWindowSize)
+	t.streamInFlow[streamID] = s.fc
 	h := t.handleFunc
 	t.mu.Unlock()
 
@@ -398,6 +491,18 @@ func (t *ShmServerTransport) handleMessage(streamID uint32, flags uint8, payload
 
 	if !exists {
 		// Stream doesn't exist, drop the message
+		return
+	}
+
+	sz := uint32(len(payload))
+	if wu := t.connInFlow.onData(sz); wu > 0 {
+		t.sendWindowUpdate(0, wu)
+	}
+	if s.fc == nil {
+		s.fc = &inFlow{limit: uint32(maxWindowSize)}
+	}
+	if err := s.fc.onData(sz); err != nil {
+		s.write(recvMsg{err: err})
 		return
 	}
 
@@ -449,6 +554,8 @@ func (t *ShmServerTransport) handleTrailers(streamID uint32, payload []byte) {
 	var dbg string
 	t.mu.Lock()
 	delete(t.streams, streamID)
+	delete(t.streamSendQuota, streamID)
+	delete(t.streamInFlow, streamID)
 	if t.draining.Load() && len(t.streams) == 0 && !t.closed.Load() {
 		shouldClose = true
 		dbg = t.drainDebugData
@@ -477,6 +584,8 @@ func (t *ShmServerTransport) handleCancel(streamID uint32) {
 	var dbg string
 	t.mu.Lock()
 	delete(t.streams, streamID)
+	delete(t.streamSendQuota, streamID)
+	delete(t.streamInFlow, streamID)
 	if t.draining.Load() && len(t.streams) == 0 && !t.closed.Load() {
 		shouldClose = true
 		dbg = t.drainDebugData
@@ -496,6 +605,10 @@ func (t *ShmServerTransport) Close(err error) {
 		if err == nil {
 			err = ErrConnClosing
 		}
+
+		t.sendQuotaMu.Lock()
+		t.notifyQuotaChangeLocked()
+		t.sendQuotaMu.Unlock()
 
 		// Best-effort notify peer that we're closing immediately with debug data.
 		if t.serverToClient != nil {
@@ -660,6 +773,11 @@ func (t *ShmServerTransport) write(s *ServerStream, hdr []byte, data mem.BufferS
 		payload = append(payload, buf.ReadOnlyData()...)
 	}
 
+	// Enforce outbound flow control before writing.
+	if err := t.acquireSendQuota(s.id, len(payload), s.ctx); err != nil {
+		return err
+	}
+
 	log.Printf("[DEBUG] ShmServerTransport.write: total payload=%d bytes", len(payload))
 
 	// Create MESSAGE frame
@@ -744,6 +862,8 @@ func (t *ShmServerTransport) writeStatus(s *ServerStream, st *status.Status) err
 	var dbg string
 	t.mu.Lock()
 	delete(t.streams, s.id)
+	delete(t.streamSendQuota, s.id)
+	delete(t.streamInFlow, s.id)
 	if t.draining.Load() && len(t.streams) == 0 && !t.closed.Load() {
 		shouldClose = true
 		dbg = t.drainDebugData
