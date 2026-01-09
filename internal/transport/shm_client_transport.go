@@ -7,7 +7,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
-	"log"
 	"math"
 	"net"
 	"sync"
@@ -28,6 +27,7 @@ type ShmClientTransport struct {
 	segment        *Segment // The shared memory segment
 	clientToServer *ShmRing // Ring for client->server data
 	serverToClient *ShmRing // Ring for server->client data
+	segmentName    string   // Segment identifier for cleanup
 
 	// Connection state
 	localAddr  net.Addr
@@ -173,10 +173,16 @@ func NewShmClientTransport(segment *Segment, localAddr, remoteAddr net.Addr) (*S
 
 	ctx, cancel := context.WithCancel(context.Background())
 
+	segName := ""
+	if addr, ok := remoteAddr.(*ShmAddr); ok {
+		segName = addr.Name
+	}
+
 	t := &ShmClientTransport{
 		segment:               segment,
 		clientToServer:        clientToServer,
 		serverToClient:        serverToClient,
+		segmentName:           segName,
 		localAddr:             localAddr,
 		remoteAddr:            remoteAddr,
 		ctx:                   ctx,
@@ -215,9 +221,9 @@ func NewShmClientTransport(segment *Segment, localAddr, remoteAddr net.Addr) (*S
 
 // processIncomingData reads data from the server->client ring and processes gRPC frames
 func (t *ShmClientTransport) processIncomingData(ctx context.Context) {
-	log.Printf("[DEBUG] ShmClientTransport.processIncomingData: STARTED")
+	shmDebugf("[DEBUG] ShmClientTransport.processIncomingData: STARTED")
 	defer func() {
-		log.Printf("[DEBUG] ShmClientTransport.processIncomingData: EXITING")
+		shmDebugf("[DEBUG] ShmClientTransport.processIncomingData: EXITING")
 		if !t.closed.Load() {
 			go t.Close(errors.New("incoming data processing ended"))
 		}
@@ -225,14 +231,14 @@ func (t *ShmClientTransport) processIncomingData(ctx context.Context) {
 
 	for {
 		if t.closed.Load() {
-			log.Printf("[DEBUG] ShmClientTransport.processIncomingData: transport closed, exiting")
+			shmDebugf("[DEBUG] ShmClientTransport.processIncomingData: transport closed, exiting")
 			return
 		}
-		log.Printf("[DEBUG] ShmClientTransport.processIncomingData: waiting for frame from server...")
+		shmDebugf("[DEBUG] ShmClientTransport.processIncomingData: waiting for frame from server...")
 		// Event-driven: block on next frame from rx ring.
 		fh, payload, err := readFrame(t.serverToClient, ctx)
 		if err != nil {
-			log.Printf("[DEBUG] ShmClientTransport.processIncomingData: readFrame error: %v", err)
+			shmDebugf("[DEBUG] ShmClientTransport.processIncomingData: readFrame error: %v", err)
 			if errors.Is(err, io.EOF) {
 				return
 			}
@@ -244,7 +250,7 @@ func (t *ShmClientTransport) processIncomingData(ctx context.Context) {
 			}
 			continue
 		}
-		log.Printf("[DEBUG] ShmClientTransport.processIncomingData: received frame type=%d, streamID=%d, length=%d", fh.Type, fh.StreamID, fh.Length)
+		shmDebugf("[DEBUG] ShmClientTransport.processIncomingData: received frame type=%d, streamID=%d, length=%d", fh.Type, fh.StreamID, fh.Length)
 
 		// Transport-level frames are not associated with a particular stream.
 		switch fh.Type {
@@ -445,9 +451,12 @@ func (t *ShmClientTransport) Close(err error) {
 		}
 		t.readerWG.Wait()
 
-		// Close the segment last.
+		// Close the segment last and unlink the backing file.
 		if t.segment != nil {
 			_ = t.segment.Close()
+		}
+		if t.segmentName != "" {
+			_ = RemoveSegment(t.segmentName)
 		}
 
 		// Signal closure
@@ -802,18 +811,10 @@ func (t *ShmClientTransport) write(s *ClientStream, hdr []byte, data mem.BufferS
 		return errStreamDone
 	}
 
-	// Combine header and data into a single payload
-	var payload []byte
-	if hdr != nil {
-		payload = append(payload, hdr...)
-	}
-	if data.Len() > 0 {
-		// Materialize the BufferSlice into a contiguous byte slice
-		payload = append(payload, data.Materialize()...)
-	}
+	payloadLen := len(hdr) + data.Len()
 
 	// Enforce outbound flow control: wait for available send window.
-	if err := t.acquireSendQuota(s.id, len(payload), s.ctx); err != nil {
+	if err := t.acquireSendQuota(s.id, payloadLen, s.ctx); err != nil {
 		return err
 	}
 
@@ -827,7 +828,7 @@ func (t *ShmClientTransport) write(s *ClientStream, hdr []byte, data mem.BufferS
 		fh.Flags = MessageFlagMORE
 	}
 
-	if err := writeFrame(t.clientToServer, fh, payload, s.ctx); err != nil {
+	if err := writeFrameBuffers(t.clientToServer, fh, hdr, data, s.ctx); err != nil {
 		return err
 	}
 

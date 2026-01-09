@@ -286,6 +286,9 @@ func (c *shmConn) Close() error {
 		if c.segment != nil {
 			c.segment.Close()
 		}
+		if c.segmentName != "" {
+			_ = RemoveSegment(c.segmentName)
+		}
 	})
 	return nil
 }
