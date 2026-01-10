@@ -29,6 +29,32 @@ import (
 	"sync/atomic"
 	"time"
 	"unsafe"
+	_ "unsafe" // for go:linkname
+)
+
+// runtime_procyield yields the processor, executing a PAUSE instruction on x86.
+// This is more efficient than runtime.Gosched() for short spin waits as it:
+// - Hints to the CPU that we're in a spin loop
+// - Reduces power consumption
+// - Allows hyperthreaded sibling to make progress
+// cycles is typically 1 for a single PAUSE.
+//
+//go:linkname runtime_procyield runtime.procyield
+func runtime_procyield(cycles uint32)
+
+// Spin-wait constants for adaptive spinning before falling back to futex.
+// Based on research from Facebook Folly's synchronization primitives.
+const (
+	// spinIterationsDefault is the default number of spin iterations before futex.
+	// At ~7ns per PAUSE instruction, 300 iterations ≈ 2µs of spinning.
+	// Folly uses 2µs as default because futex wake costs ~7-10µs.
+	spinIterationsDefault = 300
+
+	// spinIterationsMin is the minimum spin iterations for adaptive adjustment.
+	spinIterationsMin = 50
+
+	// spinIterationsMax is the maximum spin iterations to prevent excessive CPU use.
+	spinIterationsMax = 2000
 )
 
 var shmDebugEnabled = os.Getenv("GRPC_SHM_DEBUG") != ""
@@ -75,6 +101,11 @@ type ShmRing struct {
 	// The shared readIdx only advances when buffers are freed.
 	pendingReadIdx uint64
 	pendingMu      sync.Mutex // protects pendingReadIdx
+
+	// Adaptive spin state for minimizing latency on fast paths.
+	// These are process-local and help tune spin duration based on workload.
+	dataSpinCutoff  uint32 // Current spin iterations for waiting on data
+	spaceSpinCutoff uint32 // Current spin iterations for waiting on space
 	// No Go pointers into shared memory stored here; compute addresses on demand
 }
 
@@ -97,11 +128,13 @@ func NewShmRingFromSegment(ringView *ringView, mem []byte) *ShmRing {
 	}
 
 	r := &ShmRing{
-		capMask:  capacity - 1, // For modulo operations: pos = idx & capMask
-		hdrOff:   uintptr(ringView.offset),
-		dataOff:  uintptr(ringView.offset + RingHeaderSize),
-		mem:      mem,
-		capacity: capacity, // Store actual capacity separately
+		capMask:         capacity - 1, // For modulo operations: pos = idx & capMask
+		hdrOff:          uintptr(ringView.offset),
+		dataOff:         uintptr(ringView.offset + RingHeaderSize),
+		mem:             mem,
+		capacity:        capacity, // Store actual capacity separately
+		dataSpinCutoff:  spinIterationsDefault,
+		spaceSpinCutoff: spinIterationsDefault,
 	}
 	// Initialize pendingReadIdx from current shared readIdx
 	r.pendingReadIdx = r.header().ReadIndex()
@@ -223,7 +256,10 @@ func (r *ShmRing) WriteBlocking(data []byte) error {
 			// after any successful write commit.
 			if len(data) > 0 {
 				hdr.IncrementDataSequence()
-				futexWake(&hdr.dataSeq, 1)
+				// Only wake if readers are actually blocked on futex (not spinning)
+				if hdr.DataWaiters() > 0 {
+					futexWake(&hdr.dataSeq, 1)
+				}
 			}
 
 			return nil
@@ -236,7 +272,35 @@ func (r *ShmRing) WriteBlocking(data []byte) error {
 		usedBefore = writeIdx - readIdx
 		available = r.capacity - usedBefore
 		if available == 0 {
-			// Full: wait on spaceSeq (full→not-full)
+			// Full: spin-wait then wait on spaceSeq (full→not-full)
+			// Phase 1: Spin-wait before falling back to futex
+			spinLimit := atomic.LoadUint32(&r.spaceSpinCutoff)
+			spaceAvailable := false
+			for spin := uint32(0); spin < spinLimit; spin++ {
+				writeIdx = hdr.WriteIndex()
+				readIdx = hdr.ReadIndex()
+				if (r.capacity - (writeIdx - readIdx)) >= uint64(len(data)) {
+					// Space available! Update adaptive cutoff
+					if spin > 0 {
+						target := min(spinIterationsMax, spin*2)
+						newCutoff := (7*spinLimit + target) / 8
+						atomic.StoreUint32(&r.spaceSpinCutoff, max(spinIterationsMin, newCutoff))
+					}
+					spaceAvailable = true
+					break
+				}
+				if hdr.Closed() {
+					return ErrRingClosed
+				}
+				runtime_procyield(1)
+			}
+			if spaceAvailable {
+				continue
+			}
+			// Phase 2: Spin failed, reduce cutoff and fall back to futex
+			newCutoff := (7*spinLimit + spinIterationsMin) / 8
+			atomic.StoreUint32(&r.spaceSpinCutoff, max(spinIterationsMin, newCutoff))
+
 			hdr.IncSpaceWaiters()
 			exp := hdr.SpaceSequence()
 			// Re-check condition to avoid missed wake
@@ -254,7 +318,34 @@ func (r *ShmRing) WriteBlocking(data []byte) error {
 			}
 			continue
 		}
-		// Not full but not enough: any read helps; wait on contigSeq.
+		// Not full but not enough: spin-wait then wait on contigSeq.
+		// Phase 1: Spin-wait before falling back to futex
+		spinLimit := atomic.LoadUint32(&r.spaceSpinCutoff)
+		spaceAvailable := false
+		for spin := uint32(0); spin < spinLimit; spin++ {
+			writeIdx = hdr.WriteIndex()
+			readIdx = hdr.ReadIndex()
+			if (r.capacity - (writeIdx - readIdx)) >= uint64(len(data)) {
+				if spin > 0 {
+					target := min(spinIterationsMax, spin*2)
+					newCutoff := (7*spinLimit + target) / 8
+					atomic.StoreUint32(&r.spaceSpinCutoff, max(spinIterationsMin, newCutoff))
+				}
+				spaceAvailable = true
+				break
+			}
+			if hdr.Closed() {
+				return ErrRingClosed
+			}
+			runtime_procyield(1)
+		}
+		if spaceAvailable {
+			continue
+		}
+		// Phase 2: Spin failed, fall back to futex
+		newCutoff := (7*spinLimit + spinIterationsMin) / 8
+		atomic.StoreUint32(&r.spaceSpinCutoff, max(spinIterationsMin, newCutoff))
+
 		hdr.IncContigWaiters()
 		exp := hdr.ContigSequence()
 		// Re-check prior to waiting
@@ -370,6 +461,35 @@ func (r *ShmRing) ReadBlocking(buf []byte) (int, error) {
 
 		// No data available - check closure and wait for producer
 		if !hdr.Closed() {
+			// Phase 1: Spin-wait for a short duration before falling back to futex.
+			// This dramatically reduces latency in ping-pong patterns where data
+			// arrives quickly, avoiding the ~10µs futex wake overhead.
+			spinLimit := atomic.LoadUint32(&r.dataSpinCutoff)
+			for spin := uint32(0); spin < spinLimit; spin++ {
+				// Check if data arrived during spin
+				if hdr.WriteIndex()-hdr.ReadIndex() > 0 {
+					// Data arrived! Update adaptive cutoff (success = spin faster next time)
+					if spin > 0 {
+						// Exponential moving average: new = (7*old + target) / 8
+						target := min(spinIterationsMax, spin*2)
+						newCutoff := (7*spinLimit + target) / 8
+						atomic.StoreUint32(&r.dataSpinCutoff, max(spinIterationsMin, newCutoff))
+					}
+					continue // Re-enter main loop to read data
+				}
+				// Check closure during spin
+				if hdr.Closed() {
+					return 0, io.EOF
+				}
+				// PAUSE instruction - yields to hyperthread, saves power
+				runtime_procyield(1)
+			}
+
+			// Phase 2: Spin didn't succeed, fall back to futex
+			// Reduce spin cutoff (timeout = spin less next time)
+			newCutoff := (7*spinLimit + spinIterationsMin) / 8
+			atomic.StoreUint32(&r.dataSpinCutoff, max(spinIterationsMin, newCutoff))
+
 			hdr.IncDataWaiters()
 			dataSeq := hdr.DataSequence()
 			// Re-check data availability and closed state before sleeping
@@ -514,7 +634,10 @@ func (r *ShmRing) WriteBlockingContext(ctx context.Context, data []byte) error {
 			// after any successful write commit.
 			if len(data) > 0 {
 				hdr.IncrementDataSequence()
-				futexWake(&hdr.dataSeq, 1)
+				// Only wake if readers are actually blocked on futex (not spinning)
+				if hdr.DataWaiters() > 0 {
+					futexWake(&hdr.dataSeq, 1)
+				}
 			}
 
 			return nil
@@ -897,13 +1020,41 @@ func (r *ShmRing) ReserveWrite(n int, ctx context.Context) (WriteReservation, er
 			}, nil
 		}
 
+		// Insufficient space - spin briefly before falling back to futex.
+		spinCutoff := atomic.LoadUint32(&r.spaceSpinCutoff)
+		spinSuccess := false
+		for i := uint32(0); i < spinCutoff; i++ {
+			runtime_procyield(1) // PAUSE instruction to reduce power/contention
+			writeIdx = hdr.WriteIndex()
+			readIdx = hdr.ReadIndex()
+			if (r.capacity - (writeIdx - readIdx)) >= uint64(n) {
+				spinSuccess = true
+				// Adapt spin cutoff upward
+				newCutoff := (7*spinCutoff + spinIterationsMax) / 8
+				if newCutoff > spinIterationsMax {
+					newCutoff = spinIterationsMax
+				}
+				atomic.StoreUint32(&r.spaceSpinCutoff, newCutoff)
+				break
+			}
+		}
+		if spinSuccess {
+			continue // Loop back to reserve space
+		}
+		// Spin timed out - adapt cutoff downward
+		newCutoff := (7*spinCutoff + spinIterationsMin) / 8
+		if newCutoff < spinIterationsMin {
+			newCutoff = spinIterationsMin
+		}
+		atomic.StoreUint32(&r.spaceSpinCutoff, newCutoff)
+
 		if dl, ok := ctx.Deadline(); ok {
 			shmDebugf("ReserveWrite: waiting with timeout=%s", time.Until(dl))
 		} else {
 			shmDebugf("ReserveWrite: waiting WITHOUT timeout")
 		}
 
-		// Insufficient space - choose wait type based on fullness
+		// Spin failed - fall back to futex, choosing wait type based on fullness
 		writeIdx = hdr.WriteIndex()
 		readIdx = hdr.ReadIndex()
 		free := r.capacity - (writeIdx - readIdx)
@@ -1094,7 +1245,38 @@ func (r *ShmRing) ReadSlices(n int, ctx context.Context) (first, second []byte, 
 			return firstSlice, secondSlice, commitFunc, nil
 		}
 
-		// No data available - wait for producer with context check
+		// No data available - spin briefly before falling back to futex.
+		// This avoids syscall overhead in the common case where data arrives quickly.
+		spinCutoff := atomic.LoadUint32(&r.dataSpinCutoff)
+		spinSuccess := false
+		for i := uint32(0); i < spinCutoff; i++ {
+			runtime_procyield(1) // PAUSE instruction to reduce power/contention
+			writeIdx = hdr.WriteIndex()
+			r.pendingMu.Lock()
+			pendingIdx = r.pendingReadIdx
+			r.pendingMu.Unlock()
+			if writeIdx-pendingIdx >= uint64(n) {
+				spinSuccess = true
+				// Adapt spin cutoff upward (exponential moving average)
+				newCutoff := (7*spinCutoff + spinIterationsMax) / 8
+				if newCutoff > spinIterationsMax {
+					newCutoff = spinIterationsMax
+				}
+				atomic.StoreUint32(&r.dataSpinCutoff, newCutoff)
+				break
+			}
+		}
+		if spinSuccess {
+			continue // Loop back to return data
+		}
+		// Spin timed out - adapt cutoff downward
+		newCutoff := (7*spinCutoff + spinIterationsMin) / 8
+		if newCutoff < spinIterationsMin {
+			newCutoff = spinIterationsMin
+		}
+		atomic.StoreUint32(&r.dataSpinCutoff, newCutoff)
+
+		// Spin failed, fall back to futex - check context first
 		select {
 		case <-ctx.Done():
 			return nil, nil, nil, ctx.Err()
