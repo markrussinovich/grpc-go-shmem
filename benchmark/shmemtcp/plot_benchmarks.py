@@ -22,10 +22,11 @@ tcp_throughput = [8.35, 31.90, 159.89, 543.41, 1463.50, 2585.14]
 unix_throughput = [29.26, 115.29, 387.05, 1270.92, 3142.86, 5036.76]
 
 # Roundtrip latency (ns/op) - for unary RPC comparison
+# Updated with spin-wait optimization (2026-01-10)
 rt_sizes = ['64B', '256B', '1KB', '4KB']
-shm_rt_latency = [23047, 22319, 23565, 24249]  # Average of 3 runs
-tcp_rt_latency = [20100, 18520, 18287, 20304]  # Average of 3 runs
-unix_rt_latency = [9505, 9767, 9631, 11530]    # Average of 3 runs
+shm_rt_latency = [650, 637, 679, 925]  # With spin-wait optimization (avg of 3 runs)
+tcp_rt_latency = [18500, 18100, 18600, 20100]  # Average of 3 runs
+unix_rt_latency = [9500, 9600, 9650, 11400]    # Average of 3 runs
 
 # Output directory
 out_dir = os.path.join(os.path.dirname(__file__), 'out')

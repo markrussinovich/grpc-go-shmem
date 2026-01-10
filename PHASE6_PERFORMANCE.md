@@ -119,8 +119,9 @@ go test -bench=BenchmarkLatency -benchmem -benchtime=10000x ./internal/transport
 
 | Feature | Shared Memory | TCP Loopback | Unix Sockets |
 |---------|--------------|--------------|--------------|
-| **Latency (1KB)** | ~50-100µs | ~200-400µs | ~100-200µs |
-| **Throughput** | Highest | Medium | High |
+| **Roundtrip (1KB)** | ~0.7µs | ~18µs | ~9.6µs |
+| **One-Way (1KB)** | ~147ns | ~6.4µs | ~2.6µs |
+| **Throughput** | Highest (7GB/s) | Medium (160MB/s) | High (390MB/s) |
 | **CPU Usage** | Lowest | Highest | Medium |
 | **Memory** | Fixed | Dynamic | Dynamic |
 | **Setup Cost** | Low | Medium | Low |
@@ -131,8 +132,9 @@ go test -bench=BenchmarkLatency -benchmem -benchtime=10000x ./internal/transport
 ### Advantages of Shared Memory
 
 ✅ **Performance:**
-- 2-5x lower latency
-- 2-4x higher throughput  
+- 10-30x lower roundtrip latency (with spin-wait optimization)
+- 20-40x faster one-way streaming
+- 15-40x higher throughput  
 - 20-40% lower CPU usage
 - More consistent tail latencies
 
@@ -237,13 +239,18 @@ ringSize := 256 * 1024 // 256KB per ring
 ## Benchmark Results Format
 
 ```
-BenchmarkUnaryRPC/size=1024B/shm-8         10000    50234 ns/op    1024 B/op    2 allocs/op
-BenchmarkUnaryRPC/size=1024B/tcp-8          3000   185671 ns/op    2048 B/op    5 allocs/op
-BenchmarkUnaryRPC/size=1024B/unix-8         5000   112456 ns/op    1536 B/op    3 allocs/op
+# Roundtrip Latency (with spin-wait optimization)
+BenchmarkShmRingRoundtrip/size=64-2      4113248    585 ns/op    218 MB/s
+BenchmarkShmRingRoundtrip/size=256-2     4212075    640 ns/op    800 MB/s
+BenchmarkShmRingRoundtrip/size=1024-2    3190785    711 ns/op   2881 MB/s
+BenchmarkShmRingRoundtrip/size=4096-2    2807312    852 ns/op   9621 MB/s
 
-Speedup Analysis:
-- SHM vs TCP:  3.70x faster
-- SHM vs Unix: 2.24x faster
+BenchmarkUnixSocketRoundtrip/size=1024-2  259462   9530 ns/op    215 MB/s
+BenchmarkTCPLoopbackRoundtrip/size=1024-2 133903  18600 ns/op    110 MB/s
+
+Speedup Analysis (1KB roundtrip):
+- SHM vs TCP:  26x faster
+- SHM vs Unix: 13x faster
 ```
 
 ## Production Deployment
