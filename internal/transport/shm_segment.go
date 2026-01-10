@@ -247,11 +247,12 @@ type RingHeader struct {
 	spaceSeq uint32 // 0x1C: space sequence for futex (consumer increments)
 	closed   uint32 // 0x20: closed flag (producer sets to 1)
 	pad      uint32 // 0x24: padding
-	// 0x28-0x33: reuse reserved slots for additional synchronization fields
-	contigSeq     uint32   // 0x28: contiguity sequence (consumer increments on every read commit)
-	spaceWaiters  uint32   // 0x2C: number of writers waiting on space
-	contigWaiters uint32   // 0x30: number of writers waiting on contiguity
-	reserved      [12]byte // 0x34-0x3F: reserved/padding to 64B
+	// 0x28-0x3F: synchronization fields
+	contigSeq     uint32  // 0x28: contiguity sequence (consumer increments on every read commit)
+	spaceWaiters  uint32  // 0x2C: number of writers waiting on space
+	contigWaiters uint32  // 0x30: number of writers waiting on contiguity
+	dataWaiters   uint32  // 0x34: number of readers waiting for data
+	reserved      [8]byte // 0x38-0x3F: reserved/padding to 64B
 	// data area starts at offset 0x40
 }
 
@@ -369,6 +370,21 @@ func (r *RingHeader) DecContigWaiters() uint32 {
 // ContigWaiters returns the current number of writers waiting for contiguity
 func (r *RingHeader) ContigWaiters() uint32 {
 	return atomic.LoadUint32(&r.contigWaiters)
+}
+
+// IncDataWaiters increments the data waiters counter
+func (r *RingHeader) IncDataWaiters() uint32 {
+	return atomic.AddUint32(&r.dataWaiters, 1)
+}
+
+// DecDataWaiters decrements the data waiters counter
+func (r *RingHeader) DecDataWaiters() uint32 {
+	return atomic.AddUint32(&r.dataWaiters, ^uint32(0))
+}
+
+// DataWaiters returns the current number of readers waiting for data
+func (r *RingHeader) DataWaiters() uint32 {
+	return atomic.LoadUint32(&r.dataWaiters)
 }
 
 // DataArea returns a pointer to the ring's data area

@@ -370,9 +370,28 @@ func (r *ShmRing) ReadBlocking(buf []byte) (int, error) {
 
 		// No data available - check closure and wait for producer
 		if !hdr.Closed() {
+			hdr.IncDataWaiters()
 			dataSeq := hdr.DataSequence()
+			// Re-check data availability and closed state before sleeping
+			writeIdx := hdr.WriteIndex()
+			readIdx := hdr.ReadIndex()
+			if writeIdx-readIdx > 0 {
+				hdr.DecDataWaiters()
+				continue
+			}
+			// Re-check closed flag to avoid missing a close that happened
+			// after our initial check but before we entered futexWait
+			if hdr.Closed() {
+				hdr.DecDataWaiters()
+				return 0, io.EOF
+			}
 			if err := futexWait(&hdr.dataSeq, dataSeq); err != nil {
 				// Continue loop for spurious wake or other wake reasons
+			}
+			// Check if ring is still valid before decrementing - segment may
+			// have been unmapped while we were blocked on futexWait
+			if atomic.LoadUint32(&r.closed) == 0 {
+				hdr.DecDataWaiters()
 			}
 		} else {
 			// Closed and no data - return EOF
@@ -685,13 +704,33 @@ func (r *ShmRing) ReadBlockingContext(ctx context.Context, buf []byte) (int, err
 		}
 
 		// Need to wait for data
+		hdr.IncDataWaiters()
 		dataSeq := hdr.DataSequence()
+
+		// Re-check data availability before sleeping
+		writeIdx = hdr.WriteIndex()
+		readIdx = hdr.ReadIndex()
+		if writeIdx-readIdx > 0 {
+			hdr.DecDataWaiters()
+			continue
+		}
+
+		// Re-check closed flag after incrementing waiters to avoid missing
+		// a close that happened between our initial check and now
+		if hdr.Closed() {
+			hdr.DecDataWaiters()
+			return 0, io.EOF
+		}
 
 		// Calculate timeout from context deadline
 		var timeoutNs int64
 		if deadline, hasDeadline := ctx.Deadline(); hasDeadline {
 			remaining := time.Until(deadline)
 			if remaining <= 0 {
+				// Check if ring is still valid before decrementing
+				if atomic.LoadUint32(&r.closed) == 0 {
+					hdr.DecDataWaiters()
+				}
 				return 0, context.DeadlineExceeded
 			}
 			timeoutNs = remaining.Nanoseconds()
@@ -703,6 +742,11 @@ func (r *ShmRing) ReadBlockingContext(ctx context.Context, buf []byte) (int, err
 			err = futexWaitTimeout(&hdr.dataSeq, dataSeq, timeoutNs)
 		} else {
 			err = futexWait(&hdr.dataSeq, dataSeq)
+		}
+		// Check if ring is still valid before decrementing - segment may
+		// have been unmapped while we were blocked on futexWait
+		if atomic.LoadUint32(&r.closed) == 0 {
+			hdr.DecDataWaiters()
 		}
 
 		if err != nil {
@@ -837,7 +881,10 @@ func (r *ShmRing) ReserveWrite(n int, ctx context.Context) (WriteReservation, er
 
 				if written > 0 {
 					hdr.IncrementDataSequence()
-					futexWake(&hdr.dataSeq, 1)
+					// Only wake if there are waiters - avoids unnecessary syscalls
+					if hdr.DataWaiters() > 0 {
+						futexWake(&hdr.dataSeq, 1)
+					}
 				}
 
 				return nil
@@ -1087,6 +1134,7 @@ func (r *ShmRing) ReadSlices(n int, ctx context.Context) (first, second []byte, 
 		// Snapshot the producer's wake-up sequence, then re-check indices before
 		// sleeping to avoid a lost-wake race where the producer commits data after
 		// our availability check but before we enter futexWait.
+		hdr.IncDataWaiters()
 		dataSeq := hdr.DataSequence()
 		writeIdx = hdr.WriteIndex()
 		r.pendingMu.Lock()
@@ -1094,7 +1142,25 @@ func (r *ShmRing) ReadSlices(n int, ctx context.Context) (first, second []byte, 
 		r.pendingMu.Unlock()
 		if writeIdx-pendingIdx >= uint64(n) {
 			// Data became available; loop back to return slices.
+			hdr.DecDataWaiters()
 			continue
+		}
+
+		// Re-check closed flag after incrementing waiters and before futexWait
+		// to avoid missing a close that happened between our initial check and now
+		localClosed = atomic.LoadUint32(&r.closed) != 0
+		headerClosed = hdr.Closed()
+		if localClosed || headerClosed {
+			hdr.DecDataWaiters()
+			// Re-check if data appeared
+			writeIdx = hdr.WriteIndex()
+			r.pendingMu.Lock()
+			pendingIdx = r.pendingReadIdx
+			r.pendingMu.Unlock()
+			if writeIdx-pendingIdx >= uint64(n) {
+				continue
+			}
+			return nil, nil, nil, io.EOF
 		}
 
 		shmDebugf("[DEBUG] Ring read: no data available, dataSeq=%d, waiting on futex...", dataSeq)
@@ -1104,6 +1170,10 @@ func (r *ShmRing) ReadSlices(n int, ctx context.Context) (first, second []byte, 
 		if deadline, has := ctx.Deadline(); has {
 			rem := time.Until(deadline)
 			if rem <= 0 {
+				// Check if ring is still valid before decrementing
+				if atomic.LoadUint32(&r.closed) == 0 {
+					hdr.DecDataWaiters()
+				}
 				return nil, nil, nil, context.DeadlineExceeded
 			}
 			shmDebugf("[DEBUG] Ring read: calling futexWaitTimeout with timeout=%v", rem)
@@ -1111,6 +1181,11 @@ func (r *ShmRing) ReadSlices(n int, ctx context.Context) (first, second []byte, 
 		} else {
 			shmDebugf("[DEBUG] Ring read: calling futexWait (no timeout)")
 			err = futexWait(&hdr.dataSeq, dataSeq)
+		}
+		// Check if ring is still valid before decrementing - the segment may have
+		// been unmapped while we were blocked on futexWait
+		if atomic.LoadUint32(&r.closed) == 0 {
+			hdr.DecDataWaiters()
 		}
 		shmDebugf("[DEBUG] Ring read: futex returned, err=%v", err)
 
