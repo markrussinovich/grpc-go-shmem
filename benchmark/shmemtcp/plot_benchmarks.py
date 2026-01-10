@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Generate benchmark comparison plots for SHM vs TCP transport performance.
+Generate benchmark comparison plots for SHM vs TCP vs Unix socket transport performance.
 """
 
 import matplotlib.pyplot as plt
@@ -14,13 +14,18 @@ sizes_bytes = [64, 256, 1024, 4096, 16384, 65536]
 # One-way latency (ns/op)
 shm_latency = [126.3, 144.5, 147.3, 198.3, 499.2, 1788]
 tcp_latency = [7663, 8026, 6404, 7538, 11195, 25351]
+unix_latency = [2187, 2220, 2646, 3223, 5213, 13012]
 
-# Throughput (MB/s)
+# Throughput (MB/s) - one-way
 shm_throughput = [506.86, 1771.83, 6949.56, 20655.31, 32822.56, 36652.51]
 tcp_throughput = [8.35, 31.90, 159.89, 543.41, 1463.50, 2585.14]
+unix_throughput = [29.26, 115.29, 387.05, 1270.92, 3142.86, 5036.76]
 
-# Calculate speedup
-speedup = [tcp/shm for tcp, shm in zip(tcp_latency, shm_latency)]
+# Roundtrip latency (ns/op) - for unary RPC comparison
+rt_sizes = ['64B', '256B', '1KB', '4KB']
+shm_rt_latency = [23047, 22319, 23565, 24249]  # Average of 3 runs
+tcp_rt_latency = [20100, 18520, 18287, 20304]  # Average of 3 runs
+unix_rt_latency = [9505, 9767, 9631, 11530]    # Average of 3 runs
 
 # Output directory
 out_dir = os.path.join(os.path.dirname(__file__), 'out')
@@ -28,47 +33,75 @@ os.makedirs(out_dir, exist_ok=True)
 
 # Set style
 plt.style.use('seaborn-v0_8-whitegrid')
-colors = {'shm': '#2ecc71', 'tcp': '#e74c3c', 'speedup': '#3498db'}
+colors = {'shm': '#2ecc71', 'tcp': '#e74c3c', 'unix': '#3498db', 'speedup': '#9b59b6'}
 
-# Plot 1: Latency Comparison (log scale)
-fig, ax = plt.subplots(figsize=(10, 6))
+# Plot 1: One-Way Latency Comparison (log scale)
+fig, ax = plt.subplots(figsize=(12, 6))
 x = np.arange(len(sizes))
-width = 0.35
+width = 0.25
 
-bars1 = ax.bar(x - width/2, shm_latency, width, label='SHM', color=colors['shm'], edgecolor='black', linewidth=0.5)
-bars2 = ax.bar(x + width/2, tcp_latency, width, label='TCP', color=colors['tcp'], edgecolor='black', linewidth=0.5)
+bars1 = ax.bar(x - width, shm_latency, width, label='SHM', color=colors['shm'], edgecolor='black', linewidth=0.5)
+bars2 = ax.bar(x, unix_latency, width, label='Unix Socket', color=colors['unix'], edgecolor='black', linewidth=0.5)
+bars3 = ax.bar(x + width, tcp_latency, width, label='TCP Loopback', color=colors['tcp'], edgecolor='black', linewidth=0.5)
 
 ax.set_ylabel('Latency (ns/op)', fontsize=12)
 ax.set_xlabel('Message Size', fontsize=12)
-ax.set_title('One-Way Latency: SHM vs TCP Loopback', fontsize=14, fontweight='bold')
+ax.set_title('One-Way Streaming Latency: SHM vs Unix Socket vs TCP', fontsize=14, fontweight='bold')
 ax.set_xticks(x)
 ax.set_xticklabels(sizes)
 ax.legend(loc='upper left', fontsize=11)
 ax.set_yscale('log')
 ax.set_ylim(50, 100000)
 
-# Add value labels on bars
-for bar, val in zip(bars1, shm_latency):
-    ax.annotate(f'{val:.0f}', xy=(bar.get_x() + bar.get_width()/2, bar.get_height()),
-                xytext=(0, 3), textcoords='offset points', ha='center', va='bottom', fontsize=8)
-for bar, val in zip(bars2, tcp_latency):
-    ax.annotate(f'{val:.0f}', xy=(bar.get_x() + bar.get_width()/2, bar.get_height()),
-                xytext=(0, 3), textcoords='offset points', ha='center', va='bottom', fontsize=8)
-
 plt.tight_layout()
 plt.savefig(os.path.join(out_dir, 'latency_comparison.png'), dpi=150, bbox_inches='tight')
 plt.close()
 print(f"Created: {os.path.join(out_dir, 'latency_comparison.png')}")
 
-# Plot 2: Throughput Comparison (log scale)
+# Plot 2: Roundtrip (Unary RPC) Latency Comparison
 fig, ax = plt.subplots(figsize=(10, 6))
+x = np.arange(len(rt_sizes))
+width = 0.25
 
-bars1 = ax.bar(x - width/2, shm_throughput, width, label='SHM', color=colors['shm'], edgecolor='black', linewidth=0.5)
-bars2 = ax.bar(x + width/2, tcp_throughput, width, label='TCP', color=colors['tcp'], edgecolor='black', linewidth=0.5)
+# Convert to microseconds for readability
+bars1 = ax.bar(x - width, [l/1000 for l in shm_rt_latency], width, label='SHM', color=colors['shm'], edgecolor='black', linewidth=0.5)
+bars2 = ax.bar(x, [l/1000 for l in unix_rt_latency], width, label='Unix Socket', color=colors['unix'], edgecolor='black', linewidth=0.5)
+bars3 = ax.bar(x + width, [l/1000 for l in tcp_rt_latency], width, label='TCP Loopback', color=colors['tcp'], edgecolor='black', linewidth=0.5)
+
+ax.set_ylabel('Roundtrip Latency (µs)', fontsize=12)
+ax.set_xlabel('Message Size', fontsize=12)
+ax.set_title('Unary RPC Roundtrip Latency Comparison', fontsize=14, fontweight='bold')
+ax.set_xticks(x)
+ax.set_xticklabels(rt_sizes)
+ax.legend(loc='upper left', fontsize=11)
+
+# Add value labels
+for bar, val in zip(bars1, shm_rt_latency):
+    ax.annotate(f'{val/1000:.1f}', xy=(bar.get_x() + bar.get_width()/2, bar.get_height()),
+                xytext=(0, 3), textcoords='offset points', ha='center', va='bottom', fontsize=9)
+for bar, val in zip(bars2, unix_rt_latency):
+    ax.annotate(f'{val/1000:.1f}', xy=(bar.get_x() + bar.get_width()/2, bar.get_height()),
+                xytext=(0, 3), textcoords='offset points', ha='center', va='bottom', fontsize=9)
+for bar, val in zip(bars3, tcp_rt_latency):
+    ax.annotate(f'{val/1000:.1f}', xy=(bar.get_x() + bar.get_width()/2, bar.get_height()),
+                xytext=(0, 3), textcoords='offset points', ha='center', va='bottom', fontsize=9)
+
+plt.tight_layout()
+plt.savefig(os.path.join(out_dir, 'roundtrip_comparison.png'), dpi=150, bbox_inches='tight')
+plt.close()
+print(f"Created: {os.path.join(out_dir, 'roundtrip_comparison.png')}")
+
+# Plot 3: Throughput Comparison (log scale)
+fig, ax = plt.subplots(figsize=(12, 6))
+x = np.arange(len(sizes))
+
+bars1 = ax.bar(x - width, shm_throughput, width, label='SHM', color=colors['shm'], edgecolor='black', linewidth=0.5)
+bars2 = ax.bar(x, unix_throughput, width, label='Unix Socket', color=colors['unix'], edgecolor='black', linewidth=0.5)
+bars3 = ax.bar(x + width, tcp_throughput, width, label='TCP Loopback', color=colors['tcp'], edgecolor='black', linewidth=0.5)
 
 ax.set_ylabel('Throughput (MB/s)', fontsize=12)
 ax.set_xlabel('Message Size', fontsize=12)
-ax.set_title('Throughput: SHM vs TCP Loopback', fontsize=14, fontweight='bold')
+ax.set_title('One-Way Streaming Throughput', fontsize=14, fontweight='bold')
 ax.set_xticks(x)
 ax.set_xticklabels(sizes)
 ax.legend(loc='upper left', fontsize=11)
@@ -80,63 +113,69 @@ plt.savefig(os.path.join(out_dir, 'throughput_comparison.png'), dpi=150, bbox_in
 plt.close()
 print(f"Created: {os.path.join(out_dir, 'throughput_comparison.png')}")
 
-# Plot 3: Speedup Factor
+# Plot 4: Speedup Factor for One-Way (SHM vs others)
 fig, ax = plt.subplots(figsize=(10, 6))
+x = np.arange(len(sizes))
 
-bars = ax.bar(x, speedup, width=0.6, color=colors['speedup'], edgecolor='black', linewidth=0.5)
+speedup_vs_tcp = [tcp/shm for tcp, shm in zip(tcp_latency, shm_latency)]
+speedup_vs_unix = [unix/shm for unix, shm in zip(unix_latency, shm_latency)]
+
+width = 0.35
+bars1 = ax.bar(x - width/2, speedup_vs_tcp, width, label='vs TCP Loopback', color=colors['tcp'], edgecolor='black', linewidth=0.5)
+bars2 = ax.bar(x + width/2, speedup_vs_unix, width, label='vs Unix Socket', color=colors['unix'], edgecolor='black', linewidth=0.5)
 ax.axhline(y=1, color='gray', linestyle='--', linewidth=1, alpha=0.7)
 
-ax.set_ylabel('Speedup (TCP latency / SHM latency)', fontsize=12)
+ax.set_ylabel('SHM Speedup Factor', fontsize=12)
 ax.set_xlabel('Message Size', fontsize=12)
-ax.set_title('SHM Speedup vs TCP Loopback', fontsize=14, fontweight='bold')
+ax.set_title('SHM One-Way Streaming Speedup', fontsize=14, fontweight='bold')
 ax.set_xticks(x)
 ax.set_xticklabels(sizes)
-ax.set_ylim(0, 70)
+ax.legend(loc='upper right', fontsize=11)
+ax.set_ylim(0, 75)
 
 # Add value labels
-for bar, val in zip(bars, speedup):
+for bar, val in zip(bars1, speedup_vs_tcp):
     ax.annotate(f'{val:.0f}x', xy=(bar.get_x() + bar.get_width()/2, bar.get_height()),
-                xytext=(0, 3), textcoords='offset points', ha='center', va='bottom', fontsize=11, fontweight='bold')
+                xytext=(0, 3), textcoords='offset points', ha='center', va='bottom', fontsize=9, fontweight='bold')
+for bar, val in zip(bars2, speedup_vs_unix):
+    ax.annotate(f'{val:.0f}x', xy=(bar.get_x() + bar.get_width()/2, bar.get_height()),
+                xytext=(0, 3), textcoords='offset points', ha='center', va='bottom', fontsize=9, fontweight='bold')
 
 plt.tight_layout()
 plt.savefig(os.path.join(out_dir, 'speedup.png'), dpi=150, bbox_inches='tight')
 plt.close()
 print(f"Created: {os.path.join(out_dir, 'speedup.png')}")
 
-# Plot 4: Latency vs Message Size (line plot)
+# Plot 5: Latency vs Message Size (line plot)
 fig, ax = plt.subplots(figsize=(10, 6))
 
 ax.plot(sizes_bytes, shm_latency, 'o-', color=colors['shm'], linewidth=2, markersize=8, label='SHM')
-ax.plot(sizes_bytes, tcp_latency, 's-', color=colors['tcp'], linewidth=2, markersize=8, label='TCP')
+ax.plot(sizes_bytes, unix_latency, 's-', color=colors['unix'], linewidth=2, markersize=8, label='Unix Socket')
+ax.plot(sizes_bytes, tcp_latency, '^-', color=colors['tcp'], linewidth=2, markersize=8, label='TCP Loopback')
 
 ax.set_ylabel('Latency (ns/op)', fontsize=12)
 ax.set_xlabel('Message Size (bytes)', fontsize=12)
-ax.set_title('Latency Scaling with Message Size', fontsize=14, fontweight='bold')
+ax.set_title('One-Way Latency Scaling with Message Size', fontsize=14, fontweight='bold')
 ax.set_xscale('log')
 ax.set_yscale('log')
 ax.legend(loc='upper left', fontsize=11)
 ax.grid(True, alpha=0.3)
-
-# Add annotations for key points
-ax.annotate(f'61x faster', xy=(64, 126), xytext=(200, 50),
-            arrowprops=dict(arrowstyle='->', color='gray'), fontsize=10)
-ax.annotate(f'14x faster', xy=(65536, 1788), xytext=(20000, 500),
-            arrowprops=dict(arrowstyle='->', color='gray'), fontsize=10)
 
 plt.tight_layout()
 plt.savefig(os.path.join(out_dir, 'latency_scaling.png'), dpi=150, bbox_inches='tight')
 plt.close()
 print(f"Created: {os.path.join(out_dir, 'latency_scaling.png')}")
 
-# Plot 5: Throughput vs Message Size (line plot)
+# Plot 6: Throughput vs Message Size (line plot)
 fig, ax = plt.subplots(figsize=(10, 6))
 
 ax.plot(sizes_bytes, [t/1000 for t in shm_throughput], 'o-', color=colors['shm'], linewidth=2, markersize=8, label='SHM')
-ax.plot(sizes_bytes, [t/1000 for t in tcp_throughput], 's-', color=colors['tcp'], linewidth=2, markersize=8, label='TCP')
+ax.plot(sizes_bytes, [t/1000 for t in unix_throughput], 's-', color=colors['unix'], linewidth=2, markersize=8, label='Unix Socket')
+ax.plot(sizes_bytes, [t/1000 for t in tcp_throughput], '^-', color=colors['tcp'], linewidth=2, markersize=8, label='TCP Loopback')
 
 ax.set_ylabel('Throughput (GB/s)', fontsize=12)
 ax.set_xlabel('Message Size (bytes)', fontsize=12)
-ax.set_title('Throughput Scaling with Message Size', fontsize=14, fontweight='bold')
+ax.set_title('One-Way Throughput Scaling with Message Size', fontsize=14, fontweight='bold')
 ax.set_xscale('log')
 ax.legend(loc='upper left', fontsize=11)
 ax.grid(True, alpha=0.3)
@@ -144,7 +183,7 @@ ax.set_ylim(0, 40)
 
 # Highlight peak throughput
 ax.axhline(y=36.65, color=colors['shm'], linestyle='--', linewidth=1, alpha=0.5)
-ax.annotate('Peak: 36.7 GB/s', xy=(65536, 36.65), xytext=(10000, 38),
+ax.annotate('SHM Peak: 36.7 GB/s', xy=(65536, 36.65), xytext=(10000, 38),
             fontsize=10, color=colors['shm'])
 
 plt.tight_layout()
@@ -152,42 +191,46 @@ plt.savefig(os.path.join(out_dir, 'throughput_scaling.png'), dpi=150, bbox_inche
 plt.close()
 print(f"Created: {os.path.join(out_dir, 'throughput_scaling.png')}")
 
-# Plot 6: Summary Dashboard
+# Plot 7: Summary Dashboard
 fig, axes = plt.subplots(2, 2, figsize=(14, 10))
 
-# Subplot 1: Latency bars
+# Subplot 1: One-way latency bars
 ax = axes[0, 0]
-bars1 = ax.bar(x - width/2, shm_latency, width, label='SHM', color=colors['shm'])
-bars2 = ax.bar(x + width/2, tcp_latency, width, label='TCP', color=colors['tcp'])
+x = np.arange(len(sizes))
+bars1 = ax.bar(x - width, shm_latency, width, label='SHM', color=colors['shm'])
+bars2 = ax.bar(x, unix_latency, width, label='Unix', color=colors['unix'])
+bars3 = ax.bar(x + width, tcp_latency, width, label='TCP', color=colors['tcp'])
 ax.set_ylabel('Latency (ns/op)')
-ax.set_title('One-Way Latency')
+ax.set_title('One-Way Streaming Latency')
 ax.set_xticks(x)
 ax.set_xticklabels(sizes)
 ax.legend()
 ax.set_yscale('log')
 
-# Subplot 2: Throughput bars
+# Subplot 2: Roundtrip latency bars
 ax = axes[0, 1]
-bars1 = ax.bar(x - width/2, [t/1000 for t in shm_throughput], width, label='SHM', color=colors['shm'])
-bars2 = ax.bar(x + width/2, [t/1000 for t in tcp_throughput], width, label='TCP', color=colors['tcp'])
+x = np.arange(len(rt_sizes))
+bars1 = ax.bar(x - width, [l/1000 for l in shm_rt_latency], width, label='SHM', color=colors['shm'])
+bars2 = ax.bar(x, [l/1000 for l in unix_rt_latency], width, label='Unix', color=colors['unix'])
+bars3 = ax.bar(x + width, [l/1000 for l in tcp_rt_latency], width, label='TCP', color=colors['tcp'])
+ax.set_ylabel('Latency (µs)')
+ax.set_title('Unary RPC Roundtrip Latency')
+ax.set_xticks(x)
+ax.set_xticklabels(rt_sizes)
+ax.legend()
+
+# Subplot 3: Throughput
+ax = axes[1, 0]
+x = np.arange(len(sizes))
+bars1 = ax.bar(x - width, [t/1000 for t in shm_throughput], width, label='SHM', color=colors['shm'])
+bars2 = ax.bar(x, [t/1000 for t in unix_throughput], width, label='Unix', color=colors['unix'])
+bars3 = ax.bar(x + width, [t/1000 for t in tcp_throughput], width, label='TCP', color=colors['tcp'])
 ax.set_ylabel('Throughput (GB/s)')
-ax.set_title('Throughput')
+ax.set_title('One-Way Throughput')
 ax.set_xticks(x)
 ax.set_xticklabels(sizes)
 ax.legend()
 ax.set_yscale('log')
-
-# Subplot 3: Speedup
-ax = axes[1, 0]
-bars = ax.bar(x, speedup, width=0.6, color=colors['speedup'])
-ax.axhline(y=1, color='gray', linestyle='--', linewidth=1)
-ax.set_ylabel('Speedup Factor')
-ax.set_title('SHM Speedup vs TCP')
-ax.set_xticks(x)
-ax.set_xticklabels(sizes)
-for bar, val in zip(bars, speedup):
-    ax.annotate(f'{val:.0f}x', xy=(bar.get_x() + bar.get_width()/2, bar.get_height()),
-                xytext=(0, 3), textcoords='offset points', ha='center', va='bottom', fontsize=9, fontweight='bold')
 
 # Subplot 4: Summary text
 ax = axes[1, 1]
@@ -196,33 +239,33 @@ summary_text = """
 SHM Transport Performance Summary
 ═══════════════════════════════════════
 
-Key Metrics (64B messages):
-  • SHM Latency:  126 ns
-  • TCP Latency:  7,663 ns
-  • Speedup:      61x
+One-Way Streaming (best case):
+  • SHM: 126 ns (64B) → 36.7 GB/s peak
+  • Unix: 2,187 ns    → 5.0 GB/s peak  
+  • TCP:  7,663 ns    → 2.6 GB/s peak
+  
+  SHM is 17x faster than Unix, 61x faster than TCP
 
-Peak Throughput:
-  • SHM: 36.7 GB/s (64KB messages)
-  • TCP: 2.6 GB/s (64KB messages)
+Unary RPC Roundtrip (64B):
+  • Unix: 9.5 µs  ← Fastest (kernel optimized)
+  • TCP:  20.1 µs  
+  • SHM:  23.0 µs ← Needs spin-wait optimization
 
-Optimizations Applied:
-  ✓ dataWaiters counter (eliminates
-    unnecessary futex wakeups)
-  ✓ Zero-copy reads with pendingReadIdx
-  ✓ Minimal syscalls in steady-state
-
-Best Use Case:
-  High-throughput streaming between
-  local processes on the same machine.
+Key Insight:
+  SHM excels at streaming (no syscalls in 
+  steady-state). For unary RPC, futex wakes
+  on every message add latency. Future work:
+  spin-wait before futex to reduce latency.
 """
 ax.text(0.1, 0.9, summary_text, transform=ax.transAxes, fontsize=11,
         verticalalignment='top', fontfamily='monospace',
         bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
 
-plt.suptitle('SHM vs TCP Transport Benchmark Results', fontsize=16, fontweight='bold', y=0.98)
+plt.suptitle('SHM vs Unix Socket vs TCP Benchmark Results', fontsize=16, fontweight='bold', y=0.98)
 plt.tight_layout(rect=[0, 0, 1, 0.96])
 plt.savefig(os.path.join(out_dir, 'benchmark_dashboard.png'), dpi=150, bbox_inches='tight')
 plt.close()
 print(f"Created: {os.path.join(out_dir, 'benchmark_dashboard.png')}")
 
 print(f"\nAll plots saved to: {out_dir}")
+

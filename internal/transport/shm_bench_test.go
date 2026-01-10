@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -209,6 +210,87 @@ func BenchmarkTCPLoopback(b *testing.B) {
 				_, err := conn.Write(data)
 				if err != nil {
 					b.Fatalf("Write failed: %v", err)
+				}
+			}
+
+			wg.Wait()
+			select {
+			case err := <-errCh:
+				b.Fatalf("Server error: %v", err)
+			default:
+			}
+		})
+	}
+}
+
+// BenchmarkUnixSocketRoundtrip measures Unix socket round-trip time
+func BenchmarkUnixSocketRoundtrip(b *testing.B) {
+	sizes := []int{64, 256, 1024, 4096}
+
+	for _, size := range sizes {
+		b.Run(fmt.Sprintf("size=%d", size), func(b *testing.B) {
+			sockPath := fmt.Sprintf("/tmp/bench-unix-rt-%d.sock", time.Now().UnixNano())
+			defer os.Remove(sockPath)
+
+			listener, err := net.Listen("unix", sockPath)
+			if err != nil {
+				b.Fatalf("Listen failed: %v", err)
+			}
+			defer listener.Close()
+
+			data := make([]byte, size)
+			recvBuf := make([]byte, size)
+
+			var wg sync.WaitGroup
+			errCh := make(chan error, 2)
+			started := make(chan struct{})
+
+			// Echo server
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				conn, err := listener.Accept()
+				if err != nil {
+					errCh <- err
+					return
+				}
+				defer conn.Close()
+				close(started)
+
+				buf := make([]byte, size)
+				for i := 0; i < b.N; i++ {
+					_, err := io.ReadFull(conn, buf)
+					if err != nil {
+						errCh <- err
+						return
+					}
+					_, err = conn.Write(buf)
+					if err != nil {
+						errCh <- err
+						return
+					}
+				}
+			}()
+
+			conn, err := net.Dial("unix", sockPath)
+			if err != nil {
+				b.Fatalf("Dial failed: %v", err)
+			}
+			defer conn.Close()
+
+			<-started
+
+			b.SetBytes(int64(size * 2)) // round trip
+			b.ResetTimer()
+
+			for i := 0; i < b.N; i++ {
+				_, err := conn.Write(data)
+				if err != nil {
+					b.Fatalf("Write failed: %v", err)
+				}
+				_, err = io.ReadFull(conn, recvBuf)
+				if err != nil {
+					b.Fatalf("Read failed: %v", err)
 				}
 			}
 
