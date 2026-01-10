@@ -115,10 +115,9 @@ func futexWaitTimeout(addr *uint32, val uint32, timeoutNs int64) error {
 		return nil // Value already changed, no need to wait
 	}
 
-	// Convert nanoseconds to timespec
-	var ts syscall.Timespec
-	ts.Sec = int64(timeoutNs / 1e9)
-	ts.Nsec = int64(timeoutNs % 1e9)
+	// Convert nanoseconds to timespec using the standard library helper
+	// which handles architecture-specific field types (int64 on amd64, int32 on 386)
+	ts := syscall.NsecToTimespec(timeoutNs)
 
 	// Use syscall.Syscall6 instead of RawSyscall6 for cross-process futex
 	r1, _, errno := syscall.Syscall6(
