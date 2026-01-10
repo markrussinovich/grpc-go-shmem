@@ -62,7 +62,7 @@ type streamingClientStream struct {
 	trCh  chan TrailersV1
 	// trailers holds the received trailers (once). It allows RecvMsg to drain any
 	// buffered messages before returning EOF/status.
-	trailers *TrailersV1
+	trailers atomic.Pointer[TrailersV1]
 	errCh    chan error
 
 	// Send coordination
@@ -325,7 +325,7 @@ func (c *ShmStreamingClient) dispatchTrailers(id uint32, tr TrailersV1, err erro
 		return
 	}
 	s.recvDone.Store(true)
-	s.trailers = &tr
+	s.trailers.Store(&tr)
 	select {
 	case s.trCh <- tr:
 	default:
@@ -385,9 +385,9 @@ func (s *streamingClientStream) RecvMsg() ([]byte, error) {
 		default:
 		}
 
-		if s.trailers != nil && len(s.msgCh) == 0 {
-			if s.trailers.GRPCStatusCode != 0 {
-				return nil, fmt.Errorf("stream ended with status %d: %s", s.trailers.GRPCStatusCode, s.trailers.GRPCStatusMsg)
+		if tr := s.trailers.Load(); tr != nil && len(s.msgCh) == 0 {
+			if tr.GRPCStatusCode != 0 {
+				return nil, fmt.Errorf("stream ended with status %d: %s", tr.GRPCStatusCode, tr.GRPCStatusMsg)
 			}
 			return nil, io.EOF
 		}
@@ -396,7 +396,7 @@ func (s *streamingClientStream) RecvMsg() ([]byte, error) {
 		case msg := <-s.msgCh:
 			return msg, nil
 		case tr := <-s.trCh:
-			s.trailers = &tr
+			s.trailers.Store(&tr)
 			continue
 		case err := <-s.errCh:
 			return nil, err

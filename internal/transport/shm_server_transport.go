@@ -7,7 +7,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
-	"log"
 	"math"
 	"net"
 	"strings"
@@ -250,7 +249,9 @@ func (t *ShmServerTransport) HandleStreams(ctx context.Context, handle func(*Ser
 
 // processIncomingData reads data from the client->server ring and processes gRPC frames
 func (t *ShmServerTransport) processIncomingData(ctx context.Context) {
+	shmDebugf("[DEBUG] ShmServerTransport.processIncomingData: STARTED, ring=%p", t.clientToServer)
 	defer func() {
+		shmDebugf("[DEBUG] ShmServerTransport.processIncomingData: EXITING")
 		if !t.closed.Load() {
 			go t.Close(errors.New("incoming data processing ended"))
 		}
@@ -258,14 +259,32 @@ func (t *ShmServerTransport) processIncomingData(ctx context.Context) {
 
 	for {
 		if t.closed.Load() {
+			shmDebugf("[DEBUG] ShmServerTransport.processIncomingData: transport closed, exiting")
 			return
 		}
-		fh, payload, err := readFrame(t.clientToServer, ctx)
+		shmDebugf("[DEBUG] ShmServerTransport.processIncomingData: waiting for frame from client... widx=%d, ridx=%d", t.clientToServer.header().WriteIndex(), t.clientToServer.header().ReadIndex())
+		fh, payloadBuf, err := readFrameView(t.clientToServer, ctx)
 		if err != nil {
+			shmDebugf("[DEBUG] ShmServerTransport.processIncomingData: readFrameView error: %v", err)
 			if errors.Is(err, ErrRingClosed) || errors.Is(err, io.EOF) || errors.Is(err, context.Canceled) || t.closed.Load() {
 				return
 			}
 			continue
+		}
+		shmDebugf("[DEBUG] ShmServerTransport.processIncomingData: received frame type=%d, streamID=%d, length=%d", fh.Type, fh.StreamID, fh.Length)
+
+		payloadTransferred := false
+		release := func() {
+			shmDebugf("[DEBUG] ShmServerTransport.processIncomingData: release() called, payloadTransferred=%v, payloadBuf=%v", payloadTransferred, payloadBuf)
+			if !payloadTransferred && payloadBuf != nil {
+				payloadBuf.Free()
+				payloadBuf = nil
+			}
+		}
+
+		var payload []byte
+		if payloadBuf != nil {
+			payload = payloadBuf.ReadOnlyData()
 		}
 
 		// Dispatch frames based on type
@@ -273,8 +292,10 @@ func (t *ShmServerTransport) processIncomingData(ctx context.Context) {
 		case FrameTypeHEADERS:
 			if err := t.handleHeaders(ctx, fh.StreamID, payload); err != nil {
 				// Log error but continue processing
+				release()
 				continue
 			}
+			release()
 		case FrameTypeGOAWAY:
 			// Client is draining or closing the connection.
 			// Enter draining mode so we stop accepting new streams, and close once
@@ -284,6 +305,7 @@ func (t *ShmServerTransport) processIncomingData(ctx context.Context) {
 				if dbg == "" {
 					dbg = "received GOAWAY (immediate)"
 				}
+				release()
 				go t.Close(errors.New(dbg))
 				return
 			}
@@ -299,20 +321,32 @@ func (t *ShmServerTransport) processIncomingData(ctx context.Context) {
 				t.mu.Unlock()
 
 				if active == 0 {
+					release()
 					go t.Close(errors.New("transport drained: received GOAWAY (draining)"))
 					return
 				}
 			}
+			release()
 			continue
 		case FrameTypeMESSAGE:
-			t.handleMessage(fh.StreamID, fh.Flags, payload)
+			// Transfer ownership to the stream to avoid copying when possible.
+			if payloadBuf != nil {
+				payloadTransferred = true
+				t.handleMessageBuffer(fh.StreamID, fh.Flags, payloadBuf)
+				payloadBuf = nil
+			} else {
+				t.handleMessage(fh.StreamID, fh.Flags, payload)
+			}
 		case FrameTypeTRAILERS:
 			t.handleTrailers(fh.StreamID, payload)
+			release()
 		case FrameTypeCANCEL:
 			t.handleCancel(fh.StreamID)
+			release()
 		case FrameTypePING:
 			// Reply with PONG on the same connection.
 			if t.closed.Load() {
+				release()
 				continue
 			}
 			t.writeMu.Lock()
@@ -321,17 +355,21 @@ func (t *ShmServerTransport) processIncomingData(ctx context.Context) {
 			if err != nil {
 				continue
 			}
+			release()
 		case FrameTypeWINDOW_UPDATE:
 			if len(payload) >= 4 {
 				delta := binary.LittleEndian.Uint32(payload[:4])
 				t.addSendQuota(fh.StreamID, delta)
 			}
+			release()
 			continue
 		case FrameTypePONG:
 			// No-op for now; could be used for keepalive bookkeeping.
+			release()
 			continue
 		default:
 			// Unknown frame type, ignore
+			release()
 		}
 	}
 }
@@ -517,6 +555,44 @@ func (t *ShmServerTransport) handleMessage(streamID uint32, flags uint8, payload
 	}
 }
 
+// handleMessageBuffer mirrors handleMessage but transfers ownership of the
+// provided ring-backed buffer to the stream to avoid copying.
+func (t *ShmServerTransport) handleMessageBuffer(streamID uint32, flags uint8, buf mem.Buffer) {
+	if buf == nil {
+		return
+	}
+	payload := buf.ReadOnlyData()
+	s, exists := func() (*ServerStream, bool) {
+		t.mu.RLock()
+		s, ok := t.streams[streamID]
+		t.mu.RUnlock()
+		return s, ok
+	}()
+	if !exists {
+		buf.Free()
+		return
+	}
+
+	sz := uint32(len(payload))
+	if wu := t.connInFlow.onData(sz); wu > 0 {
+		t.sendWindowUpdate(0, wu)
+	}
+	if s.fc == nil {
+		s.fc = &inFlow{limit: uint32(maxWindowSize)}
+	}
+	if err := s.fc.onData(sz); err != nil {
+		buf.Free()
+		s.write(recvMsg{err: err})
+		return
+	}
+
+	s.write(recvMsg{buffer: buf})
+
+	if flags&MessageFlagMORE == 0 {
+		s.write(recvMsg{err: io.EOF})
+	}
+}
+
 // handleTrailers processes a TRAILERS frame
 func (t *ShmServerTransport) handleTrailers(streamID uint32, payload []byte) {
 	t.mu.RLock()
@@ -606,12 +682,16 @@ func (t *ShmServerTransport) Close(err error) {
 			err = ErrConnClosing
 		}
 
+		// If the underlying segment was already closed (e.g., listener teardown
+		// raced this Close path), avoid touching unmapped memory in the rings.
+		segClosed := t.segment != nil && t.segment.closed.Load()
+
 		t.sendQuotaMu.Lock()
 		t.notifyQuotaChangeLocked()
 		t.sendQuotaMu.Unlock()
 
 		// Best-effort notify peer that we're closing immediately with debug data.
-		if t.serverToClient != nil {
+		if t.serverToClient != nil && !segClosed {
 			_ = writeFrame(t.serverToClient, FrameHeader{Type: FrameTypeGOAWAY, Flags: GoAwayFlagIMMEDIATE}, []byte("server closing"), context.Background())
 		}
 
@@ -631,14 +711,17 @@ func (t *ShmServerTransport) Close(err error) {
 				s.cancel()
 			}
 			s.write(recvMsg{err: err})
+			s.drainRecvBuffer()
 		}
 
 		// Cancel context to stop all goroutines
 		t.cancel()
 
 		// Close the rings
-		t.serverToClient.Close()
-		t.clientToServer.Close()
+		if !segClosed {
+			t.serverToClient.Close()
+			t.clientToServer.Close()
+		}
 
 		// Wait for reader goroutine to exit before unmapping.
 		t.readerWG.Wait()
@@ -696,7 +779,7 @@ func (t *ShmServerTransport) writeHeader(s *ServerStream, md metadata.MD) error 
 		return nil
 	}
 
-	log.Printf("[DEBUG] ShmServerTransport.writeHeader: stream=%d, metadata keys=%v", s.id, len(md))
+	shmDebugf("[DEBUG] ShmServerTransport.writeHeader: stream=%d, metadata keys=%v", s.id, len(md))
 
 	// Convert metadata.MD to []KV format
 	var kvs []KV
@@ -727,17 +810,17 @@ func (t *ShmServerTransport) writeHeader(s *ServerStream, md metadata.MD) error 
 		Length:   uint32(len(payload)),
 	}
 
-	log.Printf("[DEBUG] ShmServerTransport.writeHeader: Writing HEADERS frame, streamID=%d, length=%d", s.id, fh.Length)
+	shmDebugf("[DEBUG] ShmServerTransport.writeHeader: Writing HEADERS frame, streamID=%d, length=%d", s.id, fh.Length)
 
 	// Write frame to server->client ring
 	t.writeMu.Lock()
 	defer t.writeMu.Unlock()
 	if err := writeFrame(t.serverToClient, fh, payload, context.Background()); err != nil {
-		log.Printf("[ERROR] ShmServerTransport.writeHeader: Failed to write frame: %v", err)
+		shmDebugf("[ERROR] ShmServerTransport.writeHeader: Failed to write frame: %v", err)
 		return err
 	}
 
-	log.Printf("[DEBUG] ShmServerTransport.writeHeader: Successfully wrote HEADERS frame")
+	shmDebugf("[DEBUG] ShmServerTransport.writeHeader: Successfully wrote HEADERS frame")
 	return nil
 }
 
@@ -762,40 +845,29 @@ func (t *ShmServerTransport) write(s *ServerStream, hdr []byte, data mem.BufferS
 		return err
 	}
 
-	log.Printf("[DEBUG] ShmServerTransport.write: stream=%d, hdr_len=%d, data_slices=%d", s.id, len(hdr), len(data))
-
-	// Materialize the BufferSlice into a contiguous []byte
-	var payload []byte
-	if len(hdr) > 0 {
-		payload = append(payload, hdr...)
-	}
-	for _, buf := range data {
-		payload = append(payload, buf.ReadOnlyData()...)
-	}
+	payloadLen := len(hdr) + data.Len()
+	shmDebugf("[DEBUG] ShmServerTransport.write: stream=%d, hdr_len=%d, data_bytes=%d", s.id, len(hdr), data.Len())
 
 	// Enforce outbound flow control before writing.
-	if err := t.acquireSendQuota(s.id, len(payload), s.ctx); err != nil {
+	if err := t.acquireSendQuota(s.id, payloadLen, s.ctx); err != nil {
 		return err
 	}
-
-	log.Printf("[DEBUG] ShmServerTransport.write: total payload=%d bytes", len(payload))
 
 	// Create MESSAGE frame
 	fh := FrameHeader{
 		Type:     FrameTypeMESSAGE,
 		StreamID: s.id,
-		Length:   uint32(len(payload)),
 	}
 
 	// Write frame to server->client ring
 	t.writeMu.Lock()
 	defer t.writeMu.Unlock()
-	if err := writeFrame(t.serverToClient, fh, payload, context.Background()); err != nil {
-		log.Printf("[ERROR] ShmServerTransport.write: Failed to write frame: %v", err)
+	if err := writeFrameBuffers(t.serverToClient, fh, hdr, data, context.Background()); err != nil {
+		shmDebugf("[ERROR] ShmServerTransport.write: Failed to write frame: %v", err)
 		return err
 	}
 
-	log.Printf("[DEBUG] ShmServerTransport.write: Successfully wrote MESSAGE frame")
+	shmDebugf("[DEBUG] ShmServerTransport.write: Successfully wrote MESSAGE frame")
 	return nil
 }
 
@@ -812,7 +884,7 @@ func (t *ShmServerTransport) writeStatus(s *ServerStream, st *status.Status) err
 		return err
 	}
 
-	log.Printf("[DEBUG] ShmServerTransport.writeStatus: stream=%d, code=%v, msg=%s", s.id, st.Code(), st.Message())
+	shmDebugf("[DEBUG] ShmServerTransport.writeStatus: stream=%d, code=%v, msg=%s", s.id, st.Code(), st.Message())
 
 	// Snapshot trailer metadata.
 	s.hdrMu.Lock()
@@ -845,17 +917,17 @@ func (t *ShmServerTransport) writeStatus(s *ServerStream, st *status.Status) err
 		Length:   uint32(len(payload)),
 	}
 
-	log.Printf("[DEBUG] ShmServerTransport.writeStatus: Writing TRAILERS frame, streamID=%d, length=%d", s.id, fh.Length)
+	shmDebugf("[DEBUG] ShmServerTransport.writeStatus: Writing TRAILERS frame, streamID=%d, length=%d", s.id, fh.Length)
 
 	// Write frame to server->client ring
 	t.writeMu.Lock()
 	defer t.writeMu.Unlock()
 	if err := writeFrame(t.serverToClient, fh, payload, context.Background()); err != nil {
-		log.Printf("[ERROR] ShmServerTransport.writeStatus: Failed to write frame: %v", err)
+		shmDebugf("[ERROR] ShmServerTransport.writeStatus: Failed to write frame: %v", err)
 		return err
 	}
 
-	log.Printf("[DEBUG] ShmServerTransport.writeStatus: Successfully wrote TRAILERS frame")
+	shmDebugf("[DEBUG] ShmServerTransport.writeStatus: Successfully wrote TRAILERS frame")
 
 	// Remove stream from active streams and finish draining if needed.
 	var shouldClose bool

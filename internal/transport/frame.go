@@ -23,6 +23,9 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"sync"
+
+	"google.golang.org/grpc/mem"
 )
 
 // Helpers operate on the blocking shared-memory ring (ShmRing).
@@ -99,6 +102,24 @@ func decodeFrameHeader(b []byte) (FrameHeader, error) {
 	fh.Reserved = binary.LittleEndian.Uint16(b[10:12])
 	fh.Reserved2 = binary.LittleEndian.Uint32(b[12:16])
 	return fh, nil
+}
+
+// ringCommitPool defers advancing the ring read index until the payload buffer
+// is fully released by the consumer.
+type ringCommitPool struct {
+	once   sync.Once
+	commit func(consumed int)
+}
+
+func (p *ringCommitPool) Get(n int) *[]byte { return nil }
+
+func (p *ringCommitPool) Put(b *[]byte) {
+	p.once.Do(func() {
+		if p.commit != nil {
+			shmDebugf("[DEBUG] ringCommitPool.Put: committing %d bytes", len(*b))
+			p.commit(len(*b))
+		}
+	})
 }
 
 // Simple binary v1 payloads.
@@ -404,6 +425,74 @@ func writeFrame(tx *ShmRing, fh FrameHeader, payload []byte, ctx context.Context
 	return res.Commit(total)
 }
 
+// writeFrameBuffers writes a frame whose payload is composed of an optional
+// header prefix plus a BufferSlice. It avoids building an intermediate
+// contiguous payload, reducing allocations and copies on the hot path.
+func writeFrameBuffers(tx *ShmRing, fh FrameHeader, hdr []byte, payload mem.BufferSlice, ctx context.Context) error {
+	dataLen := payload.Len()
+	payloadLen := len(hdr) + dataLen
+	fh.Length = uint32(payloadLen)
+	fh.Reserved = 0
+	fh.Reserved2 = 0
+
+	total := frameHeaderSize + payloadLen
+	res, err := tx.ReserveWrite(total, ctx)
+	if err != nil {
+		return err
+	}
+
+	var fhBytes [frameHeaderSize]byte
+	encodeFrameHeaderTo(&fhBytes, fh)
+
+	written := 0
+	writeSeq := func(src []byte) error {
+		for len(src) > 0 {
+			if written < len(res.First) {
+				n := copy(res.First[written:], src)
+				written += n
+				src = src[n:]
+				if len(src) == 0 {
+					return nil
+				}
+			}
+
+			secondOff := written - len(res.First)
+			if secondOff >= len(res.Second) {
+				return errors.New("failed to copy frame bytes: reservation overflow")
+			}
+
+			n := copy(res.Second[secondOff:], src)
+			written += n
+			src = src[n:]
+		}
+		return nil
+	}
+
+	if err := writeSeq(fhBytes[:]); err != nil {
+		return err
+	}
+	if len(hdr) > 0 {
+		if err := writeSeq(hdr); err != nil {
+			return err
+		}
+	}
+	for _, buf := range payload {
+		data := buf.ReadOnlyData()
+		if len(data) == 0 {
+			continue
+		}
+		if err := writeSeq(data); err != nil {
+			return err
+		}
+	}
+
+	if written != total {
+		return errors.New("failed to copy frame bytes: short write")
+	}
+
+	return res.Commit(total)
+}
+
 // readFrame reads one non-PAD frame (skipping any PAD frames). It blocks if
 // necessary and never spins.
 func readFrame(rx *ShmRing, ctx context.Context) (FrameHeader, []byte, error) {
@@ -452,6 +541,80 @@ func readFrame(rx *ShmRing, ctx context.Context) (FrameHeader, []byte, error) {
 			payload = p
 		}
 		return fh, payload, nil
+	}
+}
+
+// readFrameView reads a frame and returns a zero-copy payload view when
+// possible. The returned mem.Buffer must be freed by the caller to release the
+// underlying ring reservation.
+func readFrameView(rx *ShmRing, ctx context.Context) (FrameHeader, mem.Buffer, error) {
+	for {
+		first, second, commitHeader, err := rx.ReadSlices(frameHeaderSize, ctx)
+		if err != nil {
+			return FrameHeader{}, nil, err
+		}
+		var hb [frameHeaderSize]byte
+		n := 0
+		if len(first) > 0 {
+			k := copy(hb[:], first)
+			n += k
+		}
+		if n < frameHeaderSize && len(second) > 0 {
+			n += copy(hb[n:], second)
+		}
+		commitHeader(frameHeaderSize)
+		if n != frameHeaderSize {
+			return FrameHeader{}, nil, errors.New("short header read")
+		}
+
+		fh, err := decodeFrameHeader(hb[:])
+		if err != nil {
+			return FrameHeader{}, nil, err
+		}
+
+		if fh.Type == FrameTypePAD {
+			if fh.Length > 0 {
+				if _, err := rx.ReadExact(int(fh.Length), nil, ctx); err != nil {
+					return FrameHeader{}, nil, err
+				}
+			}
+			continue
+		}
+
+		if fh.Length == 0 {
+			return fh, nil, nil
+		}
+
+		payloadLen := int(fh.Length)
+		pFirst, pSecond, commitPayload, err := rx.ReadSlices(payloadLen, ctx)
+		if err != nil {
+			return FrameHeader{}, nil, err
+		}
+
+		// Fast-path: contiguous payload; wrap-around is rare with large rings.
+		if len(pSecond) == 0 {
+			contig := pFirst[:payloadLen]
+			// mem.NewBuffer ignores the pool for small buffers (<=1024 bytes),
+			// so we must commit immediately for small payloads to avoid blocking
+			// the ring buffer reader.
+			if mem.IsBelowBufferPoolingThreshold(payloadLen) {
+				commitPayload(payloadLen)
+				// Return a copy so caller doesn't hold ring memory
+				result := make([]byte, payloadLen)
+				copy(result, contig)
+				return fh, mem.SliceBuffer(result), nil
+			}
+			pool := &ringCommitPool{commit: commitPayload}
+			buf := mem.NewBuffer(&contig, pool)
+			return fh, buf, nil
+		}
+
+		// Wrap-around fallback: copy once into a contiguous buffer, then commit immediately.
+		contig := make([]byte, payloadLen)
+		copied := copy(contig, pFirst)
+		copy(contig[copied:], pSecond)
+		commitPayload(payloadLen)
+		return fh, mem.SliceBuffer(contig), nil
 	}
 }
 

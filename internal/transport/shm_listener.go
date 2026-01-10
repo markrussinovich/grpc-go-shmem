@@ -46,7 +46,7 @@ type ShmListener struct {
 
 	// Connection handling
 	mu             sync.RWMutex
-	activeSegments map[string]*Segment // Track active segments for cleanup
+	activeSegments map[string]*shmConn // Track active connections for cleanup
 
 	// Configuration
 	segmentSize uint64
@@ -83,7 +83,7 @@ func NewShmListener(addr *ShmAddr, segmentSize, ringASize, ringBSize uint64) (*S
 		baseName:       addr.Name,
 		ctx:            ctx,
 		cancel:         cancel,
-		activeSegments: make(map[string]*Segment),
+		activeSegments: make(map[string]*shmConn),
 		segmentSize:    segmentSize,
 		ringASize:      ringASize,
 		ringBSize:      ringBSize,
@@ -171,10 +171,6 @@ func (l *ShmListener) Accept() (net.Conn, error) {
 			return nil, err
 		}
 
-		l.mu.Lock()
-		l.activeSegments[segmentName] = segment
-		l.mu.Unlock()
-
 		conn := &shmConn{
 			segment:     segment,
 			segmentName: segmentName,
@@ -193,6 +189,9 @@ func (l *ShmListener) Accept() (net.Conn, error) {
 		}
 		conn.transport = serverTransport
 		conn.established.Store(true)
+		l.mu.Lock()
+		l.activeSegments[segmentName] = conn
+		l.mu.Unlock()
 		return conn, nil
 	}
 }
@@ -222,16 +221,17 @@ func (l *ShmListener) Close() error {
 			l.ctlSegment = nil
 		}
 
-		// Clean up all active segments
+		// Clean up all active connections to ensure rings close before unmapping.
 		l.mu.Lock()
-		for _, segment := range l.activeSegments {
-			segment.Close()
+		conns := make([]*shmConn, 0, len(l.activeSegments))
+		for _, c := range l.activeSegments {
+			conns = append(conns, c)
 		}
-		for name := range l.activeSegments {
-			_ = RemoveSegment(name)
-		}
-		l.activeSegments = make(map[string]*Segment)
+		l.activeSegments = make(map[string]*shmConn)
 		l.mu.Unlock()
+		for _, c := range conns {
+			_ = c.Close()
+		}
 	})
 	return nil
 }

@@ -179,9 +179,9 @@ func TestCalculateSegmentLayout(t *testing.T) {
 			ringACapacity: DefaultRingCapacity,
 			ringBCapacity: DefaultRingCapacity,
 			wantErr:       false,
-			wantTotalSize: 131328, // Calculated: 128 + 64 + 65536 + 64 + 65536 = 131328
-			wantRingAOff:  128,    // Aligned segment header
-			wantRingBOff:  65728,  // Aligned after ring A: 128 + 64 + 65536 = 65728
+			wantTotalSize: 134217984, // Calculated: 128 + 64 + 64MiB + 64 + 64MiB
+			wantRingAOff:  128,        // Aligned segment header
+			wantRingBOff:  67109056,   // 128 + 64 + 64MiB
 		},
 		{
 			name:          "minimum capacities",

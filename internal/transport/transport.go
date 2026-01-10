@@ -114,6 +114,33 @@ func (b *recvBuffer) load() {
 	b.mu.Unlock()
 }
 
+// drainAndFree removes any queued messages and frees their buffers. It does
+// not mutate the buffer error state; callers should invoke this only when the
+// stream is ending and no further reads are expected.
+func (b *recvBuffer) drainAndFree() {
+	b.mu.Lock()
+	backlog := b.backlog
+	b.backlog = nil
+	b.mu.Unlock()
+
+	for _, m := range backlog {
+		if m.buffer != nil {
+			m.buffer.Free()
+		}
+	}
+
+	for {
+		select {
+		case m := <-b.c:
+			if m.buffer != nil {
+				m.buffer.Free()
+			}
+		default:
+			return
+		}
+	}
+}
+
 // get returns the channel that receives a recvMsg in the buffer.
 //
 // Upon receipt of a recvMsg, the caller should call load to send another
@@ -342,6 +369,15 @@ func (s *Stream) Method() string {
 
 func (s *Stream) write(m recvMsg) {
 	s.buf.put(m)
+}
+
+// drainRecvBuffer frees any queued message buffers to release underlying ring
+// reservations when a stream is being torn down without consuming all data.
+func (s *Stream) drainRecvBuffer() {
+	if s == nil || s.buf == nil {
+		return
+	}
+	s.buf.drainAndFree()
 }
 
 // ReadMessageHeader reads data into the provided header slice from the stream.

@@ -45,13 +45,13 @@ const (
 	// Minimum ring capacity (4KB)
 	MinRingCapacity = 4096
 
-	// Default ring capacity (64KB)
-	DefaultRingCapacity = 65536
+	// Default ring capacity (64 MiB) to keep large payloads in a single write.
+	DefaultRingCapacity = 64 * 1024 * 1024
 
 	// Default sizes for shared memory segments and rings
-	DefaultSegmentSize = 4 * 1024 * 1024 // 4MB total segment
-	DefaultRingASize   = 1024 * 1024     // 1MB for client->server
-	DefaultRingBSize   = 1024 * 1024     // 1MB for server->client
+	DefaultSegmentSize = 136 * 1024 * 1024 // Sized to cover two 64 MiB rings plus headers
+	DefaultRingASize   = 64 * 1024 * 1024  // 64 MiB for client->server
+	DefaultRingBSize   = 64 * 1024 * 1024  // 64 MiB for server->client
 )
 
 // Platform-specific functions (implemented in platform-specific files)

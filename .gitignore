@@ -1,1 +1,4 @@
 .gocache/*
+
+# Local logs
+*.log

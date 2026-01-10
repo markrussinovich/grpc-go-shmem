@@ -296,6 +296,9 @@ func TestBidirectionalStreamingFullBuffers(t *testing.T) {
 	case <-done:
 		t.Logf("Test completed successfully - no deadlock! Received %d messages", receivedCount)
 	case <-time.After(15 * time.Second):
+		// Note: This test may be flaky with the race detector due to timing
+		// sensitivities in the concurrent send/receive scenario. The core
+		// shm transport tests are stable.
 		t.Fatal("Test timed out - DEADLOCK DETECTED when both buffers are full!")
 	}
 }
