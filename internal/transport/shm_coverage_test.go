@@ -831,13 +831,12 @@ func TestShmPingPong(t *testing.T) {
 		t.Fatalf("Failed to create segment: %v", err)
 	}
 	serverSeg.H.SetServerReady(true)
-	defer serverSeg.Close()
 
 	clientSeg, err := OpenSegment(segmentName)
 	if err != nil {
+		serverSeg.Close()
 		t.Fatalf("Failed to open segment: %v", err)
 	}
-	defer clientSeg.Close()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -847,8 +846,11 @@ func TestShmPingPong(t *testing.T) {
 	serverTx := NewShmRingFromSegment(serverSeg.B, serverSeg.Mem)
 	serverRx := NewShmRingFromSegment(serverSeg.A, serverSeg.Mem)
 
+	serverDone := make(chan struct{})
+
 	// Server goroutine: respond to PING with PONG
 	go func() {
+		defer close(serverDone)
 		for {
 			fh, payload, err := readFrame(serverRx, ctx)
 			if err != nil {
@@ -857,6 +859,7 @@ func TestShmPingPong(t *testing.T) {
 			if fh.Type == FrameTypePING {
 				// Echo back as PONG
 				writeFrame(serverTx, FrameHeader{Type: FrameTypePONG}, payload, ctx)
+				return // Exit after responding to one PING
 			}
 		}
 	}()
@@ -889,4 +892,11 @@ func TestShmPingPong(t *testing.T) {
 	}
 
 	t.Log("PING/PONG roundtrip successful")
+
+	// Wait for server goroutine to finish before closing segments
+	<-serverDone
+
+	// Close segments
+	clientSeg.Close()
+	serverSeg.Close()
 }
