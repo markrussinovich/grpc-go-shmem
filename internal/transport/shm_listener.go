@@ -11,6 +11,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"google.golang.org/grpc/keepalive"
 )
 
 // ShmAddr represents a shared memory network address
@@ -53,6 +55,10 @@ type ShmListener struct {
 	ringASize   uint64
 	ringBSize   uint64
 	maxStreams  uint32
+
+	// Keepalive configuration for server transports
+	kp  keepalive.ServerParameters
+	kep keepalive.EnforcementPolicy
 }
 
 // shmConn represents a shared memory connection
@@ -187,6 +193,8 @@ func (l *ShmListener) Accept() (net.Conn, error) {
 			segment.Close()
 			return nil, fmt.Errorf("failed to create server transport: %v", err)
 		}
+		// Configure keepalive on the server transport.
+		serverTransport.ConfigureKeepalive(l.kp, l.kep)
 		conn.transport = serverTransport
 		conn.established.Store(true)
 		l.mu.Lock()
@@ -239,6 +247,15 @@ func (l *ShmListener) Close() error {
 // Addr returns the listener's network address
 func (l *ShmListener) Addr() net.Addr {
 	return l.addr
+}
+
+// SetKeepaliveParams sets the keepalive parameters for server transports
+// created by this listener. This must be called before Accept is called.
+func (l *ShmListener) SetKeepaliveParams(kp keepalive.ServerParameters, kep keepalive.EnforcementPolicy) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.kp = kp
+	l.kep = kep
 }
 
 // shmConn net.Conn implementation

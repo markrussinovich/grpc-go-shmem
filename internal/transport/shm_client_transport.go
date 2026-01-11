@@ -11,10 +11,12 @@ import (
 	"net"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"golang.org/x/net/http2"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/internal/grpcutil"
+	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/mem"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
@@ -70,6 +72,16 @@ type ShmClientTransport struct {
 	goAwayDebugMessage string
 
 	readerWG sync.WaitGroup
+
+	// Keepalive
+	lastRead         int64 // Unix nanos; updated atomically on each received frame
+	kp               keepalive.ClientParameters
+	keepaliveEnabled bool
+	keepaliveDone    chan struct{} // closed when keepalive goroutine exits
+	// kpDormancyCond signals the keepalive goroutine to exit dormant state.
+	// Guarded by mu.
+	kpDormancyCond *sync.Cond
+	kpDormant      bool
 }
 
 func (t *ShmClientTransport) setGoAwayReason(flags uint8, debug string) {
@@ -195,7 +207,10 @@ func NewShmClientTransport(segment *Segment, localAddr, remoteAddr net.Addr) (*S
 		goAwayCh:              make(chan struct{}),
 		quotaSignal:           make(chan struct{}),
 		streamsQuotaAvailable: make(chan struct{}, 1),
+		keepaliveDone:         make(chan struct{}),
 	}
+	// Initialize dormancy condition variable.
+	t.kpDormancyCond = sync.NewCond(&t.mu)
 	// Initialize connection-level flow control windows to the HTTP/2 maximum.
 	t.connSendQuota = int64(maxWindowSize)
 	t.connInFlow = trInFlow{limit: uint32(maxWindowSize)}
@@ -217,6 +232,23 @@ func NewShmClientTransport(segment *Segment, localAddr, remoteAddr net.Addr) (*S
 	}
 
 	return t, nil
+}
+
+// ConfigureKeepalive sets keepalive parameters and starts the keepalive
+// goroutine if Time != infinity.
+func (t *ShmClientTransport) ConfigureKeepalive(kp keepalive.ClientParameters) {
+	// Apply defaults matching HTTP/2 transport.
+	if kp.Time == 0 {
+		kp.Time = defaultClientKeepaliveTime
+	}
+	if kp.Timeout == 0 {
+		kp.Timeout = defaultClientKeepaliveTimeout
+	}
+	t.kp = kp
+	if kp.Time != infinity {
+		t.keepaliveEnabled = true
+		go t.keepalive()
+	}
 }
 
 // processIncomingData reads data from the server->client ring and processes gRPC frames
@@ -251,6 +283,9 @@ func (t *ShmClientTransport) processIncomingData(ctx context.Context) {
 			continue
 		}
 		shmDebugf("[DEBUG] ShmClientTransport.processIncomingData: received frame type=%d, streamID=%d, length=%d", fh.Type, fh.StreamID, fh.Length)
+
+		// Update last read timestamp for keepalive tracking.
+		atomic.StoreInt64(&t.lastRead, time.Now().UnixNano())
 
 		payloadTransferred := false
 		release := func() {
@@ -454,8 +489,20 @@ func (t *ShmClientTransport) Close(err error) {
 			_ = writeFrame(t.clientToServer, FrameHeader{Type: FrameTypeGOAWAY, Flags: GoAwayFlagIMMEDIATE}, []byte("client closing"), context.Background())
 		}
 
-		// Cancel context to stop background reader goroutine.
+		// Cancel context to stop background reader goroutine and keepalive.
 		t.cancel()
+
+		// Wake up the keepalive goroutine if it's dormant, so it can exit.
+		t.mu.Lock()
+		if t.kpDormant {
+			t.kpDormancyCond.Signal()
+		}
+		t.mu.Unlock()
+
+		// Wait for keepalive goroutine to exit before unmapping the segment.
+		if t.keepaliveEnabled && t.keepaliveDone != nil {
+			<-t.keepaliveDone
+		}
 
 		// Terminate all active streams before closing/unmapping the segment.
 		// This prevents concurrent stream Close paths from touching unmapped ring
@@ -627,6 +674,11 @@ func (t *ShmClientTransport) NewStream(ctx context.Context, callHdr *CallHdr) (*
 			case t.streamsQuotaAvailable <- struct{}{}:
 			default:
 			}
+		}
+		// Wake up the keepalive goroutine if it's dormant, so it can start
+		// monitoring the now-active connection.
+		if t.kpDormant {
+			t.kpDormancyCond.Signal()
 		}
 		t.mu.Unlock()
 
@@ -881,6 +933,103 @@ func (t *ShmClientTransport) write(s *ClientStream, hdr []byte, data mem.BufferS
 	shmDebugf("[DEBUG] ShmClientTransport.write: frame written successfully, widx after=%d", t.clientToServer.header().WriteIndex())
 
 	return nil
+}
+
+// sendPing sends a PING frame with 8-byte opaque data.
+func (t *ShmClientTransport) sendPing() error {
+	// Check if transport is closed before attempting to write.
+	if t.closed.Load() {
+		return ErrConnClosing
+	}
+	var data [8]byte
+	// Use current time nanos as opaque payload (not strictly required, just convenient).
+	binary.LittleEndian.PutUint64(data[:], uint64(time.Now().UnixNano()))
+	return writeFrame(t.clientToServer, FrameHeader{Type: FrameTypePING}, data[:], t.ctx)
+}
+
+// keepalive monitors connection health and sends periodic PING frames.
+// It follows the gRPC keepalive semantics:
+// - Send PING after kp.Time of inactivity.
+// - Close connection if no PONG within kp.Timeout.
+// - Go dormant if no active streams and !PermitWithoutStream.
+func (t *ShmClientTransport) keepalive() {
+	var err error
+	defer func() {
+		close(t.keepaliveDone)
+		if err != nil {
+			t.Close(err)
+		}
+	}()
+
+	// True iff a ping has been sent, and no data has been received since then.
+	outstandingPing := false
+	// Amount of time remaining before which we should receive an ACK for the
+	// last sent ping.
+	timeoutLeft := time.Duration(0)
+	// Records the last value of t.lastRead before we go block on the timer.
+	prevNano := time.Now().UnixNano()
+	timer := time.NewTimer(t.kp.Time)
+	defer timer.Stop()
+
+	for {
+		select {
+		case <-timer.C:
+			lastRead := atomic.LoadInt64(&t.lastRead)
+			if lastRead > prevNano {
+				// There has been read activity since the last time we were here.
+				outstandingPing = false
+				// Next timer should fire at kp.Time seconds from lastRead time.
+				timer.Reset(time.Duration(lastRead) + t.kp.Time - time.Duration(time.Now().UnixNano()))
+				prevNano = lastRead
+				continue
+			}
+			if outstandingPing && timeoutLeft <= 0 {
+				err = connectionErrorf(true, nil, "keepalive ping failed to receive ACK within timeout")
+				return
+			}
+			t.mu.Lock()
+			if t.closed.Load() {
+				// Transport is closing; exit.
+				t.mu.Unlock()
+				return
+			}
+			if len(t.streams) < 1 && !t.kp.PermitWithoutStream {
+				// If a ping was sent out previously (because there were active
+				// streams at that point) which wasn't acked and its timeout
+				// hadn't fired, but we got here and are about to go dormant,
+				// we should make sure that we unconditionally send a ping once
+				// we awaken.
+				outstandingPing = false
+				t.kpDormant = true
+				t.kpDormancyCond.Wait()
+			}
+			t.kpDormant = false
+			t.mu.Unlock()
+
+			// We get here either because we were dormant and a new stream was
+			// created which unblocked the Wait() call, or because the
+			// keepalive timer expired. In both cases, we need to send a ping.
+			if !outstandingPing {
+				if err := t.sendPing(); err != nil {
+					// Failed to send ping; connection may be broken.
+					err = connectionErrorf(true, err, "keepalive failed to send ping")
+					return
+				}
+				timeoutLeft = t.kp.Timeout
+				outstandingPing = true
+			}
+			// The amount of time to sleep here is the minimum of kp.Time and
+			// timeoutLeft. This will ensure that we wait only for kp.Time
+			// before sending out the next ping (for cases where the ping is
+			// acked).
+			sleepDuration := min(t.kp.Time, timeoutLeft)
+			timeoutLeft -= sleepDuration
+			timer.Reset(sleepDuration)
+		case <-t.ctx.Done():
+			// Transport is shutting down.
+			return
+		}
+	}
 }
 
 // Compile-time check to ensure ShmClientTransport implements clientTransport.

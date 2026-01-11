@@ -16,6 +16,7 @@ import (
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/internal/grpcutil"
+	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/mem"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/peer"
@@ -65,8 +66,22 @@ type ShmServerTransport struct {
 	// Error handling
 	closeOnce sync.Once
 	errCh     chan struct{}
+	done      chan struct{} // closed when transport is shutting down
 
 	readerWG sync.WaitGroup
+
+	// Keepalive
+	lastRead      int64 // Unix nanos; updated atomically on each received frame
+	kp            keepalive.ServerParameters
+	kep           keepalive.EnforcementPolicy
+	keepaliveDone chan struct{} // closed when keepalive goroutine exits
+	// idle is the time when the connection became idle (no active streams).
+	// Zero if the connection is not idle.
+	idle time.Time
+	// lastPingAt is the timestamp of the last PING received, for enforcement.
+	lastPingAt time.Time
+	// pingStrikes counts policy violations; too many triggers close.
+	pingStrikes uint8
 }
 
 func (t *ShmServerTransport) sendGoAway(flags uint8, debugData string) {
@@ -194,6 +209,8 @@ func NewShmServerTransport(segment *Segment, localAddr, remoteAddr net.Addr) (*S
 		streamInFlow:    make(map[uint32]*inFlow),
 		errCh:           make(chan struct{}),
 		quotaSignal:     make(chan struct{}),
+		done:            make(chan struct{}),
+		keepaliveDone:   make(chan struct{}),
 	}
 	// Initialize flow control windows.
 	t.connSendQuota = int64(maxWindowSize)
@@ -273,6 +290,9 @@ func (t *ShmServerTransport) processIncomingData(ctx context.Context) {
 		}
 		shmDebugf("[DEBUG] ShmServerTransport.processIncomingData: received frame type=%d, streamID=%d, length=%d", fh.Type, fh.StreamID, fh.Length)
 
+		// Update last read timestamp for keepalive tracking.
+		atomic.StoreInt64(&t.lastRead, time.Now().UnixNano())
+
 		payloadTransferred := false
 		release := func() {
 			shmDebugf("[DEBUG] ShmServerTransport.processIncomingData: release() called, payloadTransferred=%v, payloadBuf=%v", payloadTransferred, payloadBuf)
@@ -344,17 +364,8 @@ func (t *ShmServerTransport) processIncomingData(ctx context.Context) {
 			t.handleCancel(fh.StreamID)
 			release()
 		case FrameTypePING:
-			// Reply with PONG on the same connection.
-			if t.closed.Load() {
-				release()
-				continue
-			}
-			t.writeMu.Lock()
-			err := writeFrame(t.serverToClient, FrameHeader{Type: FrameTypePONG}, payload, ctx)
-			t.writeMu.Unlock()
-			if err != nil {
-				continue
-			}
+			// Handle PING with enforcement policy.
+			t.handlePing(ctx, payload)
 			release()
 		case FrameTypeWINDOW_UPDATE:
 			if len(payload) >= 4 {
@@ -509,6 +520,10 @@ func (t *ShmServerTransport) handleHeaders(ctx context.Context, streamID uint32,
 	t.streams[streamID] = s
 	t.streamSendQuota[streamID] = int64(maxWindowSize)
 	t.streamInFlow[streamID] = s.fc
+	// Clear idle time when we have active streams.
+	t.idle = time.Time{}
+	// Reset ping strikes when streams become active.
+	t.pingStrikes = 0
 	h := t.handleFunc
 	t.mu.Unlock()
 
@@ -593,6 +608,56 @@ func (t *ShmServerTransport) handleMessageBuffer(streamID uint32, flags uint8, b
 	}
 }
 
+// handlePing processes a PING frame, sends PONG, and enforces keepalive policy.
+func (t *ShmServerTransport) handlePing(ctx context.Context, payload []byte) {
+	if t.closed.Load() {
+		return
+	}
+	// Send PONG.
+	t.writeMu.Lock()
+	_ = writeFrame(t.serverToClient, FrameHeader{Type: FrameTypePONG}, payload, ctx)
+	t.writeMu.Unlock()
+
+	now := time.Now()
+	defer func() {
+		t.mu.Lock()
+		t.lastPingAt = now
+		t.mu.Unlock()
+	}()
+
+	// Check enforcement policy.
+	t.mu.Lock()
+	ns := len(t.streams)
+	lastPing := t.lastPingAt
+	t.mu.Unlock()
+
+	if ns < 1 && !t.kep.PermitWithoutStream {
+		// Keepalive shouldn't be active; this ping should have come after
+		// at least defaultPingTimeout.
+		if !lastPing.IsZero() && lastPing.Add(defaultPingTimeout).After(now) {
+			t.mu.Lock()
+			t.pingStrikes++
+			t.mu.Unlock()
+		}
+	} else {
+		// Check if keepalive policy is respected.
+		if !lastPing.IsZero() && lastPing.Add(t.kep.MinTime).After(now) {
+			t.mu.Lock()
+			t.pingStrikes++
+			t.mu.Unlock()
+		}
+	}
+
+	t.mu.Lock()
+	strikes := t.pingStrikes
+	t.mu.Unlock()
+	if strikes > maxPingStrikes {
+		// Send GOAWAY and close.
+		t.sendGoAway(GoAwayFlagIMMEDIATE, "too_many_pings")
+		go t.Close(errors.New("too many pings from client"))
+	}
+}
+
 // handleTrailers processes a TRAILERS frame
 func (t *ShmServerTransport) handleTrailers(streamID uint32, payload []byte) {
 	t.mu.RLock()
@@ -632,6 +697,10 @@ func (t *ShmServerTransport) handleTrailers(streamID uint32, payload []byte) {
 	delete(t.streams, streamID)
 	delete(t.streamSendQuota, streamID)
 	delete(t.streamInFlow, streamID)
+	// Mark idle when no more active streams.
+	if len(t.streams) == 0 {
+		t.idle = time.Now()
+	}
 	if t.draining.Load() && len(t.streams) == 0 && !t.closed.Load() {
 		shouldClose = true
 		dbg = t.drainDebugData
@@ -662,6 +731,10 @@ func (t *ShmServerTransport) handleCancel(streamID uint32) {
 	delete(t.streams, streamID)
 	delete(t.streamSendQuota, streamID)
 	delete(t.streamInFlow, streamID)
+	// Mark idle when no more active streams.
+	if len(t.streams) == 0 {
+		t.idle = time.Now()
+	}
 	if t.draining.Load() && len(t.streams) == 0 && !t.closed.Load() {
 		shouldClose = true
 		dbg = t.drainDebugData
@@ -681,6 +754,9 @@ func (t *ShmServerTransport) Close(err error) {
 		if err == nil {
 			err = ErrConnClosing
 		}
+
+		// Signal the keepalive goroutine to exit.
+		close(t.done)
 
 		// If the underlying segment was already closed (e.g., listener teardown
 		// raced this Close path), avoid touching unmapped memory in the rings.
@@ -936,6 +1012,10 @@ func (t *ShmServerTransport) writeStatus(s *ServerStream, st *status.Status) err
 	delete(t.streams, s.id)
 	delete(t.streamSendQuota, s.id)
 	delete(t.streamInFlow, s.id)
+	// Mark idle when no more active streams.
+	if len(t.streams) == 0 {
+		t.idle = time.Now()
+	}
 	if t.draining.Load() && len(t.streams) == 0 && !t.closed.Load() {
 		shouldClose = true
 		dbg = t.drainDebugData
@@ -951,4 +1031,128 @@ func (t *ShmServerTransport) writeStatus(s *ServerStream, st *status.Status) err
 // incrMsgRecv increments the message received counter
 func (t *ShmServerTransport) incrMsgRecv() {
 	// Channelz metrics are not wired for shm transport; keep a no-op to satisfy interface expectations.
+}
+
+// ConfigureKeepalive sets keepalive parameters and starts the keepalive
+// goroutine.
+func (t *ShmServerTransport) ConfigureKeepalive(kp keepalive.ServerParameters, kep keepalive.EnforcementPolicy) {
+	// Apply defaults matching HTTP/2 transport.
+	if kp.MaxConnectionIdle == 0 {
+		kp.MaxConnectionIdle = defaultMaxConnectionIdle
+	}
+	if kp.MaxConnectionAge == 0 {
+		kp.MaxConnectionAge = defaultMaxConnectionAge
+	}
+	if kp.MaxConnectionAgeGrace == 0 {
+		kp.MaxConnectionAgeGrace = defaultMaxConnectionAgeGrace
+	}
+	if kp.Time == 0 {
+		kp.Time = defaultServerKeepaliveTime
+	}
+	if kp.Timeout == 0 {
+		kp.Timeout = defaultServerKeepaliveTimeout
+	}
+	if kep.MinTime == 0 {
+		kep.MinTime = defaultKeepalivePolicyMinTime
+	}
+	t.kp = kp
+	t.kep = kep
+	// Mark connection as initially idle.
+	t.mu.Lock()
+	t.idle = time.Now()
+	t.mu.Unlock()
+	go t.keepalive()
+}
+
+// sendPing sends a PING frame with 8-byte opaque data.
+func (t *ShmServerTransport) sendPing() error {
+	var data [8]byte
+	binary.LittleEndian.PutUint64(data[:], uint64(time.Now().UnixNano()))
+	t.writeMu.Lock()
+	defer t.writeMu.Unlock()
+	return writeFrame(t.serverToClient, FrameHeader{Type: FrameTypePING}, data[:], context.Background())
+}
+
+// keepalive monitors connection health and enforces server-side policies:
+// - MaxConnectionIdle: close after being idle too long.
+// - MaxConnectionAge: close after connection exists too long.
+// - Time/Timeout: send PINGs to check liveness.
+func (t *ShmServerTransport) keepalive() {
+	defer close(t.keepaliveDone)
+
+	// True iff a ping has been sent, and no data has been received since then.
+	outstandingPing := false
+	// Amount of time remaining before which we should receive an ACK for the
+	// last sent ping.
+	kpTimeoutLeft := time.Duration(0)
+	// Records the last value of t.lastRead before we go block on the timer.
+	prevNano := time.Now().UnixNano()
+
+	idleTimer := time.NewTimer(t.kp.MaxConnectionIdle)
+	ageTimer := time.NewTimer(t.kp.MaxConnectionAge)
+	kpTimer := time.NewTimer(t.kp.Time)
+	defer func() {
+		idleTimer.Stop()
+		ageTimer.Stop()
+		kpTimer.Stop()
+	}()
+
+	for {
+		select {
+		case <-idleTimer.C:
+			t.mu.Lock()
+			idle := t.idle
+			if idle.IsZero() {
+				// Connection is not idle.
+				t.mu.Unlock()
+				idleTimer.Reset(t.kp.MaxConnectionIdle)
+				continue
+			}
+			val := t.kp.MaxConnectionIdle - time.Since(idle)
+			t.mu.Unlock()
+			if val <= 0 {
+				// Connection has been idle for MaxConnectionIdle; drain.
+				t.Drain("max_idle")
+				return
+			}
+			idleTimer.Reset(val)
+		case <-ageTimer.C:
+			// Connection age exceeded; drain.
+			t.Drain("max_age")
+			ageTimer.Reset(t.kp.MaxConnectionAgeGrace)
+			select {
+			case <-ageTimer.C:
+				// Grace period expired; close.
+				t.Close(errors.New("max connection age grace exceeded"))
+			case <-t.done:
+			}
+			return
+		case <-kpTimer.C:
+			lastRead := atomic.LoadInt64(&t.lastRead)
+			if lastRead > prevNano {
+				// There has been read activity.
+				outstandingPing = false
+				kpTimer.Reset(time.Duration(lastRead) + t.kp.Time - time.Duration(time.Now().UnixNano()))
+				prevNano = lastRead
+				continue
+			}
+			if outstandingPing && kpTimeoutLeft <= 0 {
+				t.Close(errors.New("keepalive ping not acked within timeout"))
+				return
+			}
+			if !outstandingPing {
+				if err := t.sendPing(); err != nil {
+					t.Close(errors.New("keepalive failed to send ping"))
+					return
+				}
+				kpTimeoutLeft = t.kp.Timeout
+				outstandingPing = true
+			}
+			sleepDuration := min(t.kp.Time, kpTimeoutLeft)
+			kpTimeoutLeft -= sleepDuration
+			kpTimer.Reset(sleepDuration)
+		case <-t.done:
+			return
+		}
+	}
 }

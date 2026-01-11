@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"net"
 	"time"
+
+	"google.golang.org/grpc/keepalive"
 )
 
 // DialOptions contains options for dialing a shared memory connection
@@ -23,6 +25,9 @@ type DialOptions struct {
 
 	// Timeout for connection establishment
 	ConnectTimeout time.Duration
+
+	// KeepaliveParams stores the keepalive parameters for the client.
+	KeepaliveParams keepalive.ClientParameters
 }
 
 // DefaultDialOptions returns sensible defaults for dialing
@@ -93,6 +98,8 @@ func DialShm(ctx context.Context, addr string, opts *DialOptions) (ClientTranspo
 			segment.Close()
 			return nil, fmt.Errorf("failed to create client transport: %v", err)
 		}
+		// Configure keepalive if params are provided.
+		clientTransport.ConfigureKeepalive(opts.KeepaliveParams)
 		return clientTransport, nil
 	case FrameTypeREJECT:
 		r, err := decodeConnectReject(respPayload)
