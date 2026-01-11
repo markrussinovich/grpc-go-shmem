@@ -1219,9 +1219,12 @@ func (r *ShmRing) ReadSlices(n int, ctx context.Context) (first, second []byte, 
 					return // Invalid consumption, ignore
 				}
 
-				// Calculate how much space the writer sees as used
-				// (from shared readIdx to writeIdx)
-				usedBefore := writeIdx - commitReadIdx
+				// Calculate how much space the writer sees as used BEFORE this commit.
+				// We must read the CURRENT writeIdx (not the captured one) because
+				// the writer may have written more data since ReadSlices was called.
+				// If the ring became full after our read, we need to wake the writer.
+				currentWriteIdx := hdr.WriteIndex()
+				usedBefore := currentWriteIdx - commitReadIdx
 
 				// Advance shared read index (release-publish) - frees space for writer
 				hdr.SetReadIndex(commitReadIdx + uint64(consumed))
