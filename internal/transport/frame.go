@@ -493,6 +493,66 @@ func writeFrameBuffers(tx *ShmRing, fh FrameHeader, hdr []byte, payload mem.Buff
 	return res.Commit(total)
 }
 
+// writeFrameBuffersChunked writes a MESSAGE frame whose payload (hdr + data) may
+// exceed the ring capacity. If the payload fits in a single frame (fast path), it
+// is written directly. Otherwise, it is split into multiple frames with the MORE
+// flag set on all but the final chunk.
+//
+// The maxFramePayload parameter specifies the maximum payload size per frame. If
+// zero, it defaults to ringCapacity - frameHeaderSize - safetyMargin. A sensible
+// default is 32KB or (capacity/2) whichever is smaller.
+func writeFrameBuffersChunked(tx *ShmRing, fh FrameHeader, hdr []byte, data mem.BufferSlice, maxFramePayload int, ctx context.Context) error {
+	payloadLen := len(hdr) + data.Len()
+
+	// Calculate effective max payload if not specified.
+	if maxFramePayload <= 0 {
+		// Use half of ring capacity minus header size as a safe default.
+		// This leaves room for other frames and prevents blocking.
+		cap := int(tx.Capacity())
+		maxFramePayload = cap/2 - frameHeaderSize
+		if maxFramePayload < 1024 {
+			maxFramePayload = 1024 // minimum 1KB chunks
+		}
+	}
+
+	// Fast path: payload fits in a single frame.
+	if payloadLen <= maxFramePayload {
+		return writeFrameBuffers(tx, fh, hdr, data, ctx)
+	}
+
+	// Slow path: need to chunk the payload.
+	// Materialize hdr + data into a contiguous buffer for chunking.
+	combined := make([]byte, payloadLen)
+	copy(combined, hdr)
+	offset := len(hdr)
+	for _, buf := range data {
+		n := copy(combined[offset:], buf.ReadOnlyData())
+		offset += n
+	}
+
+	// Write chunks with MORE flag on all but the last.
+	remaining := combined
+	for len(remaining) > 0 {
+		chunkSize := maxFramePayload
+		if chunkSize > len(remaining) {
+			chunkSize = len(remaining)
+		}
+		chunk := remaining[:chunkSize]
+		remaining = remaining[chunkSize:]
+
+		chunkFH := fh
+		if len(remaining) > 0 {
+			chunkFH.Flags |= MessageFlagMORE
+		}
+
+		if err := writeFrame(tx, chunkFH, chunk, ctx); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
 // readFrame reads one non-PAD frame (skipping any PAD frames). It blocks if
 // necessary and never spins.
 func readFrame(rx *ShmRing, ctx context.Context) (FrameHeader, []byte, error) {

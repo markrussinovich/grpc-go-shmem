@@ -874,8 +874,8 @@ func (t *ShmClientTransport) write(s *ClientStream, hdr []byte, data mem.BufferS
 	}
 
 	shmDebugf("[DEBUG] ShmClientTransport.write: writing frame to ring, widx before=%d", t.clientToServer.header().WriteIndex())
-	if err := writeFrameBuffers(t.clientToServer, fh, hdr, data, s.ctx); err != nil {
-		shmDebugf("[ERROR] ShmClientTransport.write: writeFrameBuffers failed: %v", err)
+	if err := writeFrameBuffersChunked(t.clientToServer, fh, hdr, data, 0, s.ctx); err != nil {
+		shmDebugf("[ERROR] ShmClientTransport.write: writeFrameBuffersChunked failed: %v", err)
 		return err
 	}
 	shmDebugf("[DEBUG] ShmClientTransport.write: frame written successfully, widx after=%d", t.clientToServer.header().WriteIndex())
