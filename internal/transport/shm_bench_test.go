@@ -824,3 +824,389 @@ func BenchmarkUnixLargePayloads(b *testing.B) {
 		})
 	}
 }
+
+// =============================================================================
+// LARGE PAYLOAD ROUNDTRIP (UNARY) BENCHMARKS
+// =============================================================================
+
+// BenchmarkShmRingLargePayloadsRoundtrip benchmarks SHM unary/roundtrip with large payloads
+func BenchmarkShmRingLargePayloadsRoundtrip(b *testing.B) {
+	sizes := []int{
+		1 * 1024 * 1024,   // 1MB
+		4 * 1024 * 1024,   // 4MB
+		16 * 1024 * 1024,  // 16MB
+		64 * 1024 * 1024,  // 64MB
+		128 * 1024 * 1024, // 128MB
+		256 * 1024 * 1024, // 256MB
+	}
+	const ringSize = 64 * 1024 * 1024  // 64MB ring
+	const chunkSize = 32 * 1024 * 1024 // 32MB chunks
+
+	for _, size := range sizes {
+		sizeMB := size / (1024 * 1024)
+		b.Run(fmt.Sprintf("size=%dMB", sizeMB), func(b *testing.B) {
+			segName := fmt.Sprintf("bench-large-rt-%d-%d", size, time.Now().UnixNano())
+			seg, err := CreateSegment(segName, ringSize, ringSize)
+			if err != nil {
+				b.Fatalf("CreateSegment failed: %v", err)
+			}
+			b.Cleanup(func() {
+				seg.Close()
+				RemoveSegment(segName)
+			})
+
+			// Ring A: client -> server, Ring B: server -> client
+			clientToServer := NewShmRingFromSegment(seg.A, seg.Mem)
+			serverToClient := NewShmRingFromSegment(seg.B, seg.Mem)
+
+			ctx := context.Background()
+			data := make([]byte, size)
+			for i := range data {
+				data[i] = byte(i & 0xFF)
+			}
+
+			started := make(chan struct{})
+			done := make(chan struct{})
+			errCh := make(chan error, 1)
+
+			// Echo server goroutine
+			go func() {
+				close(started)
+				recvBuf := make([]byte, chunkSize)
+
+				for {
+					select {
+					case <-done:
+						return
+					default:
+					}
+
+					// Read request in chunks
+					totalRead := 0
+					for totalRead < size {
+						toRead := min(size-totalRead, chunkSize)
+						first, second, commit, err := clientToServer.ReadSlices(toRead, ctx)
+						if err != nil {
+							select {
+							case <-done:
+								return
+							default:
+								errCh <- err
+								return
+							}
+						}
+						n := len(first) + len(second)
+						// Copy to recvBuf for echo
+						copy(recvBuf[:len(first)], first)
+						if len(second) > 0 {
+							copy(recvBuf[len(first):], second)
+						}
+						commit(n)
+						totalRead += n
+
+						// Echo back this chunk immediately
+						if err := serverToClient.WriteAll(recvBuf[:n], ctx); err != nil {
+							select {
+							case <-done:
+								return
+							default:
+								errCh <- err
+								return
+							}
+						}
+					}
+				}
+			}()
+
+			<-started
+
+			b.SetBytes(int64(size * 2)) // roundtrip
+			b.ResetTimer()
+
+			for i := 0; i < b.N; i++ {
+				// Send request in chunks
+				offset := 0
+				for offset < size {
+					writeSize := min(chunkSize, size-offset)
+					if err := clientToServer.WriteAll(data[offset:offset+writeSize], ctx); err != nil {
+						b.Fatalf("WriteAll failed: %v", err)
+					}
+
+					// Read corresponding response chunk
+					chunkRead := 0
+					for chunkRead < writeSize {
+						first, second, commit, err := serverToClient.ReadSlices(min(writeSize-chunkRead, 32*1024), ctx)
+						if err != nil {
+							b.Fatalf("ReadSlices failed: %v", err)
+						}
+						n := len(first) + len(second)
+						commit(n)
+						chunkRead += n
+					}
+					offset += writeSize
+				}
+			}
+
+			b.StopTimer()
+			close(done)
+
+			select {
+			case err := <-errCh:
+				b.Fatalf("Server error: %v", err)
+			default:
+			}
+		})
+	}
+}
+
+// BenchmarkTCPLargePayloadsRoundtrip benchmarks TCP unary/roundtrip with large payloads
+func BenchmarkTCPLargePayloadsRoundtrip(b *testing.B) {
+	sizes := []int{
+		1 * 1024 * 1024,   // 1MB
+		4 * 1024 * 1024,   // 4MB
+		16 * 1024 * 1024,  // 16MB
+		64 * 1024 * 1024,  // 64MB
+		128 * 1024 * 1024, // 128MB
+		256 * 1024 * 1024, // 256MB
+	}
+
+	for _, size := range sizes {
+		sizeMB := size / (1024 * 1024)
+		b.Run(fmt.Sprintf("size=%dMB", sizeMB), func(b *testing.B) {
+			listener, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				b.Fatalf("Listen failed: %v", err)
+			}
+			defer listener.Close()
+
+			addr := listener.Addr().String()
+			data := make([]byte, size)
+			for i := range data {
+				data[i] = byte(i & 0xFF)
+			}
+
+			started := make(chan struct{})
+			done := make(chan struct{})
+			errCh := make(chan error, 1)
+
+			// Echo server
+			go func() {
+				conn, err := listener.Accept()
+				if err != nil {
+					errCh <- err
+					return
+				}
+				defer conn.Close()
+				close(started)
+
+				buf := make([]byte, 256*1024)
+				for {
+					select {
+					case <-done:
+						return
+					default:
+					}
+
+					// Read and echo
+					conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+					n, err := conn.Read(buf)
+					if err != nil {
+						if ne, ok := err.(net.Error); ok && ne.Timeout() {
+							continue
+						}
+						return
+					}
+					conn.SetWriteDeadline(time.Now().Add(1 * time.Second))
+					_, err = conn.Write(buf[:n])
+					if err != nil {
+						return
+					}
+				}
+			}()
+
+			conn, err := net.Dial("tcp", addr)
+			if err != nil {
+				b.Fatalf("Dial failed: %v", err)
+			}
+			defer conn.Close()
+			<-started
+
+			recvBuf := make([]byte, 256*1024)
+
+			b.SetBytes(int64(size * 2)) // roundtrip
+			b.ResetTimer()
+
+			for i := 0; i < b.N; i++ {
+				var writeErr error
+				var wg sync.WaitGroup
+				wg.Add(1)
+
+				// Write concurrently with read to avoid deadlock on large payloads
+				go func() {
+					defer wg.Done()
+					totalWritten := 0
+					for totalWritten < size {
+						n, err := conn.Write(data[totalWritten:])
+						if err != nil {
+							writeErr = err
+							return
+						}
+						totalWritten += n
+					}
+				}()
+
+				// Receive full response
+				totalRead := 0
+				for totalRead < size {
+					n, err := conn.Read(recvBuf)
+					if err != nil {
+						b.Fatalf("Read failed: %v", err)
+					}
+					totalRead += n
+				}
+
+				wg.Wait()
+				if writeErr != nil {
+					b.Fatalf("Write failed: %v", writeErr)
+				}
+			}
+
+			b.StopTimer()
+			close(done)
+
+			select {
+			case err := <-errCh:
+				b.Fatalf("Server error: %v", err)
+			default:
+			}
+		})
+	}
+}
+
+// BenchmarkUnixLargePayloadsRoundtrip benchmarks Unix socket unary/roundtrip with large payloads
+func BenchmarkUnixLargePayloadsRoundtrip(b *testing.B) {
+	sizes := []int{
+		1 * 1024 * 1024,   // 1MB
+		4 * 1024 * 1024,   // 4MB
+		16 * 1024 * 1024,  // 16MB
+		64 * 1024 * 1024,  // 64MB
+		128 * 1024 * 1024, // 128MB
+		256 * 1024 * 1024, // 256MB
+	}
+
+	for _, size := range sizes {
+		sizeMB := size / (1024 * 1024)
+		b.Run(fmt.Sprintf("size=%dMB", sizeMB), func(b *testing.B) {
+			sockPath := fmt.Sprintf("/tmp/bench-unix-large-rt-%d.sock", time.Now().UnixNano())
+
+			listener, err := net.Listen("unix", sockPath)
+			if err != nil {
+				b.Fatalf("Listen failed: %v", err)
+			}
+			defer func() {
+				listener.Close()
+				os.Remove(sockPath)
+			}()
+
+			data := make([]byte, size)
+			for i := range data {
+				data[i] = byte(i & 0xFF)
+			}
+
+			started := make(chan struct{})
+			done := make(chan struct{})
+			errCh := make(chan error, 1)
+
+			// Echo server
+			go func() {
+				conn, err := listener.Accept()
+				if err != nil {
+					errCh <- err
+					return
+				}
+				defer conn.Close()
+				close(started)
+
+				buf := make([]byte, 256*1024)
+				for {
+					select {
+					case <-done:
+						return
+					default:
+					}
+
+					// Read and echo
+					conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+					n, err := conn.Read(buf)
+					if err != nil {
+						if ne, ok := err.(net.Error); ok && ne.Timeout() {
+							continue
+						}
+						return
+					}
+					conn.SetWriteDeadline(time.Now().Add(1 * time.Second))
+					_, err = conn.Write(buf[:n])
+					if err != nil {
+						return
+					}
+				}
+			}()
+
+			conn, err := net.Dial("unix", sockPath)
+			if err != nil {
+				b.Fatalf("Dial failed: %v", err)
+			}
+			defer conn.Close()
+			<-started
+
+			recvBuf := make([]byte, 256*1024)
+
+			b.SetBytes(int64(size * 2)) // roundtrip
+			b.ResetTimer()
+
+			for i := 0; i < b.N; i++ {
+				var writeErr error
+				var wg sync.WaitGroup
+				wg.Add(1)
+
+				// Write concurrently with read to avoid deadlock on large payloads
+				go func() {
+					defer wg.Done()
+					totalWritten := 0
+					for totalWritten < size {
+						n, err := conn.Write(data[totalWritten:])
+						if err != nil {
+							writeErr = err
+							return
+						}
+						totalWritten += n
+					}
+				}()
+
+				// Receive full response
+				totalRead := 0
+				for totalRead < size {
+					n, err := conn.Read(recvBuf)
+					if err != nil {
+						b.Fatalf("Read failed: %v", err)
+					}
+					totalRead += n
+				}
+
+				wg.Wait()
+				if writeErr != nil {
+					b.Fatalf("Write failed: %v", writeErr)
+				}
+			}
+
+			b.StopTimer()
+			close(done)
+
+			select {
+			case err := <-errCh:
+				b.Fatalf("Server error: %v", err)
+			default:
+			}
+		})
+	}
+}

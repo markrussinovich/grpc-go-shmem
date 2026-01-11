@@ -2,3 +2,4 @@
 
 # Local logs
 *.log
+*.pyc
