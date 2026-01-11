@@ -31,8 +31,8 @@ import (
 
 // BenchmarkShmRingWriteRead measures raw ring buffer throughput
 func BenchmarkShmRingWriteRead(b *testing.B) {
-	sizes := []int{64, 256, 1024, 4096, 16384, 65536}
-	const ringSize = 1024 * 1024 // 1MB ring for benchmarks
+	sizes := []int{64, 256, 1024, 4096, 16384, 65536, 262144, 1048576} // 64B to 1MB
+	const ringSize = 64 * 1024 * 1024                                   // 64MB ring for benchmarks
 
 	for _, size := range sizes {
 		size := size // capture
@@ -83,8 +83,8 @@ func BenchmarkShmRingWriteRead(b *testing.B) {
 
 // BenchmarkShmRingThroughput measures sustained streaming throughput
 func BenchmarkShmRingThroughput(b *testing.B) {
-	sizes := []int{1024, 4096, 16384, 65536}
-	const ringSize = 1024 * 1024 // 1MB ring for benchmarks
+	sizes := []int{1024, 4096, 16384, 65536, 262144, 1048576, 4194304} // 1KB to 4MB
+	const ringSize = 64 * 1024 * 1024                                    // 64MB ring for benchmarks
 
 	for _, size := range sizes {
 		b.Run(fmt.Sprintf("size=%d", size), func(b *testing.B) {
@@ -155,7 +155,7 @@ func BenchmarkShmRingThroughput(b *testing.B) {
 
 // BenchmarkTCPLoopback measures TCP loopback performance for comparison
 func BenchmarkTCPLoopback(b *testing.B) {
-	sizes := []int{64, 256, 1024, 4096, 16384, 65536}
+	sizes := []int{64, 256, 1024, 4096, 16384, 65536, 262144, 1048576} // 64B to 1MB
 
 	for _, size := range sizes {
 		b.Run(fmt.Sprintf("size=%d", size), func(b *testing.B) {
@@ -475,7 +475,7 @@ func BenchmarkShmRingRoundtrip(b *testing.B) {
 
 // BenchmarkUnixSocketLoopback for comparison
 func BenchmarkUnixSocketLoopback(b *testing.B) {
-	sizes := []int{64, 256, 1024, 4096, 16384, 65536}
+	sizes := []int{64, 256, 1024, 4096, 16384, 65536, 262144, 1048576} // 64B to 1MB
 
 	for _, size := range sizes {
 		b.Run(fmt.Sprintf("size=%d", size), func(b *testing.B) {
@@ -532,6 +532,290 @@ func BenchmarkUnixSocketLoopback(b *testing.B) {
 			}
 
 			wg.Wait()
+			select {
+			case err := <-errCh:
+				b.Fatalf("Server error: %v", err)
+			default:
+			}
+		})
+	}
+}
+
+// BenchmarkShmRingLargePayloads benchmarks very large message transfers up to 256MB
+// using the 64MB ring buffer with automatic chunking.
+func BenchmarkShmRingLargePayloads(b *testing.B) {
+	// Test from 1MB to 256MB - these require chunking with the 64MB ring
+	sizes := []int{
+		1 * 1024 * 1024,   // 1MB
+		4 * 1024 * 1024,   // 4MB
+		16 * 1024 * 1024,  // 16MB
+		64 * 1024 * 1024,  // 64MB (ring size)
+		128 * 1024 * 1024, // 128MB (requires chunking)
+		256 * 1024 * 1024, // 256MB (requires chunking)
+	}
+	const ringSize = 64 * 1024 * 1024 // 64MB ring
+	const chunkSize = 32 * 1024 * 1024 // 32MB chunks for transfers > ring size
+
+	for _, size := range sizes {
+		sizeMB := size / (1024 * 1024)
+		b.Run(fmt.Sprintf("size=%dMB", sizeMB), func(b *testing.B) {
+			segName := fmt.Sprintf("bench-large-%d-%d", size, time.Now().UnixNano())
+			seg, err := CreateSegment(segName, ringSize, ringSize)
+			if err != nil {
+				b.Fatalf("CreateSegment failed: %v", err)
+			}
+			b.Cleanup(func() {
+				seg.Close()
+				RemoveSegment(segName)
+			})
+
+			ring := NewShmRingFromSegment(seg.A, seg.Mem)
+			ctx := context.Background()
+			data := make([]byte, size)
+			// Fill with pattern
+			for i := range data {
+				data[i] = byte(i & 0xFF)
+			}
+
+			b.SetBytes(int64(size))
+			b.ResetTimer()
+
+			if size <= int(ringSize) {
+				// Sequential write-then-read for payloads that fit in ring
+				for i := 0; i < b.N; i++ {
+					// Write the full payload
+					if err := ring.WriteAll(data, ctx); err != nil {
+						b.Fatalf("WriteAll failed at iter %d: %v", i, err)
+					}
+
+					// Read the full payload
+					totalRead := 0
+					for totalRead < size {
+						first, second, commit, err := ring.ReadSlices(min(size-totalRead, 32*1024), ctx)
+						if err != nil {
+							b.Fatalf("ReadSlices failed at iter %d, %d/%d: %v", i, totalRead, size, err)
+						}
+						n := len(first) + len(second)
+						commit(n)
+						totalRead += n
+					}
+				}
+			} else {
+				// Chunked transfer for payloads larger than ring
+				// Use alternating write-chunk/read-chunk to avoid filling the ring
+				for i := 0; i < b.N; i++ {
+					offset := 0
+					for offset < size {
+						// Determine chunk size for this iteration
+						writeSize := chunkSize
+						if offset+writeSize > size {
+							writeSize = size - offset
+						}
+
+						// Write chunk
+						if err := ring.WriteAll(data[offset:offset+writeSize], ctx); err != nil {
+							b.Fatalf("WriteAll chunk failed at iter %d, offset %d: %v", i, offset, err)
+						}
+
+						// Read chunk immediately
+						chunkRead := 0
+						for chunkRead < writeSize {
+							first, second, commit, err := ring.ReadSlices(min(writeSize-chunkRead, 32*1024), ctx)
+							if err != nil {
+								b.Fatalf("ReadSlices chunk failed at iter %d, offset %d: %v", i, offset, err)
+							}
+							n := len(first) + len(second)
+							commit(n)
+							chunkRead += n
+						}
+
+						offset += writeSize
+					}
+				}
+			}
+		})
+	}
+}
+
+// BenchmarkTCPLargePayloads benchmarks TCP with large payloads for comparison
+func BenchmarkTCPLargePayloads(b *testing.B) {
+	sizes := []int{
+		1 * 1024 * 1024,   // 1MB
+		4 * 1024 * 1024,   // 4MB
+		16 * 1024 * 1024,  // 16MB
+		64 * 1024 * 1024,  // 64MB
+		128 * 1024 * 1024, // 128MB
+		256 * 1024 * 1024, // 256MB
+	}
+
+	for _, size := range sizes {
+		sizeMB := size / (1024 * 1024)
+		b.Run(fmt.Sprintf("size=%dMB", sizeMB), func(b *testing.B) {
+			listener, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				b.Fatalf("Listen failed: %v", err)
+			}
+			defer listener.Close()
+
+			addr := listener.Addr().String()
+			data := make([]byte, size)
+			for i := range data {
+				data[i] = byte(i & 0xFF)
+			}
+
+			// Use channels for synchronization
+			serverReady := make(chan struct{})
+			done := make(chan struct{})
+			errCh := make(chan error, 1)
+
+			// Server goroutine - reads data continuously until done
+			go func() {
+				conn, err := listener.Accept()
+				if err != nil {
+					errCh <- err
+					return
+				}
+				defer conn.Close()
+				close(serverReady)
+
+				recvBuf := make([]byte, 256*1024) // 256KB read buffer
+				for {
+					select {
+					case <-done:
+						return
+					default:
+					}
+					conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+					_, err := conn.Read(recvBuf)
+					if err != nil {
+						if ne, ok := err.(net.Error); ok && ne.Timeout() {
+							continue
+						}
+						return
+					}
+				}
+			}()
+
+			conn, err := net.Dial("tcp", addr)
+			if err != nil {
+				b.Fatalf("Dial failed: %v", err)
+			}
+			defer conn.Close()
+			<-serverReady
+
+			b.SetBytes(int64(size))
+			b.ResetTimer()
+
+			for i := 0; i < b.N; i++ {
+				totalWritten := 0
+				for totalWritten < size {
+					n, err := conn.Write(data[totalWritten:])
+					if err != nil {
+						b.Fatalf("Write failed: %v", err)
+					}
+					totalWritten += n
+				}
+			}
+
+			b.StopTimer()
+			close(done)
+
+			select {
+			case err := <-errCh:
+				b.Fatalf("Server error: %v", err)
+			default:
+			}
+		})
+	}
+}
+
+// BenchmarkUnixLargePayloads benchmarks Unix socket with large payloads for comparison
+func BenchmarkUnixLargePayloads(b *testing.B) {
+	sizes := []int{
+		1 * 1024 * 1024,   // 1MB
+		4 * 1024 * 1024,   // 4MB
+		16 * 1024 * 1024,  // 16MB
+		64 * 1024 * 1024,  // 64MB
+		128 * 1024 * 1024, // 128MB
+		256 * 1024 * 1024, // 256MB
+	}
+
+	for _, size := range sizes {
+		sizeMB := size / (1024 * 1024)
+		b.Run(fmt.Sprintf("size=%dMB", sizeMB), func(b *testing.B) {
+			sockPath := fmt.Sprintf("/tmp/bench-unix-large-%d.sock", time.Now().UnixNano())
+
+			listener, err := net.Listen("unix", sockPath)
+			if err != nil {
+				b.Fatalf("Listen failed: %v", err)
+			}
+			defer func() {
+				listener.Close()
+				os.Remove(sockPath)
+			}()
+
+			data := make([]byte, size)
+			for i := range data {
+				data[i] = byte(i & 0xFF)
+			}
+
+			// Use channels for synchronization
+			serverReady := make(chan struct{})
+			done := make(chan struct{})
+			errCh := make(chan error, 1)
+
+			// Server goroutine - reads data continuously until done
+			go func() {
+				conn, err := listener.Accept()
+				if err != nil {
+					errCh <- err
+					return
+				}
+				defer conn.Close()
+				close(serverReady)
+
+				recvBuf := make([]byte, 256*1024) // 256KB read buffer
+				for {
+					select {
+					case <-done:
+						return
+					default:
+					}
+					conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+					_, err := conn.Read(recvBuf)
+					if err != nil {
+						if ne, ok := err.(net.Error); ok && ne.Timeout() {
+							continue
+						}
+						return
+					}
+				}
+			}()
+
+			conn, err := net.Dial("unix", sockPath)
+			if err != nil {
+				b.Fatalf("Dial failed: %v", err)
+			}
+			defer conn.Close()
+			<-serverReady
+
+			b.SetBytes(int64(size))
+			b.ResetTimer()
+
+			for i := 0; i < b.N; i++ {
+				totalWritten := 0
+				for totalWritten < size {
+					n, err := conn.Write(data[totalWritten:])
+					if err != nil {
+						b.Fatalf("Write failed: %v", err)
+					}
+					totalWritten += n
+				}
+			}
+
+			b.StopTimer()
+			close(done)
+
 			select {
 			case err := <-errCh:
 				b.Fatalf("Server error: %v", err)

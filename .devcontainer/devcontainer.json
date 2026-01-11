@@ -1,0 +1,23 @@
+{
+    "name": "gRPC-Go Shared Memory Development",
+    "image": "mcr.microsoft.com/devcontainers/go:1.24",
+    
+    "features": {
+        "ghcr.io/devcontainers/features/python:1": {}
+    },
+    
+    "runArgs": [
+        "--shm-size=512m"
+    ],
+    
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "golang.go",
+                "ms-python.python"
+            ]
+        }
+    },
+    
+    "postCreateCommand": "pip install matplotlib numpy && go mod download"
+}
