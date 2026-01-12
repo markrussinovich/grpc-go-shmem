@@ -61,7 +61,7 @@ func readFrameWithContext(ctx context.Context, rx *ShmRing) (FrameHeader, []byte
 			if _, _, commit, err := rx.ReadSlices(int(remToEnd), ctx); err != nil {
 				return FrameHeader{}, nil, err
 			} else {
-				commit(int(remToEnd))
+				commit.Commit(int(remToEnd))
 			}
 			// Consume the PAD header at offset 0 silently, then continue
 			if _, err := rx.ReadExact(frameHeaderSize, nil, ctx); err != nil {

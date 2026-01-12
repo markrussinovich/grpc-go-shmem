@@ -91,7 +91,7 @@ func BenchmarkShmRingLargeMessages(b *testing.B) {
 						copy(res.Second, second)
 					}
 					res.Commit(size)
-					commit(size)
+					commit.Commit(size)
 				}
 			}()
 
@@ -116,7 +116,7 @@ func BenchmarkShmRingLargeMessages(b *testing.B) {
 					b.Fatalf("ReadSlices failed: %v", err)
 				}
 				_ = first
-				commit(size)
+				commit.Commit(size)
 			}
 
 			wg.Wait()
@@ -185,7 +185,7 @@ func BenchmarkShmConcurrentStreams(b *testing.B) {
 						copy(res.Second, second)
 					}
 					res.Commit(messageSize)
-					commit(messageSize)
+					commit.Commit(messageSize)
 
 					if atomic.AddInt64(&serverOps, 1) >= totalOps {
 						return
@@ -217,7 +217,7 @@ func BenchmarkShmConcurrentStreams(b *testing.B) {
 						if err != nil {
 							return
 						}
-						commit(messageSize)
+						commit.Commit(messageSize)
 					}
 				}()
 			}
@@ -276,7 +276,7 @@ func BenchmarkShmLatencyPercentiles(b *testing.B) {
 				copy(res.Second, second)
 			}
 			res.Commit(messageSize)
-			commit(messageSize)
+			commit.Commit(messageSize)
 		}
 	}()
 
@@ -299,7 +299,7 @@ func BenchmarkShmLatencyPercentiles(b *testing.B) {
 		if err != nil {
 			b.Fatalf("ReadSlices failed: %v", err)
 		}
-		commit(messageSize)
+		commit.Commit(messageSize)
 
 		latencies[i] = time.Since(start)
 	}
@@ -406,7 +406,7 @@ func BenchmarkShmClientStreaming(b *testing.B) {
 						if err != nil {
 							return
 						}
-						commit(messageSize)
+						commit.Commit(messageSize)
 					}
 
 					// Send single response
@@ -440,7 +440,7 @@ func BenchmarkShmClientStreaming(b *testing.B) {
 				if err != nil {
 					b.Fatalf("ReadSlices failed: %v", err)
 				}
-				commit(messageSize)
+				commit.Commit(messageSize)
 			}
 
 			wg.Wait()
@@ -488,7 +488,7 @@ func BenchmarkShmServerStreaming(b *testing.B) {
 					if err != nil {
 						return
 					}
-					commit(messageSize)
+					commit.Commit(messageSize)
 
 					// Send all responses
 					for j := 0; j < count; j++ {
@@ -522,7 +522,7 @@ func BenchmarkShmServerStreaming(b *testing.B) {
 					if err != nil {
 						b.Fatalf("ReadSlices failed: %v", err)
 					}
-					commit(messageSize)
+					commit.Commit(messageSize)
 				}
 			}
 
@@ -577,7 +577,7 @@ func BenchmarkShmBidirectionalStreaming(b *testing.B) {
 							if err != nil {
 								return
 							}
-							commit(messageSize)
+							commit.Commit(messageSize)
 						}
 					}()
 
@@ -630,7 +630,7 @@ func BenchmarkShmBidirectionalStreaming(b *testing.B) {
 						if err != nil {
 							return
 						}
-						commit(messageSize)
+						commit.Commit(messageSize)
 					}
 				}()
 
@@ -678,7 +678,7 @@ func BenchmarkShmBackpressure(b *testing.B) {
 			}
 			// Simulate slow processing
 			time.Sleep(10 * time.Microsecond)
-			commit(messageSize)
+			commit.Commit(messageSize)
 		}
 	}()
 
@@ -745,7 +745,7 @@ func BenchmarkShmVsTCPComparison(b *testing.B) {
 					copy(res.Second, second)
 				}
 				res.Commit(messageSize)
-				commit(messageSize)
+				commit.Commit(messageSize)
 			}
 		}()
 
@@ -766,7 +766,7 @@ func BenchmarkShmVsTCPComparison(b *testing.B) {
 			if err != nil {
 				b.Fatalf("ReadSlices failed: %v", err)
 			}
-			commit(messageSize)
+			commit.Commit(messageSize)
 		}
 
 		wg.Wait()

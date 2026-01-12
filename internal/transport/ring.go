@@ -25,7 +25,6 @@ import (
 	"io"
 	"log"
 	"os"
-	"sync"
 	"sync/atomic"
 	"time"
 	"unsafe"
@@ -99,14 +98,92 @@ type ShmRing struct {
 	// This is process-local (not in shared memory) and allows the reader to
 	// continue reading new frames while holding references to uncommitted buffers.
 	// The shared readIdx only advances when buffers are freed.
+	// Access via atomic operations (single reader in SPSC design).
 	pendingReadIdx uint64
-	pendingMu      sync.Mutex // protects pendingReadIdx
 
 	// Adaptive spin state for minimizing latency on fast paths.
 	// These are process-local and help tune spin duration based on workload.
 	dataSpinCutoff  uint32 // Current spin iterations for waiting on data
 	spaceSpinCutoff uint32 // Current spin iterations for waiting on space
-	// No Go pointers into shared memory stored here; compute addresses on demand
+
+	// Pre-allocated commit contexts to avoid closure allocation on every operation.
+	// These are reused across calls - callers must commit before the next operation.
+	writeCommit WriteCommit
+	readCommit  ReadCommit
+}
+
+// WriteCommit holds the state needed to commit a write operation.
+// This is embedded in ShmRing to avoid allocation on every ReserveWrite call.
+type WriteCommit struct {
+	ring     *ShmRing
+	writeIdx uint64
+	maxBytes int
+}
+
+// Commit commits the written bytes and advances the write index.
+// written must not exceed maxBytes.
+func (wc *WriteCommit) Commit(written int) error {
+	if written < 0 || written > wc.maxBytes {
+		return fmt.Errorf("invalid written count %d, expected 0-%d", written, wc.maxBytes)
+	}
+
+	hdr := wc.ring.header()
+
+	// Publish new write index.
+	hdr.SetWriteIndex(wc.writeIdx + uint64(written)) // release-publish
+
+	if written > 0 {
+		hdr.IncrementDataSequence()
+		// Only wake if there are waiters - avoids unnecessary syscalls
+		if hdr.DataWaiters() > 0 {
+			futexWake(&hdr.dataSeq, 1)
+		}
+	}
+
+	return nil
+}
+
+// ReadCommit holds the state needed to commit a read operation.
+// This is embedded in ShmRing to avoid allocation on every ReadSlices call.
+type ReadCommit struct {
+	ring          *ShmRing
+	commitReadIdx uint64
+	maxBytes      int
+}
+
+// Commit advances the shared read index to free space for the writer.
+// consumed must not exceed maxBytes.
+func (rc *ReadCommit) Commit(consumed int) {
+	if consumed < 0 || consumed > rc.maxBytes {
+		return // Invalid consumption, ignore
+	}
+
+	hdr := rc.ring.header()
+
+	// Calculate how much space the writer sees as used BEFORE this commit.
+	// We must read the CURRENT writeIdx (not the captured one) because
+	// the writer may have written more data since ReadSlices was called.
+	// If the ring became full after our read, we need to wake the writer.
+	currentWriteIdx := hdr.WriteIndex()
+	usedBefore := currentWriteIdx - rc.commitReadIdx
+
+	// Advance shared read index (release-publish) - frees space for writer
+	hdr.SetReadIndex(rc.commitReadIdx + uint64(consumed))
+
+	// Contiguity: always bump after any positive read commit
+	if consumed > 0 {
+		hdr.IncrementContigSequence()
+		if hdr.ContigWaiters() > 0 {
+			futexWake(&hdr.contigSeq, 1)
+		}
+	}
+	// Space: only on full→not-full
+	if usedBefore == rc.ring.capacity {
+		hdr.IncrementSpaceSequence()
+		if hdr.SpaceWaiters() > 0 {
+			futexWake(&hdr.spaceSeq, 1)
+		}
+	}
 }
 
 // SMF (Shared Memory Framing) helpers are defined in frame.go. This file uses
@@ -136,9 +213,12 @@ func NewShmRingFromSegment(ringView *ringView, mem []byte) *ShmRing {
 		dataSpinCutoff:  spinIterationsDefault,
 		spaceSpinCutoff: spinIterationsDefault,
 	}
+	// Initialize commit contexts with back-pointers
+	r.writeCommit.ring = r
+	r.readCommit.ring = r
 	// Initialize pendingReadIdx from current shared readIdx
-	r.pendingReadIdx = r.header().ReadIndex()
-	shmDebugf("[DEBUG] NewShmRingFromSegment: ring=%p, hdrOff=%d, mem[0]=%p, hdr=%p, pendingReadIdx=%d", r, r.hdrOff, &mem[0], r.header(), r.pendingReadIdx)
+	atomic.StoreUint64(&r.pendingReadIdx, r.header().ReadIndex())
+	shmDebugf("[DEBUG] NewShmRingFromSegment: ring=%p, hdrOff=%d, mem[0]=%p, hdr=%p, pendingReadIdx=%d", r, r.hdrOff, &mem[0], r.header(), atomic.LoadUint64(&r.pendingReadIdx))
 	return r
 }
 
@@ -920,15 +1000,15 @@ func DiagnoseDuelingBuffers(clientToServer, serverToClient *ShmRing) (bool, stri
 // WriteReservation represents a reservation for writing data to the ring.
 // The caller must fill exactly the reserved bytes and call Commit with the actual bytes written.
 type WriteReservation struct {
-	First  []byte // First contiguous slice (from write position to end of buffer or requested size)
-	Second []byte // Second contiguous slice (from start of buffer) - may be empty if First has enough space
-	commit func(written int) error
+	First      []byte       // First contiguous slice (from write position to end of buffer or requested size)
+	Second     []byte       // Second contiguous slice (from start of buffer) - may be empty if First has enough space
+	commitCtx  *WriteCommit // Pre-allocated commit context (no allocation)
 }
 
 // Commit commits the written bytes and advances the write index.
 // written must not exceed the total capacity of First + Second slices.
 func (wr *WriteReservation) Commit(written int) error {
-	return wr.commit(written)
+	return wr.commitCtx.Commit(written)
 }
 
 // ReserveWrite blocks until at least n bytes of contiguous space is available, then returns
@@ -990,33 +1070,14 @@ func (r *ShmRing) ReserveWrite(n int, ctx context.Context) (WriteReservation, er
 				second = unsafe.Slice((*byte)(secondPtr), secondLenI)
 			}
 
-			// Create commit function that captures the current write state.
-			// Memory ordering rationale: the caller copies into First/Second slices
-			// first, then Commit performs a release store of the new w index, then
-			// checks emptiness at commit time to avoid lost wake race.
-			commitFunc := func(written int) error {
-				if written < 0 || written > n {
-					return fmt.Errorf("invalid written count %d, expected 0-%d", written, n)
-				}
-
-				// Publish new write index.
-				hdr.SetWriteIndex(writeIdx + uint64(written)) // release-publish
-
-				if written > 0 {
-					hdr.IncrementDataSequence()
-					// Only wake if there are waiters - avoids unnecessary syscalls
-					if hdr.DataWaiters() > 0 {
-						futexWake(&hdr.dataSeq, 1)
-					}
-				}
-
-				return nil
-			}
+			// Set up pre-allocated commit context (no closure allocation)
+			r.writeCommit.writeIdx = writeIdx
+			r.writeCommit.maxBytes = n
 
 			return WriteReservation{
-				First:  first,
-				Second: second,
-				commit: commitFunc,
+				First:     first,
+				Second:    second,
+				commitCtx: &r.writeCommit,
 			}, nil
 		}
 
@@ -1135,8 +1196,8 @@ func (r *ShmRing) ReserveWrite(n int, ctx context.Context) (WriteReservation, er
 
 // ReadSlices blocks until at least n bytes are available to read; returns slices spanning wrap.
 // This enables proper reconstruction of headers that may straddle wrap boundaries.
-// The caller must call commit with the number of bytes consumed.
-func (r *ShmRing) ReadSlices(n int, ctx context.Context) (first, second []byte, commit func(consumed int), err error) {
+// The caller must call commit.Commit() with the number of bytes consumed.
+func (r *ShmRing) ReadSlices(n int, ctx context.Context) (first, second []byte, commit *ReadCommit, err error) {
 	if n <= 0 {
 		return nil, nil, nil, errors.New("read size must be positive")
 	}
@@ -1158,9 +1219,7 @@ func (r *ShmRing) ReadSlices(n int, ctx context.Context) (first, second []byte, 
 		headerClosed := hdr.Closed()
 
 		// Use pendingReadIdx for availability (allows read-ahead while buffers are held)
-		r.pendingMu.Lock()
-		pendingIdx := r.pendingReadIdx
-		r.pendingMu.Unlock()
+		pendingIdx := atomic.LoadUint64(&r.pendingReadIdx)
 
 		if localClosed || headerClosed {
 			// Check if data is still available even when closed
@@ -1206,46 +1265,13 @@ func (r *ShmRing) ReadSlices(n int, ctx context.Context) (first, second []byte, 
 
 			// Advance pendingReadIdx now - this allows us to read ahead
 			// while the application holds the buffer
-			r.pendingMu.Lock()
-			r.pendingReadIdx = pendingIdx + uint64(n)
-			r.pendingMu.Unlock()
+			atomic.StoreUint64(&r.pendingReadIdx, pendingIdx+uint64(n))
 
-			// Capture the shared read index at this point for the commit
-			commitReadIdx := sharedReadIdx
+			// Set up pre-allocated commit context (no closure allocation)
+			r.readCommit.commitReadIdx = sharedReadIdx
+			r.readCommit.maxBytes = n
 
-			// Create commit function - advances SHARED readIdx to free space for writer
-			commitFunc := func(consumed int) {
-				if consumed < 0 || consumed > n {
-					return // Invalid consumption, ignore
-				}
-
-				// Calculate how much space the writer sees as used BEFORE this commit.
-				// We must read the CURRENT writeIdx (not the captured one) because
-				// the writer may have written more data since ReadSlices was called.
-				// If the ring became full after our read, we need to wake the writer.
-				currentWriteIdx := hdr.WriteIndex()
-				usedBefore := currentWriteIdx - commitReadIdx
-
-				// Advance shared read index (release-publish) - frees space for writer
-				hdr.SetReadIndex(commitReadIdx + uint64(consumed))
-
-				// Contiguity: always bump after any positive read commit
-				if consumed > 0 {
-					hdr.IncrementContigSequence()
-					if hdr.ContigWaiters() > 0 {
-						futexWake(&hdr.contigSeq, 1)
-					}
-				}
-				// Space: only on full→not-full
-				if usedBefore == r.capacity {
-					hdr.IncrementSpaceSequence()
-					if hdr.SpaceWaiters() > 0 {
-						futexWake(&hdr.spaceSeq, 1)
-					}
-				}
-			}
-
-			return firstSlice, secondSlice, commitFunc, nil
+			return firstSlice, secondSlice, &r.readCommit, nil
 		}
 
 		// No data available - spin briefly before falling back to futex.
@@ -1255,9 +1281,7 @@ func (r *ShmRing) ReadSlices(n int, ctx context.Context) (first, second []byte, 
 		for i := uint32(0); i < spinCutoff; i++ {
 			runtime_procyield(1) // PAUSE instruction to reduce power/contention
 			writeIdx = hdr.WriteIndex()
-			r.pendingMu.Lock()
-			pendingIdx = r.pendingReadIdx
-			r.pendingMu.Unlock()
+			pendingIdx = atomic.LoadUint64(&r.pendingReadIdx)
 			if writeIdx-pendingIdx >= uint64(n) {
 				spinSuccess = true
 				// Adapt spin cutoff upward (exponential moving average)
@@ -1300,9 +1324,7 @@ func (r *ShmRing) ReadSlices(n int, ctx context.Context) (first, second []byte, 
 		if localClosed || headerClosed {
 			// Re-check if data appeared (race with producer)
 			writeIdx = hdr.WriteIndex()
-			r.pendingMu.Lock()
-			pendingIdx = r.pendingReadIdx
-			r.pendingMu.Unlock()
+			pendingIdx = atomic.LoadUint64(&r.pendingReadIdx)
 			available := writeIdx - pendingIdx
 			if available == 0 {
 				return nil, nil, nil, io.EOF
@@ -1322,9 +1344,7 @@ func (r *ShmRing) ReadSlices(n int, ctx context.Context) (first, second []byte, 
 		hdr.IncDataWaiters()
 		dataSeq := hdr.DataSequence()
 		writeIdx = hdr.WriteIndex()
-		r.pendingMu.Lock()
-		pendingIdx = r.pendingReadIdx
-		r.pendingMu.Unlock()
+		pendingIdx = atomic.LoadUint64(&r.pendingReadIdx)
 		if writeIdx-pendingIdx >= uint64(n) {
 			// Data became available; loop back to return slices.
 			hdr.DecDataWaiters()
@@ -1339,9 +1359,7 @@ func (r *ShmRing) ReadSlices(n int, ctx context.Context) (first, second []byte, 
 			hdr.DecDataWaiters()
 			// Re-check if data appeared
 			writeIdx = hdr.WriteIndex()
-			r.pendingMu.Lock()
-			pendingIdx = r.pendingReadIdx
-			r.pendingMu.Unlock()
+			pendingIdx = atomic.LoadUint64(&r.pendingReadIdx)
 			if writeIdx-pendingIdx >= uint64(n) {
 				continue
 			}
@@ -1473,7 +1491,7 @@ func (r *ShmRing) ReadExact(n int, dst []byte, ctx context.Context) ([]byte, err
 		}
 
 		// Commit the read
-		commit(copied)
+		commit.Commit(copied)
 		totalRead += copied
 	}
 

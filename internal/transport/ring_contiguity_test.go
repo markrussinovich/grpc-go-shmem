@@ -85,7 +85,7 @@ func TestRing_ContiguityWait_TailShort(t *testing.T) {
 	}
 	_ = first
 	_ = second
-	commit(32)
+	commit.Commit(32)
 
 	// Writer should wake and finish reservation without error
 	select {
@@ -150,7 +150,7 @@ func TestRing_SpaceLimited_WaitsOnSpace(t *testing.T) {
 	}
 	_ = first
 	_ = second
-	commit(16)
+	commit.Commit(16)
 
 	select {
 	case err := <-done:

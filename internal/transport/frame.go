@@ -28,6 +28,17 @@ import (
 	"google.golang.org/grpc/mem"
 )
 
+// Buffer pools for header/trailer encoding to reduce allocations on hot path.
+// Small pool (512B) handles typical headers; large pool (4KB) for metadata-heavy cases.
+var (
+	smallHeaderPool = sync.Pool{
+		New: func() any { return make([]byte, 512) },
+	}
+	largeHeaderPool = sync.Pool{
+		New: func() any { return make([]byte, 4096) },
+	}
+)
+
 // Helpers operate on the blocking shared-memory ring (ShmRing).
 
 // Frame header layout (16 bytes, little-endian, aligned 16):
@@ -105,20 +116,19 @@ func decodeFrameHeader(b []byte) (FrameHeader, error) {
 }
 
 // ringCommitPool defers advancing the ring read index until the payload buffer
-// is fully released by the consumer.
+// is fully released by the consumer. It holds a COPY of the ReadCommit state
+// to avoid races when the ring's embedded ReadCommit is reused by later reads.
 type ringCommitPool struct {
 	once   sync.Once
-	commit func(consumed int)
+	commit ReadCommit // Value copy, not pointer - captures state at creation time
 }
 
 func (p *ringCommitPool) Get(n int) *[]byte { return nil }
 
 func (p *ringCommitPool) Put(b *[]byte) {
 	p.once.Do(func() {
-		if p.commit != nil {
-			shmDebugf("[DEBUG] ringCommitPool.Put: committing %d bytes", len(*b))
-			p.commit(len(*b))
-		}
+		shmDebugf("[DEBUG] ringCommitPool.Put: committing %d bytes", len(*b))
+		p.commit.Commit(len(*b))
 	})
 }
 
@@ -191,6 +201,92 @@ func encodeHeaders(h HeadersV1) []byte {
 		}
 	}
 	return out
+}
+
+// encodeHeadersPooled encodes headers into a pooled buffer and returns
+// the buffer along with the actual data slice and a release function.
+// The caller MUST call the release function after the data has been
+// written to the ring buffer.
+func encodeHeadersPooled(h HeadersV1) (data []byte, release func()) {
+	// Size calculation
+	size := 1 + 1 + 4 // version + hdrType + methodLen
+	size += len(h.Method)
+	size += 4 + len(h.Authority)
+	size += 8 // deadline
+	size += 2 // mdCount
+	for _, kv := range h.Metadata {
+		size += 2 + len(kv.Key)
+		size += 2 // valCount
+		for _, v := range kv.Values {
+			size += 4 + len(v)
+		}
+	}
+
+	// Get buffer from appropriate pool
+	var buf []byte
+	var pool *sync.Pool
+	if size <= 512 {
+		pool = &smallHeaderPool
+		buf = pool.Get().([]byte)
+	} else if size <= 4096 {
+		pool = &largeHeaderPool
+		buf = pool.Get().([]byte)
+	} else {
+		// Too large for pools, allocate directly
+		buf = make([]byte, size)
+		pool = nil
+	}
+
+	// Ensure buffer is large enough
+	if len(buf) < size {
+		buf = make([]byte, size)
+		pool = nil // Don't return oversized allocation to pool
+	}
+
+	out := buf[:size]
+	i := 0
+	out[i] = 1
+	i++
+	out[i] = h.HdrType
+	i++
+	if h.HdrType == 0 {
+		binary.LittleEndian.PutUint32(out[i:i+4], uint32(len(h.Method)))
+		i += 4
+		copy(out[i:i+len(h.Method)], []byte(h.Method))
+		i += len(h.Method)
+	} else {
+		binary.LittleEndian.PutUint32(out[i:i+4], 0)
+		i += 4
+	}
+	binary.LittleEndian.PutUint32(out[i:i+4], uint32(len(h.Authority)))
+	i += 4
+	copy(out[i:i+len(h.Authority)], []byte(h.Authority))
+	i += len(h.Authority)
+	binary.LittleEndian.PutUint64(out[i:i+8], h.DeadlineUnixNano)
+	i += 8
+	binary.LittleEndian.PutUint16(out[i:i+2], uint16(len(h.Metadata)))
+	i += 2
+	for _, kv := range h.Metadata {
+		binary.LittleEndian.PutUint16(out[i:i+2], uint16(len(kv.Key)))
+		i += 2
+		copy(out[i:i+len(kv.Key)], []byte(kv.Key))
+		i += len(kv.Key)
+		binary.LittleEndian.PutUint16(out[i:i+2], uint16(len(kv.Values)))
+		i += 2
+		for _, v := range kv.Values {
+			binary.LittleEndian.PutUint32(out[i:i+4], uint32(len(v)))
+			i += 4
+			copy(out[i:i+len(v)], v)
+			i += len(v)
+		}
+	}
+
+	release = func() {
+		if pool != nil {
+			pool.Put(buf)
+		}
+	}
+	return out, release
 }
 
 func decodeHeaders(b []byte) (HeadersV1, error) {
@@ -316,6 +412,73 @@ func encodeTrailers(t TrailersV1) []byte {
 	return out
 }
 
+// encodeTrailersPooled encodes trailers using a pooled buffer.
+// The caller MUST call the release function after the data has been
+// written to the ring buffer.
+func encodeTrailersPooled(t TrailersV1) (data []byte, release func()) {
+	size := 1 + 4 + 4 + len(t.GRPCStatusMsg) + 2
+	for _, kv := range t.Metadata {
+		size += 2 + len(kv.Key)
+		size += 2
+		for _, v := range kv.Values {
+			size += 4 + len(v)
+		}
+	}
+
+	// Get buffer from appropriate pool
+	var buf []byte
+	var pool *sync.Pool
+	if size <= 512 {
+		pool = &smallHeaderPool
+		buf = pool.Get().([]byte)
+	} else if size <= 4096 {
+		pool = &largeHeaderPool
+		buf = pool.Get().([]byte)
+	} else {
+		buf = make([]byte, size)
+		pool = nil
+	}
+
+	if len(buf) < size {
+		buf = make([]byte, size)
+		pool = nil
+	}
+
+	out := buf[:size]
+	i := 0
+	out[i] = 1
+	i++
+	binary.LittleEndian.PutUint32(out[i:i+4], t.GRPCStatusCode)
+	i += 4
+	binary.LittleEndian.PutUint32(out[i:i+4], uint32(len(t.GRPCStatusMsg)))
+	i += 4
+	copy(out[i:i+len(t.GRPCStatusMsg)], []byte(t.GRPCStatusMsg))
+	i += len(t.GRPCStatusMsg)
+	binary.LittleEndian.PutUint16(out[i:i+2], uint16(len(t.Metadata)))
+	i += 2
+	for _, kv := range t.Metadata {
+		binary.LittleEndian.PutUint16(out[i:i+2], uint16(len(kv.Key)))
+		i += 2
+		copy(out[i:i+len(kv.Key)], []byte(kv.Key))
+		i += len(kv.Key)
+		binary.LittleEndian.PutUint16(out[i:i+2], uint16(len(kv.Values)))
+		i += 2
+		for _, v := range kv.Values {
+			binary.LittleEndian.PutUint32(out[i:i+4], uint32(len(v)))
+			i += 4
+			copy(out[i:i+len(v)], v)
+			i += len(v)
+		}
+	}
+
+	release = func() {
+		if pool != nil {
+			pool.Put(buf)
+		}
+	}
+	return out, release
+}
+
 func decodeTrailers(b []byte) (TrailersV1, error) {
 	var t TrailersV1
 	i := 0
@@ -422,6 +585,76 @@ func writeFrame(tx *ShmRing, fh FrameHeader, payload []byte, ctx context.Context
 	if err := writeAt(frameHeaderSize, payload); err != nil {
 		return err
 	}
+	return res.Commit(total)
+}
+
+// writeFramesBatched writes multiple frames in a single ring buffer commit.
+// This reduces the number of futex wakes and mutex acquisitions for small messages.
+// Each frame is a (FrameHeader, payload) pair. All frames share the same streamID.
+func writeFramesBatched(tx *ShmRing, frames []struct {
+	fh      FrameHeader
+	payload []byte
+}, ctx context.Context) error {
+	if len(frames) == 0 {
+		return nil
+	}
+
+	// Calculate total size needed
+	total := 0
+	for i := range frames {
+		total += frameHeaderSize + len(frames[i].payload)
+	}
+
+	// Reserve space for all frames at once
+	res, err := tx.ReserveWrite(total, ctx)
+	if err != nil {
+		return err
+	}
+
+	written := 0
+	writeSeq := func(src []byte) error {
+		for len(src) > 0 {
+			if written < len(res.First) {
+				n := copy(res.First[written:], src)
+				written += n
+				src = src[n:]
+				if len(src) == 0 {
+					return nil
+				}
+			}
+			secondOff := written - len(res.First)
+			if secondOff >= len(res.Second) {
+				return errors.New("failed to copy frame bytes: reservation overflow")
+			}
+			n := copy(res.Second[secondOff:], src)
+			written += n
+			src = src[n:]
+		}
+		return nil
+	}
+
+	// Write each frame's header and payload
+	var hdr [frameHeaderSize]byte
+	for i := range frames {
+		frames[i].fh.Length = uint32(len(frames[i].payload))
+		frames[i].fh.Reserved = 0
+		frames[i].fh.Reserved2 = 0
+		encodeFrameHeaderTo(&hdr, frames[i].fh)
+
+		if err := writeSeq(hdr[:]); err != nil {
+			return err
+		}
+		if len(frames[i].payload) > 0 {
+			if err := writeSeq(frames[i].payload); err != nil {
+				return err
+			}
+		}
+	}
+
+	if written != total {
+		return errors.New("failed to copy frame bytes: short write")
+	}
+
 	return res.Commit(total)
 }
 
@@ -571,7 +804,7 @@ func readFrame(rx *ShmRing, ctx context.Context) (FrameHeader, []byte, error) {
 		if n < frameHeaderSize && len(second) > 0 {
 			n += copy(hb[n:], second)
 		}
-		commit(frameHeaderSize)
+		commit.Commit(frameHeaderSize)
 		if n != frameHeaderSize {
 			return FrameHeader{}, nil, errors.New("short header read")
 		}
@@ -622,7 +855,7 @@ func readFrameView(rx *ShmRing, ctx context.Context) (FrameHeader, mem.Buffer, e
 		if n < frameHeaderSize && len(second) > 0 {
 			n += copy(hb[n:], second)
 		}
-		commitHeader(frameHeaderSize)
+		commitHeader.Commit(frameHeaderSize)
 		if n != frameHeaderSize {
 			return FrameHeader{}, nil, errors.New("short header read")
 		}
@@ -658,13 +891,13 @@ func readFrameView(rx *ShmRing, ctx context.Context) (FrameHeader, mem.Buffer, e
 			// so we must commit immediately for small payloads to avoid blocking
 			// the ring buffer reader.
 			if mem.IsBelowBufferPoolingThreshold(payloadLen) {
-				commitPayload(payloadLen)
+				commitPayload.Commit(payloadLen)
 				// Return a copy so caller doesn't hold ring memory
 				result := make([]byte, payloadLen)
 				copy(result, contig)
 				return fh, mem.SliceBuffer(result), nil
 			}
-			pool := &ringCommitPool{commit: commitPayload}
+			pool := &ringCommitPool{commit: *commitPayload} // Value copy to capture state
 			buf := mem.NewBuffer(&contig, pool)
 			return fh, buf, nil
 		}
@@ -673,7 +906,7 @@ func readFrameView(rx *ShmRing, ctx context.Context) (FrameHeader, mem.Buffer, e
 		contig := make([]byte, payloadLen)
 		copied := copy(contig, pFirst)
 		copy(contig[copied:], pSecond)
-		commitPayload(payloadLen)
+		commitPayload.Commit(payloadLen)
 		return fh, mem.SliceBuffer(contig), nil
 	}
 }

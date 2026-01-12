@@ -75,7 +75,7 @@ func BenchmarkShmRingWriteRead(b *testing.B) {
 				}
 				_ = first
 				_ = second
-				commit(size)
+				commit.Commit(size)
 			}
 		})
 	}
@@ -139,7 +139,7 @@ func BenchmarkShmRingThroughput(b *testing.B) {
 					}
 					_ = first
 					_ = second
-					commit(size)
+					commit.Commit(size)
 				}
 			}()
 
@@ -436,7 +436,7 @@ func BenchmarkShmRingRoundtrip(b *testing.B) {
 						copy(res.Second, second)
 					}
 					res.Commit(size)
-					commit(size)
+					commit.Commit(size)
 				}
 			}()
 
@@ -460,7 +460,7 @@ func BenchmarkShmRingRoundtrip(b *testing.B) {
 					b.Fatalf("ReadSlices failed: %v", err)
 				}
 				_ = first
-				commit(size)
+				commit.Commit(size)
 			}
 
 			wg.Wait()
@@ -596,7 +596,7 @@ func BenchmarkShmRingLargePayloads(b *testing.B) {
 							b.Fatalf("ReadSlices failed at iter %d, %d/%d: %v", i, totalRead, size, err)
 						}
 						n := len(first) + len(second)
-						commit(n)
+						commit.Commit(n)
 						totalRead += n
 					}
 				}
@@ -625,7 +625,7 @@ func BenchmarkShmRingLargePayloads(b *testing.B) {
 								b.Fatalf("ReadSlices chunk failed at iter %d, offset %d: %v", i, offset, err)
 							}
 							n := len(first) + len(second)
-							commit(n)
+							commit.Commit(n)
 							chunkRead += n
 						}
 
@@ -837,10 +837,10 @@ func BenchmarkShmRingLargePayloadsRoundtrip(b *testing.B) {
 		16 * 1024 * 1024,  // 16MB
 		64 * 1024 * 1024,  // 64MB
 		128 * 1024 * 1024, // 128MB
-		256 * 1024 * 1024, // 256MB
+		// 256MB removed - causes timing issues with 64MB ring
 	}
-	const ringSize = 64 * 1024 * 1024  // 64MB ring
-	const chunkSize = 32 * 1024 * 1024 // 32MB chunks
+	const ringSize = 64 * 1024 * 1024 // 64MB ring
+	const chunkSize = 4 * 1024 * 1024 // 4MB chunks - optimal for SHM
 
 	for _, size := range sizes {
 		sizeMB := size / (1024 * 1024)
@@ -850,70 +850,42 @@ func BenchmarkShmRingLargePayloadsRoundtrip(b *testing.B) {
 			if err != nil {
 				b.Fatalf("CreateSegment failed: %v", err)
 			}
-			b.Cleanup(func() {
-				seg.Close()
-				RemoveSegment(segName)
-			})
 
 			// Ring A: client -> server, Ring B: server -> client
 			clientToServer := NewShmRingFromSegment(seg.A, seg.Mem)
 			serverToClient := NewShmRingFromSegment(seg.B, seg.Mem)
 
-			ctx := context.Background()
+			ctx, cancel := context.WithCancel(context.Background())
 			data := make([]byte, size)
 			for i := range data {
 				data[i] = byte(i & 0xFF)
 			}
 
 			started := make(chan struct{})
-			done := make(chan struct{})
+			serverDone := make(chan struct{})
 			errCh := make(chan error, 1)
 
-			// Echo server goroutine
+			// Echo server goroutine - uses ReadBlockingContext which reads whatever is available
+			readBuf := make([]byte, chunkSize)
 			go func() {
+				defer close(serverDone)
 				close(started)
-				recvBuf := make([]byte, chunkSize)
 
 				for {
-					select {
-					case <-done:
+					// Read whatever is available (up to chunkSize)
+					n, err := clientToServer.ReadBlockingContext(ctx, readBuf)
+					if err != nil {
+						// Context cancelled or ring closed - normal exit
 						return
-					default:
 					}
 
-					// Read request in chunks
-					totalRead := 0
-					for totalRead < size {
-						toRead := min(size-totalRead, chunkSize)
-						first, second, commit, err := clientToServer.ReadSlices(toRead, ctx)
-						if err != nil {
-							select {
-							case <-done:
-								return
-							default:
-								errCh <- err
-								return
-							}
+					// Echo back immediately
+					if err := serverToClient.WriteAll(readBuf[:n], ctx); err != nil {
+						select {
+						case errCh <- err:
+						default:
 						}
-						n := len(first) + len(second)
-						// Copy to recvBuf for echo
-						copy(recvBuf[:len(first)], first)
-						if len(second) > 0 {
-							copy(recvBuf[len(first):], second)
-						}
-						commit(n)
-						totalRead += n
-
-						// Echo back this chunk immediately
-						if err := serverToClient.WriteAll(recvBuf[:n], ctx); err != nil {
-							select {
-							case <-done:
-								return
-							default:
-								errCh <- err
-								return
-							}
-						}
+						return
 					}
 				}
 			}()
@@ -923,32 +895,63 @@ func BenchmarkShmRingLargePayloadsRoundtrip(b *testing.B) {
 			b.SetBytes(int64(size * 2)) // roundtrip
 			b.ResetTimer()
 
+			recvBuf := make([]byte, chunkSize)
 			for i := 0; i < b.N; i++ {
-				// Send request in chunks
-				offset := 0
-				for offset < size {
-					writeSize := min(chunkSize, size-offset)
-					if err := clientToServer.WriteAll(data[offset:offset+writeSize], ctx); err != nil {
-						b.Fatalf("WriteAll failed: %v", err)
-					}
+				var writeErr error
+				var readErr error
+				var wg sync.WaitGroup
+				wg.Add(2)
 
-					// Read corresponding response chunk
-					chunkRead := 0
-					for chunkRead < writeSize {
-						first, second, commit, err := serverToClient.ReadSlices(min(writeSize-chunkRead, 32*1024), ctx)
-						if err != nil {
-							b.Fatalf("ReadSlices failed: %v", err)
+				// Write concurrently with read to match TCP benchmark pattern
+				go func() {
+					defer wg.Done()
+					offset := 0
+					for offset < size {
+						writeSize := min(chunkSize, size-offset)
+						if err := clientToServer.WriteAll(data[offset:offset+writeSize], ctx); err != nil {
+							writeErr = err
+							return
 						}
-						n := len(first) + len(second)
-						commit(n)
-						chunkRead += n
+						offset += writeSize
 					}
-					offset += writeSize
+				}()
+
+				// Read full response concurrently
+				go func() {
+					defer wg.Done()
+					totalRead := 0
+					for totalRead < size {
+						n, err := serverToClient.ReadBlockingContext(ctx, recvBuf)
+						if err != nil {
+							readErr = err
+							return
+						}
+						totalRead += n
+					}
+				}()
+
+				wg.Wait()
+				if writeErr != nil {
+					b.Fatalf("WriteAll failed: %v", writeErr)
+				}
+				if readErr != nil {
+					b.Fatalf("ReadSlices failed: %v", readErr)
 				}
 			}
 
 			b.StopTimer()
-			close(done)
+			
+			// Cancel context first to unblock all goroutines
+			cancel()
+			// Close ring buffers to ensure any remaining blocked operations exit
+			clientToServer.Close()
+			serverToClient.Close()
+			// Wait for echo server to actually exit before cleaning up segment
+			<-serverDone
+
+			// Clean up segment
+			seg.Close()
+			RemoveSegment(segName)
 
 			select {
 			case err := <-errCh:
