@@ -112,8 +112,11 @@ func futexWaitTimeout(addr *uint32, val uint32, timeoutNs int64) error {
 	// the sequence and wakes us between our snapshot and futex entry
 	currentVal := atomic.LoadUint32(addr)
 	if currentVal != val {
+		shmDebugf("FUTEX_PRECHECK_SKIP: expected=%d, current=%d, addr=%p", val, currentVal, addr)
 		return nil // Value already changed, no need to wait
 	}
+
+	shmDebugf("FUTEX_ENTERING_SYSCALL: expected=%d, current=%d, addr=%p, timeout=%dns", val, currentVal, addr, timeoutNs)
 
 	// Convert nanoseconds to timespec using the standard library helper
 	// which handles architecture-specific field types (int64 on amd64, int32 on 386)

@@ -70,14 +70,16 @@ var ErrRingClosed = errors.New("ring closed")
 
 // RingState represents a snapshot of ring buffer state for debugging and diagnostics
 type RingState struct {
-	Capacity  uint64 // Total ring capacity
-	Widx      uint64 // Current write index (monotonic)
-	Ridx      uint64 // Current read index (monotonic)
-	Used      uint64 // Bytes currently in ring (Widx - Ridx)
-	DataSeq   uint32 // Data availability sequence number
-	SpaceSeq  uint32 // Space availability sequence number
-	ContigSeq uint32 // Contiguity sequence number (readSeq equivalent)
-	Closed    uint32 // Ring closed flag (0 = open, 1 = closed)
+	Capacity     uint64 // Total ring capacity
+	Widx         uint64 // Current write index (monotonic)
+	Ridx         uint64 // Current read index (monotonic)
+	Used         uint64 // Bytes currently in ring (Widx - Ridx)
+	DataSeq      uint32 // Data availability sequence number
+	SpaceSeq     uint32 // Space availability sequence number
+	ContigSeq    uint32 // Contiguity sequence number (readSeq equivalent)
+	Closed       uint32 // Ring closed flag (0 = open, 1 = closed)
+	DataWaiters  uint32 // Number of readers waiting for data
+	SpaceWaiters uint32 // Number of writers waiting for space
 }
 
 // ShmRing represents a single-producer single-consumer (SPSC) ring buffer
@@ -134,8 +136,12 @@ func (wc *WriteCommit) Commit(written int) error {
 
 	if written > 0 {
 		hdr.IncrementDataSequence()
+		newSeq := hdr.DataSequence()
+		waiters := hdr.DataWaiters()
+		shmDebugf("COMMIT_DATA_WAKE: written=%d, newSeq=%d, dataWaiters=%d", written, newSeq, waiters)
 		// Only wake if there are waiters - avoids unnecessary syscalls
-		if hdr.DataWaiters() > 0 {
+		if waiters > 0 {
+			shmDebugf("COMMIT_DATA_WAKE: waking 1 waiter")
 			futexWake(&hdr.dataSeq, 1)
 		}
 	}
@@ -177,10 +183,13 @@ func (rc *ReadCommit) Commit(consumed int) {
 			futexWake(&hdr.contigSeq, 1)
 		}
 	}
-	// Space: only on full→not-full
-	if usedBefore == rc.ring.capacity {
+	// Space: Wake if ring was full OR if there are waiting writers.
+	// The second condition is crucial: the writer may have filled the ring
+	// AFTER we calculated usedBefore. If a writer is waiting, we must wake it.
+	waiters := hdr.SpaceWaiters()
+	if usedBefore == rc.ring.capacity || waiters > 0 {
 		hdr.IncrementSpaceSequence()
-		if hdr.SpaceWaiters() > 0 {
+		if waiters > 0 {
 			futexWake(&hdr.spaceSeq, 1)
 		}
 	}
@@ -241,6 +250,7 @@ func (r *ShmRing) Capacity() uint64 {
 // All values are read atomically for consistent state observation.
 func (r *ShmRing) DebugState() RingState {
 	hdr := r.header()
+	shmDebugf("DebugState: ring=%p, hdr=%p, &dataSeq=%p, &spaceSeq=%p", r, hdr, &hdr.dataSeq, &hdr.spaceSeq)
 
 	// Read all state atomically for consistent snapshot
 	widx := hdr.WriteIndex()
@@ -254,14 +264,16 @@ func (r *ShmRing) DebugState() RingState {
 	}
 
 	return RingState{
-		Capacity:  r.capacity,
-		Widx:      widx,
-		Ridx:      ridx,
-		Used:      widx - ridx,
-		DataSeq:   dataSeq,
-		SpaceSeq:  spaceSeq,
-		ContigSeq: contigSeq,
-		Closed:    closed,
+		Capacity:     r.capacity,
+		Widx:         widx,
+		Ridx:         ridx,
+		Used:         widx - ridx,
+		DataSeq:      dataSeq,
+		SpaceSeq:     spaceSeq,
+		ContigSeq:    contigSeq,
+		Closed:       closed,
+		DataWaiters:  hdr.DataWaiters(),
+		SpaceWaiters: hdr.SpaceWaiters(),
 	}
 }
 
@@ -516,7 +528,7 @@ func (r *ShmRing) ReadBlocking(buf []byte) (int, error) {
 			// Memory ordering rationale:
 			// 1) Reader copies out bytes first
 			// 2) Publish the new read index with an atomic store (acts as a release)
-			// 3) Bump contigSeq always (contiguity improved), and spaceSeq only on full→not-full.
+			// 3) Bump contigSeq always (contiguity improved), and spaceSeq when space freed.
 			prevUsed := availableBefore
 			hdr.SetReadIndex(readIdx + uint64(bytesRead)) // release-publish
 
@@ -528,10 +540,14 @@ func (r *ShmRing) ReadBlocking(buf []byte) (int, error) {
 				}
 			}
 
-			// Space became available only if we were full before this read
-			if prevUsed == r.capacity {
+			// Space: Wake if ring was full OR if there are waiting writers.
+			// The second condition is crucial: the writer may have filled the ring
+			// AFTER our snapshot of availableBefore, so prevUsed doesn't reflect the
+			// true state. If a writer is waiting, we must wake it.
+			waiters := hdr.SpaceWaiters()
+			if prevUsed == r.capacity || waiters > 0 {
 				hdr.IncrementSpaceSequence()
-				if hdr.SpaceWaiters() > 0 {
+				if waiters > 0 {
 					futexWake(&hdr.spaceSeq, 1)
 				}
 			}
@@ -878,7 +894,7 @@ func (r *ShmRing) ReadBlockingContext(ctx context.Context, buf []byte) (int, err
 			// Memory ordering rationale:
 			// 1) Reader copies out bytes first
 			// 2) Publish the new read index with an atomic store (acts as a release)
-			// 3) Bump contigSeq always (contiguity improved), and spaceSeq only on full→not-full.
+			// 3) Bump contigSeq always (contiguity improved), and spaceSeq when space freed.
 			prevUsed := usedBefore
 			hdr.SetReadIndex(readIdx + uint64(bytesRead)) // release-publish
 
@@ -890,10 +906,18 @@ func (r *ShmRing) ReadBlockingContext(ctx context.Context, buf []byte) (int, err
 				}
 			}
 
-			// Space became available only if we were full before this read
-			if prevUsed == r.capacity {
+			// Space: Wake if ring was full OR if there are waiting writers.
+			// The second condition is crucial: the writer may have filled the ring
+			// AFTER our snapshot of usedBefore, so prevUsed doesn't reflect the
+			// true state. If a writer is waiting, we must wake it.
+			waiters := hdr.SpaceWaiters()
+			if prevUsed == r.capacity || waiters > 0 {
 				hdr.IncrementSpaceSequence()
-				if hdr.SpaceWaiters() > 0 {
+				newSeq := hdr.SpaceSequence()
+				shmDebugf("READBLOCKING_SPACE_WAKE: prevUsed=%d, cap=%d, new spaceSeq=%d, spaceWaiters=%d",
+					prevUsed, r.capacity, newSeq, waiters)
+				if waiters > 0 {
+					shmDebugf("READBLOCKING_SPACE_WAKE: waking %d waiters", waiters)
 					futexWake(&hdr.spaceSeq, 1)
 				}
 			}
@@ -909,6 +933,8 @@ func (r *ShmRing) ReadBlockingContext(ctx context.Context, buf []byte) (int, err
 		// Need to wait for data
 		hdr.IncDataWaiters()
 		dataSeq := hdr.DataSequence()
+		shmDebugf("READBLOCKING_DATA_WAIT: empty ring, dataWaiters=%d, dataSeq=%d, widx=%d, ridx=%d",
+			hdr.DataWaiters(), dataSeq, hdr.WriteIndex(), hdr.ReadIndex())
 
 		// Re-check data availability before sleeping
 		writeIdx = hdr.WriteIndex()
@@ -958,6 +984,161 @@ func (r *ShmRing) ReadBlockingContext(ctx context.Context, buf []byte) (int, err
 				return 0, context.DeadlineExceeded
 			}
 			return 0, err
+		}
+	}
+}
+
+// ReadSlicesAvailable is a zero-copy read that blocks until data is available,
+// then returns direct slices into the ring buffer memory. This avoids the copy
+// that ReadBlockingContext performs, making it ideal for echo/forwarding patterns.
+//
+// Unlike ReadSlices (which waits for exactly n bytes), this returns whatever
+// data is currently available, up to maxBytes.
+//
+// The returned slices are valid until commit.Commit() is called. The caller
+// MUST call commit.Commit(n) with the number of bytes consumed to release
+// the space back to the writer.
+//
+// If the available data wraps around the ring buffer, both first and second
+// will be non-empty and must be processed in order.
+func (r *ShmRing) ReadSlicesAvailable(ctx context.Context, maxBytes int) (first, second []byte, commit *ReadCommit, err error) {
+	if maxBytes <= 0 {
+		return nil, nil, nil, errors.New("maxBytes must be positive")
+	}
+
+	hdr := r.header()
+
+	for {
+		// Check context cancellation/deadline
+		select {
+		case <-ctx.Done():
+			return nil, nil, nil, ctx.Err()
+		default:
+		}
+
+		// Load current indices to check available data
+		writeIdx := hdr.WriteIndex()
+		readIdx := hdr.ReadIndex()
+
+		available := writeIdx - readIdx
+
+		if available > 0 {
+			// Data available - return slices (zero-copy)
+			toRead := available
+			if toRead > uint64(maxBytes) {
+				toRead = uint64(maxBytes)
+			}
+
+			readPos := readIdx & r.capMask
+			toReadI := int(toRead)
+
+			var firstSlice, secondSlice []byte
+
+			// Handle ring wrap-around
+			if readPos+toRead <= r.capacity {
+				// Simple case: no wrap
+				srcPtr := unsafe.Pointer(uintptr(r.dataPtr()) + uintptr(readPos))
+				firstSlice = unsafe.Slice((*byte)(srcPtr), toReadI)
+			} else {
+				// Wrap case: split across end and beginning
+				firstLen := r.capacity - readPos
+				firstLenI := int(firstLen)
+
+				srcPtr1 := unsafe.Pointer(uintptr(r.dataPtr()) + uintptr(readPos))
+				firstSlice = unsafe.Slice((*byte)(srcPtr1), firstLenI)
+
+				secondLen := toRead - firstLen
+				secondLenI := int(secondLen)
+				srcPtr2 := r.dataPtr()
+				secondSlice = unsafe.Slice((*byte)(srcPtr2), secondLenI)
+			}
+
+			// Set up pre-allocated commit context (no closure allocation)
+			r.readCommit.commitReadIdx = readIdx
+			r.readCommit.maxBytes = toReadI
+
+			return firstSlice, secondSlice, &r.readCommit, nil
+		}
+
+		// Check if ring is closed and no data available
+		if hdr.Closed() {
+			return nil, nil, nil, io.EOF
+		}
+
+		// No data - spin briefly before falling back to futex
+		spinCutoff := atomic.LoadUint32(&r.dataSpinCutoff)
+		spinSuccess := false
+		for i := uint32(0); i < spinCutoff; i++ {
+			runtime_procyield(1)
+			writeIdx = hdr.WriteIndex()
+			readIdx = hdr.ReadIndex()
+			if writeIdx-readIdx > 0 {
+				spinSuccess = true
+				newCutoff := (7*spinCutoff + spinIterationsMax) / 8
+				if newCutoff > spinIterationsMax {
+					newCutoff = spinIterationsMax
+				}
+				atomic.StoreUint32(&r.dataSpinCutoff, newCutoff)
+				break
+			}
+		}
+		if spinSuccess {
+			continue
+		}
+		// Spin timed out - adapt cutoff downward
+		newCutoff := (7*spinCutoff + spinIterationsMin) / 8
+		if newCutoff < spinIterationsMin {
+			newCutoff = spinIterationsMin
+		}
+		atomic.StoreUint32(&r.dataSpinCutoff, newCutoff)
+
+		// Need to wait for data via futex
+		hdr.IncDataWaiters()
+		dataSeq := hdr.DataSequence()
+
+		// Re-check data availability before sleeping
+		writeIdx = hdr.WriteIndex()
+		readIdx = hdr.ReadIndex()
+		if writeIdx-readIdx > 0 {
+			hdr.DecDataWaiters()
+			continue
+		}
+
+		// Re-check closed flag
+		if hdr.Closed() {
+			hdr.DecDataWaiters()
+			return nil, nil, nil, io.EOF
+		}
+
+		// Calculate timeout from context deadline
+		var timeoutNs int64
+		if deadline, hasDeadline := ctx.Deadline(); hasDeadline {
+			remaining := time.Until(deadline)
+			if remaining <= 0 {
+				if atomic.LoadUint32(&r.closed) == 0 {
+					hdr.DecDataWaiters()
+				}
+				return nil, nil, nil, context.DeadlineExceeded
+			}
+			timeoutNs = remaining.Nanoseconds()
+		}
+
+		// Wait for data with timeout
+		var waitErr error
+		if timeoutNs > 0 {
+			waitErr = futexWaitTimeout(&hdr.dataSeq, dataSeq, timeoutNs)
+		} else {
+			waitErr = futexWait(&hdr.dataSeq, dataSeq)
+		}
+		if atomic.LoadUint32(&r.closed) == 0 {
+			hdr.DecDataWaiters()
+		}
+
+		if waitErr != nil {
+			if errors.Is(waitErr, ErrFutexTimeout) {
+				return nil, nil, nil, context.DeadlineExceeded
+			}
+			// Spurious wake - continue loop
 		}
 	}
 }
@@ -1122,6 +1303,8 @@ func (r *ShmRing) ReserveWrite(n int, ctx context.Context) (WriteReservation, er
 		if free == 0 {
 			hdr.IncSpaceWaiters()
 			exp := hdr.SpaceSequence()
+			shmDebugf("RESERVE_WRITE_SPACE_WAIT: ring FULL, spaceWaiters=%d, exp=%d, widx=%d, ridx=%d",
+				hdr.SpaceWaiters(), exp, writeIdx, readIdx)
 			// Re-check
 			writeIdx = hdr.WriteIndex()
 			readIdx = hdr.ReadIndex()
@@ -1136,7 +1319,9 @@ func (r *ShmRing) ReserveWrite(n int, ctx context.Context) (WriteReservation, er
 					hdr.DecSpaceWaiters()
 					return WriteReservation{}, context.DeadlineExceeded
 				}
+				shmDebugf("FUTEX_ENTER: exp=%d, rem=%v", exp, rem)
 				err = futexWaitTimeout(&hdr.spaceSeq, exp, rem.Nanoseconds())
+				shmDebugf("FUTEX_EXIT: exp=%d, err=%v, newSeq=%d", exp, err, hdr.SpaceSequence())
 			} else {
 				err = futexWait(&hdr.spaceSeq, exp)
 			}

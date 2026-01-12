@@ -962,6 +962,146 @@ func BenchmarkShmRingLargePayloadsRoundtrip(b *testing.B) {
 	}
 }
 
+// BenchmarkShmRingLargePayloadsRoundtripZeroCopy benchmarks SHM roundtrip using zero-copy reads.
+// This demonstrates the performance improvement from eliminating copy operations on the read path.
+func BenchmarkShmRingLargePayloadsRoundtripZeroCopy(b *testing.B) {
+	sizes := []int{
+		1 * 1024 * 1024,   // 1MB
+		4 * 1024 * 1024,   // 4MB
+		16 * 1024 * 1024,  // 16MB
+		64 * 1024 * 1024,  // 64MB
+		128 * 1024 * 1024, // 128MB
+	}
+	const ringSize = 64 * 1024 * 1024 // 64MB ring
+	const chunkSize = 4 * 1024 * 1024 // 4MB chunks
+
+	for _, size := range sizes {
+		sizeMB := size / (1024 * 1024)
+		b.Run(fmt.Sprintf("size=%dMB", sizeMB), func(b *testing.B) {
+			segName := fmt.Sprintf("bench-zc-rt-%d-%d", size, time.Now().UnixNano())
+			seg, err := CreateSegment(segName, ringSize, ringSize)
+			if err != nil {
+				b.Fatalf("CreateSegment failed: %v", err)
+			}
+
+			clientToServer := NewShmRingFromSegment(seg.A, seg.Mem)
+			serverToClient := NewShmRingFromSegment(seg.B, seg.Mem)
+
+			ctx, cancel := context.WithCancel(context.Background())
+			data := make([]byte, size)
+			for i := range data {
+				data[i] = byte(i & 0xFF)
+			}
+
+			started := make(chan struct{})
+			serverDone := make(chan struct{})
+			errCh := make(chan error, 1)
+
+			// Zero-copy echo server: reads directly from ring, writes directly to ring
+			go func() {
+				defer close(serverDone)
+				close(started)
+
+				for {
+					// Zero-copy read: get slices directly into ring memory
+					first, second, commit, err := clientToServer.ReadSlicesAvailable(ctx, chunkSize)
+					if err != nil {
+						return
+					}
+
+					// Write the data to the other ring (still requires copy ring-to-ring)
+					// But we avoid the intermediate buffer copy
+					if len(first) > 0 {
+						if err := serverToClient.WriteAll(first, ctx); err != nil {
+							select {
+							case errCh <- err:
+							default:
+							}
+							return
+						}
+					}
+					if len(second) > 0 {
+						if err := serverToClient.WriteAll(second, ctx); err != nil {
+							select {
+							case errCh <- err:
+							default:
+							}
+							return
+						}
+					}
+
+					// Commit the read (releases space for writer)
+					commit.Commit(len(first) + len(second))
+				}
+			}()
+
+			<-started
+
+			b.SetBytes(int64(size * 2)) // roundtrip
+			b.ResetTimer()
+
+			for i := 0; i < b.N; i++ {
+				var writeErr error
+				var readErr error
+				var wg sync.WaitGroup
+				wg.Add(2)
+
+				// Write concurrently with read
+				go func() {
+					defer wg.Done()
+					offset := 0
+					for offset < size {
+						writeSize := min(chunkSize, size-offset)
+						if err := clientToServer.WriteAll(data[offset:offset+writeSize], ctx); err != nil {
+							writeErr = err
+							return
+						}
+						offset += writeSize
+					}
+				}()
+
+				// Zero-copy read on client side
+				go func() {
+					defer wg.Done()
+					totalRead := 0
+					for totalRead < size {
+						first, second, commit, err := serverToClient.ReadSlicesAvailable(ctx, chunkSize)
+						if err != nil {
+							readErr = err
+							return
+						}
+						n := len(first) + len(second)
+						commit.Commit(n)
+						totalRead += n
+					}
+				}()
+
+				wg.Wait()
+				if writeErr != nil {
+					b.Fatalf("WriteAll failed: %v", writeErr)
+				}
+				if readErr != nil {
+					b.Fatalf("ReadSlicesAvailable failed: %v", readErr)
+				}
+			}
+
+			b.StopTimer()
+			cancel()
+			clientToServer.Close()
+			serverToClient.Close()
+			<-serverDone
+			seg.Close()
+			RemoveSegment(segName)
+
+			select {
+			case err := <-errCh:
+				b.Fatalf("Server error: %v", err)
+			default:
+			}
+		})
+	}
+}
+
 // BenchmarkTCPLargePayloadsRoundtrip benchmarks TCP unary/roundtrip with large payloads
 func BenchmarkTCPLargePayloadsRoundtrip(b *testing.B) {
 	sizes := []int{

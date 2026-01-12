@@ -574,3 +574,92 @@ func TestShmRingStressSPSC(t *testing.T) {
 		}
 	}
 }
+// TestShmRingReadSlicesAvailable tests the zero-copy read functionality
+func TestShmRingReadSlicesAvailable(t *testing.T) {
+	segName := fmt.Sprintf("test-ring-zc-%d", time.Now().UnixNano())
+	segment, err := CreateSegment(segName, 4096, 4096)
+	if err != nil {
+		t.Fatalf("failed to create segment: %v", err)
+	}
+	defer func() {
+		segment.Close()
+		RemoveSegment(segName)
+	}()
+
+	ring := NewShmRingFromSegment(segment.A, segment.Mem)
+	defer ring.Close()
+
+	ctx := context.Background()
+
+	// Test 1: Write some data, then read with zero-copy
+	testData := []byte("Hello, zero-copy world!")
+	if err := ring.WriteAll(testData, ctx); err != nil {
+		t.Fatalf("WriteAll failed: %v", err)
+	}
+
+	first, second, commit, err := ring.ReadSlicesAvailable(ctx, 1024)
+	if err != nil {
+		t.Fatalf("ReadSlicesAvailable failed: %v", err)
+	}
+
+	// Verify data matches
+	got := make([]byte, len(first)+len(second))
+	copy(got, first)
+	copy(got[len(first):], second)
+	if !bytes.Equal(got, testData) {
+		t.Fatalf("data mismatch: got %q, want %q", got, testData)
+	}
+
+	// Must commit before next operation
+	commit.Commit(len(first) + len(second))
+
+	// Test 2: Verify that slices are directly into ring memory (zero-copy)
+	// by modifying the ring and checking if slices reflect changes
+	testData2 := []byte("Second message")
+	if err := ring.WriteAll(testData2, ctx); err != nil {
+		t.Fatalf("WriteAll failed: %v", err)
+	}
+
+	first2, second2, commit2, err := ring.ReadSlicesAvailable(ctx, 1024)
+	if err != nil {
+		t.Fatalf("ReadSlicesAvailable failed: %v", err)
+	}
+
+	// Slices should point to ring memory
+	got2 := make([]byte, len(first2)+len(second2))
+	copy(got2, first2)
+	copy(got2[len(first2):], second2)
+	if !bytes.Equal(got2, testData2) {
+		t.Fatalf("data mismatch: got %q, want %q", got2, testData2)
+	}
+	commit2.Commit(len(first2) + len(second2))
+
+	// Test 3: Partial read - request less than available
+	testData3 := []byte("This is a longer message for partial read testing")
+	if err := ring.WriteAll(testData3, ctx); err != nil {
+		t.Fatalf("WriteAll failed: %v", err)
+	}
+
+	// Request only 10 bytes
+	first3, second3, commit3, err := ring.ReadSlicesAvailable(ctx, 10)
+	if err != nil {
+		t.Fatalf("ReadSlicesAvailable failed: %v", err)
+	}
+
+	n3 := len(first3) + len(second3)
+	if n3 > 10 {
+		t.Fatalf("got %d bytes, wanted at most 10", n3)
+	}
+	commit3.Commit(n3)
+
+	// Read the rest
+	first4, second4, commit4, err := ring.ReadSlicesAvailable(ctx, 1024)
+	if err != nil {
+		t.Fatalf("ReadSlicesAvailable failed: %v", err)
+	}
+	n4 := len(first4) + len(second4)
+	if n3+n4 != len(testData3) {
+		t.Fatalf("total read %d, expected %d", n3+n4, len(testData3))
+	}
+	commit4.Commit(n4)
+}

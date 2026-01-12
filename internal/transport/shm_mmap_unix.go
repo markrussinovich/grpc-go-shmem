@@ -36,84 +36,94 @@ func init() {
 
 // CreateSegment creates a new shared memory segment for the server
 func CreateSegment(name string, ringCapA, ringCapB uint64) (*Segment, error) {
-	// Generate the segment path
-	path := generateSegmentPath(name)
-
 	// Calculate the layout
 	totalSize, ringAOffset, ringBOffset, err := CalculateSegmentLayout(ringCapA, ringCapB)
 	if err != nil {
 		return nil, fmt.Errorf("layout calculation failed: %w", err)
 	}
 
-	// Create the file with exclusive access. If /dev/shm exists but is not
-	// writable in this environment, gracefully fall back to the temp dir.
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0600)
-	if err != nil {
-		if os.IsPermission(err) {
-			// Retry under temp directory
-			altPath := filepath.Join(os.TempDir(), "grpc_shm_"+name)
-			path = altPath
-			file, err = os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0600)
-		}
+	// Try /dev/shm first, then fall back to temp dir for:
+	// - Permission errors
+	// - Not enough space (e.g. /dev/shm is smaller than segment size)
+	// - Any creation/truncation/allocation errors
+	paths := []string{
+		generateSegmentPath(name),
+		filepath.Join(os.TempDir(), "grpc_shm_"+name),
+	}
+
+	var file *os.File
+	var path string
+	var lastErr error
+
+	for _, tryPath := range paths {
+		// Try to create the file
+		f, err := os.OpenFile(tryPath, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0600)
 		if err != nil {
-			return nil, fmt.Errorf("failed to create segment file %s: %w", path, err)
+			lastErr = err
+			continue
 		}
+
+		// Use Fallocate to actually allocate space, not just extend the file.
+		// This is crucial for tmpfs (/dev/shm) where Truncate creates sparse files
+		// that fail with SIGBUS when accessed beyond available space.
+		// Fallocate returns ENOSPC if there's not enough space.
+		fd := int(f.Fd())
+		if err := syscall.Fallocate(fd, 0, 0, int64(totalSize)); err != nil {
+			f.Close()
+			os.Remove(tryPath)
+			lastErr = fmt.Errorf("fallocate failed: %w", err)
+			continue
+		}
+
+		// Try to mmap the file
+		mem, err := mmapFile(f, int(totalSize))
+		if err != nil {
+			f.Close()
+			os.Remove(tryPath)
+			lastErr = err
+			continue
+		}
+
+		// Success - use this file and path
+		file = f
+		path = tryPath
+		// We have the mem already, continue with segment creation
+		segment := &Segment{
+			File: file,
+			Mem:  mem,
+			Path: path,
+			H:    &hdrView{basePtr: unsafe.Pointer(&mem[0])},
+			A:    &ringView{basePtr: unsafe.Pointer(&mem[0]), offset: ringAOffset},
+			B:    &ringView{basePtr: unsafe.Pointer(&mem[0]), offset: ringBOffset},
+		}
+
+		// Initialize the segment header
+		magic := [8]byte{'G', 'R', 'P', 'C', 'S', 'H', 'M', 0}
+		segment.H.SetMagic(magic)
+		segment.H.SetVersion(SegmentVersion)
+		segment.H.SetTotalSize(totalSize)
+		segment.H.SetRingAOffset(ringAOffset)
+		segment.H.SetRingACapacity(ringCapA)
+		segment.H.SetRingBOffset(ringBOffset)
+		segment.H.SetRingBCapacity(ringCapB)
+		segment.H.SetServerPID(uint32(os.Getpid()))
+		segment.H.SetMaxStreams(math.MaxUint32)
+
+		// Initialize ring headers
+		segment.A.SetCapacity(ringCapA)
+		segment.A.SetWriteIndex(0)
+		segment.A.SetReadIndex(0)
+		segment.A.SetClosed(false)
+
+		segment.B.SetCapacity(ringCapB)
+		segment.B.SetWriteIndex(0)
+		segment.B.SetReadIndex(0)
+		segment.B.SetClosed(false)
+
+		return segment, nil
 	}
 
-	// Ensure cleanup on error
-	cleanup := func() {
-		file.Close()
-		os.Remove(path)
-	}
-
-	// Set the file size
-	if err := file.Truncate(int64(totalSize)); err != nil {
-		cleanup()
-		return nil, fmt.Errorf("failed to resize segment file: %w", err)
-	}
-
-	// Memory map the file
-	mem, err := mmapFile(file, int(totalSize))
-	if err != nil {
-		cleanup()
-		return nil, fmt.Errorf("failed to mmap segment: %w", err)
-	}
-
-	// Create segment views
-	segment := &Segment{
-		File: file,
-		Mem:  mem,
-		Path: path,
-		H:    &hdrView{basePtr: unsafe.Pointer(&mem[0])},
-		A:    &ringView{basePtr: unsafe.Pointer(&mem[0]), offset: ringAOffset},
-		B:    &ringView{basePtr: unsafe.Pointer(&mem[0]), offset: ringBOffset},
-	}
-
-	// Initialize the segment header
-	magic := [8]byte{'G', 'R', 'P', 'C', 'S', 'H', 'M', 0}
-	segment.H.SetMagic(magic)
-	segment.H.SetVersion(SegmentVersion)
-	segment.H.SetTotalSize(totalSize)
-	segment.H.SetRingAOffset(ringAOffset)
-	segment.H.SetRingACapacity(ringCapA)
-	segment.H.SetRingBOffset(ringBOffset)
-	segment.H.SetRingBCapacity(ringCapB)
-	segment.H.SetServerPID(uint32(os.Getpid()))
-	segment.H.SetMaxStreams(math.MaxUint32)
-	// Note: ServerReady should be set by the actual server, not during segment creation
-
-	// Initialize ring headers
-	segment.A.SetCapacity(ringCapA)
-	segment.A.SetWriteIndex(0)
-	segment.A.SetReadIndex(0)
-	segment.A.SetClosed(false)
-
-	segment.B.SetCapacity(ringCapB)
-	segment.B.SetWriteIndex(0)
-	segment.B.SetReadIndex(0)
-	segment.B.SetClosed(false)
-
-	return segment, nil
+	return nil, fmt.Errorf("failed to create segment in any location: %w", lastErr)
 }
 
 // OpenSegment opens an existing shared memory segment for the client
