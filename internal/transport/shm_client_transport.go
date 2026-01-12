@@ -394,6 +394,7 @@ func (t *ShmClientTransport) processIncomingData(ctx context.Context) {
 
 		case FrameTypeMESSAGE:
 			// Server sent a message. Apply inbound flow control before delivering.
+			shmDebugf("[DEBUG] ShmClientTransport: MESSAGE handler entered for stream %d, payload size=%d", fh.StreamID, len(payload))
 			sz := uint32(len(payload))
 			if wu := t.connInFlow.onData(sz); wu > 0 {
 				t.sendWindowUpdate(0, wu)
@@ -402,6 +403,7 @@ func (t *ShmClientTransport) processIncomingData(ctx context.Context) {
 				stream.fc = &inFlow{limit: uint32(maxWindowSize)}
 			}
 			if err := stream.fc.onData(sz); err != nil {
+				shmDebugf("[DEBUG] ShmClientTransport: MESSAGE flow control error: %v", err)
 				release()
 				t.closeStream(stream, err, true, http2.ErrCodeFlowControl, status.New(codes.Internal, err.Error()), nil, false)
 				continue
@@ -409,13 +411,16 @@ func (t *ShmClientTransport) processIncomingData(ctx context.Context) {
 
 			// Transfer ownership of the ring-backed buffer to the stream for zero-copy delivery.
 			if payloadBuf != nil {
+				shmDebugf("[DEBUG] ShmClientTransport: MESSAGE delivering payloadBuf (len=%d) to stream %d", payloadBuf.Len(), fh.StreamID)
 				payloadTransferred = true
 				stream.write(recvMsg{buffer: payloadBuf})
 				payloadBuf = nil
 			} else {
+				shmDebugf("[DEBUG] ShmClientTransport: MESSAGE delivering copied payload (len=%d) to stream %d", len(payload), fh.StreamID)
 				buf := mem.Copy(payload, mem.DefaultBufferPool())
 				stream.write(recvMsg{buffer: buf})
 			}
+			shmDebugf("[DEBUG] ShmClientTransport: MESSAGE delivered to stream %d", fh.StreamID)
 
 		case FrameTypePING:
 			// Respond with PONG carrying the same opaque data.
@@ -826,6 +831,14 @@ func (t *ShmClientTransport) closeStream(s *ClientStream, err error, rst bool, r
 		s.trailer = mdata
 	}
 
+	// Signal error to readers. This must happen BEFORE closing headerChan
+	// so that gRPC can read any buffered data before seeing the error.
+	// For graceful close (eosReceived=true), err is io.EOF which signals
+	// the reader that the stream ended normally.
+	if err != nil {
+		s.write(recvMsg{err: err})
+	}
+
 	// Close header channel if not already closed
 	if atomic.CompareAndSwapUint32(&s.headerChanClosed, 0, 1) {
 		s.noHeaders = true
@@ -850,14 +863,6 @@ func (t *ShmClientTransport) closeStream(s *ClientStream, err error, rst bool, r
 	}
 	shouldClose = t.draining.Load() && len(t.streams) == 0 && !t.closed.Load()
 	t.mu.Unlock()
-
-	// Drop any queued messages now that the stream is no longer referenced.
-	s.drainRecvBuffer()
-
-	// Signal error to readers if present after draining stale buffers.
-	if err != nil {
-		s.write(recvMsg{err: err})
-	}
 
 	// Send CANCEL frame if requested
 	if rst && !t.closed.Load() {

@@ -156,8 +156,10 @@ type ServerTransportProvider interface {
 func NewServerTransport(conn net.Conn, config *ServerConfig) (_ ServerTransport, err error) {
 	// Check if the connection provides its own server transport
 	if provider, ok := conn.(ServerTransportProvider); ok {
+		shmDebugf("[DEBUG] NewServerTransport: using ServerTransportProvider from conn type %T", conn)
 		return provider.GetServerTransport(), nil
 	}
+	shmDebugf("[DEBUG] NewServerTransport: conn type %T does not implement ServerTransportProvider, using HTTP/2", conn)
 
 	var authInfo credentials.AuthInfo
 	rawConn := conn
