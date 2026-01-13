@@ -830,7 +830,6 @@ func BenchmarkUnixLargePayloads(b *testing.B) {
 // =============================================================================
 
 // BenchmarkShmRingLargePayloadsRoundtrip benchmarks SHM unary/roundtrip with large payloads
-// using zero-copy APIs that match how the gRPC transport actually works.
 func BenchmarkShmRingLargePayloadsRoundtrip(b *testing.B) {
 	sizes := []int{
 		1 * 1024 * 1024,   // 1MB
@@ -838,6 +837,7 @@ func BenchmarkShmRingLargePayloadsRoundtrip(b *testing.B) {
 		16 * 1024 * 1024,  // 16MB
 		64 * 1024 * 1024,  // 64MB
 		128 * 1024 * 1024, // 128MB
+		// 256MB removed - causes timing issues with 64MB ring
 	}
 	const ringSize = 64 * 1024 * 1024 // 64MB ring
 	const chunkSize = 4 * 1024 * 1024 // 4MB chunks - optimal for SHM
@@ -865,53 +865,28 @@ func BenchmarkShmRingLargePayloadsRoundtrip(b *testing.B) {
 			serverDone := make(chan struct{})
 			errCh := make(chan error, 1)
 
-			// Echo server goroutine - uses zero-copy ReadSlicesAvailable
+			// Echo server goroutine - uses ReadBlockingContext which reads whatever is available
+			readBuf := make([]byte, chunkSize)
 			go func() {
 				defer close(serverDone)
 				close(started)
 
 				for {
-					// Zero-copy read: get slices directly into ring memory
-					first, second, commit, err := clientToServer.ReadSlicesAvailable(ctx, chunkSize)
+					// Read whatever is available (up to chunkSize)
+					n, err := clientToServer.ReadBlockingContext(ctx, readBuf)
 					if err != nil {
+						// Context cancelled or ring closed - normal exit
 						return
 					}
 
-					// Write directly from the read slices to the other ring
-					// This matches how the gRPC transport echoes/forwards data
-					if len(first) > 0 {
-						res, err := serverToClient.ReserveWrite(len(first), ctx)
-						if err != nil {
-							select {
-							case errCh <- err:
-							default:
-							}
-							return
+					// Echo back immediately
+					if err := serverToClient.WriteAll(readBuf[:n], ctx); err != nil {
+						select {
+						case errCh <- err:
+						default:
 						}
-						copy(res.First, first)
-						if len(res.Second) > 0 && len(first) > len(res.First) {
-							copy(res.Second, first[len(res.First):])
-						}
-						res.Commit(len(first))
+						return
 					}
-					if len(second) > 0 {
-						res, err := serverToClient.ReserveWrite(len(second), ctx)
-						if err != nil {
-							select {
-							case errCh <- err:
-							default:
-							}
-							return
-						}
-						copy(res.First, second)
-						if len(res.Second) > 0 && len(second) > len(res.First) {
-							copy(res.Second, second[len(res.First):])
-						}
-						res.Commit(len(second))
-					}
-
-					// Commit the read (releases space for writer)
-					commit.Commit(len(first) + len(second))
 				}
 			}()
 
@@ -920,62 +895,61 @@ func BenchmarkShmRingLargePayloadsRoundtrip(b *testing.B) {
 			b.SetBytes(int64(size * 2)) // roundtrip
 			b.ResetTimer()
 
+			recvBuf := make([]byte, chunkSize)
 			for i := 0; i < b.N; i++ {
 				var writeErr error
 				var readErr error
 				var wg sync.WaitGroup
 				wg.Add(2)
 
-				// Write using zero-copy ReserveWrite
+				// Write concurrently with read to match TCP benchmark pattern
 				go func() {
 					defer wg.Done()
 					offset := 0
 					for offset < size {
 						writeSize := min(chunkSize, size-offset)
-						res, err := clientToServer.ReserveWrite(writeSize, ctx)
-						if err != nil {
+						if err := clientToServer.WriteAll(data[offset:offset+writeSize], ctx); err != nil {
 							writeErr = err
 							return
 						}
-						n := copy(res.First, data[offset:offset+writeSize])
-						if n < writeSize && len(res.Second) > 0 {
-							copy(res.Second, data[offset+n:offset+writeSize])
-						}
-						res.Commit(writeSize)
 						offset += writeSize
 					}
 				}()
 
-				// Zero-copy read on client side
+				// Read full response concurrently
 				go func() {
 					defer wg.Done()
 					totalRead := 0
 					for totalRead < size {
-						first, second, commit, err := serverToClient.ReadSlicesAvailable(ctx, chunkSize)
+						n, err := serverToClient.ReadBlockingContext(ctx, recvBuf)
 						if err != nil {
 							readErr = err
 							return
 						}
-						n := len(first) + len(second)
-						commit.Commit(n)
 						totalRead += n
 					}
 				}()
 
 				wg.Wait()
 				if writeErr != nil {
-					b.Fatalf("ReserveWrite failed: %v", writeErr)
+					b.Fatalf("WriteAll failed: %v", writeErr)
 				}
 				if readErr != nil {
-					b.Fatalf("ReadSlicesAvailable failed: %v", readErr)
+					b.Fatalf("ReadSlices failed: %v", readErr)
 				}
 			}
 
 			b.StopTimer()
+			
+			// Cancel context first to unblock all goroutines
 			cancel()
+			// Close ring buffers to ensure any remaining blocked operations exit
 			clientToServer.Close()
 			serverToClient.Close()
+			// Wait for echo server to actually exit before cleaning up segment
 			<-serverDone
+
+			// Clean up segment
 			seg.Close()
 			RemoveSegment(segName)
 
