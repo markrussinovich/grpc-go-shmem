@@ -63,8 +63,11 @@ func TestCrossProcessRingBuffer(t *testing.T) {
 	clientToServer := NewShmRingFromSegment(seg.A, seg.Mem)
 	serverToClient := NewShmRingFromSegment(seg.B, seg.Mem)
 
-	// Spawn child process
-	cmd := exec.Command(os.Args[0], "-test.run=TestCrossProcessRingBuffer", "-test.v")
+	// Spawn child process with context for timeout
+	childCtx, childCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer childCancel()
+
+	cmd := exec.CommandContext(childCtx, os.Args[0], "-test.run=^TestCrossProcessRingBuffer$", "-test.v")
 	cmd.Env = append(os.Environ(),
 		"GRPC_CROSS_PROCESS_CHILD=1",
 		"GRPC_CROSS_PROCESS_SEGMENT="+segmentName,
@@ -75,6 +78,13 @@ func TestCrossProcessRingBuffer(t *testing.T) {
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("Failed to start child process: %v", err)
 	}
+
+	// Ensure child is killed if test panics
+	defer func() {
+		if cmd.Process != nil {
+			cmd.Process.Kill()
+		}
+	}()
 
 	// Parent acts as "client" - writes to clientToServer, reads from serverToClient
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -125,9 +135,20 @@ func TestCrossProcessRingBuffer(t *testing.T) {
 		}
 	}
 
-	// Wait for child to exit
-	if err := cmd.Wait(); err != nil {
-		t.Fatalf("Child process failed: %v", err)
+	// Wait for child to exit with timeout
+	waitDone := make(chan error, 1)
+	go func() {
+		waitDone <- cmd.Wait()
+	}()
+
+	select {
+	case err := <-waitDone:
+		if err != nil {
+			t.Fatalf("Child process failed: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		cmd.Process.Kill()
+		t.Fatal("Timeout waiting for child process to exit")
 	}
 
 	t.Log("Cross-process test passed!")
