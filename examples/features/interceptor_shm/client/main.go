@@ -34,7 +34,7 @@ import (
 
 var shmName = flag.String("shm_name", "interceptor_shm", "Shared memory segment name")
 
-func unaryInterceptor(ctx context.Context, method string, req, reply interface{}, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
+func unaryInterceptor(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
 	start := time.Now()
 	fmt.Printf("[Client Interceptor] Unary call: %s\n", method)
 
@@ -50,7 +50,7 @@ type wrappedStream struct {
 	grpc.ClientStream
 }
 
-func (w *wrappedStream) RecvMsg(m interface{}) error {
+func (w *wrappedStream) RecvMsg(m any) error {
 	err := w.ClientStream.RecvMsg(m)
 	if err == nil {
 		fmt.Printf("[Client Stream Interceptor] RecvMsg: %T\n", m)
@@ -58,7 +58,7 @@ func (w *wrappedStream) RecvMsg(m interface{}) error {
 	return err
 }
 
-func (w *wrappedStream) SendMsg(m interface{}) error {
+func (w *wrappedStream) SendMsg(m any) error {
 	fmt.Printf("[Client Stream Interceptor] SendMsg: %T\n", m)
 	return w.ClientStream.SendMsg(m)
 }

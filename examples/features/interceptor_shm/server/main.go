@@ -60,7 +60,7 @@ func (s *server) BidirectionalStreamingEcho(stream pb.Echo_BidirectionalStreamin
 	}
 }
 
-func unaryInterceptor(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
+func unaryInterceptor(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
 	start := time.Now()
 	fmt.Printf("[Server Interceptor] Unary call: %s\n", info.FullMethod)
 
@@ -76,7 +76,7 @@ type wrappedStream struct {
 	grpc.ServerStream
 }
 
-func (w *wrappedStream) RecvMsg(m interface{}) error {
+func (w *wrappedStream) RecvMsg(m any) error {
 	err := w.ServerStream.RecvMsg(m)
 	if err == nil {
 		fmt.Printf("[Server Stream Interceptor] RecvMsg: %T\n", m)
@@ -84,12 +84,12 @@ func (w *wrappedStream) RecvMsg(m interface{}) error {
 	return err
 }
 
-func (w *wrappedStream) SendMsg(m interface{}) error {
+func (w *wrappedStream) SendMsg(m any) error {
 	fmt.Printf("[Server Stream Interceptor] SendMsg: %T\n", m)
 	return w.ServerStream.SendMsg(m)
 }
 
-func streamInterceptor(srv interface{}, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+func streamInterceptor(srv any, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
 	fmt.Printf("[Server Interceptor] Stream call: %s (client=%v, server=%v)\n",
 		info.FullMethod, info.IsClientStream, info.IsServerStream)
 
