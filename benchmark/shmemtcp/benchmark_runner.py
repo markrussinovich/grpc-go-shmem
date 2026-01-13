@@ -49,10 +49,12 @@ def run_benchmarks() -> dict:
         "BenchmarkUnixSocketLoopback|BenchmarkUnixSocketRoundtrip|"
         "BenchmarkUnixLargePayloads$|BenchmarkUnixLargePayloadsRoundtrip"
     )
+    # Use 2s benchtime to allow proper warm-up - shared memory transport has
+    # initial segment creation overhead that distorts results with short benchtime
     cmd = [
         "go", "test", 
         f"-bench={benchmark_pattern}",
-        "-benchtime=100ms", "-cpu=2",
+        "-benchtime=2s", "-cpu=2",
         "-run=^$",  # Don't run tests, only benchmarks
         "google.golang.org/grpc/internal/transport",
         "-benchmem"
