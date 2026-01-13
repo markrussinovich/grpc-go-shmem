@@ -830,6 +830,7 @@ func BenchmarkUnixLargePayloads(b *testing.B) {
 // =============================================================================
 
 // BenchmarkShmRingLargePayloadsRoundtrip benchmarks SHM unary/roundtrip with large payloads
+// using zero-copy APIs that match how the gRPC transport actually works.
 func BenchmarkShmRingLargePayloadsRoundtrip(b *testing.B) {
 	sizes := []int{
 		1 * 1024 * 1024,   // 1MB
@@ -837,7 +838,6 @@ func BenchmarkShmRingLargePayloadsRoundtrip(b *testing.B) {
 		16 * 1024 * 1024,  // 16MB
 		64 * 1024 * 1024,  // 64MB
 		128 * 1024 * 1024, // 128MB
-		// 256MB removed - causes timing issues with 64MB ring
 	}
 	const ringSize = 64 * 1024 * 1024 // 64MB ring
 	const chunkSize = 4 * 1024 * 1024 // 4MB chunks - optimal for SHM
@@ -865,139 +865,7 @@ func BenchmarkShmRingLargePayloadsRoundtrip(b *testing.B) {
 			serverDone := make(chan struct{})
 			errCh := make(chan error, 1)
 
-			// Echo server goroutine - uses ReadBlockingContext which reads whatever is available
-			readBuf := make([]byte, chunkSize)
-			go func() {
-				defer close(serverDone)
-				close(started)
-
-				for {
-					// Read whatever is available (up to chunkSize)
-					n, err := clientToServer.ReadBlockingContext(ctx, readBuf)
-					if err != nil {
-						// Context cancelled or ring closed - normal exit
-						return
-					}
-
-					// Echo back immediately
-					if err := serverToClient.WriteAll(readBuf[:n], ctx); err != nil {
-						select {
-						case errCh <- err:
-						default:
-						}
-						return
-					}
-				}
-			}()
-
-			<-started
-
-			b.SetBytes(int64(size * 2)) // roundtrip
-			b.ResetTimer()
-
-			recvBuf := make([]byte, chunkSize)
-			for i := 0; i < b.N; i++ {
-				var writeErr error
-				var readErr error
-				var wg sync.WaitGroup
-				wg.Add(2)
-
-				// Write concurrently with read to match TCP benchmark pattern
-				go func() {
-					defer wg.Done()
-					offset := 0
-					for offset < size {
-						writeSize := min(chunkSize, size-offset)
-						if err := clientToServer.WriteAll(data[offset:offset+writeSize], ctx); err != nil {
-							writeErr = err
-							return
-						}
-						offset += writeSize
-					}
-				}()
-
-				// Read full response concurrently
-				go func() {
-					defer wg.Done()
-					totalRead := 0
-					for totalRead < size {
-						n, err := serverToClient.ReadBlockingContext(ctx, recvBuf)
-						if err != nil {
-							readErr = err
-							return
-						}
-						totalRead += n
-					}
-				}()
-
-				wg.Wait()
-				if writeErr != nil {
-					b.Fatalf("WriteAll failed: %v", writeErr)
-				}
-				if readErr != nil {
-					b.Fatalf("ReadSlices failed: %v", readErr)
-				}
-			}
-
-			b.StopTimer()
-			
-			// Cancel context first to unblock all goroutines
-			cancel()
-			// Close ring buffers to ensure any remaining blocked operations exit
-			clientToServer.Close()
-			serverToClient.Close()
-			// Wait for echo server to actually exit before cleaning up segment
-			<-serverDone
-
-			// Clean up segment
-			seg.Close()
-			RemoveSegment(segName)
-
-			select {
-			case err := <-errCh:
-				b.Fatalf("Server error: %v", err)
-			default:
-			}
-		})
-	}
-}
-
-// BenchmarkShmRingLargePayloadsRoundtripZeroCopy benchmarks SHM roundtrip using zero-copy reads.
-// This demonstrates the performance improvement from eliminating copy operations on the read path.
-func BenchmarkShmRingLargePayloadsRoundtripZeroCopy(b *testing.B) {
-	sizes := []int{
-		1 * 1024 * 1024,   // 1MB
-		4 * 1024 * 1024,   // 4MB
-		16 * 1024 * 1024,  // 16MB
-		64 * 1024 * 1024,  // 64MB
-		128 * 1024 * 1024, // 128MB
-	}
-	const ringSize = 64 * 1024 * 1024 // 64MB ring
-	const chunkSize = 4 * 1024 * 1024 // 4MB chunks
-
-	for _, size := range sizes {
-		sizeMB := size / (1024 * 1024)
-		b.Run(fmt.Sprintf("size=%dMB", sizeMB), func(b *testing.B) {
-			segName := fmt.Sprintf("bench-zc-rt-%d-%d", size, time.Now().UnixNano())
-			seg, err := CreateSegment(segName, ringSize, ringSize)
-			if err != nil {
-				b.Fatalf("CreateSegment failed: %v", err)
-			}
-
-			clientToServer := NewShmRingFromSegment(seg.A, seg.Mem)
-			serverToClient := NewShmRingFromSegment(seg.B, seg.Mem)
-
-			ctx, cancel := context.WithCancel(context.Background())
-			data := make([]byte, size)
-			for i := range data {
-				data[i] = byte(i & 0xFF)
-			}
-
-			started := make(chan struct{})
-			serverDone := make(chan struct{})
-			errCh := make(chan error, 1)
-
-			// Zero-copy echo server: reads directly from ring, writes directly to ring
+			// Echo server goroutine - uses zero-copy ReadSlicesAvailable
 			go func() {
 				defer close(serverDone)
 				close(started)
@@ -1009,25 +877,37 @@ func BenchmarkShmRingLargePayloadsRoundtripZeroCopy(b *testing.B) {
 						return
 					}
 
-					// Write the data to the other ring (still requires copy ring-to-ring)
-					// But we avoid the intermediate buffer copy
+					// Write directly from the read slices to the other ring
+					// This matches how the gRPC transport echoes/forwards data
 					if len(first) > 0 {
-						if err := serverToClient.WriteAll(first, ctx); err != nil {
+						res, err := serverToClient.ReserveWrite(len(first), ctx)
+						if err != nil {
 							select {
 							case errCh <- err:
 							default:
 							}
 							return
 						}
+						copy(res.First, first)
+						if len(res.Second) > 0 && len(first) > len(res.First) {
+							copy(res.Second, first[len(res.First):])
+						}
+						res.Commit(len(first))
 					}
 					if len(second) > 0 {
-						if err := serverToClient.WriteAll(second, ctx); err != nil {
+						res, err := serverToClient.ReserveWrite(len(second), ctx)
+						if err != nil {
 							select {
 							case errCh <- err:
 							default:
 							}
 							return
 						}
+						copy(res.First, second)
+						if len(res.Second) > 0 && len(second) > len(res.First) {
+							copy(res.Second, second[len(res.First):])
+						}
+						res.Commit(len(second))
 					}
 
 					// Commit the read (releases space for writer)
@@ -1046,16 +926,22 @@ func BenchmarkShmRingLargePayloadsRoundtripZeroCopy(b *testing.B) {
 				var wg sync.WaitGroup
 				wg.Add(2)
 
-				// Write concurrently with read
+				// Write using zero-copy ReserveWrite
 				go func() {
 					defer wg.Done()
 					offset := 0
 					for offset < size {
 						writeSize := min(chunkSize, size-offset)
-						if err := clientToServer.WriteAll(data[offset:offset+writeSize], ctx); err != nil {
+						res, err := clientToServer.ReserveWrite(writeSize, ctx)
+						if err != nil {
 							writeErr = err
 							return
 						}
+						n := copy(res.First, data[offset:offset+writeSize])
+						if n < writeSize && len(res.Second) > 0 {
+							copy(res.Second, data[offset+n:offset+writeSize])
+						}
+						res.Commit(writeSize)
 						offset += writeSize
 					}
 				}()
@@ -1078,7 +964,7 @@ func BenchmarkShmRingLargePayloadsRoundtripZeroCopy(b *testing.B) {
 
 				wg.Wait()
 				if writeErr != nil {
-					b.Fatalf("WriteAll failed: %v", writeErr)
+					b.Fatalf("ReserveWrite failed: %v", writeErr)
 				}
 				if readErr != nil {
 					b.Fatalf("ReadSlicesAvailable failed: %v", readErr)
