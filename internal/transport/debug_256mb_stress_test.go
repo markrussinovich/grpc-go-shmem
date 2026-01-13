@@ -1,3 +1,21 @@
+/*
+ *
+ * Copyright 2025 gRPC authors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *
+ */
+
 package transport
 
 import (
@@ -86,17 +104,17 @@ func TestDebug256MBRoundtrip(t *testing.T) {
 				cr := atomic.LoadInt64(&clientBytesRead)
 				sr := atomic.LoadInt64(&serverBytesRead)
 				sw := atomic.LoadInt64(&serverBytesWritten)
-				
+
 				// Get ring states
 				ctsState := clientToServer.DebugState()
 				stcState := serverToClient.DebugState()
-				
+
 				// Get blocking states
 				sR := atomic.LoadInt32(&serverReading)
 				sW := atomic.LoadInt32(&serverWriting)
 				cW := atomic.LoadInt32(&clientWriting)
 				cR := atomic.LoadInt32(&clientReading)
-				
+
 				t.Logf("Progress: cW=%dMB cR=%dMB sR=%dMB sW=%dMB | Blocking: sR=%d sW=%d cW=%d cR=%d",
 					cw/(1024*1024), cr/(1024*1024), sr/(1024*1024), sw/(1024*1024),
 					sR, sW, cW, cR)

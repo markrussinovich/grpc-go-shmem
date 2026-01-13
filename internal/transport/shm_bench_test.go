@@ -32,7 +32,7 @@ import (
 // BenchmarkShmRingWriteRead measures raw ring buffer throughput
 func BenchmarkShmRingWriteRead(b *testing.B) {
 	sizes := []int{64, 256, 1024, 4096, 16384, 65536, 262144, 1048576} // 64B to 1MB
-	const ringSize = 64 * 1024 * 1024                                   // 64MB ring for benchmarks
+	const ringSize = 64 * 1024 * 1024                                  // 64MB ring for benchmarks
 
 	for _, size := range sizes {
 		size := size // capture
@@ -84,7 +84,7 @@ func BenchmarkShmRingWriteRead(b *testing.B) {
 // BenchmarkShmRingThroughput measures sustained streaming throughput
 func BenchmarkShmRingThroughput(b *testing.B) {
 	sizes := []int{1024, 4096, 16384, 65536, 262144, 1048576, 4194304} // 1KB to 4MB
-	const ringSize = 64 * 1024 * 1024                                    // 64MB ring for benchmarks
+	const ringSize = 64 * 1024 * 1024                                  // 64MB ring for benchmarks
 
 	for _, size := range sizes {
 		b.Run(fmt.Sprintf("size=%d", size), func(b *testing.B) {
@@ -553,7 +553,7 @@ func BenchmarkShmRingLargePayloads(b *testing.B) {
 		128 * 1024 * 1024, // 128MB (requires chunking)
 		256 * 1024 * 1024, // 256MB (requires chunking)
 	}
-	const ringSize = 64 * 1024 * 1024 // 64MB ring
+	const ringSize = 64 * 1024 * 1024  // 64MB ring
 	const chunkSize = 32 * 1024 * 1024 // 32MB chunks for transfers > ring size
 
 	for _, size := range sizes {
@@ -940,7 +940,7 @@ func BenchmarkShmRingLargePayloadsRoundtrip(b *testing.B) {
 			}
 
 			b.StopTimer()
-			
+
 			// Cancel context first to unblock all goroutines
 			cancel()
 			// Close ring buffers to ensure any remaining blocked operations exit

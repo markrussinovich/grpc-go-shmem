@@ -1016,9 +1016,9 @@ func DiagnoseDuelingBuffers(clientToServer, serverToClient *ShmRing) (bool, stri
 // WriteReservation represents a reservation for writing data to the ring.
 // The caller must fill exactly the reserved bytes and call Commit with the actual bytes written.
 type WriteReservation struct {
-	First      []byte       // First contiguous slice (from write position to end of buffer or requested size)
-	Second     []byte       // Second contiguous slice (from start of buffer) - may be empty if First has enough space
-	commitCtx  *WriteCommit // Pre-allocated commit context (no allocation)
+	First     []byte       // First contiguous slice (from write position to end of buffer or requested size)
+	Second    []byte       // Second contiguous slice (from start of buffer) - may be empty if First has enough space
+	commitCtx *WriteCommit // Pre-allocated commit context (no allocation)
 }
 
 // Commit commits the written bytes and advances the write index.

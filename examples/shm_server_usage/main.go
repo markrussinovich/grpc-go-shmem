@@ -1,3 +1,21 @@
+/*
+ *
+ * Copyright 2025 gRPC authors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *
+ */
+
 // Package main demonstrates using the shared memory transport with grpc.NewServer()
 package main
 
@@ -19,9 +37,9 @@ func main() {
 
 	// Configuration
 	segmentName := "my_segment"
-	segmentSize := uint64(2 * 1024 * 1024)  // 2MB
-	ringASize := uint64(512 * 1024)          // 512KB
-	ringBSize := uint64(512 * 1024)          // 512KB
+	segmentSize := uint64(2 * 1024 * 1024) // 2MB
+	ringASize := uint64(512 * 1024)        // 512KB
+	ringBSize := uint64(512 * 1024)        // 512KB
 
 	fmt.Printf("Configuration:\n")
 	fmt.Printf("  Segment Name: %s\n", segmentName)
@@ -46,10 +64,10 @@ func main() {
 	// Create gRPC server
 	fmt.Println("Creating gRPC server...")
 	_ = grpc.NewServer()
-	
+
 	// In a real application, you would register your service here:
 	// pb.RegisterGreeterServer(s, &greeterServer{})
-	
+
 	fmt.Println("✓ gRPC server created")
 	fmt.Println()
 
@@ -70,12 +88,12 @@ func main() {
 	defer cancel()
 
 	fmt.Println("Calling Accept() (will timeout after 10 seconds if no client connects)...")
-	
+
 	// This will block until a client connects or context times out
 	done := make(chan struct{})
 	var conn interface{}
 	var acceptErr error
-	
+
 	go func() {
 		conn, acceptErr = listener.Accept()
 		close(done)

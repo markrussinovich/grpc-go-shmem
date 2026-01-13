@@ -1,5 +1,23 @@
 //go:build linux
 
+/*
+ *
+ * Copyright 2025 gRPC authors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *
+ */
+
 package grpc_test
 
 import (
@@ -62,15 +80,15 @@ func TestFullGRPCWithSHM(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	payload := benchmark.NewPayload(testpb.PayloadType_COMPRESSABLE, 0)  // Empty payload like benchmark
+	payload := benchmark.NewPayload(testpb.PayloadType_COMPRESSABLE, 0) // Empty payload like benchmark
 	req := &testpb.SimpleRequest{
 		ResponseType: payload.Type,
-		ResponseSize: int32(0),  // Empty response
+		ResponseSize: int32(0), // Empty response
 		Payload:      payload,
 	}
 
 	t.Log("Making UnaryCall...")
-	
+
 	// Enable verbose tracing
 	t.Log("About to call UnaryCall...")
 	resp, err := client.UnaryCall(ctx, req)
