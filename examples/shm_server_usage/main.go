@@ -91,7 +91,7 @@ func main() {
 
 	// This will block until a client connects or context times out
 	done := make(chan struct{})
-	var conn interface{}
+	var conn any
 	var acceptErr error
 
 	go func() {

@@ -61,12 +61,12 @@ func (UnimplementedEchoTestServiceServer) StreamingCall(EchoTestService_Streamin
 }
 
 // RegisterEchoTestServiceServer registers the service (stub for now)
-func RegisterEchoTestServiceServer(s interface{}, srv EchoTestService) {
+func RegisterEchoTestServiceServer(s any, srv EchoTestService) {
 	// This is a stub - actual implementation would register with gRPC server
 }
 
 // NewEchoTestServiceClient creates a new client (stub for now)
-func NewEchoTestServiceClient(cc interface{}) EchoTestServiceClient {
+func NewEchoTestServiceClient(cc any) EchoTestServiceClient {
 	return &echoTestServiceClient{}
 }
 

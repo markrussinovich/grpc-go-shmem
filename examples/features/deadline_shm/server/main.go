@@ -47,8 +47,11 @@ func (s *server) UnaryEcho(ctx context.Context, in *pb.EchoRequest) (*pb.EchoRes
 		fmt.Printf("No deadline received\n")
 	}
 
+	timer := time.NewTimer(200 * time.Millisecond)
+	defer timer.Stop()
+
 	select {
-	case <-time.After(200 * time.Millisecond):
+	case <-timer.C:
 		fmt.Printf("Finished processing\n")
 	case <-ctx.Done():
 		fmt.Printf("Context cancelled: %v\n", ctx.Err())
