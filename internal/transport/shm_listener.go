@@ -215,18 +215,18 @@ func (l *ShmListener) Close() error {
 			// The listener context cancellation alone cannot interrupt a futex wait
 			// without a deadline, so we must explicitly close the rings (which bumps
 			// sequences and futex-wakes waiters) before unmapping the segment.
+			// Note: We don't nil these pointers because Accept() might still be
+			// reading l.ctlRx concurrently. The Close() on the ring will cause
+			// the read to fail, which is the desired behavior.
 			if l.ctlRx != nil {
 				_ = l.ctlRx.Close()
-				l.ctlRx = nil
 			}
 			if l.ctlTx != nil {
 				_ = l.ctlTx.Close()
-				l.ctlTx = nil
 			}
 
 			l.ctlSegment.Close()
 			_ = RemoveSegment(l.baseName + shmControlSuffix)
-			l.ctlSegment = nil
 		}
 
 		// Clean up all active connections to ensure rings close before unmapping.

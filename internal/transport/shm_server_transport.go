@@ -518,7 +518,6 @@ func (t *ShmServerTransport) handleHeaders(ctx context.Context, streamID uint32,
 		return nil
 	}
 	t.streams[streamID] = s
-	t.streamSendQuota[streamID] = int64(maxWindowSize)
 	t.streamInFlow[streamID] = s.fc
 	// Clear idle time when we have active streams.
 	t.idle = time.Time{}
@@ -526,6 +525,11 @@ func (t *ShmServerTransport) handleHeaders(ctx context.Context, streamID uint32,
 	t.pingStrikes = 0
 	h := t.handleFunc
 	t.mu.Unlock()
+
+	// Initialize send quota for this stream (protected by sendQuotaMu, not mu).
+	t.sendQuotaMu.Lock()
+	t.streamSendQuota[streamID] = int64(maxWindowSize)
+	t.sendQuotaMu.Unlock()
 
 	// Call the handler in a new goroutine.
 	if h != nil {
@@ -690,12 +694,16 @@ func (t *ShmServerTransport) handleTrailers(streamID uint32, payload []byte) {
 	// Signal end-of-client-stream to the stream.
 	s.write(recvMsg{err: endErr})
 
+	// Remove stream send quota (protected by sendQuotaMu).
+	t.sendQuotaMu.Lock()
+	delete(t.streamSendQuota, streamID)
+	t.sendQuotaMu.Unlock()
+
 	// Remove stream from active streams and finish draining if needed.
 	var shouldClose bool
 	var dbg string
 	t.mu.Lock()
 	delete(t.streams, streamID)
-	delete(t.streamSendQuota, streamID)
 	delete(t.streamInFlow, streamID)
 	// Mark idle when no more active streams.
 	if len(t.streams) == 0 {
@@ -724,12 +732,16 @@ func (t *ShmServerTransport) handleCancel(streamID uint32) {
 	// Cancel the stream context
 	s.cancel()
 
+	// Remove stream send quota (protected by sendQuotaMu).
+	t.sendQuotaMu.Lock()
+	delete(t.streamSendQuota, streamID)
+	t.sendQuotaMu.Unlock()
+
 	// Remove from active streams and finish draining if needed.
 	var shouldClose bool
 	var dbg string
 	t.mu.Lock()
 	delete(t.streams, streamID)
-	delete(t.streamSendQuota, streamID)
 	delete(t.streamInFlow, streamID)
 	// Mark idle when no more active streams.
 	if len(t.streams) == 0 {
@@ -767,8 +779,11 @@ func (t *ShmServerTransport) Close(err error) {
 		t.sendQuotaMu.Unlock()
 
 		// Best-effort notify peer that we're closing immediately with debug data.
+		// Hold writeMu to avoid racing with handler goroutines that may still be writing.
 		if t.serverToClient != nil && !segClosed {
+			t.writeMu.Lock()
 			_ = writeFrame(t.serverToClient, FrameHeader{Type: FrameTypeGOAWAY, Flags: GoAwayFlagIMMEDIATE}, []byte("server closing"), context.Background())
+			t.writeMu.Unlock()
 		}
 
 		// Snapshot and terminate all active streams.
@@ -1005,12 +1020,16 @@ func (t *ShmServerTransport) writeStatus(s *ServerStream, st *status.Status) err
 
 	shmDebugf("[DEBUG] ShmServerTransport.writeStatus: Successfully wrote TRAILERS frame")
 
+	// Remove stream send quota (protected by sendQuotaMu).
+	t.sendQuotaMu.Lock()
+	delete(t.streamSendQuota, s.id)
+	t.sendQuotaMu.Unlock()
+
 	// Remove stream from active streams and finish draining if needed.
 	var shouldClose bool
 	var dbg string
 	t.mu.Lock()
 	delete(t.streams, s.id)
-	delete(t.streamSendQuota, s.id)
 	delete(t.streamInFlow, s.id)
 	// Mark idle when no more active streams.
 	if len(t.streams) == 0 {

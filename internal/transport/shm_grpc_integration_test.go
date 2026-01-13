@@ -378,8 +378,10 @@ func TestShmMetadataPropagation(t *testing.T) {
 	defer serverTransport.Close(nil)
 
 	serverSawOutgoing := make(chan struct{}, 1)
+	serverDone := make(chan struct{})
 
 	go serverTransport.HandleStreams(context.Background(), func(s *ServerStream) {
+		defer close(serverDone)
 		inMD, _ := metadata.FromIncomingContext(s.Context())
 		if got := inMD.Get("x-test"); len(got) != 1 || got[0] != "abc" {
 			t.Errorf("Server incoming metadata x-test=%v, want [abc]", got)
@@ -420,6 +422,13 @@ func TestShmMetadataPropagation(t *testing.T) {
 
 	// Ensure the stream finishes cleanly.
 	<-stream.Done()
+
+	// Wait for server handler to finish before closing transport
+	select {
+	case <-serverDone:
+	case <-ctx.Done():
+		t.Fatalf("Timed out waiting for server handler to complete: %v", ctx.Err())
+	}
 }
 
 func TestShmContentTypeAndEncodingNegotiation(t *testing.T) {
@@ -453,8 +462,10 @@ func TestShmContentTypeAndEncodingNegotiation(t *testing.T) {
 	defer serverTransport.Close(nil)
 
 	serverSaw := make(chan struct{}, 1)
+	serverDone := make(chan struct{})
 
 	go serverTransport.HandleStreams(context.Background(), func(s *ServerStream) {
+		defer close(serverDone)
 		if got := s.ContentSubtype(); got != "proto" {
 			t.Errorf("Server ContentSubtype=%q, want %q", got, "proto")
 			return
@@ -494,6 +505,13 @@ func TestShmContentTypeAndEncodingNegotiation(t *testing.T) {
 		t.Fatalf("Client RecvCompress=%q, want %q", got, "gzip")
 	}
 	<-stream.Done()
+
+	// Wait for server handler to finish before closing transport
+	select {
+	case <-serverDone:
+	case <-ctx.Done():
+		t.Fatalf("Timed out waiting for server handler to complete: %v", ctx.Err())
+	}
 }
 
 func TestShmServerDrain(t *testing.T) {
@@ -621,8 +639,10 @@ func TestShmTrailerMetadataPropagation(t *testing.T) {
 	defer serverTransport.Close(nil)
 
 	serverSaw := make(chan struct{}, 1)
+	serverDone := make(chan struct{})
 
 	go serverTransport.HandleStreams(context.Background(), func(s *ServerStream) {
+		defer close(serverDone)
 		serverSaw <- struct{}{}
 		if err := s.SetTrailer(metadata.Pairs("x-trailer", "tv")); err != nil {
 			t.Errorf("Server SetTrailer failed: %v", err)
@@ -649,6 +669,13 @@ func TestShmTrailerMetadataPropagation(t *testing.T) {
 	case <-stream.Done():
 	case <-ctx.Done():
 		t.Fatalf("Timed out waiting for stream to finish: %v", ctx.Err())
+	}
+
+	// Wait for server handler to complete writing before checking trailer
+	select {
+	case <-serverDone:
+	case <-ctx.Done():
+		t.Fatalf("Timed out waiting for server handler to complete: %v", ctx.Err())
 	}
 
 	md := stream.Trailer()

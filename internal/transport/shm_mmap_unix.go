@@ -59,6 +59,10 @@ func CreateSegment(name string, ringCapA, ringCapB uint64) (*Segment, error) {
 		// Try to create the file
 		f, err := os.OpenFile(tryPath, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0600)
 		if err != nil {
+			// If file already exists, don't fall back to another path - this is an error
+			if os.IsExist(err) {
+				return nil, fmt.Errorf("segment %q already exists: %w", name, err)
+			}
 			lastErr = err
 			continue
 		}
