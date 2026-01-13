@@ -430,7 +430,8 @@ func TestCrossProcessBackpressure(t *testing.T) {
 		t.Skip("linux-only for now")
 	}
 
-	segmentName := fmt.Sprintf("test-backpressure-%d", os.Getpid())
+	segmentName := fmt.Sprintf("test-backpressure-%d-%d", os.Getpid(), time.Now().UnixNano())
+	defer RemoveSegment(segmentName)
 
 	// Use small ring capacity (4096 bytes minimum) to test backpressure
 	seg, err := CreateSegment(segmentName, 4096, 4096)
