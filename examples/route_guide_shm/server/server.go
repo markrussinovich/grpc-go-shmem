@@ -232,7 +232,7 @@ func main() {
 	log.Printf("  Segment size: %d bytes", *segmentSize)
 	log.Printf("  Ring A size: %d bytes", *ringASize)
 	log.Printf("  Ring B size: %d bytes", *ringBSize)
-	
+
 	if err := s.Serve(lis); err != nil {
 		log.Fatalf("failed to serve: %v", err)
 	}

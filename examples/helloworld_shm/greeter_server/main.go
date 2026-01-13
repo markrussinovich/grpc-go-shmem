@@ -49,7 +49,7 @@ func (s *server) SayHello(_ context.Context, in *pb.HelloRequest) (*pb.HelloRepl
 
 func main() {
 	flag.Parse()
-	
+
 	// Create shared memory listener
 	addr := &transport.ShmAddr{Name: *segmentName}
 	lis, err := transport.NewShmListener(addr, *segmentSize, *ringASize, *ringBSize)
@@ -57,7 +57,7 @@ func main() {
 		log.Fatalf("failed to create shm listener: %v", err)
 	}
 	defer lis.Close()
-	
+
 	s := grpc.NewServer()
 	pb.RegisterGreeterServer(s, &server{})
 	log.Printf("server listening on shared memory segment: %s", *segmentName)
@@ -65,7 +65,7 @@ func main() {
 	log.Printf("  Ring A size: %d bytes", *ringASize)
 	log.Printf("  Ring B size: %d bytes", *ringBSize)
 	log.Println("Waiting for client connections...")
-	
+
 	if err := s.Serve(lis); err != nil {
 		log.Fatalf("failed to serve: %v", err)
 	}

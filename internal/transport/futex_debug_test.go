@@ -133,12 +133,12 @@ func TestFutexWithWaker(t *testing.T) {
 	// Wait on value 100 with a timeout to prevent test hang
 	t.Logf("Waiter: starting futex_wait on value 100")
 	start := time.Now()
-	
+
 	// Use a 2-second timeout to prevent infinite hang
 	var ts syscall.Timespec
 	ts.Sec = 2
 	ts.Nsec = 0
-	
+
 	r1, r2, errno := syscall.RawSyscall6(
 		syscall.SYS_FUTEX,
 		uintptr(unsafe.Pointer(addr)),

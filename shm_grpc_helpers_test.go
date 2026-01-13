@@ -43,24 +43,24 @@ func (s) TestWithShmTransport(t *testing.T) {
 func (s) TestShmDialerIntegration(t *testing.T) {
 	// This is a basic test to ensure the dialer function works correctly
 	// We can't actually dial without a server, but we can test the function structure
-	
+
 	opt := WithShmTransport()
-	
+
 	// Apply the option to a dialOptions struct
 	var opts dialOptions
 	for _, o := range []DialOption{opt} {
 		o.apply(&opts)
 	}
-	
+
 	// Verify that a dialer was set
 	if opts.copts.Dialer == nil {
 		t.Fatal("WithShmTransport() did not set a dialer")
 	}
-	
+
 	// Test that the dialer rejects non-shm addresses
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
-	
+
 	_, err := opts.copts.Dialer(ctx, "tcp://localhost:50051")
 	if err == nil {
 		t.Fatal("Expected error for non-shm address, got nil")

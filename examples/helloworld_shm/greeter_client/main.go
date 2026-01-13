@@ -41,7 +41,7 @@ var (
 
 func main() {
 	flag.Parse()
-	
+
 	// Set up a connection to the server using shared memory transport
 	conn, err := grpc.NewClient(
 		"shm://"+*segmentName,
@@ -52,14 +52,14 @@ func main() {
 		log.Fatalf("did not connect: %v", err)
 	}
 	defer conn.Close()
-	
+
 	c := pb.NewGreeterClient(conn)
 
 	// Contact the server and print out its response.
 	log.Printf("Connecting to shared memory segment: %s", *segmentName)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	
+
 	log.Printf("Calling SayHello with name: %s", *name)
 	r, err := c.SayHello(ctx, &pb.HelloRequest{Name: *name})
 	if err != nil {

@@ -25,7 +25,7 @@ type SimpleRequest struct {
 	Payload []byte
 }
 
-// SimpleResponse for benchmark testing  
+// SimpleResponse for benchmark testing
 type SimpleResponse struct {
 	Payload []byte
 }

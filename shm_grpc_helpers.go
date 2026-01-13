@@ -63,7 +63,7 @@ func WithShmTransportAndOptions(opts *transport.DialOptions) DialOption {
 		if strings.HasPrefix(addr, "shm:") {
 			// Extract segment name from "shm:segment_name"
 			segmentName := strings.TrimPrefix(addr, "shm:")
-			
+
 			// Use the shared memory dialer
 			clientTransport, err := transport.DialShm(ctx, segmentName, opts)
 			if err != nil {

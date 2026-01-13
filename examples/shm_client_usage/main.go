@@ -35,10 +35,10 @@ import (
 func main() {
 	// Example 1: Basic usage with default options
 	fmt.Println("Example 1: Creating client with default shared memory transport options")
-	
+
 	_, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	
+
 	// This creates a client that will use shared memory transport when connecting to shm:// addresses
 	conn, err := grpc.NewClient(
 		"shm://my_service_segment",
@@ -51,17 +51,17 @@ func main() {
 		defer conn.Close()
 		fmt.Println("Client created successfully with shared memory transport")
 	}
-	
+
 	// Example 2: Custom options
 	fmt.Println("\nExample 2: Creating client with custom shared memory transport options")
-	
+
 	customOpts := &transport.DialOptions{
 		SegmentSize:    2 * 1024 * 1024,  // 2MB total
 		RingASize:      512 * 1024,        // 512KB client->server
 		RingBSize:      512 * 1024,        // 512KB server->client
 		ConnectTimeout: 10 * time.Second,
 	}
-	
+
 	conn2, err := grpc.NewClient(
 		"shm://large_segment",
 		grpc.WithShmTransportAndOptions(customOpts),
@@ -73,7 +73,7 @@ func main() {
 		defer conn2.Close()
 		fmt.Println("Client created successfully with custom options")
 	}
-	
+
 	fmt.Println("\nTo use this client for actual RPC calls:")
 	fmt.Println("1. Start a server using grpc.NewServer().Serve(shmListener)")
 	fmt.Println("2. Generate protobuf stubs for your service")
