@@ -26,7 +26,7 @@ import (
 	"time"
 )
 
-func TestWithShmTransport(t *testing.T) {
+func (s) TestWithShmTransport(t *testing.T) {
 	// Test that WithShmTransport returns a valid DialOption
 	opt := WithShmTransport()
 	if opt == nil {
@@ -40,7 +40,7 @@ func TestWithShmTransport(t *testing.T) {
 	}
 }
 
-func TestShmDialerIntegration(t *testing.T) {
+func (s) TestShmDialerIntegration(t *testing.T) {
 	// This is a basic test to ensure the dialer function works correctly
 	// We can't actually dial without a server, but we can test the function structure
 	
