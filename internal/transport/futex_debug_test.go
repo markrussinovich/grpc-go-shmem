@@ -1,3 +1,5 @@
+//go:build linux && (amd64 || arm64)
+
 /*
  * Copyright 2024 gRPC authors.
  *
@@ -37,8 +39,8 @@ func TestFutexDirect(t *testing.T) {
 	// Manual futex call with timeout
 	var ts syscall.Timespec
 	timeoutNs := int64(100 * 1000 * 1000) // 100ms
-	ts.Sec = timeoutNs / 1e9
-	ts.Nsec = timeoutNs % 1e9
+	ts.Sec = int64(timeoutNs / 1e9)
+	ts.Nsec = int64(timeoutNs % 1e9)
 
 	t.Logf("Direct futex test: addr=%p, val=42, timeout=%d.%09d", addr, ts.Sec, ts.Nsec)
 
@@ -53,8 +55,8 @@ func TestFutexDirect(t *testing.T) {
 		if timeoutNs < 0 {
 			timeoutNs = 0
 		}
-		ts.Sec = timeoutNs / 1e9
-		ts.Nsec = timeoutNs % 1e9
+		ts.Sec = int64(timeoutNs / 1e9)
+		ts.Nsec = int64(timeoutNs % 1e9)
 
 		r1, r2, errno := syscall.RawSyscall6(
 			syscall.SYS_FUTEX,
