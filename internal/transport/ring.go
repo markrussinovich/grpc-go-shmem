@@ -163,19 +163,24 @@ func (rc *ReadCommit) Commit(consumed int) {
 
 	hdr := rc.ring.header()
 
+	// Capture used before advancing read index, for SpaceWaiters wake decision
+	writeIdx := hdr.WriteIndex()
+	usedBefore := writeIdx - rc.commitReadIdx
+
 	// Advance shared read index (release-publish) - frees space for writer
 	hdr.SetReadIndex(rc.commitReadIdx + uint64(consumed))
 
-	// Contiguity: always bump after any positive read commit
+	// Contiguity: always bump after any positive read commit.
+	// ContigWaiters are waiting for "more space" (not full ring), so wake on every read.
 	if consumed > 0 {
 		hdr.IncrementContigSequence()
 		if hdr.ContigWaiters() > 0 {
 			futexWake(&hdr.contigSeq, 1)
 		}
 	}
-	// Space: always wake waiters if any are waiting, since writers may
-	// be blocked waiting for N bytes even if the ring wasn't completely full.
-	if consumed > 0 && hdr.SpaceWaiters() > 0 {
+	// Space: only wake SpaceWaiters when ring transitions from completely full to not-full.
+	// SpaceWaiters only wait when free == 0, so they only need waking on full->not-full.
+	if usedBefore == rc.ring.capacity && consumed > 0 && hdr.SpaceWaiters() > 0 {
 		hdr.IncrementSpaceSequence()
 		futexWake(&hdr.spaceSeq, 1)
 	}
@@ -879,16 +884,17 @@ func (r *ShmRing) ReadBlockingContext(ctx context.Context, buf []byte) (int, err
 			hdr.SetReadIndex(readIdx + uint64(bytesRead)) // release-publish
 
 			if bytesRead > 0 {
-				// Contiguity: always bump after any positive read commit
+				// Contiguity: always bump after any positive read commit.
+				// ContigWaiters are waiting for "more space" (not full ring), so wake on every read.
 				hdr.IncrementContigSequence()
 				if hdr.ContigWaiters() > 0 {
 					futexWake(&hdr.contigSeq, 1)
 				}
 			}
 
-			// Space: always wake waiters if any are waiting, since writers may
-			// be blocked waiting for N bytes even if the ring wasn't completely full.
-			if bytesRead > 0 && hdr.SpaceWaiters() > 0 {
+			// Space: only wake SpaceWaiters when ring transitions from completely full to not-full.
+			// SpaceWaiters only wait when free == 0, so they only need waking on full->not-full.
+			if usedBefore == r.capacity && bytesRead > 0 && hdr.SpaceWaiters() > 0 {
 				hdr.IncrementSpaceSequence()
 				newSeq := hdr.SpaceSequence()
 				shmDebugf("READBLOCKING_SPACE_WAKE: freed %d bytes, new spaceSeq=%d, waking waiters",
