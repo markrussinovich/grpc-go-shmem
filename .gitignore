@@ -20,6 +20,7 @@ examples/shm_server_usage/shm_server_usage
 
 # Benchmark binaries
 benchmark/shmemtcp/shmemtcp_bench
+benchmark/shmemtcp/out/*.png
 internal/transport/transport.test
 transport.test
 shm.test.exe
