@@ -56,9 +56,9 @@ func main() {
 	fmt.Println("\nExample 2: Creating client with custom shared memory transport options")
 
 	customOpts := &transport.DialOptions{
-		SegmentSize:    2 * 1024 * 1024,  // 2MB total
-		RingASize:      512 * 1024,        // 512KB client->server
-		RingBSize:      512 * 1024,        // 512KB server->client
+		SegmentSize:    2 * 1024 * 1024, // 2MB total
+		RingASize:      512 * 1024,      // 512KB client->server
+		RingBSize:      512 * 1024,      // 512KB server->client
 		ConnectTimeout: 10 * time.Second,
 	}
 
