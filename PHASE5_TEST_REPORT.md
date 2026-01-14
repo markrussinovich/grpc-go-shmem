@@ -158,7 +158,7 @@ All four gRPC RPC types validated with shared memory transport:
 --- PASS: TestShmResolverClose (0.00s)
 
 PASS
-ok  	google.golang.org/grpc/internal/transport	0.220s
+ok      google.golang.org/grpc/internal/transport       0.220s
 ```
 
 ### End-to-End Example
