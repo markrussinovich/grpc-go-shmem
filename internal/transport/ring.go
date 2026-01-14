@@ -112,40 +112,6 @@ type ShmRing struct {
 	readCommit ReadCommit
 }
 
-// WriteCommit holds the state needed to commit a write operation.
-type WriteCommit struct {
-	ring     *ShmRing
-	writeIdx uint64
-	maxBytes int
-}
-
-// Commit commits the written bytes and advances the write index.
-// written must not exceed maxBytes.
-func (wc *WriteCommit) Commit(written int) error {
-	if written < 0 || written > wc.maxBytes {
-		return fmt.Errorf("invalid written count %d, expected 0-%d", written, wc.maxBytes)
-	}
-
-	hdr := wc.ring.header()
-
-	// Publish new write index.
-	hdr.SetWriteIndex(wc.writeIdx + uint64(written)) // release-publish
-
-	if written > 0 {
-		hdr.IncrementDataSequence()
-		newSeq := hdr.DataSequence()
-		waiters := hdr.DataWaiters()
-		shmDebugf("COMMIT_DATA_WAKE: written=%d, newSeq=%d, dataWaiters=%d", written, newSeq, waiters)
-		// Only wake if there are waiters - avoids unnecessary syscalls
-		if waiters > 0 {
-			shmDebugf("COMMIT_DATA_WAKE: waking 1 waiter")
-			futexWake(&hdr.dataSeq, 1)
-		}
-	}
-
-	return nil
-}
-
 // ReadCommit holds the state needed to commit a read operation.
 // This is embedded in ShmRing to avoid allocation on every ReadSlices call.
 type ReadCommit struct {
@@ -1006,15 +972,38 @@ func DiagnoseDuelingBuffers(clientToServer, serverToClient *ShmRing) (bool, stri
 // WriteReservation represents a reservation for writing data to the ring.
 // The caller must fill exactly the reserved bytes and call Commit with the actual bytes written.
 type WriteReservation struct {
-	First     []byte       // First contiguous slice (from write position to end of buffer or requested size)
-	Second    []byte       // Second contiguous slice (from start of buffer) - may be empty if First has enough space
-	commitCtx *WriteCommit // Commit context for this reservation
+	First    []byte   // First contiguous slice (from write position to end of buffer or requested size)
+	Second   []byte   // Second contiguous slice (from start of buffer) - may be empty if First has enough space
+	ring     *ShmRing // Ring buffer reference for commit
+	writeIdx uint64   // Write index at reservation time
+	maxBytes int      // Maximum bytes that can be committed
 }
 
 // Commit commits the written bytes and advances the write index.
-// written must not exceed the total capacity of First + Second slices.
+// written must not exceed maxBytes (the reservation size).
 func (wr *WriteReservation) Commit(written int) error {
-	return wr.commitCtx.Commit(written)
+	if written < 0 || written > wr.maxBytes {
+		return fmt.Errorf("invalid written count %d, expected 0-%d", written, wr.maxBytes)
+	}
+
+	hdr := wr.ring.header()
+
+	// Publish new write index.
+	hdr.SetWriteIndex(wr.writeIdx + uint64(written)) // release-publish
+
+	if written > 0 {
+		hdr.IncrementDataSequence()
+		newSeq := hdr.DataSequence()
+		waiters := hdr.DataWaiters()
+		shmDebugf("COMMIT_DATA_WAKE: written=%d, newSeq=%d, dataWaiters=%d", written, newSeq, waiters)
+		// Only wake if there are waiters - avoids unnecessary syscalls
+		if waiters > 0 {
+			shmDebugf("COMMIT_DATA_WAKE: waking 1 waiter")
+			futexWake(&hdr.dataSeq, 1)
+		}
+	}
+
+	return nil
 }
 
 // ReserveWrite blocks until at least n bytes of contiguous space is available, then returns
@@ -1076,19 +1065,13 @@ func (r *ShmRing) ReserveWrite(n int, ctx context.Context) (WriteReservation, er
 				second = unsafe.Slice((*byte)(secondPtr), secondLenI)
 			}
 
-			// Set up commit context for this reservation.
-			// Note: We allocate a new WriteCommit per reservation to avoid races
-			// when multiple goroutines call ReserveWrite concurrently.
-			commitCtx := &WriteCommit{
+			// Return reservation with embedded commit state (no heap allocation)
+			return WriteReservation{
+				First:    first,
+				Second:   second,
 				ring:     r,
 				writeIdx: writeIdx,
 				maxBytes: n,
-			}
-
-			return WriteReservation{
-				First:     first,
-				Second:    second,
-				commitCtx: commitCtx,
 			}, nil
 		}
 
