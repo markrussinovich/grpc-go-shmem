@@ -40,10 +40,10 @@ func futexLogf(format string, args ...any) {
 
 // Linux futex constants
 const (
-	futexOpWait        = 0   // FUTEX_WAIT (shared, for cross-process)
-	futexOpWake        = 1   // FUTEX_WAKE (shared, for cross-process)
-	futexWaitPrivate   = 128 // FUTEX_WAIT | FUTEX_PRIVATE_FLAG
-	futexWakePrivate   = 129 // FUTEX_WAKE | FUTEX_PRIVATE_FLAG
+	futexOpWait      = 0   // FUTEX_WAIT (shared, for cross-process)
+	futexOpWake      = 1   // FUTEX_WAKE (shared, for cross-process)
+	futexWaitPrivate = 128 // FUTEX_WAIT | FUTEX_PRIVATE_FLAG
+	futexWakePrivate = 129 // FUTEX_WAKE | FUTEX_PRIVATE_FLAG
 )
 
 // futexWait waits for the value at addr to change from val.
