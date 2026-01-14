@@ -20,18 +20,10 @@
 package main
 
 import (
-	"flag"
 	"fmt"
 )
 
-var (
-	segmentName = flag.String("segment", "grpc_echo", "Shared memory segment name")
-	message     = flag.String("message", "Hello, shared memory!", "Message to echo")
-	count       = flag.Int("count", 10, "Number of requests to send")
-)
-
 func main() {
-	flag.Parse()
 
 	fmt.Println("╔══════════════════════════════════════════════════════════╗")
 	fmt.Println("║    Shared Memory Echo Client - Direct Transport Demo    ║")
