@@ -11,7 +11,7 @@ This document describes the HTTP/2 integration for the gRPC shared memory transp
 The shared memory transport uses Linux futexes for efficient cross-process synchronization:
 
 - **Data Sequence (`dataSeq`)**: Incremented when data is written; readers wait on this
-- **Space Sequence (`spaceSeq`)**: Incremented when data is read; writers wait on this  
+- **Space Sequence (`spaceSeq`)**: Incremented when data is read; writers wait on this
 - **Contiguity Sequence (`contigSeq`)**: Incremented on reads to wake writers waiting for any space
 
 This futex-based design provides:
@@ -98,10 +98,10 @@ Each side has independent goroutines:
 type ShmStreamingClient struct {
     tx *ShmRing  // client → server
     rx *ShmRing  // server → client
-    
+
     // Single reader goroutine
     // Dispatches frames to per-stream channels
-    
+
     // Per-stream sender goroutines
     // Each stream has its own send queue
 }
@@ -123,10 +123,10 @@ type ShmStreamingClient struct {
 type ShmStreamingServer struct {
     tx *ShmRing  // server → client
     rx *ShmRing  // client → server
-    
+
     // Single reader goroutine
     // Dispatches to stream handlers
-    
+
     // Per-stream sender goroutines
     // Each stream has its own send queue
 }

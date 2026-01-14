@@ -133,21 +133,21 @@ func (t *ShmClientTransport) effectiveMaxPayload() int {
 ```go
 func writeFrameBuffersChunked(tx *ShmRing, fh FrameHeader, hdr []byte, data mem.BufferSlice, ctx context.Context, maxPayload int) error {
     totalPayload := len(hdr) + data.Len()
-    
+
     // Fast path: fits in single frame
     if totalPayload <= maxPayload {
         return writeFrameBuffers(tx, fh, hdr, data, ctx)
     }
-    
+
     // Slow path: chunk the payload
     // First frame includes hdr, subsequent frames are data-only
     remaining := data
     firstChunk := true
-    
+
     for firstChunk || remaining.Len() > 0 {
         var chunkData mem.BufferSlice
         var chunkHdr []byte
-        
+
         if firstChunk {
             chunkHdr = hdr
             // Calculate how much data fits with header
@@ -165,18 +165,18 @@ func writeFrameBuffersChunked(tx *ShmRing, fh FrameHeader, hdr []byte, data mem.
             }
             chunkData, remaining = splitBufferSlice(remaining, chunkSize)
         }
-        
+
         chunkFh := fh
         if remaining.Len() > 0 {
             chunkFh.Flags |= MessageFlagMORE
         }
-        
+
         if err := writeFrameBuffers(tx, chunkFh, chunkHdr, chunkData, ctx); err != nil {
             return err
         }
         chunkHdr = nil // Only first chunk has header
     }
-    
+
     return nil
 }
 ```

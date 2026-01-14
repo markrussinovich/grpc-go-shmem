@@ -27,7 +27,7 @@ run_test() {
     echo "=========================================" | tee -a "$LOG_FILE"
     echo "Running: $name" | tee -a "$LOG_FILE"
     echo "=========================================" | tee -a "$LOG_FILE"
-    
+
     if "$@" 2>&1 | tee -a "$LOG_FILE"; then
         echo "" | tee -a "$LOG_FILE"
         echo "✅ $name: SUCCESS" | tee -a "$LOG_FILE"

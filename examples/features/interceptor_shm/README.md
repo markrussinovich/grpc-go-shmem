@@ -22,5 +22,5 @@ go run ./client/main.go
 - Timing measurement
 - All works over shared memory transport
 
-Note: This is a simplified version without TLS/authentication since shared memory 
+Note: This is a simplified version without TLS/authentication since shared memory
 transport is inherently local and doesn't require encryption.

@@ -134,7 +134,7 @@ go test -bench=BenchmarkLatency -benchmem -benchtime=10000x ./internal/transport
 ✅ **Performance:**
 - 10-30x lower roundtrip latency (with spin-wait optimization)
 - 20-40x faster one-way streaming
-- 15-40x higher throughput  
+- 15-40x higher throughput
 - 20-40% lower CPU usage
 - More consistent tail latencies
 
@@ -289,10 +289,10 @@ Speedup Analysis (1KB roundtrip):
 
 Phase 6 provides comprehensive performance validation demonstrating:
 
-✅ **2-5x latency improvement** over TCP loopback  
-✅ **2-4x throughput improvement** in most scenarios  
-✅ **20-40% CPU reduction** under load  
-✅ **Consistent performance** across message sizes  
+✅ **2-5x latency improvement** over TCP loopback
+✅ **2-4x throughput improvement** in most scenarios
+✅ **20-40% CPU reduction** under load
+✅ **Consistent performance** across message sizes
 ✅ **Excellent scalability** with concurrency
 
 The shared memory transport is **production-ready** for local IPC scenarios requiring high performance. It's a true drop-in replacement for TCP when both client and server run on the same machine.

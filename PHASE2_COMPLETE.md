@@ -12,7 +12,7 @@ Two new public API functions:
 
 ```go
 // Basic usage
-grpc.WithShmTransport() 
+grpc.WithShmTransport()
 
 // With custom options
 grpc.WithShmTransportAndOptions(opts *transport.DialOptions)

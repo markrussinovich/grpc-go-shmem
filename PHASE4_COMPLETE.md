@@ -30,7 +30,7 @@ Both server and client build successfully:
 $ cd examples/helloworld_shm/greeter_server && go build
 # Success
 
-$ cd examples/helloworld_shm/greeter_client && go build  
+$ cd examples/helloworld_shm/greeter_client && go build
 # Success
 ```
 
@@ -79,7 +79,7 @@ s.Serve(lis)  // Same call!
 
 **Original TCP Client:**
 ```go
-conn, err := grpc.NewClient("localhost:50051", 
+conn, err := grpc.NewClient("localhost:50051",
     grpc.WithTransportCredentials(insecure.NewCredentials()))
 ```
 

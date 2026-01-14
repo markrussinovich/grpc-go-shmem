@@ -21,5 +21,5 @@ go run ./client/main.go
 - Server enforcement policy
 - Connection health monitoring over shared memory
 
-Note: Keepalive with shared memory works the same as TCP, maintaining 
+Note: Keepalive with shared memory works the same as TCP, maintaining
 connection health through periodic pings.

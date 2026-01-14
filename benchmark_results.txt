@@ -1,7 +1,7 @@
 goos: linux
 goarch: amd64
 pkg: google.golang.org/grpc/internal/transport
-cpu: AMD EPYC 7763 64-Core Processor                
+cpu: AMD EPYC 7763 64-Core Processor
 BenchmarkShmRingWriteRead/size=64-2        	21002420	        57.99 ns/op	1103.71 MB/s
 BenchmarkShmRingWriteRead/size=64-2        	21542661	        56.24 ns/op	1138.05 MB/s
 BenchmarkShmRingWriteRead/size=64-2        	20312721	        57.06 ns/op	1121.62 MB/s

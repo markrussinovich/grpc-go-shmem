@@ -140,7 +140,7 @@ All four gRPC RPC types validated with shared memory transport:
 === RUN   TestUnary_CancellationWithSlowServer
 --- PASS: TestUnary_CancellationWithSlowServer (0.50s)
 
-=== RUN   TestBidirectional_BasicFlow  
+=== RUN   TestBidirectional_BasicFlow
 --- PASS: TestBidirectional_BasicFlow (0.02s)
 
 === RUN   TestBidirectional_FullBuffer
@@ -321,7 +321,7 @@ go test -v ./internal/transport -run "Test.*Shm|TestUnary|TestBidirectional|Test
 # Run resolver tests
 go test -v ./internal/transport -run "TestShmResolver"
 
-# Run integration tests  
+# Run integration tests
 go test -v ./internal/transport -run "TestClientTransport|TestServerTransport"
 
 # Run examples

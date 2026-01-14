@@ -4,7 +4,7 @@
 
 - **Environment:** Ensure you have a recent Go toolchain installed (gRPC-Go requires one of the latest two Go releases). Set up the `grpc-go` repository locally by forking and cloning it. Create a new branch for the shared memory transport feature to isolate your work.
 - **Repository Structure:** Familiarize yourself with the `grpc-go` repository layout. The transport internals reside in the `internal/transport` package. Plan to implement the shared memory transport within this internal package (or a new subpackage under it) to avoid exposing unstable APIs externally.
-- **Dependencies:** Avoid adding new external dependencies for this feature. If you need low-level system calls (e.g. futex or eventfd), use Go’s standard libraries or `golang.org/x/sys` as needed. Introducing new dependencies requires discussion with maintainers. 
+- **Dependencies:** Avoid adding new external dependencies for this feature. If you need low-level system calls (e.g. futex or eventfd), use Go’s standard libraries or `golang.org/x/sys` as needed. Introducing new dependencies requires discussion with maintainers.
 - **License Header:** When creating new files, include the standard gRPC license header at the top (copy from an existing file and update the year).
 - **Initial Test Run:** Before writing new code, run the existing test suite to ensure you have a green baseline. Use the provided scripts and commands (e.g. `./scripts/vet.sh`, `go test -cpu 1,4 -timeout 7m ./...`) to catch any issues early. All tests should pass before you proceed with new changes.
 

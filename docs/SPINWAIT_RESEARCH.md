@@ -90,7 +90,7 @@ const (
     // Spin budget before falling back to futex
     // 2µs ≈ 4000 iterations at ~0.5ns/pause on modern CPUs
     SpinIterations = 4000
-    
+
     // Adaptive parameters
     MinSpinLimit = 200
     MaxSpinLimit = 20000
@@ -104,7 +104,7 @@ func (r *ShmRing) waitForDataWithSpin(ctx context.Context) error {
         }
         runtime_procyield(1) // Go's PAUSE equivalent
     }
-    
+
     // Phase 2: Fall back to futex
     return r.waitForDataFutex(ctx)
 }
@@ -174,7 +174,7 @@ type ShmDialOption struct {
     // BusyPoll enables pure spinning without futex for minimum latency
     // Warning: This will consume 100% CPU on idle connections
     BusyPoll bool
-    
+
     // SpinMicroseconds controls spin duration before futex (default: 2)
     SpinMicroseconds int
 }

@@ -69,20 +69,20 @@ import sys
 def parse_benchmark_results(filename):
     with open(filename, 'r') as f:
         content = f.read()
-    
+
     results = {}
     pattern = r'Benchmark(\w+)/size=(\d+)B/(shm|tcp|unix)\s+\d+\s+(\d+\.?\d*)\s+ns/op'
-    
+
     for match in re.finditer(pattern, content):
         bench_type, size, transport, ns_per_op = match.groups()
         key = (bench_type, int(size))
         if key not in results:
             results[key] = {}
         results[key][transport] = float(ns_per_op)
-    
+
     print("\n=== Performance Summary ===\n")
     print("Speedup of SHM vs TCP and Unix sockets:\n")
-    
+
     for (bench_type, size), transports in sorted(results.items()):
         if 'shm' in transports and 'tcp' in transports:
             speedup_tcp = transports['tcp'] / transports['shm']
