@@ -143,7 +143,7 @@ func TestFutexWithWaker(t *testing.T) {
 		syscall.SYS_FUTEX,
 		uintptr(unsafe.Pointer(addr)),
 		FUTEX_WAIT_PRIVATE,
-		100, // expected value
+		100,                          // expected value
 		uintptr(unsafe.Pointer(&ts)), // timeout to prevent hang
 		0,
 		0,
