@@ -57,7 +57,8 @@ func BenchmarkShmRingLargeMessages(b *testing.B) {
 			clientToServer := NewShmRingFromSegment(seg.A, seg.Mem)
 			serverToClient := NewShmRingFromSegment(seg.B, seg.Mem)
 
-			ctx := context.Background()
+			ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+			defer cancel()
 			data := make([]byte, size)
 			// Fill with pattern for verification
 			for i := range data {
@@ -151,7 +152,8 @@ func BenchmarkShmConcurrentStreams(b *testing.B) {
 			clientToServer := NewShmRingFromSegment(seg.A, seg.Mem)
 			serverToClient := NewShmRingFromSegment(seg.B, seg.Mem)
 
-			ctx := context.Background()
+			ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+			defer cancel()
 
 			var serverWg sync.WaitGroup
 			serverDone := make(chan struct{})
@@ -249,7 +251,8 @@ func BenchmarkShmLatencyPercentiles(b *testing.B) {
 	clientToServer := NewShmRingFromSegment(seg.A, seg.Mem)
 	serverToClient := NewShmRingFromSegment(seg.B, seg.Mem)
 
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer cancel()
 	data := make([]byte, messageSize)
 
 	var wg sync.WaitGroup
@@ -387,7 +390,8 @@ func BenchmarkShmClientStreaming(b *testing.B) {
 			clientToServer := NewShmRingFromSegment(seg.A, seg.Mem)
 			serverToClient := NewShmRingFromSegment(seg.B, seg.Mem)
 
-			ctx := context.Background()
+			ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+			defer cancel()
 			data := make([]byte, messageSize)
 
 			var wg sync.WaitGroup
@@ -470,7 +474,8 @@ func BenchmarkShmServerStreaming(b *testing.B) {
 			clientToServer := NewShmRingFromSegment(seg.A, seg.Mem)
 			serverToClient := NewShmRingFromSegment(seg.B, seg.Mem)
 
-			ctx := context.Background()
+			ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+			defer cancel()
 			data := make([]byte, messageSize)
 
 			var wg sync.WaitGroup
@@ -553,7 +558,8 @@ func BenchmarkShmBidirectionalStreaming(b *testing.B) {
 			clientToServer := NewShmRingFromSegment(seg.A, seg.Mem)
 			serverToClient := NewShmRingFromSegment(seg.B, seg.Mem)
 
-			ctx := context.Background()
+			ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+			defer cancel()
 			data := make([]byte, messageSize)
 
 			var wg sync.WaitGroup
@@ -659,7 +665,8 @@ func BenchmarkShmBackpressure(b *testing.B) {
 	}()
 
 	ring := NewShmRingFromSegment(seg.A, seg.Mem)
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer cancel()
 	data := make([]byte, messageSize)
 
 	var wg sync.WaitGroup
@@ -719,7 +726,8 @@ func BenchmarkShmVsTCPComparison(b *testing.B) {
 		clientToServer := NewShmRingFromSegment(seg.A, seg.Mem)
 		serverToClient := NewShmRingFromSegment(seg.B, seg.Mem)
 
-		ctx := context.Background()
+		ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+		defer cancel()
 		data := make([]byte, messageSize)
 
 		var wg sync.WaitGroup

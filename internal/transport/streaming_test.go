@@ -86,7 +86,7 @@ func TestBidirectionalStreamingNoDeadlock(t *testing.T) {
 	}
 
 	// Start server (this starts its reader)
-	serverCtx, serverCancel := context.WithCancel(context.Background())
+	serverCtx, serverCancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	defer serverCancel()
 	go server.Serve(serverCtx, server.handler)
 
@@ -94,7 +94,7 @@ func TestBidirectionalStreamingNoDeadlock(t *testing.T) {
 	client.Start()
 
 	// Create stream (this will send HEADERS)
-	stream, err := client.NewStream(context.Background(), "/test.Service/Echo", "localhost", nil)
+	stream, err := client.NewStream(serverCtx, "/test.Service/Echo", "localhost", nil)
 	if err != nil {
 		t.Fatalf("Failed to create stream: %v", err)
 	}
@@ -235,7 +235,7 @@ func TestBidirectionalStreamingFullBuffers(t *testing.T) {
 	}
 
 	// Start server
-	serverCtx, serverCancel := context.WithCancel(context.Background())
+	serverCtx, serverCancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	defer serverCancel()
 	go server.Serve(serverCtx, server.handler)
 
@@ -243,7 +243,7 @@ func TestBidirectionalStreamingFullBuffers(t *testing.T) {
 	client.Start()
 
 	// Create stream
-	stream, err := client.NewStream(context.Background(), "/test.Service/BulkTransfer", "localhost", nil)
+	stream, err := client.NewStream(serverCtx, "/test.Service/BulkTransfer", "localhost", nil)
 	if err != nil {
 		t.Fatalf("Failed to create stream: %v", err)
 	}
@@ -351,7 +351,7 @@ func TestConcurrentStreams(t *testing.T) {
 	}
 
 	// Start server
-	serverCtx, serverCancel := context.WithCancel(context.Background())
+	serverCtx, serverCancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	defer serverCancel()
 	go server.Serve(serverCtx, server.handler)
 
@@ -368,7 +368,7 @@ func TestConcurrentStreams(t *testing.T) {
 		go func(streamNum int) {
 			defer wg.Done()
 
-			stream, err := client.NewStream(context.Background(), fmt.Sprintf("/test.Service/Method%d", streamNum), "localhost", nil)
+			stream, err := client.NewStream(serverCtx, fmt.Sprintf("/test.Service/Method%d", streamNum), "localhost", nil)
 			if err != nil {
 				errors <- fmt.Errorf("stream %d: failed to create: %w", streamNum, err)
 				return

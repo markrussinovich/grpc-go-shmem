@@ -35,6 +35,9 @@ import (
 // while waiting for a slow server, it properly sends a CANCEL frame and returns
 // codes.Canceled error.
 func TestUnary_CancellationWithSlowServer(t *testing.T) {
+	testCtx, testCancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer testCancel()
+
 	t.Logf("=== Starting TestUnary_CancellationWithSlowServer ===")
 
 	name := fmt.Sprintf("cancel-slow-server-%d", time.Now().UnixNano())
@@ -107,7 +110,7 @@ func TestUnary_CancellationWithSlowServer(t *testing.T) {
 		err3 := writeFrame(srvTx, FrameHeader{
 			StreamID: streamID,
 			Type:     FrameTypeHEADERS,
-		}, hdrBytes, context.Background())
+		}, hdrBytes, testCtx)
 
 		if err3 != nil {
 			log.Printf("Server: Failed to write HEADERS response: %v", err3)

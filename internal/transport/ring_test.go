@@ -357,6 +357,9 @@ func TestShmRingFullBuffer(t *testing.T) {
 
 // TestShmRingNoPolling verifies that blocking operations are event-driven, not polling
 func TestShmRingNoPolling(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer cancel()
+
 	segName := fmt.Sprintf("test-ring-no-polling-%d", time.Now().UnixNano())
 	segment, err := CreateSegment(segName, 4096, 4096) // Use minimum required size
 	if err != nil {
@@ -366,8 +369,6 @@ func TestShmRingNoPolling(t *testing.T) {
 
 	ringA := segment.A
 	ring := NewShmRingFromSegment(ringA, segment.Mem)
-
-	ctx := context.Background()
 
 	// Fill the ring completely
 	fillData := make([]byte, ring.Capacity())

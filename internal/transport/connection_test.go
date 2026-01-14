@@ -67,7 +67,8 @@ func TestShmDialer(t *testing.T) {
 	})
 
 	// Test dial to non-existent address should timeout quickly
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer cancel()
 
 	start := time.Now()
 	conn, err := dialer.Dial(ctx, "non_existent")
@@ -129,7 +130,8 @@ func TestShmConnectionEstablishment(t *testing.T) {
 		ConnectTimeout: 500 * time.Millisecond,
 	})
 
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer cancel()
 	conn, err := dialer.Dial(ctx, testAddr)
 	if err != nil {
 		t.Fatalf("Expected dial to succeed with pre-created segment: %v", err)

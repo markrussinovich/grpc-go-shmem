@@ -403,7 +403,8 @@ func BenchmarkChunkedWriteSmallRing(b *testing.B) {
 	tx := NewShmRingFromSegment(seg.A, seg.Mem)
 	rx := NewShmRingFromSegment(seg.A, seg.Mem)
 
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer cancel()
 
 	payloadSizes := []int{1024, 8 * 1024, 32 * 1024, 64 * 1024, 128 * 1024}
 

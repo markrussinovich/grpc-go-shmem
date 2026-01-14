@@ -121,6 +121,9 @@ func readFrameWithContext(ctx context.Context, rx *ShmRing) (FrameHeader, []byte
 
 // Test backpressure and blocking semantics with small rings and large messages.
 func TestUnary_BackpressureAndBlocking(t *testing.T) {
+	testCtx, testCancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer testCancel()
+
 	// Small rings: 64 KiB each
 	const ringCap = 64 * 1024
 	name := fmt.Sprintf("pressure-%d", time.Now().UnixNano())
@@ -168,7 +171,7 @@ func TestUnary_BackpressureAndBlocking(t *testing.T) {
 			time.Sleep(20 * time.Millisecond)
 
 			// Read request HEADERS
-			fh, _, err := readFrame(cliTx, context.Background())
+			fh, _, err := readFrame(cliTx, testCtx)
 			if err != nil {
 				serverResult <- fmt.Errorf("server read headers: %v", err)
 				return
@@ -181,7 +184,7 @@ func TestUnary_BackpressureAndBlocking(t *testing.T) {
 			// Read MESSAGE frame(s) - should be chunked due to ring size
 			var acc []byte
 			for {
-				fhm, p, err := readFrame(cliTx, context.Background())
+				fhm, p, err := readFrame(cliTx, testCtx)
 				if err != nil {
 					serverResult <- fmt.Errorf("server read message: %v", err)
 					return
@@ -197,15 +200,15 @@ func TestUnary_BackpressureAndBlocking(t *testing.T) {
 			}
 
 			// Respond with same data
-			if err := writeFrame(cliRx, FrameHeader{StreamID: fh.StreamID, Type: FrameTypeHEADERS, Flags: HeadersFlagINITIAL}, encodeHeaders(HeadersV1{Version: 1, HdrType: 1}), context.Background()); err != nil {
+			if err := writeFrame(cliRx, FrameHeader{StreamID: fh.StreamID, Type: FrameTypeHEADERS, Flags: HeadersFlagINITIAL}, encodeHeaders(HeadersV1{Version: 1, HdrType: 1}), testCtx); err != nil {
 				serverResult <- fmt.Errorf("server write headers: %v", err)
 				return
 			}
-			if err := writeFrame(cliRx, FrameHeader{StreamID: fh.StreamID, Type: FrameTypeMESSAGE}, acc, context.Background()); err != nil {
+			if err := writeFrame(cliRx, FrameHeader{StreamID: fh.StreamID, Type: FrameTypeMESSAGE}, acc, testCtx); err != nil {
 				serverResult <- fmt.Errorf("server write message: %v", err)
 				return
 			}
-			if err := writeFrame(cliRx, FrameHeader{StreamID: fh.StreamID, Type: FrameTypeTRAILERS, Flags: TrailersFlagEND_STREAM}, encodeTrailers(TrailersV1{Version: 1, GRPCStatusCode: 0}), context.Background()); err != nil {
+			if err := writeFrame(cliRx, FrameHeader{StreamID: fh.StreamID, Type: FrameTypeTRAILERS, Flags: TrailersFlagEND_STREAM}, encodeTrailers(TrailersV1{Version: 1, GRPCStatusCode: 0}), testCtx); err != nil {
 				serverResult <- fmt.Errorf("server write trailers: %v", err)
 				return
 			}

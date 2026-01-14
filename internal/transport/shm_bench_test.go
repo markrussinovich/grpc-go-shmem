@@ -48,7 +48,8 @@ func BenchmarkShmRingWriteRead(b *testing.B) {
 			})
 
 			ring := NewShmRingFromSegment(seg.A, seg.Mem)
-			ctx := context.Background()
+			ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+			defer cancel()
 			data := make([]byte, size)
 
 			b.SetBytes(int64(size))
@@ -99,7 +100,8 @@ func BenchmarkShmRingThroughput(b *testing.B) {
 			}()
 
 			ring := NewShmRingFromSegment(seg.A, seg.Mem)
-			ctx := context.Background()
+			ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+			defer cancel()
 			data := make([]byte, size)
 
 			// Writer and reader in separate goroutines
@@ -404,7 +406,8 @@ func BenchmarkShmRingRoundtrip(b *testing.B) {
 			clientToServer := NewShmRingFromSegment(seg.A, seg.Mem)
 			serverToClient := NewShmRingFromSegment(seg.B, seg.Mem)
 
-			ctx := context.Background()
+			ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+			defer cancel()
 			data := make([]byte, size)
 
 			var wg sync.WaitGroup
@@ -570,7 +573,8 @@ func BenchmarkShmRingLargePayloads(b *testing.B) {
 			})
 
 			ring := NewShmRingFromSegment(seg.A, seg.Mem)
-			ctx := context.Background()
+			ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+			defer cancel()
 			data := make([]byte, size)
 			// Fill with pattern
 			for i := range data {

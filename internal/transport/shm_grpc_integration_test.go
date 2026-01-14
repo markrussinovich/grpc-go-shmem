@@ -320,15 +320,19 @@ func TestShmDeadlinePropagation(t *testing.T) {
 	}
 	gotCh := make(chan deadlineResult, 1)
 
-	go serverTransport.HandleStreams(context.Background(), func(s *ServerStream) {
+	serverCtx, serverCancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer serverCancel()
+
+	go serverTransport.HandleStreams(serverCtx, func(s *ServerStream) {
 		d, ok := s.Context().Deadline()
 		<-s.Context().Done()
 		gotCh <- deadlineResult{ok: ok, unixNano: d.UnixNano(), ctxErr: s.Context().Err()}
 	})
 
-	deadline := time.Now().Add(200 * time.Millisecond)
-	ctx, cancel := context.WithDeadline(context.Background(), deadline)
+	deadlineDuration := 200 * time.Millisecond
+	ctx, cancel := context.WithTimeout(context.Background(), deadlineDuration)
 	defer cancel()
+	deadline := time.Now().Add(deadlineDuration)
 
 	callHdr := &CallHdr{Host: "testhost", Method: "/test.Service/Deadline"}
 	_, err = clientTransport.NewStream(ctx, callHdr)
@@ -398,7 +402,10 @@ func TestShmMetadataPropagation(t *testing.T) {
 	serverSawOutgoing := make(chan struct{}, 1)
 	serverDone := make(chan struct{})
 
-	go serverTransport.HandleStreams(context.Background(), func(s *ServerStream) {
+	serverCtx, serverCancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer serverCancel()
+
+	go serverTransport.HandleStreams(serverCtx, func(s *ServerStream) {
 		defer close(serverDone)
 		inMD, _ := metadata.FromIncomingContext(s.Context())
 		if got := inMD.Get("x-test"); len(got) != 1 || got[0] != "abc" {
@@ -482,7 +489,10 @@ func TestShmContentTypeAndEncodingNegotiation(t *testing.T) {
 	serverSaw := make(chan struct{}, 1)
 	serverDone := make(chan struct{})
 
-	go serverTransport.HandleStreams(context.Background(), func(s *ServerStream) {
+	serverCtx, serverCancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer serverCancel()
+
+	go serverTransport.HandleStreams(serverCtx, func(s *ServerStream) {
 		defer close(serverDone)
 		if got := s.ContentSubtype(); got != "proto" {
 			t.Errorf("Server ContentSubtype=%q, want %q", got, "proto")
@@ -565,7 +575,10 @@ func TestShmServerDrain(t *testing.T) {
 	serverSaw := make(chan *ServerStream, 1)
 	allowReply := make(chan struct{})
 
-	go serverTransport.HandleStreams(context.Background(), func(s *ServerStream) {
+	serverCtx, serverCancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer serverCancel()
+
+	go serverTransport.HandleStreams(serverCtx, func(s *ServerStream) {
 		serverSaw <- s
 		<-allowReply
 
@@ -659,7 +672,10 @@ func TestShmTrailerMetadataPropagation(t *testing.T) {
 	serverSaw := make(chan struct{}, 1)
 	serverDone := make(chan struct{})
 
-	go serverTransport.HandleStreams(context.Background(), func(s *ServerStream) {
+	serverCtx, serverCancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer serverCancel()
+
+	go serverTransport.HandleStreams(serverCtx, func(s *ServerStream) {
 		defer close(serverDone)
 		serverSaw <- struct{}{}
 		if err := s.SetTrailer(metadata.Pairs("x-trailer", "tv")); err != nil {
@@ -735,7 +751,10 @@ func TestShmServerCloseTerminatesActiveStreams(t *testing.T) {
 	started := make(chan struct{})
 	readErrCh := make(chan error, 1)
 
-	go serverTransport.HandleStreams(context.Background(), func(s *ServerStream) {
+	serverCtx, serverCancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer serverCancel()
+
+	go serverTransport.HandleStreams(serverCtx, func(s *ServerStream) {
 		close(started)
 		_, err := s.Read(1)
 		readErrCh <- err

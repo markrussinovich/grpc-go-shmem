@@ -46,6 +46,9 @@ func TestRing_ContiguityWait_TailShort(t *testing.T) {
 	if !isLinuxPlatform() {
 		t.Skip("Linux-only")
 	}
+	testCtx, testCancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer testCancel()
+
 	const cap = 4096
 	seg := newTestSegment(t, cap)
 	ring := NewShmRingFromSegment(seg.A, seg.Mem)
@@ -97,7 +100,7 @@ func TestRing_ContiguityWait_TailShort(t *testing.T) {
 	prevSpace := hdr.SpaceSequence()
 
 	// Reader consumes 32 bytes to improve contiguity; this increments contigSeq.
-	first, second, commit, err := ring.ReadSlices(32, context.Background())
+	first, second, commit, err := ring.ReadSlices(32, testCtx)
 	if err != nil {
 		t.Fatalf("ReadSlices: %v", err)
 	}
@@ -129,6 +132,9 @@ func TestRing_SpaceLimited_WaitsOnSpace(t *testing.T) {
 	if !isLinuxPlatform() {
 		t.Skip("Linux-only")
 	}
+	testCtx, testCancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer testCancel()
+
 	const cap = 4096
 	seg := newTestSegment(t, cap)
 	ring := NewShmRingFromSegment(seg.A, seg.Mem)
@@ -162,7 +168,7 @@ func TestRing_SpaceLimited_WaitsOnSpace(t *testing.T) {
 	prevContig := hdr.ContigSequence()
 
 	// Consume 16 bytes; since ring was full, this must increment spaceSeq exactly once
-	first, second, commit, err := ring.ReadSlices(16, context.Background())
+	first, second, commit, err := ring.ReadSlices(16, testCtx)
 	if err != nil {
 		t.Fatalf("ReadSlices: %v", err)
 	}

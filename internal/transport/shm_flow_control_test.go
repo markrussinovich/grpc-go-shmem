@@ -33,6 +33,9 @@ import (
 // Test that a client write blocks when the outbound flow-control window is
 // exhausted and resumes when WINDOW_UPDATE frames arrive.
 func TestShmFlowControlBlocksUntilWindowUpdate(t *testing.T) {
+	testCtx, testCancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer testCancel()
+
 	segName := fmt.Sprintf("test-flow-ctrl-%d", time.Now().UnixNano())
 	defer RemoveSegment(segName)
 
@@ -65,7 +68,7 @@ func TestShmFlowControlBlocksUntilWindowUpdate(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	go srvTransport.HandleStreams(context.Background(), func(s *ServerStream) {
+	go srvTransport.HandleStreams(testCtx, func(s *ServerStream) {
 		// Read whatever the client sends to consume the window on the receive side.
 		_, _ = s.Read(5)
 		_ = s.WriteStatus(status.New(codes.OK, ""))
@@ -101,8 +104,8 @@ func TestShmFlowControlBlocksUntilWindowUpdate(t *testing.T) {
 	delta := uint32(msg.Len())
 	payload := make([]byte, 4)
 	binary.LittleEndian.PutUint32(payload, delta)
-	_ = writeFrame(srvTransport.serverToClient, FrameHeader{Type: FrameTypeWINDOW_UPDATE}, payload, context.Background())
-	_ = writeFrame(srvTransport.serverToClient, FrameHeader{Type: FrameTypeWINDOW_UPDATE, StreamID: cs.id}, payload, context.Background())
+	_ = writeFrame(srvTransport.serverToClient, FrameHeader{Type: FrameTypeWINDOW_UPDATE}, payload, ctx)
+	_ = writeFrame(srvTransport.serverToClient, FrameHeader{Type: FrameTypeWINDOW_UPDATE, StreamID: cs.id}, payload, ctx)
 
 	select {
 	case err := <-writeErr:

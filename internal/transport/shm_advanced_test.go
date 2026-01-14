@@ -51,6 +51,9 @@ func TestShmPingPongSizes(t *testing.T) {
 
 	for _, tc := range sizes {
 		t.Run(tc.name, func(t *testing.T) {
+			testCtx, testCancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+			defer testCancel()
+
 			name := fmt.Sprintf("pingpong-%s-%d", tc.name, time.Now().UnixNano())
 			// Use reasonable ring sizes (minimum 4KB) with enough space for frames
 			ringSize := tc.size * 4
@@ -79,7 +82,7 @@ func TestShmPingPongSizes(t *testing.T) {
 				srvTx := NewShmRingFromSegment(seg.B, seg.Mem)
 
 				// Read headers
-				fh, pl, err := readFrame(srvRx, context.Background())
+				fh, pl, err := readFrame(srvRx, testCtx)
 				if err != nil {
 					t.Errorf("server read headers: %v", err)
 					return
@@ -94,7 +97,7 @@ func TestShmPingPongSizes(t *testing.T) {
 				}
 
 				// Read message
-				fh2, msg, err := readFrame(srvRx, context.Background())
+				fh2, msg, err := readFrame(srvRx, testCtx)
 				if err != nil {
 					t.Errorf("server read msg: %v", err)
 					return
@@ -106,16 +109,16 @@ func TestShmPingPongSizes(t *testing.T) {
 
 				// Echo back: HEADERS + MESSAGE + TRAILERS
 				h := HeadersV1{Version: 1, HdrType: 1}
-				_ = writeFrame(srvTx, FrameHeader{StreamID: fh.StreamID, Type: FrameTypeHEADERS, Flags: HeadersFlagINITIAL}, encodeHeaders(h), context.Background())
-				_ = writeFrame(srvTx, FrameHeader{StreamID: fh.StreamID, Type: FrameTypeMESSAGE}, msg, context.Background())
+				_ = writeFrame(srvTx, FrameHeader{StreamID: fh.StreamID, Type: FrameTypeHEADERS, Flags: HeadersFlagINITIAL}, encodeHeaders(h), testCtx)
+				_ = writeFrame(srvTx, FrameHeader{StreamID: fh.StreamID, Type: FrameTypeMESSAGE}, msg, testCtx)
 				tr := TrailersV1{Version: 1, GRPCStatusCode: 0}
-				_ = writeFrame(srvTx, FrameHeader{StreamID: fh.StreamID, Type: FrameTypeTRAILERS, Flags: TrailersFlagEND_STREAM}, encodeTrailers(tr), context.Background())
+				_ = writeFrame(srvTx, FrameHeader{StreamID: fh.StreamID, Type: FrameTypeTRAILERS, Flags: TrailersFlagEND_STREAM}, encodeTrailers(tr), testCtx)
 			}()
 
 			// Client factory
 			enableClientReader.Store(false)
 			defer enableClientReader.Store(true)
-			ct, err := newShmClientFactory(context.Background(), raw)
+			ct, err := newShmClientFactory(testCtx, raw)
 			if err != nil {
 				t.Fatalf("client factory: %v", err)
 			}
@@ -163,6 +166,9 @@ func TestShmPingPongSizes(t *testing.T) {
 
 // TestShmConcurrentStreams tests multiple concurrent streams
 func TestShmConcurrentStreams(t *testing.T) {
+	testCtx, testCancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer testCancel()
+
 	name := fmt.Sprintf("concurrent-%d", time.Now().UnixNano())
 	raw := fmt.Sprintf("shm://%s?cap=131072", name)
 
@@ -194,7 +200,7 @@ func TestShmConcurrentStreams(t *testing.T) {
 		}
 		reqs := make([]req, 0, numCalls)
 		for i := 0; i < numCalls; i++ {
-			fh, pl, err := readFrame(srvRx, context.Background())
+			fh, pl, err := readFrame(srvRx, testCtx)
 			if err != nil {
 				t.Errorf("server read headers: %v", err)
 				return
@@ -208,7 +214,7 @@ func TestShmConcurrentStreams(t *testing.T) {
 				return
 			}
 
-			fh2, msg, err := readFrame(srvRx, context.Background())
+			fh2, msg, err := readFrame(srvRx, testCtx)
 			if err != nil {
 				t.Errorf("server read msg: %v", err)
 				return
@@ -224,17 +230,17 @@ func TestShmConcurrentStreams(t *testing.T) {
 		for i := len(reqs) - 1; i >= 0; i-- {
 			r := reqs[i]
 			h := HeadersV1{Version: 1, HdrType: 1}
-			_ = writeFrame(srvTx, FrameHeader{StreamID: r.streamID, Type: FrameTypeHEADERS, Flags: HeadersFlagINITIAL}, encodeHeaders(h), context.Background())
-			_ = writeFrame(srvTx, FrameHeader{StreamID: r.streamID, Type: FrameTypeMESSAGE}, r.msg, context.Background())
+			_ = writeFrame(srvTx, FrameHeader{StreamID: r.streamID, Type: FrameTypeHEADERS, Flags: HeadersFlagINITIAL}, encodeHeaders(h), testCtx)
+			_ = writeFrame(srvTx, FrameHeader{StreamID: r.streamID, Type: FrameTypeMESSAGE}, r.msg, testCtx)
 			tr := TrailersV1{Version: 1, GRPCStatusCode: 0}
-			_ = writeFrame(srvTx, FrameHeader{StreamID: r.streamID, Type: FrameTypeTRAILERS, Flags: TrailersFlagEND_STREAM}, encodeTrailers(tr), context.Background())
+			_ = writeFrame(srvTx, FrameHeader{StreamID: r.streamID, Type: FrameTypeTRAILERS, Flags: TrailersFlagEND_STREAM}, encodeTrailers(tr), testCtx)
 		}
 	}()
 
 	// Client factory
 	enableClientReader.Store(false)
 	defer enableClientReader.Store(true)
-	ct, err := newShmClientFactory(context.Background(), raw)
+	ct, err := newShmClientFactory(testCtx, raw)
 	if err != nil {
 		t.Fatalf("client factory: %v", err)
 	}
@@ -301,6 +307,9 @@ func TestShmConcurrentStreams(t *testing.T) {
 
 // TestShmStreamError tests error handling
 func TestShmStreamError(t *testing.T) {
+	testCtx, testCancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer testCancel()
+
 	name := fmt.Sprintf("error-%d", time.Now().UnixNano())
 	raw := fmt.Sprintf("shm://%s?cap=65536", name)
 
@@ -324,14 +333,14 @@ func TestShmStreamError(t *testing.T) {
 		srvTx := NewShmRingFromSegment(seg.B, seg.Mem)
 
 		// Read headers
-		fh, _, err := readFrame(srvRx, context.Background())
+		fh, _, err := readFrame(srvRx, testCtx)
 		if err != nil {
 			t.Errorf("server read: %v", err)
 			return
 		}
 
 		// Read message
-		_, _, err = readFrame(srvRx, context.Background())
+		_, _, err = readFrame(srvRx, testCtx)
 		if err != nil {
 			t.Errorf("server read msg: %v", err)
 			return
@@ -339,13 +348,13 @@ func TestShmStreamError(t *testing.T) {
 
 		// Send error TRAILERS
 		tr := TrailersV1{Version: 1, GRPCStatusCode: uint32(codes.Internal), GRPCStatusMsg: "test error"}
-		_ = writeFrame(srvTx, FrameHeader{StreamID: fh.StreamID, Type: FrameTypeTRAILERS, Flags: TrailersFlagEND_STREAM}, encodeTrailers(tr), context.Background())
+		_ = writeFrame(srvTx, FrameHeader{StreamID: fh.StreamID, Type: FrameTypeTRAILERS, Flags: TrailersFlagEND_STREAM}, encodeTrailers(tr), testCtx)
 	}()
 
 	// Client factory
 	enableClientReader.Store(false)
 	defer enableClientReader.Store(true)
-	ct, err := newShmClientFactory(context.Background(), raw)
+	ct, err := newShmClientFactory(testCtx, raw)
 	if err != nil {
 		t.Fatalf("client factory: %v", err)
 	}
@@ -513,7 +522,7 @@ func TestShmContextCanceledOnClose(t *testing.T) {
 	}
 	defer clientTransport.Close(nil)
 
-	cs, err := clientTransport.NewStream(context.Background(), &CallHdr{Method: "/test/CtxCancel"})
+	cs, err := clientTransport.NewStream(ctx, &CallHdr{Method: "/test/CtxCancel"})
 	if err != nil {
 		t.Fatalf("NewStream failed: %v", err)
 	}
@@ -569,9 +578,12 @@ func TestShmGracefulClose(t *testing.T) {
 	}
 	defer serverTransport.Close(nil)
 
+	testCtx, testCancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer testCancel()
+
 	// Start server stream handler: echo one message, then wait for client
 	// half-close and send OK trailers.
-	go serverTransport.HandleStreams(context.Background(), func(s *ServerStream) {
+	go serverTransport.HandleStreams(testCtx, func(s *ServerStream) {
 		// Send initial headers.
 		_ = serverTransport.writeHeader(s, metadata.MD{"content-type": []string{"application/grpc"}})
 
@@ -687,10 +699,13 @@ func TestShmMaxStreams(t *testing.T) {
 	}
 	defer serverTransport.Close(nil)
 
+	testCtx, testCancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer testCancel()
+
 	allowFinishFirst := make(chan struct{})
 	firstStarted := make(chan struct{})
 	var streamCount atomic.Uint32
-	go serverTransport.HandleStreams(context.Background(), func(s *ServerStream) {
+	go serverTransport.HandleStreams(testCtx, func(s *ServerStream) {
 		idx := streamCount.Add(1)
 		if idx == 1 {
 			close(firstStarted)
@@ -781,8 +796,11 @@ func TestShmServerHandlesClientGoAwayDraining(t *testing.T) {
 	}
 	defer serverTransport.Close(nil)
 
+	testCtx, testCancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer testCancel()
+
 	// Start server stream handler: respond OK immediately.
-	go serverTransport.HandleStreams(context.Background(), func(s *ServerStream) {
+	go serverTransport.HandleStreams(testCtx, func(s *ServerStream) {
 		_ = serverTransport.writeHeader(s, metadata.MD{"content-type": []string{"application/grpc"}})
 		_ = serverTransport.writeStatus(s, status.New(codes.OK, ""))
 	})
