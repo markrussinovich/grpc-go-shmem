@@ -106,7 +106,7 @@ func TestUnary_MetadataAndStatus(t *testing.T) {
 		}
 		// Send TRAILERS with status OK and custom trailer
 		tr := TrailersV1{Version: 1, GRPCStatusCode: 0, Metadata: []KV{{Key: "x-tr", Values: [][]byte{[]byte("trail-ok")}}, {Key: "x-tr-bin", Values: [][]byte{{0xEE, 0xFF}}}}}
-		if err := writeFrame(srvTx, FrameHeader{StreamID: fh.StreamID, Type: FrameTypeTRAILERS, Flags: TrailersFlagEND_STREAM}, encodeTrailers(tr), testCtx); err != nil {
+		if err := writeFrame(srvTx, FrameHeader{StreamID: fh.StreamID, Type: FrameTypeTRAILERS, Flags: TrailersFlagEndStream}, encodeTrailers(tr), testCtx); err != nil {
 			t.Errorf("write trailers: %v", err)
 			return
 		}

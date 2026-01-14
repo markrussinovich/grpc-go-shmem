@@ -112,7 +112,7 @@ func TestShmPingPongSizes(t *testing.T) {
 				_ = writeFrame(srvTx, FrameHeader{StreamID: fh.StreamID, Type: FrameTypeHEADERS, Flags: HeadersFlagINITIAL}, encodeHeaders(h), testCtx)
 				_ = writeFrame(srvTx, FrameHeader{StreamID: fh.StreamID, Type: FrameTypeMESSAGE}, msg, testCtx)
 				tr := TrailersV1{Version: 1, GRPCStatusCode: 0}
-				_ = writeFrame(srvTx, FrameHeader{StreamID: fh.StreamID, Type: FrameTypeTRAILERS, Flags: TrailersFlagEND_STREAM}, encodeTrailers(tr), testCtx)
+				_ = writeFrame(srvTx, FrameHeader{StreamID: fh.StreamID, Type: FrameTypeTRAILERS, Flags: TrailersFlagEndStream}, encodeTrailers(tr), testCtx)
 			}()
 
 			// Client factory
@@ -232,7 +232,7 @@ func TestShmConcurrentStreams(t *testing.T) {
 			_ = writeFrame(srvTx, FrameHeader{StreamID: r.streamID, Type: FrameTypeHEADERS, Flags: HeadersFlagINITIAL}, encodeHeaders(h), testCtx)
 			_ = writeFrame(srvTx, FrameHeader{StreamID: r.streamID, Type: FrameTypeMESSAGE}, r.msg, testCtx)
 			tr := TrailersV1{Version: 1, GRPCStatusCode: 0}
-			_ = writeFrame(srvTx, FrameHeader{StreamID: r.streamID, Type: FrameTypeTRAILERS, Flags: TrailersFlagEND_STREAM}, encodeTrailers(tr), testCtx)
+			_ = writeFrame(srvTx, FrameHeader{StreamID: r.streamID, Type: FrameTypeTRAILERS, Flags: TrailersFlagEndStream}, encodeTrailers(tr), testCtx)
 		}
 	}()
 
@@ -347,7 +347,7 @@ func TestShmStreamError(t *testing.T) {
 
 		// Send error TRAILERS
 		tr := TrailersV1{Version: 1, GRPCStatusCode: uint32(codes.Internal), GRPCStatusMsg: "test error"}
-		_ = writeFrame(srvTx, FrameHeader{StreamID: fh.StreamID, Type: FrameTypeTRAILERS, Flags: TrailersFlagEND_STREAM}, encodeTrailers(tr), testCtx)
+		_ = writeFrame(srvTx, FrameHeader{StreamID: fh.StreamID, Type: FrameTypeTRAILERS, Flags: TrailersFlagEndStream}, encodeTrailers(tr), testCtx)
 	}()
 
 	// Client factory

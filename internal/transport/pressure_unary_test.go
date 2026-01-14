@@ -208,7 +208,7 @@ func TestUnary_BackpressureAndBlocking(t *testing.T) {
 				serverResult <- fmt.Errorf("server write message: %v", err)
 				return
 			}
-			if err := writeFrame(cliRx, FrameHeader{StreamID: fh.StreamID, Type: FrameTypeTRAILERS, Flags: TrailersFlagEND_STREAM}, encodeTrailers(TrailersV1{Version: 1, GRPCStatusCode: 0}), testCtx); err != nil {
+			if err := writeFrame(cliRx, FrameHeader{StreamID: fh.StreamID, Type: FrameTypeTRAILERS, Flags: TrailersFlagEndStream}, encodeTrailers(TrailersV1{Version: 1, GRPCStatusCode: 0}), testCtx); err != nil {
 				serverResult <- fmt.Errorf("server write trailers: %v", err)
 				return
 			}

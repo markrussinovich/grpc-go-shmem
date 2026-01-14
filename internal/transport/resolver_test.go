@@ -60,7 +60,7 @@ func (m *mockClientConn) NewAddress(addresses []resolver.Address) {
 	m.state = resolver.State{Addresses: addresses}
 }
 
-func (m *mockClientConn) ParseServiceConfig(serviceConfigJSON string) *serviceconfig.ParseResult {
+func (m *mockClientConn) ParseServiceConfig(_ string) *serviceconfig.ParseResult {
 	return nil
 }
 

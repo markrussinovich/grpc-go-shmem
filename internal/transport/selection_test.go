@@ -80,7 +80,7 @@ func TestSelection_ChoosesSHM_and_ExecutesUnary(t *testing.T) {
 		_ = writeFrame(srvTx, FrameHeader{StreamID: fh.StreamID, Type: FrameTypeHEADERS, Flags: HeadersFlagINITIAL}, encodeHeaders(h), testCtx)
 		_ = writeFrame(srvTx, FrameHeader{StreamID: fh.StreamID, Type: FrameTypeMESSAGE}, msg, testCtx)
 		tr := TrailersV1{Version: 1, GRPCStatusCode: 0}
-		_ = writeFrame(srvTx, FrameHeader{StreamID: fh.StreamID, Type: FrameTypeTRAILERS, Flags: TrailersFlagEND_STREAM}, encodeTrailers(tr), testCtx)
+		_ = writeFrame(srvTx, FrameHeader{StreamID: fh.StreamID, Type: FrameTypeTRAILERS, Flags: TrailersFlagEndStream}, encodeTrailers(tr), testCtx)
 	}()
 
 	// Registry-like selection: prefer shm over tcp when present.

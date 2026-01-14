@@ -102,7 +102,7 @@ func TestWriteReadFrame_HeadersAndTrailers(t *testing.T) {
 
 	// Write TRAILERS
 	trPayload := encodeTrailers(TrailersV1{Version: 1, GRPCStatusCode: 0, GRPCStatusMsg: "", Metadata: nil})
-	tfh := FrameHeader{StreamID: 1, Type: FrameTypeTRAILERS, Flags: TrailersFlagEND_STREAM}
+	tfh := FrameHeader{StreamID: 1, Type: FrameTypeTRAILERS, Flags: TrailersFlagEndStream}
 	if err := writeFrame(ring, tfh, trPayload, testCtx); err != nil {
 		t.Fatalf("writeFrame TRAILERS: %v", err)
 	}
@@ -110,7 +110,7 @@ func TestWriteReadFrame_HeadersAndTrailers(t *testing.T) {
 	if err != nil {
 		t.Fatalf("readFrame TRAILERS: %v", err)
 	}
-	if gotTFH.Type != FrameTypeTRAILERS || gotTFH.StreamID != 1 || gotTFH.Flags&TrailersFlagEND_STREAM == 0 {
+	if gotTFH.Type != FrameTypeTRAILERS || gotTFH.StreamID != 1 || gotTFH.Flags&TrailersFlagEndStream == 0 {
 		t.Fatalf("unexpected trailers fh: %+v", gotTFH)
 	}
 	if _, err := decodeTrailers(gotTPayload); err != nil {

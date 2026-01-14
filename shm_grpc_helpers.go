@@ -102,7 +102,7 @@ func (c *shmClientConn) Read(b []byte) (n int, err error) {
 }
 
 // Write implements net.Conn - not used directly in gRPC transport layer
-func (c *shmClientConn) Write(b []byte) (n int, err error) {
+func (c *shmClientConn) Write(_ []byte) (n int, err error) {
 	return 0, fmt.Errorf("direct write not supported on shared memory connection")
 }
 
@@ -127,17 +127,17 @@ func (c *shmClientConn) RemoteAddr() net.Addr {
 }
 
 // SetDeadline implements net.Conn - no-op for shared memory
-func (c *shmClientConn) SetDeadline(t time.Time) error {
+func (c *shmClientConn) SetDeadline(_ time.Time) error {
 	return nil
 }
 
 // SetReadDeadline implements net.Conn - no-op for shared memory
-func (c *shmClientConn) SetReadDeadline(t time.Time) error {
+func (c *shmClientConn) SetReadDeadline(_ time.Time) error {
 	return nil
 }
 
 // SetWriteDeadline implements net.Conn - no-op for shared memory
-func (c *shmClientConn) SetWriteDeadline(t time.Time) error {
+func (c *shmClientConn) SetWriteDeadline(_ time.Time) error {
 	return nil
 }
 

@@ -181,7 +181,7 @@ func (t *ShmClientTransport) sendWindowUpdate(streamID uint32, delta uint32) {
 	}
 	buf := make([]byte, 4)
 	binary.LittleEndian.PutUint32(buf, delta)
-	_ = writeFrame(t.clientToServer, FrameHeader{Type: FrameTypeWINDOW_UPDATE, StreamID: streamID}, buf, context.Background())
+	_ = writeFrame(t.clientToServer, FrameHeader{Type: FrameTypeWindowUpdate, StreamID: streamID}, buf, context.Background())
 }
 
 // test hook: allow disabling the background reader in tests to avoid
@@ -348,7 +348,7 @@ func (t *ShmClientTransport) processIncomingData(ctx context.Context) {
 			}
 			release()
 			continue
-		case FrameTypeWINDOW_UPDATE:
+		case FrameTypeWindowUpdate:
 			if len(payload) >= 4 {
 				delta := binary.LittleEndian.Uint32(payload[:4])
 				t.addSendQuota(fh.StreamID, delta)

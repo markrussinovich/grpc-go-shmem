@@ -175,7 +175,7 @@ func (t *ShmServerTransport) sendWindowUpdate(streamID uint32, delta uint32) {
 	}
 	buf := make([]byte, 4)
 	binary.LittleEndian.PutUint32(buf, delta)
-	_ = writeFrame(t.serverToClient, FrameHeader{Type: FrameTypeWINDOW_UPDATE, StreamID: streamID}, buf, context.Background())
+	_ = writeFrame(t.serverToClient, FrameHeader{Type: FrameTypeWindowUpdate, StreamID: streamID}, buf, context.Background())
 }
 
 func (t *ShmServerTransport) rejectNewStream(streamID uint32, msg string) {
@@ -385,7 +385,7 @@ func (t *ShmServerTransport) processIncomingData(ctx context.Context) {
 			// Handle PING with enforcement policy.
 			t.handlePing(ctx, payload)
 			release()
-		case FrameTypeWINDOW_UPDATE:
+		case FrameTypeWindowUpdate:
 			if len(payload) >= 4 {
 				delta := binary.LittleEndian.Uint32(payload[:4])
 				t.addSendQuota(fh.StreamID, delta)

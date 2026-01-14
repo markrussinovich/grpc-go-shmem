@@ -348,7 +348,7 @@ func (s *streamingServerStream) SendTrailers(statusCode uint32, statusMsg string
 	fh := FrameHeader{
 		StreamID: s.id,
 		Type:     FrameTypeTRAILERS,
-		Flags:    TrailersFlagEND_STREAM,
+		Flags:    TrailersFlagEndStream,
 	}
 
 	err := s.server.writeFrameSafe(fh, payload, s.ctx)

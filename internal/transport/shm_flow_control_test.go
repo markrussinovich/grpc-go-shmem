@@ -104,8 +104,8 @@ func TestShmFlowControlBlocksUntilWindowUpdate(t *testing.T) {
 	delta := uint32(msg.Len())
 	payload := make([]byte, 4)
 	binary.LittleEndian.PutUint32(payload, delta)
-	_ = writeFrame(srvTransport.serverToClient, FrameHeader{Type: FrameTypeWINDOW_UPDATE}, payload, ctx)
-	_ = writeFrame(srvTransport.serverToClient, FrameHeader{Type: FrameTypeWINDOW_UPDATE, StreamID: cs.id}, payload, ctx)
+	_ = writeFrame(srvTransport.serverToClient, FrameHeader{Type: FrameTypeWindowUpdate}, payload, ctx)
+	_ = writeFrame(srvTransport.serverToClient, FrameHeader{Type: FrameTypeWindowUpdate, StreamID: cs.id}, payload, ctx)
 
 	select {
 	case err := <-writeErr:

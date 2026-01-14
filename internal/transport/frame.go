@@ -50,19 +50,21 @@ var (
 // uint32 reserved2 // set to zero; future use
 const frameHeaderSize = 16
 
+// FrameType represents the type of a shared memory transport frame.
 type FrameType uint8
 
+// Frame type constants for the shared memory transport protocol.
 const (
-	FrameTypePAD           FrameType = 0x00
-	FrameTypeHEADERS       FrameType = 0x01
-	FrameTypeMESSAGE       FrameType = 0x02
-	FrameTypeTRAILERS      FrameType = 0x03
-	FrameTypeCANCEL        FrameType = 0x04
-	FrameTypeGOAWAY        FrameType = 0x05
-	FrameTypePING          FrameType = 0x06
-	FrameTypePONG          FrameType = 0x07
-	FrameTypeHALFCLOSE     FrameType = 0x08
-	FrameTypeWINDOW_UPDATE FrameType = 0x09
+	FrameTypePAD          FrameType = 0x00
+	FrameTypeHEADERS      FrameType = 0x01
+	FrameTypeMESSAGE      FrameType = 0x02
+	FrameTypeTRAILERS     FrameType = 0x03
+	FrameTypeCANCEL       FrameType = 0x04
+	FrameTypeGOAWAY       FrameType = 0x05
+	FrameTypePING         FrameType = 0x06
+	FrameTypePONG         FrameType = 0x07
+	FrameTypeHALFCLOSE    FrameType = 0x08
+	FrameTypeWindowUpdate FrameType = 0x09
 )
 
 // Flags
@@ -74,7 +76,7 @@ const (
 	MessageFlagMORE = uint8(0x01)
 
 	// TRAILERS flags
-	TrailersFlagEND_STREAM = uint8(0x01)
+	TrailersFlagEndStream = uint8(0x01)
 
 	// GOAWAY flags
 	GoAwayFlagDRAINING  = uint8(0x01)
@@ -123,7 +125,7 @@ type ringCommitPool struct {
 	commit ReadCommit // Value copy, not pointer - captures state at creation time
 }
 
-func (p *ringCommitPool) Get(n int) *[]byte { return nil }
+func (p *ringCommitPool) Get(_ int) *[]byte { return nil }
 
 func (p *ringCommitPool) Put(b *[]byte) {
 	p.once.Do(func() {
@@ -134,11 +136,13 @@ func (p *ringCommitPool) Put(b *[]byte) {
 
 // Simple binary v1 payloads.
 
+// KV represents a key-value pair for metadata in shared memory transport headers.
 type KV struct {
 	Key    string
 	Values [][]byte
 }
 
+// HeadersV1 represents the version 1 header frame payload for shared memory transport.
 type HeadersV1 struct {
 	Version          uint8  // must be 1
 	HdrType          uint8  // 0=client-initial, 1=server-initial
@@ -367,6 +371,7 @@ func decodeHeaders(b []byte) (HeadersV1, error) {
 	return h, nil
 }
 
+// TrailersV1 represents the version 1 trailer frame payload for shared memory transport.
 type TrailersV1 struct {
 	Version        uint8 // must be 1
 	GRPCStatusCode uint32
