@@ -33,17 +33,17 @@ type SimpleResponse struct {
 // EchoTestService is a simple service for benchmarking
 type EchoTestService interface {
 	UnaryCall(context.Context, *SimpleRequest) (*SimpleResponse, error)
-	StreamingCall(EchoTestService_StreamingCallServer) error
+	StreamingCall(EchoTestServiceStreamingCallServer) error
 }
 
-// EchoTestService_StreamingCallServer is the server-side stream interface
-type EchoTestService_StreamingCallServer interface {
+// EchoTestServiceStreamingCallServer is the server-side stream interface
+type EchoTestServiceStreamingCallServer interface {
 	Send(*SimpleResponse) error
 	Recv() (*SimpleRequest, error)
 }
 
-// EchoTestService_StreamingCallClient is the client-side stream interface
-type EchoTestService_StreamingCallClient interface {
+// EchoTestServiceStreamingCallClient is the client-side stream interface
+type EchoTestServiceStreamingCallClient interface {
 	Send(*SimpleRequest) error
 	Recv() (*SimpleResponse, error)
 	CloseSend() error
@@ -52,36 +52,38 @@ type EchoTestService_StreamingCallClient interface {
 // UnimplementedEchoTestServiceServer can be embedded for forward compatibility
 type UnimplementedEchoTestServiceServer struct{}
 
+// UnaryCall is a stub implementation that returns nil.
 func (UnimplementedEchoTestServiceServer) UnaryCall(context.Context, *SimpleRequest) (*SimpleResponse, error) {
 	return nil, nil
 }
 
-func (UnimplementedEchoTestServiceServer) StreamingCall(EchoTestService_StreamingCallServer) error {
+// StreamingCall is a stub implementation that returns nil.
+func (UnimplementedEchoTestServiceServer) StreamingCall(EchoTestServiceStreamingCallServer) error {
 	return nil
 }
 
 // RegisterEchoTestServiceServer registers the service (stub for now)
-func RegisterEchoTestServiceServer(s any, srv EchoTestService) {
+func RegisterEchoTestServiceServer(_ any, _ EchoTestService) {
 	// This is a stub - actual implementation would register with gRPC server
 }
 
 // NewEchoTestServiceClient creates a new client (stub for now)
-func NewEchoTestServiceClient(cc any) EchoTestServiceClient {
+func NewEchoTestServiceClient(_ any) EchoTestServiceClient {
 	return &echoTestServiceClient{}
 }
 
 // EchoTestServiceClient is the client API
 type EchoTestServiceClient interface {
 	UnaryCall(ctx context.Context, req *SimpleRequest) (*SimpleResponse, error)
-	StreamingCall(ctx context.Context) (EchoTestService_StreamingCallClient, error)
+	StreamingCall(ctx context.Context) (EchoTestServiceStreamingCallClient, error)
 }
 
 type echoTestServiceClient struct{}
 
-func (c *echoTestServiceClient) UnaryCall(ctx context.Context, req *SimpleRequest) (*SimpleResponse, error) {
+func (c *echoTestServiceClient) UnaryCall(_ context.Context, _ *SimpleRequest) (*SimpleResponse, error) {
 	return &SimpleResponse{}, nil
 }
 
-func (c *echoTestServiceClient) StreamingCall(ctx context.Context) (EchoTestService_StreamingCallClient, error) {
+func (c *echoTestServiceClient) StreamingCall(_ context.Context) (EchoTestServiceStreamingCallClient, error) {
 	return nil, nil
 }

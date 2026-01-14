@@ -97,7 +97,7 @@ type shmClientConn struct {
 }
 
 // Read implements net.Conn - not used directly in gRPC transport layer
-func (c *shmClientConn) Read(b []byte) (n int, err error) {
+func (c *shmClientConn) Read(_ []byte) (n int, err error) {
 	return 0, fmt.Errorf("direct read not supported on shared memory connection")
 }
 
