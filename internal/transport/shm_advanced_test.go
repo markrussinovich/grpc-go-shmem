@@ -154,7 +154,6 @@ func TestShmPingPongSizes(t *testing.T) {
 			for i := range msg {
 				if msg[i] != payload[i] {
 					t.Fatalf("data mismatch at %d", i)
-					break
 				}
 			}
 			_ = cli.Close()

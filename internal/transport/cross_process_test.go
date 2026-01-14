@@ -154,7 +154,7 @@ func TestCrossProcessRingBuffer(t *testing.T) {
 	t.Log("Cross-process test passed!")
 }
 
-func runCrossProcessChild(t *testing.T) {
+func runCrossProcessChild(_ *testing.T) {
 	segmentName := os.Getenv("GRPC_CROSS_PROCESS_SEGMENT")
 	if segmentName == "" {
 		fmt.Println("CHILD: missing segment name")
@@ -245,7 +245,7 @@ func TestCrossProcessGRPC(t *testing.T) {
 	t.Skip("Full gRPC cross-process test requires separate binary")
 }
 
-func runCrossProcessGRPCChild(t *testing.T) {
+func runCrossProcessGRPCChild(_ *testing.T) {
 	// Placeholder for full gRPC child process
 	port := os.Getenv("GRPC_CROSS_PROCESS_PORT")
 	if port == "" {

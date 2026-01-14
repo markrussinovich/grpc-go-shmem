@@ -519,7 +519,7 @@ func (t *ShmServerTransport) handleHeaders(ctx context.Context, streamID uint32,
 			ctxDone: s.ctxDone,
 			recv:    s.buf,
 		},
-		windowHandler: func(n int) {
+		windowHandler: func(_ int) {
 			// For shm transport, window handling is implicit via ring buffer
 		},
 	}
@@ -946,7 +946,7 @@ func (t *ShmServerTransport) maybeWriteHeader(s *ServerStream) error {
 }
 
 // write writes header and data for a stream
-func (t *ShmServerTransport) write(s *ServerStream, hdr []byte, data mem.BufferSlice, opts *WriteOptions) error {
+func (t *ShmServerTransport) write(s *ServerStream, hdr []byte, data mem.BufferSlice, _ *WriteOptions) error {
 	if t.closed.Load() {
 		return ErrConnClosing
 	}

@@ -169,7 +169,7 @@ type shmClientConn struct {
 }
 
 // Read implements net.Conn - not used directly in gRPC
-func (c *shmClientConn) Read(b []byte) (n int, err error) {
+func (c *shmClientConn) Read(_ []byte) (n int, err error) {
 	if c.closed {
 		return 0, errors.New("connection closed")
 	}
@@ -177,7 +177,7 @@ func (c *shmClientConn) Read(b []byte) (n int, err error) {
 }
 
 // Write implements net.Conn - not used directly in gRPC
-func (c *shmClientConn) Write(b []byte) (n int, err error) {
+func (c *shmClientConn) Write(_ []byte) (n int, err error) {
 	if c.closed {
 		return 0, errors.New("connection closed")
 	}
@@ -205,17 +205,17 @@ func (c *shmClientConn) RemoteAddr() net.Addr {
 }
 
 // SetDeadline implements net.Conn
-func (c *shmClientConn) SetDeadline(t time.Time) error {
+func (c *shmClientConn) SetDeadline(_ time.Time) error {
 	return nil // Shared memory doesn't support deadlines
 }
 
 // SetReadDeadline implements net.Conn
-func (c *shmClientConn) SetReadDeadline(t time.Time) error {
+func (c *shmClientConn) SetReadDeadline(_ time.Time) error {
 	return nil // Shared memory doesn't support deadlines
 }
 
 // SetWriteDeadline implements net.Conn
-func (c *shmClientConn) SetWriteDeadline(t time.Time) error {
+func (c *shmClientConn) SetWriteDeadline(_ time.Time) error {
 	return nil // Shared memory doesn't support deadlines
 }
 

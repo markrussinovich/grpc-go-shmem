@@ -37,7 +37,7 @@ type shmResolverBuilder struct{}
 // Build creates a new shared memory resolver.
 // The target should be in the format "shm://segment_name" where segment_name
 // is the name of the shared memory segment to connect to.
-func (*shmResolverBuilder) Build(target resolver.Target, cc resolver.ClientConn, opts resolver.BuildOptions) (resolver.Resolver, error) {
+func (*shmResolverBuilder) Build(target resolver.Target, cc resolver.ClientConn, _ resolver.BuildOptions) (resolver.Resolver, error) {
 	// For shm://segment_name, url.Parse puts segment_name in Host, not Path.
 	// So we need to check both Endpoint() and URL.Host to get the segment name.
 	segmentName := target.Endpoint()

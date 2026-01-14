@@ -24,9 +24,8 @@ import (
 	"sync/atomic"
 )
 
-var (
-	ErrConnectionClosed = errors.New("connection closed")
-)
+// ErrConnectionClosed is returned when operations are attempted on a closed connection.
+var ErrConnectionClosed = errors.New("connection closed")
 
 // ShmConn models a duplex byte pipe backed by two rings.
 // Server: read from ring A (client->server), write to ring B (server->client)

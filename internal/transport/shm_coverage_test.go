@@ -369,7 +369,7 @@ func TestShmServerWithMisbehavedClient(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
 
-		go serverTransport.HandleStreams(ctx, func(s *ServerStream) {
+		go serverTransport.HandleStreams(ctx, func(_ *ServerStream) {
 			// Don't expect any streams
 		})
 

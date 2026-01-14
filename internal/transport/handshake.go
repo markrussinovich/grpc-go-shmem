@@ -28,9 +28,8 @@ import (
 	"unsafe"
 )
 
-var (
-	ErrFutexNotSupported = errors.New("futex operations not supported on this platform")
-)
+// ErrFutexNotSupported is returned when futex operations are attempted on a platform that doesn't support them.
+var ErrFutexNotSupported = errors.New("futex operations not supported on this platform")
 
 // WaitForClient waits for the client to mark itself as ready.
 // The server calls this after creating the segment to wait for a client connection.

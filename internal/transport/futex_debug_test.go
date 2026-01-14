@@ -61,7 +61,7 @@ func TestFutexDirect(t *testing.T) {
 		r1, r2, errno := syscall.RawSyscall6(
 			syscall.SYS_FUTEX,
 			uintptr(unsafe.Pointer(addr)),
-			FUTEX_WAIT_PRIVATE,
+			futexWaitPrivate,
 			42, // expected value
 			uintptr(unsafe.Pointer(&ts)),
 			0,
@@ -120,7 +120,7 @@ func TestFutexWithWaker(t *testing.T) {
 		r1, r2, errno := syscall.RawSyscall6(
 			syscall.SYS_FUTEX,
 			uintptr(unsafe.Pointer(addr)),
-			FUTEX_WAKE_PRIVATE,
+			futexWakePrivate,
 			1, // wake 1 waiter
 			0,
 			0,
@@ -142,7 +142,7 @@ func TestFutexWithWaker(t *testing.T) {
 	r1, r2, errno := syscall.RawSyscall6(
 		syscall.SYS_FUTEX,
 		uintptr(unsafe.Pointer(addr)),
-		FUTEX_WAIT_PRIVATE,
+		futexWaitPrivate,
 		100,                          // expected value
 		uintptr(unsafe.Pointer(&ts)), // timeout to prevent hang
 		0,

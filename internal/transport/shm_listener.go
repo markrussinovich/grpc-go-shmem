@@ -279,7 +279,7 @@ func (l *ShmListener) SetKeepaliveParams(kp keepalive.ServerParameters, kep keep
 // shmConn net.Conn implementation
 
 // Read reads data from the connection
-func (c *shmConn) Read(b []byte) (n int, err error) {
+func (c *shmConn) Read(_ []byte) (n int, err error) {
 	if c.closed.Load() {
 		return 0, errors.New("connection closed")
 	}
@@ -290,7 +290,7 @@ func (c *shmConn) Read(b []byte) (n int, err error) {
 }
 
 // Write writes data to the connection
-func (c *shmConn) Write(b []byte) (n int, err error) {
+func (c *shmConn) Write(_ []byte) (n int, err error) {
 	if c.closed.Load() {
 		return 0, errors.New("connection closed")
 	}
@@ -339,19 +339,19 @@ func (c *shmConn) RemoteAddr() net.Addr {
 }
 
 // SetDeadline sets the read and write deadlines
-func (c *shmConn) SetDeadline(t time.Time) error {
+func (c *shmConn) SetDeadline(_ time.Time) error {
 	// Shared memory connections don't support deadlines in the traditional sense
 	return nil
 }
 
 // SetReadDeadline sets the deadline for future Read calls
-func (c *shmConn) SetReadDeadline(t time.Time) error {
+func (c *shmConn) SetReadDeadline(_ time.Time) error {
 	// Shared memory connections don't support deadlines in the traditional sense
 	return nil
 }
 
 // SetWriteDeadline sets the deadline for future Write calls
-func (c *shmConn) SetWriteDeadline(t time.Time) error {
+func (c *shmConn) SetWriteDeadline(_ time.Time) error {
 	// Shared memory connections don't support deadlines in the traditional sense
 	return nil
 }

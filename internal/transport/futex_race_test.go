@@ -205,7 +205,7 @@ func TestConcurrentFutexOperations(t *testing.T) {
 		t.Skip("Futex tests only supported on Linux")
 	}
 
-	var addr uint32 = 0
+	var addr uint32
 	var wg sync.WaitGroup
 	const numGoroutines = 6  // Reduced for stability
 	const numIterations = 10 // Reduced for stability

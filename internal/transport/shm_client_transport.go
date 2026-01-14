@@ -670,7 +670,7 @@ func (t *ShmClientTransport) NewStream(ctx context.Context, callHdr *CallHdr) (*
 					s.Close(err)
 				},
 			},
-			windowHandler: func(n int) {
+			windowHandler: func(_ int) {
 				// Flow control: for shm transport, we don't need traditional flow control
 				// as the ring buffer already provides backpressure
 			},
@@ -835,7 +835,7 @@ func (t *ShmClientTransport) incrMsgRecv() {
 
 // closeStream closes the given stream and cleans up resources.
 // This is called by ClientStream.Close() to terminate the stream.
-func (t *ShmClientTransport) closeStream(s *ClientStream, err error, rst bool, rstCode http2.ErrCode, st *status.Status, mdata map[string][]string, eosReceived bool) {
+func (t *ShmClientTransport) closeStream(s *ClientStream, err error, rst bool, _ http2.ErrCode, st *status.Status, mdata map[string][]string, _ bool) {
 	// Set stream state to done
 	if s.swapState(streamDone) == streamDone {
 		// Already done, wait for first closer to finish

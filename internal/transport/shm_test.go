@@ -652,7 +652,7 @@ func TestFutexWaitWake(t *testing.T) {
 		t.Skip("Futex tests only supported on Linux")
 	}
 
-	var addr uint32 = 0
+	var addr uint32
 	waitDone := make(chan bool, 1)
 	wakeCount := make(chan int, 1)
 
@@ -750,7 +750,7 @@ func TestFutexValueChange(t *testing.T) {
 		t.Skip("Futex tests only supported on Linux")
 	}
 
-	var addr uint32 = 0
+	var addr uint32
 	waitDone := make(chan bool, 1)
 
 	// Start a waiter

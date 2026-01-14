@@ -40,10 +40,10 @@ func futexLogf(format string, args ...any) {
 
 // Linux futex constants
 const (
-	FUTEX_WAIT         = 0   // FUTEX_WAIT (shared, for cross-process)
-	FUTEX_WAKE         = 1   // FUTEX_WAKE (shared, for cross-process)
-	FUTEX_WAIT_PRIVATE = 128 // FUTEX_WAIT | FUTEX_PRIVATE_FLAG
-	FUTEX_WAKE_PRIVATE = 129 // FUTEX_WAKE | FUTEX_PRIVATE_FLAG
+	futexOpWait        = 0   // FUTEX_WAIT (shared, for cross-process)
+	futexOpWake        = 1   // FUTEX_WAKE (shared, for cross-process)
+	futexWaitPrivate   = 128 // FUTEX_WAIT | FUTEX_PRIVATE_FLAG
+	futexWakePrivate   = 129 // FUTEX_WAKE | FUTEX_PRIVATE_FLAG
 )
 
 // futexWait waits for the value at addr to change from val.
@@ -70,7 +70,7 @@ func futexWait(addr *uint32, val uint32) error {
 	r1, _, errno := syscall.Syscall6(
 		syscall.SYS_FUTEX,
 		uintptr(unsafe.Pointer(addr)), // uaddr - address to wait on
-		FUTEX_WAIT,                    // futex_op - wait operation (shared, for cross-process)
+		futexOpWait,                   // futex_op - wait operation (shared, for cross-process)
 		uintptr(val),                  // val - expected value
 		0,                             // timeout - infinite (NULL)
 		0,                             // uaddr2 - unused
@@ -126,7 +126,7 @@ func futexWaitTimeout(addr *uint32, val uint32, timeoutNs int64) error {
 	r1, _, errno := syscall.Syscall6(
 		syscall.SYS_FUTEX,
 		uintptr(unsafe.Pointer(addr)), // uaddr - address to wait on
-		FUTEX_WAIT,                    // futex_op - wait operation (shared, for cross-process)
+		futexOpWait,                   // futex_op - wait operation (shared, for cross-process)
 		uintptr(val),                  // val - expected value
 		uintptr(unsafe.Pointer(&ts)),  // timeout - timespec pointer
 		0,                             // uaddr2 - unused
@@ -165,7 +165,7 @@ func futexWake(addr *uint32, n int) (int, error) {
 	r1, _, errno := syscall.Syscall6(
 		syscall.SYS_FUTEX,
 		uintptr(unsafe.Pointer(addr)), // uaddr - address to wake on
-		FUTEX_WAKE,                    // futex_op - wake operation (shared, for cross-process)
+		futexOpWake,                   // futex_op - wake operation (shared, for cross-process)
 		uintptr(n),                    // val - number of threads to wake
 		0,                             // timeout - unused for wake
 		0,                             // uaddr2 - unused

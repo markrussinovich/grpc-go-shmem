@@ -225,16 +225,16 @@ func (r *Ring) Read(p []byte) (int, error) {
 // contiguous slices (head/tail) referencing internal storage. Caller must fill
 // at most len(s1)+len(s2) bytes and then call CommitWrite(k). Returns ok=false
 // if insufficient space or ring is closed.
-func (r *Ring) ReserveWrite(n int) (s1, s2 []byte, ok bool) { /* stub */ return nil, nil, false }
+func (r *Ring) ReserveWrite(_ int) (s1, s2 []byte, ok bool) { /* stub */ return nil, nil, false }
 
 // CommitWrite advances the write index by n bytes previously obtained via
 // ReserveWrite. It is the caller's responsibility to not over-commit.
-func (r *Ring) CommitWrite(n int) { /* stub */ }
+func (r *Ring) CommitWrite(_ int) { /* stub */ }
 
 // PeekRead returns up to n bytes available for reading as two contiguous slices.
 // Caller must call CommitRead(k) after consuming bytes from s1/s2. Returns
 // (nil,nil,false) if no data.
-func (r *Ring) PeekRead(n int) (s1, s2 []byte, ok bool) { /* stub */ return nil, nil, false }
+func (r *Ring) PeekRead(_ int) (s1, s2 []byte, ok bool) { /* stub */ return nil, nil, false }
 
 // CommitRead advances the read index by n bytes previously obtained via PeekRead.
-func (r *Ring) CommitRead(n int) { /* stub */ }
+func (r *Ring) CommitRead(_ int) { /* stub */ }
