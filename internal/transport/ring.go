@@ -108,14 +108,11 @@ type ShmRing struct {
 	dataSpinCutoff  uint32 // Current spin iterations for waiting on data
 	spaceSpinCutoff uint32 // Current spin iterations for waiting on space
 
-	// Pre-allocated commit contexts to avoid closure allocation on every operation.
-	// These are reused across calls - callers must commit before the next operation.
-	writeCommit WriteCommit
-	readCommit  ReadCommit
+	// Pre-allocated commit context for read operations (reads are single-threaded).
+	readCommit ReadCommit
 }
 
 // WriteCommit holds the state needed to commit a write operation.
-// This is embedded in ShmRing to avoid allocation on every ReserveWrite call.
 type WriteCommit struct {
 	ring     *ShmRing
 	writeIdx uint64
@@ -219,8 +216,7 @@ func NewShmRingFromSegment(ringView *ringView, mem []byte) *ShmRing {
 		dataSpinCutoff:  spinIterationsDefault,
 		spaceSpinCutoff: spinIterationsDefault,
 	}
-	// Initialize commit contexts with back-pointers
-	r.writeCommit.ring = r
+	// Initialize read commit context with back-pointer (reads are single-threaded)
 	r.readCommit.ring = r
 	// Initialize pendingReadIdx from current shared readIdx
 	atomic.StoreUint64(&r.pendingReadIdx, r.header().ReadIndex())
@@ -1018,7 +1014,7 @@ func DiagnoseDuelingBuffers(clientToServer, serverToClient *ShmRing) (bool, stri
 type WriteReservation struct {
 	First     []byte       // First contiguous slice (from write position to end of buffer or requested size)
 	Second    []byte       // Second contiguous slice (from start of buffer) - may be empty if First has enough space
-	commitCtx *WriteCommit // Pre-allocated commit context (no allocation)
+	commitCtx *WriteCommit // Commit context for this reservation
 }
 
 // Commit commits the written bytes and advances the write index.
@@ -1086,14 +1082,19 @@ func (r *ShmRing) ReserveWrite(n int, ctx context.Context) (WriteReservation, er
 				second = unsafe.Slice((*byte)(secondPtr), secondLenI)
 			}
 
-			// Set up pre-allocated commit context (no closure allocation)
-			r.writeCommit.writeIdx = writeIdx
-			r.writeCommit.maxBytes = n
+			// Set up commit context for this reservation.
+			// Note: We allocate a new WriteCommit per reservation to avoid races
+			// when multiple goroutines call ReserveWrite concurrently.
+			commitCtx := &WriteCommit{
+				ring:     r,
+				writeIdx: writeIdx,
+				maxBytes: n,
+			}
 
 			return WriteReservation{
 				First:     first,
 				Second:    second,
-				commitCtx: &r.writeCommit,
+				commitCtx: commitCtx,
 			}, nil
 		}
 
