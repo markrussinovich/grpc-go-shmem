@@ -129,10 +129,6 @@ func (rc *ReadCommit) Commit(consumed int) {
 
 	hdr := rc.ring.header()
 
-	// Capture used before advancing read index, for SpaceWaiters wake decision
-	writeIdx := hdr.WriteIndex()
-	usedBefore := writeIdx - rc.commitReadIdx
-
 	// Advance shared read index (release-publish) - frees space for writer
 	hdr.SetReadIndex(rc.commitReadIdx + uint64(consumed))
 
@@ -144,9 +140,9 @@ func (rc *ReadCommit) Commit(consumed int) {
 			futexWake(&hdr.contigSeq, 1)
 		}
 	}
-	// Space: only wake SpaceWaiters when ring transitions from completely full to not-full.
-	// SpaceWaiters only wait when free == 0, so they only need waking on full->not-full.
-	if usedBefore == rc.ring.capacity && consumed > 0 && hdr.SpaceWaiters() > 0 {
+	// Space: always wake waiters if any are waiting.
+	// This is conservative but avoids potential races in the waiter registration.
+	if consumed > 0 && hdr.SpaceWaiters() > 0 {
 		hdr.IncrementSpaceSequence()
 		futexWake(&hdr.spaceSeq, 1)
 	}
@@ -858,9 +854,9 @@ func (r *ShmRing) ReadBlockingContext(ctx context.Context, buf []byte) (int, err
 				}
 			}
 
-			// Space: only wake SpaceWaiters when ring transitions from completely full to not-full.
-			// SpaceWaiters only wait when free == 0, so they only need waking on full->not-full.
-			if usedBefore == r.capacity && bytesRead > 0 && hdr.SpaceWaiters() > 0 {
+			// Space: always wake waiters if any are waiting.
+			// This is conservative but avoids potential races in the waiter registration.
+			if bytesRead > 0 && hdr.SpaceWaiters() > 0 {
 				hdr.IncrementSpaceSequence()
 				newSeq := hdr.SpaceSequence()
 				shmDebugf("READBLOCKING_SPACE_WAKE: freed %d bytes, new spaceSeq=%d, waking waiters",
