@@ -18,8 +18,6 @@
  *
  */
 
-// Package shm implements a shared memory resolver for gRPC.
-// It resolves addresses of the form "shm://segment_name" to shared memory connections.
 package transport
 
 import (

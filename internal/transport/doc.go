@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-// Package shm provides a shared memory transport implementation for gRPC.
+// Package transport provides a shared memory transport implementation for gRPC.
 //
 // This package implements a high-performance shared memory transport that allows
 // gRPC communication between processes on the same machine without going through

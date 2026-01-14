@@ -16,9 +16,6 @@
  *
  */
 
-// Package shm provides a shared memory transport for gRPC over shared memory
-// segments, enabling high-performance inter-process communication (IPC) for
-// local gRPC clients and servers.
 package transport
 
 import (

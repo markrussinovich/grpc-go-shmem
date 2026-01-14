@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 
-// Package shm provides shared-memory transport primitives.
 package transport
 
 import (
