@@ -551,7 +551,8 @@ func (r *ShmRing) ReadBlocking(buf []byte) (int, error) {
 				return 0, io.EOF
 			}
 			if err := futexWait(&hdr.dataSeq, dataSeq); err != nil {
-				// Continue loop for spurious wake or other wake reasons
+				// Spurious wake or other wake reasons - just continue the loop
+				_ = err // silence staticcheck SA9003
 			}
 			// Check if ring is still valid before decrementing - segment may
 			// have been unmapped while we were blocked on futexWait

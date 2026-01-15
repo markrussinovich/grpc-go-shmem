@@ -559,6 +559,7 @@ func TestShmEncodingRequiredStatus(t *testing.T) {
 		}
 		if err != nil {
 			// Continue anyway - may be EOF
+			_ = err // silence staticcheck SA9003
 		}
 
 		// Send headers

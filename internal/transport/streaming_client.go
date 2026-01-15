@@ -66,7 +66,6 @@ type StreamingClientStream struct {
 	errCh    chan error
 
 	// Send coordination
-	sendMu     sync.Mutex
 	sendQueue  chan []byte // buffered queue for outgoing messages
 	senderDone chan struct{}
 
@@ -227,11 +226,6 @@ func (c *ShmStreamingClient) NewStream(ctx context.Context, method, authority st
 	c.startReader()
 
 	return s, nil
-}
-
-// metadataToKV converts metadata []KV - just returns as-is since test uses []KV directly
-func metadataToKV(md []KV) []KV {
-	return md
 }
 
 // runStreamSender runs a dedicated sender goroutine for a stream.

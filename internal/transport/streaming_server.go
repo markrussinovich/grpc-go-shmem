@@ -63,7 +63,6 @@ type streamingServerStream struct {
 
 	// Send coordination
 	sendQueue  chan []byte // buffered queue for outgoing messages
-	sendMu     sync.Mutex
 	senderDone chan struct{}
 
 	// Lifecycle

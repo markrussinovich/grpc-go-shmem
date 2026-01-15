@@ -69,7 +69,6 @@ type ShmServerTransport struct {
 
 	// Stream management
 	streams    map[uint32]*ServerStream
-	streamID   uint32 // next stream ID to assign
 	handleFunc func(*ServerStream)
 	maxStreams uint32
 
