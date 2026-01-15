@@ -24,3 +24,4 @@ benchmark/shmemtcp/out/*.png
 internal/transport/transport.test
 transport.test
 shm.test.exe
+.venv/

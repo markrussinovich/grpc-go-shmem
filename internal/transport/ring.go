@@ -123,9 +123,19 @@ type ReadCommit struct {
 
 // Commit advances the shared read index to free space for the writer.
 // consumed must not exceed maxBytes.
+// Safe to call after the ring is closed - silently does nothing.
 func (rc *ReadCommit) Commit(consumed int) {
 	if consumed < 0 || consumed > rc.maxBytes {
 		return // Invalid consumption, ignore
+	}
+
+	// Check if the ring has been closed before accessing shared memory.
+	// This is critical because Commit may be called from a buffer's Free()
+	// callback after the transport has been closed and the shared memory
+	// segment unmapped. Accessing shared memory after unmap causes SIGSEGV.
+	// The atomic load is cheap (~1ns) and avoids the crash.
+	if rc.ring == nil || atomic.LoadUint32(&rc.ring.closed) != 0 {
+		return
 	}
 
 	hdr := rc.ring.header()

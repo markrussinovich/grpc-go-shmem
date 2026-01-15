@@ -158,14 +158,26 @@ pip install matplotlib numpy
 
 ```
 benchmark/shmemtcp/
-├── README.md              # This file
-├── benchmark_runner.py    # Main runner script
-├── main.go                # Go benchmark harness
+├── README.md                     # This file
+├── benchmark_runner.py           # Full benchmark runner (runs Go tests + plots)
+├── generate_benchmark_plots.py   # Static visualization from cached data
+├── main.go                       # Go benchmark harness
 └── out/
-    ├── benchmark_results.json    # Cached results
-    ├── benchmark_patterns.png    # Pattern-based plots
-    └── benchmark_summary.png     # Summary dashboard
+    ├── benchmark_results.json          # Cached results from benchmark_runner.py
+    ├── benchmark_results.txt           # Raw Go benchmark output
+    ├── benchmark_comprehensive.png     # 6-panel comprehensive dashboard
+    ├── benchmark_latency_distribution.png  # Latency histograms/CDFs
+    ├── benchmark_use_cases.png         # Use case recommendation matrix
+    ├── benchmark_patterns.png          # Pattern-based comparison plots
+    └── benchmark_summary.png           # Summary dashboard
 ```
+
+## Scripts
+
+| Script | Purpose | Usage |
+|--------|---------|-------|
+| `benchmark_runner.py` | Run Go benchmarks and generate plots | `python3 benchmark_runner.py [--run\|--plot-only]` |
+| `generate_benchmark_plots.py` | Generate static plots from hardcoded data | `python3 generate_benchmark_plots.py` |
 
 ## Interpreting Results
 
