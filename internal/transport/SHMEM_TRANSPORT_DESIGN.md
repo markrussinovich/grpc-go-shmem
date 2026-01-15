@@ -168,12 +168,12 @@ func (r *ShmRing) WriteBlocking(data []byte) error {
         if r.header.Closed() {
             return ErrRingClosed
         }
-        
+
         // Calculate available space
         writeIdx := r.header.WriteIndex()
         readIdx := r.header.ReadIndex()
         available := r.capacity - (writeIdx - readIdx)
-        
+
         if len(data) <= available {
             // Perform write (handle wrap-around)
             writePos := writeIdx & r.capMask
@@ -186,10 +186,10 @@ func (r *ShmRing) WriteBlocking(data []byte) error {
                 copy(r.dataArea[writePos:], data[:firstChunk])
                 copy(r.dataArea[0:], data[firstChunk:])
             }
-            
+
             // Publish write atomically
             r.header.SetWriteIndex(writeIdx + len(data))
-            
+
             // Signal waiting readers
             r.header.IncrementDataSequence()
             if r.header.DataWaiters() > 0 {
@@ -197,7 +197,7 @@ func (r *ShmRing) WriteBlocking(data []byte) error {
             }
             return nil
         }
-        
+
         // Wait for space using futex
         r.header.IncSpaceWaiters()
         spaceSeq := r.header.SpaceSequence()
@@ -216,12 +216,12 @@ func (r *ShmRing) ReadBlocking(buf []byte) (int, error) {
         writeIdx := r.header.WriteIndex()
         readIdx := r.header.ReadIndex()
         available := writeIdx - readIdx
-        
+
         if available > 0 {
             // Read data (handle wrap-around)
             toRead := min(len(buf), available)
             readPos := readIdx & r.capMask
-            
+
             if readPos + toRead <= r.capacity {
                 copy(buf, r.dataArea[readPos:readPos+toRead])
             } else {
@@ -229,10 +229,10 @@ func (r *ShmRing) ReadBlocking(buf []byte) (int, error) {
                 copy(buf, r.dataArea[readPos:])
                 copy(buf[firstChunk:], r.dataArea[:toRead-firstChunk])
             }
-            
+
             // Publish read atomically
             r.header.SetReadIndex(readIdx + toRead)
-            
+
             // Signal waiting writers
             r.header.IncrementSpaceSequence()
             if r.header.SpaceWaiters() > 0 {
@@ -240,12 +240,12 @@ func (r *ShmRing) ReadBlocking(buf []byte) (int, error) {
             }
             return toRead, nil
         }
-        
+
         // Check for closed ring
         if r.header.Closed() {
             return 0, io.EOF
         }
-        
+
         // Wait for data using futex
         r.header.IncDataWaiters()
         dataSeq := r.header.DataSequence()
@@ -276,7 +276,7 @@ func futexWait(addr *uint32, val uint32) error {
     if atomic.LoadUint32(addr) != val {
         return nil  // Value already changed
     }
-    
+
     syscall.Syscall6(
         syscall.SYS_FUTEX,
         uintptr(unsafe.Pointer(addr)),
@@ -404,23 +404,23 @@ type TrailersV1 struct {
 ```go
 func writeFrame(ctx context.Context, tx *ShmRing, fh FrameHeader, payload []byte) error {
     fh.Length = uint32(len(payload))
-    
+
     // Atomically reserve space for header + payload
     total := frameHeaderSize + len(payload)
     res, err := tx.ReserveWrite(ctx, total)
     if err != nil {
         return err
     }
-    
+
     // Encode header
     var hdr [16]byte
     encodeFrameHeaderTo(&hdr, fh)
-    
+
     // Write header and payload
     res.Write(hdr[:])
     res.Write(payload)
     res.Commit()
-    
+
     return nil
 }
 ```
@@ -438,14 +438,14 @@ type ShmClientTransport struct {
     segment        *Segment
     clientToServer *ShmRing    // Ring A
     serverToClient *ShmRing    // Ring B
-    
+
     streams        map[uint32]*ClientStream
     streamID       uint32      // Next stream ID (odd for client)
-    
+
     // Flow control
     connSendQuota  int64
     streamSendQuota map[uint32]int64
-    
+
     // Lifecycle
     ctx            context.Context
     cancel         context.CancelFunc
@@ -460,7 +460,7 @@ type ShmClientTransport struct {
 // Create a new RPC stream
 func (t *ShmClientTransport) NewStream(ctx context.Context, callHdr *CallHdr) (*ClientStream, error)
 
-// Write data to a stream  
+// Write data to a stream
 func (t *ShmClientTransport) Write(s *ClientStream, hdr []byte, data mem.BufferSlice, opts *WriteOptions) error
 
 // Close the transport
@@ -479,14 +479,14 @@ type ShmServerTransport struct {
     segment        *Segment
     serverToClient *ShmRing    // Ring B
     clientToServer *ShmRing    // Ring A
-    
+
     streams        map[uint32]*ServerStream
     handleFunc     func(*ServerStream)
-    
+
     // Flow control
     connSendQuota  int64
     streamSendQuota map[uint32]int64
-    
+
     // Lifecycle
     ctx            context.Context
     cancel         context.CancelFunc
@@ -518,16 +518,16 @@ func (t *ShmClientTransport) processIncomingData(ctx context.Context) {
         if t.closed.Load() {
             return
         }
-        
+
         // Block on next frame (futex-based)
         fh, payload, err := readFrameView(ctx, t.serverToClient)
         if err != nil {
             return
         }
-        
+
         // Update keepalive timestamp
         atomic.StoreInt64(&t.lastRead, time.Now().UnixNano())
-        
+
         // Dispatch by frame type
         switch fh.Type {
         case FrameTypeHEADERS:
@@ -685,20 +685,20 @@ Before sending data, the transport acquires quota from both connection and strea
 func (t *ShmClientTransport) acquireSendQuota(ctx context.Context, streamID uint32, n int) error {
     for {
         t.sendQuotaMu.Lock()
-        
+
         connOK := t.connSendQuota >= int64(n)
         streamOK := t.streamSendQuota[streamID] >= int64(n)
-        
+
         if connOK && streamOK {
             t.connSendQuota -= int64(n)
             t.streamSendQuota[streamID] -= int64(n)
             t.sendQuotaMu.Unlock()
             return nil
         }
-        
+
         ch := t.quotaSignal
         t.sendQuotaMu.Unlock()
-        
+
         // Wait for quota update
         select {
         case <-ch:
@@ -718,7 +718,7 @@ Receivers send `WindowUpdate` frames to replenish sender quotas:
 func (t *ShmServerTransport) sendWindowUpdate(streamID uint32, delta uint32) {
     buf := make([]byte, 4)
     binary.LittleEndian.PutUint32(buf, delta)
-    writeFrame(context.Background(), t.serverToClient, 
+    writeFrame(context.Background(), t.serverToClient,
         FrameHeader{Type: FrameTypeWindowUpdate, StreamID: streamID}, buf)
 }
 ```
@@ -806,7 +806,7 @@ func main() {
         &transport.ShmAddr{Name: "helloworld_shm"},
         2*1024*1024, 512*1024, 512*1024,
     )
-    
+
     server := grpc.NewServer()
     pb.RegisterGreeterServer(server, &greeterServer{})
     server.Serve(lis)
@@ -831,7 +831,7 @@ func main() {
         grpc.WithTransportCredentials(insecure.NewCredentials()),
     )
     defer conn.Close()
-    
+
     client := pb.NewGreeterClient(conn)
     resp, _ := client.SayHello(context.Background(), &pb.HelloRequest{Name: "World"})
     fmt.Println("Response:", resp.Message)
