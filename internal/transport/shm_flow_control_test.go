@@ -65,7 +65,7 @@ func TestShmFlowControlBlocksUntilWindowUpdate(t *testing.T) {
 	}
 	defer cliTransport.Close(nil)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	defer cancel()
 
 	go srvTransport.HandleStreams(testCtx, func(s *ServerStream) {
