@@ -449,22 +449,19 @@ func (t *ShmServerTransport) handleHeaders(ctx context.Context, streamID uint32,
 		md[kv.Key] = vals
 	}
 
-	// Create receive buffer for the stream
-	buf := newRecvBuffer()
-
 	// Create the ServerStream
 	s := &ServerStream{
-		Stream: &Stream{
+		Stream: Stream{
 			id:             streamID,
 			method:         hdr.Method,
-			buf:            buf,
 			sendCompress:   "",
 			recvCompress:   "",
 			contentSubtype: "",
-			fc:             &inFlow{limit: uint32(maxWindowSize)},
 		},
 		st: t,
 	}
+	s.Stream.buf.init()
+	s.fc = inFlow{limit: uint32(maxWindowSize)}
 
 	// Create context for the stream. If the client provided an RPC deadline,
 	// honor it by creating a context with that deadline.
@@ -500,27 +497,18 @@ func (t *ShmServerTransport) handleHeaders(ctx context.Context, streamID uint32,
 		}
 	}
 
-	// Set requestRead callback for the stream
-	// For shared memory, no explicit flow control is needed
-	s.requestRead = func(n int) {
-		if n <= 0 {
-			return
-		}
-		if wu := s.fc.onRead(uint32(n)); wu > 0 {
-			t.sendWindowUpdate(streamID, wu)
-		}
-	}
+	// Set up readRequester for the stream
+	s.readRequester = s
+	s.ctxDone = s.ctx.Done()
 
 	// Create transport reader for the stream
-	s.trReader = &transportReader{
-		reader: &recvBufferReader{
+	s.trReader = transportReader{
+		reader: recvBufferReader{
 			ctx:     s.ctx,
 			ctxDone: s.ctxDone,
-			recv:    s.buf,
+			recv:    &s.buf,
 		},
-		windowHandler: func(_ int) {
-			// For shm transport, window handling is implicit via ring buffer
-		},
+		windowHandler: s,
 	}
 
 	// Register the stream (re-check draining/closed).
@@ -535,7 +523,7 @@ func (t *ShmServerTransport) handleHeaders(ctx context.Context, streamID uint32,
 		return nil
 	}
 	t.streams[streamID] = s
-	t.streamInFlow[streamID] = s.fc
+	t.streamInFlow[streamID] = &s.fc
 	// Clear idle time when we have active streams.
 	t.idle = time.Time{}
 	// Reset ping strikes when streams become active.
@@ -571,9 +559,6 @@ func (t *ShmServerTransport) handleMessage(streamID uint32, flags uint8, payload
 	sz := uint32(len(payload))
 	if wu := t.connInFlow.onData(sz); wu > 0 {
 		t.sendWindowUpdate(0, wu)
-	}
-	if s.fc == nil {
-		s.fc = &inFlow{limit: uint32(maxWindowSize)}
 	}
 	if err := s.fc.onData(sz); err != nil {
 		s.write(recvMsg{err: err})
@@ -612,9 +597,6 @@ func (t *ShmServerTransport) handleMessageBuffer(streamID uint32, flags uint8, b
 	sz := uint32(len(payload))
 	if wu := t.connInFlow.onData(sz); wu > 0 {
 		t.sendWindowUpdate(0, wu)
-	}
-	if s.fc == nil {
-		s.fc = &inFlow{limit: uint32(maxWindowSize)}
 	}
 	if err := s.fc.onData(sz); err != nil {
 		buf.Free()
@@ -1067,6 +1049,24 @@ func (t *ShmServerTransport) writeStatus(s *ServerStream, st *status.Status) err
 // incrMsgRecv increments the message received counter
 func (t *ShmServerTransport) incrMsgRecv() {
 	// Channelz metrics are not wired for shm transport; keep a no-op to satisfy interface expectations.
+}
+
+// adjustWindow sends out extra window update over the initial window size
+// of stream if the application is requesting data larger in size than
+// the window.
+func (t *ShmServerTransport) adjustWindow(s *ServerStream, n uint32) {
+	if w := s.fc.maybeAdjust(n); w > 0 {
+		t.sendWindowUpdate(s.id, w)
+	}
+}
+
+// updateWindow adjusts the inbound quota for the stream.
+// Window updates will be sent out when the cumulative quota
+// exceeds the corresponding threshold.
+func (t *ShmServerTransport) updateWindow(s *ServerStream, n uint32) {
+	if w := s.fc.onRead(n); w > 0 {
+		t.sendWindowUpdate(s.id, w)
+	}
 }
 
 // ConfigureKeepalive sets keepalive parameters and starts the keepalive

@@ -380,7 +380,7 @@ func (s *Stream) write(m recvMsg) {
 // drainRecvBuffer frees any queued message buffers to release underlying ring
 // reservations when a stream is being torn down without consuming all data.
 func (s *Stream) drainRecvBuffer() {
-	if s == nil || s.buf == nil {
+	if s == nil {
 		return
 	}
 	s.buf.drainAndFree()

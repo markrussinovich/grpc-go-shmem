@@ -34,6 +34,8 @@ type clientTransport interface {
 	incrMsgRecv()
 	closeStream(s *ClientStream, err error, rst bool, rstCode http2.ErrCode, st *status.Status, mdata map[string][]string, eosReceived bool)
 	write(s *ClientStream, hdr []byte, data mem.BufferSlice, opts *WriteOptions) error
+	adjustWindow(s *ClientStream, n uint32)
+	updateWindow(s *ClientStream, n uint32)
 }
 
 // Compile-time check to ensure http2Client implements clientTransport.

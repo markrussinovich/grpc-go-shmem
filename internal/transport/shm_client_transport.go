@@ -37,6 +37,7 @@ import (
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/mem"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
 )
 
@@ -417,9 +418,6 @@ func (t *ShmClientTransport) processIncomingData(ctx context.Context) {
 			if wu := t.connInFlow.onData(sz); wu > 0 {
 				t.sendWindowUpdate(0, wu)
 			}
-			if stream.fc == nil {
-				stream.fc = &inFlow{limit: uint32(maxWindowSize)}
-			}
 			if err := stream.fc.onData(sz); err != nil {
 				shmDebugf("[DEBUG] ShmClientTransport: MESSAGE flow control error: %v", err)
 				release()
@@ -645,13 +643,11 @@ func (t *ShmClientTransport) NewStream(ctx context.Context, callHdr *CallHdr) (*
 
 		// Create the client stream
 		s = &ClientStream{
-			Stream: &Stream{
+			Stream: Stream{
 				id:             streamID,
 				ctx:            ctx,
 				method:         callHdr.Method,
 				sendCompress:   callHdr.SendCompress,
-				buf:            newRecvBuffer(),
-				fc:             &inFlow{limit: uint32(maxWindowSize)},
 				contentSubtype: callHdr.ContentSubtype,
 			},
 			ct:         t, // Set the client transport (now an interface, no unsafe needed)
@@ -659,39 +655,26 @@ func (t *ShmClientTransport) NewStream(ctx context.Context, callHdr *CallHdr) (*
 			headerChan: make(chan struct{}),
 			doneFunc:   callHdr.DoneFunc,
 		}
+		s.Stream.buf.init()
+		s.fc = inFlow{limit: uint32(maxWindowSize)}
+		s.readRequester = s
 
 		// Set up transport reader for this stream
-		s.trReader = &transportReader{
-			reader: &recvBufferReader{
-				ctx:     s.ctx,
-				ctxDone: s.ctx.Done(),
-				recv:    s.buf,
-				closeStream: func(err error) {
-					s.Close(err)
-				},
+		s.trReader = transportReader{
+			reader: recvBufferReader{
+				ctx:          s.ctx,
+				ctxDone:      s.ctx.Done(),
+				recv:         &s.buf,
+				clientStream: s,
 			},
-			windowHandler: func(_ int) {
-				// Flow control: for shm transport, we don't need traditional flow control
-				// as the ring buffer already provides backpressure
-			},
-		}
-
-		// Set requestRead callback (required by Stream.ReadMessageHeader)
-		// For shared memory transport, tie window updates to application consumption.
-		s.requestRead = func(n int) {
-			if n <= 0 {
-				return
-			}
-			if wu := s.fc.onRead(uint32(n)); wu > 0 {
-				t.sendWindowUpdate(streamID, wu)
-			}
+			windowHandler: s,
 		}
 
 		// Register the stream
 		t.streams[streamID] = s
 		t.streamTransport[s] = t
 		t.streamSendQuota[streamID] = int64(maxWindowSize)
-		t.streamInFlow[streamID] = s.fc
+		t.streamInFlow[streamID] = &s.fc
 		if t.streamQuota > 0 && t.waitingStreams > 0 {
 			select {
 			case t.streamsQuotaAvailable <- struct{}{}:
@@ -826,11 +809,38 @@ func (t *ShmClientTransport) RemoteAddr() net.Addr {
 	return t.remoteAddr
 }
 
+// Peer returns the peer information for this transport.
+func (t *ShmClientTransport) Peer() *peer.Peer {
+	return &peer.Peer{
+		Addr:      t.remoteAddr,
+		AuthInfo:  nil, // Shared memory transport does not use authentication
+		LocalAddr: t.localAddr,
+	}
+}
+
 // incrMsgRecv increments the message received counter.
 // This is called by ClientStream.Read() when a message is successfully read.
 func (t *ShmClientTransport) incrMsgRecv() {
 	// For shm transport, we don't track channelz metrics yet
 	// This is a no-op for now, but maintains compatibility with ClientStream
+}
+
+// adjustWindow sends out extra window update over the initial window size
+// of stream if the application is requesting data larger in size than
+// the window.
+func (t *ShmClientTransport) adjustWindow(s *ClientStream, n uint32) {
+	if w := s.fc.maybeAdjust(n); w > 0 {
+		t.sendWindowUpdate(s.id, w)
+	}
+}
+
+// updateWindow adjusts the inbound quota for the stream.
+// Window updates will be sent out when the cumulative quota
+// exceeds the corresponding threshold.
+func (t *ShmClientTransport) updateWindow(s *ClientStream, n uint32) {
+	if w := s.fc.onRead(n); w > 0 {
+		t.sendWindowUpdate(s.id, w)
+	}
 }
 
 // closeStream closes the given stream and cleans up resources.
