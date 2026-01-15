@@ -63,9 +63,9 @@ func (s) TestResolverCaseSensitivity(t *testing.T) {
 		return nil, fmt.Errorf("not dialing with custom dialer")
 	}
 
-	cc, err := Dial(target, WithContextDialer(customDialer), WithTransportCredentials(insecure.NewCredentials()))
+	cc, err := NewClient(target, WithContextDialer(customDialer), WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
-		t.Fatalf("Unexpected Dial(%q) error: %v", target, err)
+		t.Fatalf("Unexpected NewClient(%q) error: %v", target, err)
 	}
 	cc.Connect()
 	if got, want := <-addrCh, "localhost:1234"; got != want {
@@ -85,9 +85,9 @@ func (s) TestResolverCaseSensitivity(t *testing.T) {
 	// This results in "passthrough" being used with the address as the whole
 	// target.
 	target = "caseTest2:///localhost:1234"
-	cc, err = Dial(target, WithContextDialer(customDialer), WithResolvers(res), WithTransportCredentials(insecure.NewCredentials()))
+	cc, err = NewClient(target, WithContextDialer(customDialer), withDefaultScheme("passthrough"), WithResolvers(res), WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
-		t.Fatalf("Unexpected Dial(%q) error: %v", target, err)
+		t.Fatalf("Unexpected NewClient(%q) error: %v", target, err)
 	}
 	cc.Connect()
 	if got, want := <-addrCh, target; got != want {
@@ -125,7 +125,7 @@ func (s) TestResolverAddressesToEndpoints(t *testing.T) {
 		WithResolvers(r),
 		WithDefaultServiceConfig(fmt.Sprintf(`{"loadBalancingConfig": [{"%s":{}}]}`, balancerName)))
 	if err != nil {
-		t.Fatalf("grpc.NewClient() failed: %v", err)
+		t.Fatalf("NewClient() failed: %v", err)
 	}
 	cc.Connect()
 	defer cc.Close()
@@ -176,7 +176,7 @@ func (s) TestResolverAddressesToEndpointsUsingNewAddresses(t *testing.T) {
 		WithResolvers(r),
 		WithDefaultServiceConfig(fmt.Sprintf(`{"loadBalancingConfig": [{"%s":{}}]}`, balancerName)))
 	if err != nil {
-		t.Fatalf("grpc.NewClient() failed: %v", err)
+		t.Fatalf("NewClient() failed: %v", err)
 	}
 	cc.Connect()
 	defer cc.Close()
@@ -195,23 +195,3 @@ func (s) TestResolverAddressesToEndpointsUsingNewAddresses(t *testing.T) {
 		t.Fatalf("timed out waiting for endpoints")
 	}
 }
-
-// Test ensures that there is no panic if the attributes within
-// resolver.State.Addresses contains a typed-nil value.
-func (s) TestResolverAddressesWithTypedNilAttribute(t *testing.T) {
-	r := manual.NewBuilderWithScheme(t.Name())
-	resolver.Register(r)
-
-	addrAttr := attributes.New("typed_nil", (*stringerVal)(nil))
-	r.InitialState(resolver.State{Addresses: []resolver.Address{{Addr: "addr1", Attributes: addrAttr}}})
-
-	cc, err := Dial(r.Scheme()+":///", WithTransportCredentials(insecure.NewCredentials()), WithResolvers(r))
-	if err != nil {
-		t.Fatalf("Unexpected error dialing: %v", err)
-	}
-	defer cc.Close()
-}
-
-type stringerVal struct{ s string }
-
-func (s stringerVal) String() string { return s.s }

@@ -22,6 +22,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"strings"
 	"sync"
 	"testing"
@@ -34,26 +35,24 @@ import (
 	"google.golang.org/grpc/codes"
 	estats "google.golang.org/grpc/experimental/stats"
 	"google.golang.org/grpc/internal"
+	"google.golang.org/grpc/internal/envconfig"
 	iresolver "google.golang.org/grpc/internal/resolver"
 	iringhash "google.golang.org/grpc/internal/ringhash"
 	"google.golang.org/grpc/internal/testutils"
 	"google.golang.org/grpc/internal/testutils/xds/e2e"
+	"google.golang.org/grpc/internal/xds/balancer/clusterimpl"
 	"google.golang.org/grpc/internal/xds/balancer/clustermanager"
 	"google.golang.org/grpc/internal/xds/bootstrap"
-	"google.golang.org/grpc/internal/xds/httpfilter"
+	serverFeature "google.golang.org/grpc/internal/xds/clients/xdsclient"
 	rinternal "google.golang.org/grpc/internal/xds/resolver/internal"
 	"google.golang.org/grpc/internal/xds/xdsclient"
 	"google.golang.org/grpc/internal/xds/xdsclient/xdsresource/version"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/resolver"
 	"google.golang.org/grpc/serviceconfig"
-	"google.golang.org/protobuf/proto"
-	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/durationpb"
-	"google.golang.org/protobuf/types/known/structpb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 
-	v3xdsxdstypepb "github.com/cncf/xds/go/xds/type/v3"
 	v3clusterpb "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
 	v3corepb "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	v3endpointpb "github.com/envoyproxy/go-control-plane/envoy/config/endpoint/v3"
@@ -96,9 +95,6 @@ func (s) TestResolverBuilder_AuthorityNotDefinedInBootstrap(t *testing.T) {
 	contents := e2e.DefaultBootstrapContents(t, "node-id", "dummy-management-server")
 
 	// Create an xDS resolver with the above bootstrap configuration.
-	if internal.NewXDSResolverWithConfigForTesting == nil {
-		t.Fatalf("internal.NewXDSResolverWithConfigForTesting is nil")
-	}
 	xdsResolver, err := internal.NewXDSResolverWithConfigForTesting.(func([]byte) (resolver.Builder, error))(contents)
 	if err != nil {
 		t.Fatalf("Failed to create xDS resolver for testing: %v", err)
@@ -290,6 +286,61 @@ func (s) TestResolverCloseClosesXDSClient(t *testing.T) {
 	}
 }
 
+// Tests the case where there is no virtual host in the route configuration
+// matches the dataplane authority. Verifies that the resolver returns the
+// correct error.
+func (s) TestNoMatchingVirtualHost(t *testing.T) {
+	// Spin up an xDS management server for the test.
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer cancel()
+	nodeID := uuid.New().String()
+	mgmtServer, _, _, bc := setupManagementServerForTest(t, nodeID)
+
+	// Configure route resource with no virtual host so that it does not match the authority.
+	listener := e2e.DefaultClientListener(defaultTestServiceName, defaultTestRouteConfigName)
+	route := e2e.DefaultRouteConfig(defaultTestRouteConfigName, defaultTestServiceName, defaultTestClusterName)
+	route.VirtualHosts = nil
+	configureResourcesOnManagementServer(ctx, t, mgmtServer, nodeID, []*v3listenerpb.Listener{listener}, []*v3routepb.RouteConfiguration{route})
+
+	// Build the resolver inline (duplicating buildResolverForTarget internals)
+	// to avoid issues with blocked channel writes when NACKs occur.
+	target := resolver.Target{URL: *testutils.MustParseURL("xds:///" + defaultTestServiceName)}
+
+	// Create an xDS resolver with the provided bootstrap configuration.
+	builder, err := internal.NewXDSResolverWithConfigForTesting.(func([]byte) (resolver.Builder, error))(bc)
+	if err != nil {
+		t.Fatalf("Failed to create xDS resolver for testing: %v", err)
+	}
+
+	errCh := testutils.NewChannel()
+	tcc := &testutils.ResolverClientConn{Logger: t, ReportErrorF: func(err error) { errCh.Replace(err) }}
+	r, err := builder.Build(target, tcc, resolver.BuildOptions{
+		Authority: url.PathEscape(target.Endpoint()),
+	})
+	if err != nil {
+		t.Fatalf("Failed to build xDS resolver for target %q: %v", target, err)
+	}
+	defer r.Close()
+
+	// Wait for and verify the error update from the resolver.
+	// Since the resource is not cached, it should be received as resource error.
+	select {
+	case <-ctx.Done():
+		t.Fatalf("Timeout waiting for error to be propagated to the ClientConn")
+	case gotErr := <-errCh.C:
+		if gotErr == nil {
+			t.Fatalf("got nil error from resolver, want error containing 'could not find VirtualHost'")
+		}
+		errStr := fmt.Sprint(gotErr)
+		if !strings.Contains(errStr, fmt.Sprintf("could not find VirtualHost for %q", defaultTestServiceName)) {
+			t.Fatalf("got error from resolver %q, want error containing 'could not find VirtualHost for %q'", errStr, defaultTestServiceName)
+		}
+		if !strings.Contains(errStr, nodeID) {
+			t.Fatalf("got error from resolver %q, want nodeID %q", errStr, nodeID)
+		}
+	}
+}
+
 // Tests the case where a resource, not present in cache, returned by the
 // management server is NACKed by the xDS client, which then returns an update
 // containing a resource error to the resolver. It tests the case where the
@@ -320,22 +371,51 @@ func (s) TestResolverBadServiceUpdate_NACKedWithoutCache(t *testing.T) {
 	}
 	configureResourcesOnManagementServer(ctx, t, mgmtServer, nodeID, []*v3listenerpb.Listener{lis}, nil)
 
-	// Build the resolver and expect an error update from it. Since the
-	// resource is not cached, it should be received as resource error.
-	_, errCh, _ := buildResolverForTarget(t, resolver.Target{URL: *testutils.MustParseURL("xds:///" + defaultTestServiceName)}, bc)
-	if err := waitForErrorFromResolver(ctx, errCh, "no RouteSpecifier", nodeID); err != nil {
-		t.Fatal(err)
+	// Build the resolver inline (duplicating buildResolverForTarget internals)
+	// to avoid issues with blocked channel writes when NACKs occur.
+	target := resolver.Target{URL: *testutils.MustParseURL("xds:///" + defaultTestServiceName)}
+
+	// Create an xDS resolver with the provided bootstrap configuration.
+	builder, err := internal.NewXDSResolverWithConfigForTesting.(func([]byte) (resolver.Builder, error))(bc)
+	if err != nil {
+		t.Fatalf("Failed to create xDS resolver for testing: %v", err)
+	}
+
+	errCh := testutils.NewChannel()
+	tcc := &testutils.ResolverClientConn{Logger: t, ReportErrorF: func(err error) { errCh.Replace(err) }}
+	r, err := builder.Build(target, tcc, resolver.BuildOptions{
+		Authority: url.PathEscape(target.Endpoint()),
+	})
+	if err != nil {
+		t.Fatalf("Failed to build xDS resolver for target %q: %v", target, err)
+	}
+	defer r.Close()
+
+	// Wait for and verify the error update from the resolver.
+	// Since the resource is not cached, it should be received as resource error.
+	select {
+	case <-ctx.Done():
+		t.Fatalf("Timeout waiting for error to be propagated to the ClientConn")
+	case gotErr := <-errCh.C:
+		if gotErr == nil {
+			t.Fatalf("got nil error from resolver, want error containing 'no RouteSpecifier'")
+		}
+		errStr := fmt.Sprint(gotErr)
+		if !strings.Contains(errStr, "no RouteSpecifier") {
+			t.Fatalf("got error from resolver %q, want error containing 'no RouteSpecifier'", errStr)
+		}
+		if !strings.Contains(errStr, nodeID) {
+			t.Fatalf("got error from resolver %q, want nodeID %q", errStr, nodeID)
+		}
 	}
 }
 
-// Tests the case where a resource, present in cache, returned by the
-// management server is NACKed by the xDS client, which then returns
-// an update containing an ambient error to the resolver. Verifies that the
-// update is propagated to the ClientConn by the resolver. It tests the
-// case where the resolver gets a good update first, and an error
-// after the good update. The test also verifies that these are propagated to
-// the ClientConn and that RPC succeeds as expected after receiving good update
-// as well as ambient error.
+// Tests the case where a resource, present in cache, returned by the management
+// server is NACKed by the xDS client, which then returns an update containing
+// an ambient error to the resolver. It tests the case where the resolver gets a
+// good update first, and an error after the good update. The test verifies that
+// the RPCs succeeds as expected after receiving good update as well as ambient
+// error.
 func (s) TestResolverBadServiceUpdate_NACKedWithCache(t *testing.T) {
 	// Spin up an xDS management server for the test.
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
@@ -343,16 +423,19 @@ func (s) TestResolverBadServiceUpdate_NACKedWithCache(t *testing.T) {
 	nodeID := uuid.New().String()
 	mgmtServer, _, _, bc := setupManagementServerForTest(t, nodeID)
 
-	stateCh, errCh, _ := buildResolverForTarget(t, resolver.Target{URL: *testutils.MustParseURL("xds:///" + defaultTestServiceName)}, bc)
+	stateCh, _, _ := buildResolverForTarget(t, resolver.Target{URL: *testutils.MustParseURL("xds:///" + defaultTestServiceName)}, bc)
 
-	// Configure good listener and route configuration resources on the
-	// management server.
-	listeners := []*v3listenerpb.Listener{e2e.DefaultClientListener(defaultTestServiceName, defaultTestRouteConfigName)}
-	routes := []*v3routepb.RouteConfiguration{e2e.DefaultRouteConfig(defaultTestRouteConfigName, defaultTestServiceName, defaultTestClusterName)}
-	configureResourcesOnManagementServer(ctx, t, mgmtServer, nodeID, listeners, routes)
+	// Configure all resources on the management server.
+	resources := e2e.DefaultClientResources(e2e.ResourceParams{
+		NodeID:     nodeID,
+		DialTarget: defaultTestServiceName,
+		Host:       "localhost",
+		Port:       8080,
+	})
+	mgmtServer.Update(ctx, resources)
 
 	// Expect a good update from the resolver.
-	cs := verifyUpdateFromResolver(ctx, t, stateCh, wantServiceConfig(defaultTestClusterName))
+	cs := verifyUpdateFromResolver(ctx, t, stateCh, wantServiceConfig(resources.Clusters[0].Name))
 
 	// "Make an RPC" by invoking the config selector.
 	_, err := cs.SelectConfig(iresolver.RPCInfo{Context: ctx, Method: "/service/method"})
@@ -377,12 +460,9 @@ func (s) TestResolverBadServiceUpdate_NACKedWithCache(t *testing.T) {
 		}},
 	}
 
-	// Expect an error update from the resolver. Since the resource is cached,
-	// it should be received as an ambient error.
+	// Since the resource is cached, it should be received as an ambient error
+	// and so the RPCs should continue passing.
 	configureResourcesOnManagementServer(ctx, t, mgmtServer, nodeID, []*v3listenerpb.Listener{lis}, nil)
-	if err := waitForErrorFromResolver(ctx, errCh, "no RouteSpecifier", nodeID); err != nil {
-		t.Fatal(err)
-	}
 
 	// "Make an RPC" by invoking the config selector which should succeed by
 	// continuing to use the previously cached resource.
@@ -633,44 +713,18 @@ func (s) TestResolverRemovedWithRPCs(t *testing.T) {
 		}
 	}
 
-	// Workaround for https://github.com/envoyproxy/go-control-plane/issues/431.
-	//
-	// The xDS client can miss route configurations due to a race condition
-	// between resource removal and re-addition. To avoid this, continuously
-	// push new versions of the resources to the server, ensuring the client
-	// eventually receives the configuration.
-	//
-	// TODO(https://github.com/grpc/grpc-go/issues/7807): Remove this workaround
-	// once the issue is fixed.
-waitForStateUpdate:
-	for {
-		sCtx, sCancel := context.WithTimeout(ctx, defaultTestShortTimeout)
-		defer sCancel()
+	// Add the resources back.
+	mgmtServer.Update(ctx, resources)
 
-		configureResourcesOnManagementServer(ctx, t, mgmtServer, nodeID, resources.Listeners, resources.Routes)
+	// The resolver should send a service config with the cluster name.
+	cs = verifyUpdateFromResolver(ctx, t, stateCh, wantServiceConfig(resources.Clusters[0].Name))
 
-		select {
-		case state = <-stateCh:
-			if err := state.ServiceConfig.Err; err != nil {
-				t.Fatalf("Received error in service config: %v", state.ServiceConfig.Err)
-			}
-			wantSCParsed := internal.ParseServiceConfig.(func(string) *serviceconfig.ParseResult)(wantServiceConfig(resources.Clusters[0].Name))
-			if !internal.EqualServiceConfigForTesting(state.ServiceConfig.Config, wantSCParsed.Config) {
-				t.Fatalf("Got service config:\n%s \nWant service config:\n%s", cmp.Diff(nil, state.ServiceConfig.Config), cmp.Diff(nil, wantSCParsed.Config))
-			}
-			break waitForStateUpdate
-		case <-sCtx.Done():
-		}
-	}
-	cs = iresolver.GetConfigSelector(state)
-	if cs == nil {
-		t.Fatal("Received nil config selector in update from resolver")
-	}
-
+	// Verify that RPCs pass again.
 	res, err = cs.SelectConfig(iresolver.RPCInfo{Context: ctx, Method: "/service/method"})
 	if err != nil {
 		t.Fatalf("cs.SelectConfig(): %v", err)
 	}
+
 	res.OnCommitted()
 }
 
@@ -913,7 +967,9 @@ func (s) TestResolverDelayedOnCommitted(t *testing.T) {
 		Port:       defaultTestPort[0],
 		SecLevel:   e2e.SecurityLevelNone,
 	})
-	mgmtServer.Update(ctx, resources)
+	if err := mgmtServer.Update(ctx, resources); err != nil {
+		t.Fatal(err)
+	}
 
 	stateCh, _, _ := buildResolverForTarget(t, resolver.Target{URL: *testutils.MustParseURL("xds:///" + defaultTestServiceName)}, bc)
 
@@ -1122,106 +1178,6 @@ func (s) TestResolverWRR(t *testing.T) {
 	}
 }
 
-const filterCfgPathFieldName = "path"
-const filterCfgErrorFieldName = "new_stream_error"
-
-type filterCfg struct {
-	httpfilter.FilterConfig
-	path         string
-	newStreamErr error
-}
-
-type filterBuilder struct {
-	paths   []string
-	typeURL string
-}
-
-func (fb *filterBuilder) TypeURLs() []string { return []string{fb.typeURL} }
-
-func filterConfigFromProto(cfg proto.Message) (httpfilter.FilterConfig, error) {
-	ts, ok := cfg.(*v3xdsxdstypepb.TypedStruct)
-	if !ok {
-		return nil, fmt.Errorf("unsupported filter config type: %T, want %T", cfg, &v3xdsxdstypepb.TypedStruct{})
-	}
-
-	if ts.GetValue() == nil {
-		return filterCfg{}, nil
-	}
-	ret := filterCfg{}
-	if v := ts.GetValue().GetFields()[filterCfgPathFieldName]; v != nil {
-		ret.path = v.GetStringValue()
-	}
-	if v := ts.GetValue().GetFields()[filterCfgErrorFieldName]; v != nil {
-		if v.GetStringValue() == "" {
-			ret.newStreamErr = nil
-		} else {
-			ret.newStreamErr = fmt.Errorf("%s", v.GetStringValue())
-		}
-	}
-	return ret, nil
-}
-
-func (*filterBuilder) ParseFilterConfig(cfg proto.Message) (httpfilter.FilterConfig, error) {
-	return filterConfigFromProto(cfg)
-}
-
-func (*filterBuilder) ParseFilterConfigOverride(override proto.Message) (httpfilter.FilterConfig, error) {
-	return filterConfigFromProto(override)
-}
-
-func (*filterBuilder) IsTerminal() bool { return false }
-
-var _ httpfilter.ClientInterceptorBuilder = &filterBuilder{}
-
-func (fb *filterBuilder) BuildClientInterceptor(config, override httpfilter.FilterConfig) (iresolver.ClientInterceptor, error) {
-	if config == nil {
-		panic("unexpected missing config")
-	}
-
-	fi := &filterInterceptor{
-		parent: fb,
-		pathCh: make(chan string, 10),
-	}
-
-	fb.paths = append(fb.paths, "build:"+config.(filterCfg).path)
-	err := config.(filterCfg).newStreamErr
-	if override != nil {
-		fb.paths = append(fb.paths, "override:"+override.(filterCfg).path)
-		err = override.(filterCfg).newStreamErr
-	}
-
-	fi.cfgPath = config.(filterCfg).path
-	fi.err = err
-	return fi, nil
-}
-
-type filterInterceptor struct {
-	parent  *filterBuilder
-	pathCh  chan string
-	cfgPath string
-	err     error
-}
-
-func (fi *filterInterceptor) NewStream(ctx context.Context, _ iresolver.RPCInfo, done func(), newStream func(ctx context.Context, done func()) (iresolver.ClientStream, error)) (iresolver.ClientStream, error) {
-	fi.parent.paths = append(fi.parent.paths, "newstream:"+fi.cfgPath)
-	if fi.err != nil {
-		return nil, fi.err
-	}
-	d := func() {
-		fi.parent.paths = append(fi.parent.paths, "done:"+fi.cfgPath)
-		done()
-	}
-	cs, err := newStream(ctx, d)
-	if err != nil {
-		return nil, err
-	}
-	return &clientStream{ClientStream: cs}, nil
-}
-
-type clientStream struct {
-	iresolver.ClientStream
-}
-
 func (s) TestConfigSelector_FailureCases(t *testing.T) {
 	const methodName = "1"
 
@@ -1309,298 +1265,156 @@ func (s) TestConfigSelector_FailureCases(t *testing.T) {
 	}
 }
 
-func newHTTPFilter(t *testing.T, name, typeURL, path, err string) *v3httppb.HttpFilter {
-	return &v3httppb.HttpFilter{
-		Name: name,
-		ConfigType: &v3httppb.HttpFilter_TypedConfig{
-			TypedConfig: testutils.MarshalAny(t, &v3xdsxdstypepb.TypedStruct{
-				TypeUrl: typeURL,
-				Value: &structpb.Struct{
-					Fields: map[string]*structpb.Value{
-						filterCfgPathFieldName:  {Kind: &structpb.Value_StringValue{StringValue: path}},
-						filterCfgErrorFieldName: {Kind: &structpb.Value_StringValue{StringValue: err}},
-					},
-				},
-			}),
-		},
-	}
+func newDurationP(d time.Duration) *time.Duration {
+	return &d
 }
 
-func (s) TestXDSResolverHTTPFilters(t *testing.T) {
-	const methodName1 = "1"
-	const methodName2 = "2"
-	testFilterName := t.Name()
-
-	testCases := []struct {
-		name          string
-		listener      *v3listenerpb.Listener
-		rpcRes        map[string][][]string
-		wantStreamErr string
+// TestResolver_AutoHostRewrite verifies the propagation of the AutoHostRewrite
+// field from the xDS resolver.
+//
+// Per gRFC A81, this feature should only be active if two conditions met:
+// 1. The environment variable (XDSAuthorityRewrite) is enabled.
+// 2. The xDS server is marked as "trusted_xds_server" in the bootstrap config.
+func (s) TestResolver_AutoHostRewrite(t *testing.T) {
+	for _, tt := range []struct {
+		name                string
+		autoHostRewrite     bool
+		envconfig           bool
+		serverfeature       serverFeature.ServerFeature
+		wantAutoHostRewrite bool
 	}{
 		{
-			name: "NewStream error - ensure earlier interceptor Done is still called",
-			listener: &v3listenerpb.Listener{
-				Name: defaultTestServiceName,
-				ApiListener: &v3listenerpb.ApiListener{
-					ApiListener: testutils.MarshalAny(t, &v3httppb.HttpConnectionManager{
-						RouteSpecifier: &v3httppb.HttpConnectionManager_RouteConfig{
-							RouteConfig: &v3routepb.RouteConfiguration{
-								Name: defaultTestRouteConfigName,
-								VirtualHosts: []*v3routepb.VirtualHost{{
-									Domains: []string{defaultTestServiceName},
-									Routes: []*v3routepb.Route{{
-										Match: &v3routepb.RouteMatch{
-											PathSpecifier: &v3routepb.RouteMatch_Prefix{Prefix: methodName1},
-										},
-										Action: &v3routepb.Route_Route{
-											Route: &v3routepb.RouteAction{
-												ClusterSpecifier: &v3routepb.RouteAction_WeightedClusters{
-													WeightedClusters: &v3routepb.WeightedCluster{
-														Clusters: []*v3routepb.WeightedCluster_ClusterWeight{
-															{Name: "A", Weight: wrapperspb.UInt32(1)},
-															{Name: "B", Weight: wrapperspb.UInt32(1)},
-														},
-													},
-												},
-											},
-										},
-									}},
-								}},
-							}},
-						HttpFilters: []*v3httppb.HttpFilter{
-							newHTTPFilter(t, "foo", testFilterName, "foo1", ""),
-							newHTTPFilter(t, "bar", testFilterName, "bar1", "bar newstream err"),
-							e2e.RouterHTTPFilter,
-						},
-					}),
-				},
-			},
-			rpcRes: map[string][][]string{
-				methodName1: {
-					{"build:foo1", "build:bar1", "newstream:foo1", "newstream:bar1", "done:foo1"}, // err in bar1 NewStream()
-				},
-			},
-			wantStreamErr: "bar newstream err",
+			name:                "EnvVarDisabled_NonTrustedServer_AutoHostRewriteOff",
+			autoHostRewrite:     false,
+			envconfig:           false,
+			wantAutoHostRewrite: false,
 		},
 		{
-			name: "all overrides",
-			listener: &v3listenerpb.Listener{
-				Name: defaultTestServiceName,
-				ApiListener: &v3listenerpb.ApiListener{
-					ApiListener: testutils.MarshalAny(t, &v3httppb.HttpConnectionManager{
-						RouteSpecifier: &v3httppb.HttpConnectionManager_RouteConfig{
-							RouteConfig: &v3routepb.RouteConfiguration{
-								Name: defaultTestRouteConfigName,
-								VirtualHosts: []*v3routepb.VirtualHost{{
-									Domains: []string{defaultTestServiceName},
-									Routes: []*v3routepb.Route{
-										{
-											Match: &v3routepb.RouteMatch{
-												PathSpecifier: &v3routepb.RouteMatch_Prefix{Prefix: methodName1},
-											},
-											Action: &v3routepb.Route_Route{
-												Route: &v3routepb.RouteAction{
-													ClusterSpecifier: &v3routepb.RouteAction_WeightedClusters{
-														WeightedClusters: &v3routepb.WeightedCluster{
-															Clusters: []*v3routepb.WeightedCluster_ClusterWeight{
-																{Name: "A", Weight: wrapperspb.UInt32(1)},
-																{Name: "B", Weight: wrapperspb.UInt32(1)},
-															},
-														},
-													},
-												},
-											},
-										},
-										{
-											Match: &v3routepb.RouteMatch{
-												PathSpecifier: &v3routepb.RouteMatch_Prefix{Prefix: methodName2},
-											},
-											Action: &v3routepb.Route_Route{
-												Route: &v3routepb.RouteAction{
-													ClusterSpecifier: &v3routepb.RouteAction_WeightedClusters{
-														WeightedClusters: &v3routepb.WeightedCluster{
-															Clusters: []*v3routepb.WeightedCluster_ClusterWeight{
-																{Name: "A", Weight: wrapperspb.UInt32(1)},
-																{
-																	Name:   "B",
-																	Weight: wrapperspb.UInt32(1),
-																	TypedPerFilterConfig: map[string]*anypb.Any{
-																		"foo": testutils.MarshalAny(t, &v3xdsxdstypepb.TypedStruct{
-																			TypeUrl: testFilterName,
-																			Value: &structpb.Struct{
-																				Fields: map[string]*structpb.Value{
-																					filterCfgPathFieldName: {Kind: &structpb.Value_StringValue{StringValue: "foo4"}},
-																				},
-																			},
-																		}),
-																		"bar": testutils.MarshalAny(t, &v3xdsxdstypepb.TypedStruct{
-																			TypeUrl: testFilterName,
-																			Value: &structpb.Struct{
-																				Fields: map[string]*structpb.Value{
-																					filterCfgPathFieldName: {Kind: &structpb.Value_StringValue{StringValue: "bar4"}},
-																				},
-																			},
-																		}),
-																	},
-																},
-															},
-														},
-													},
-												},
-											},
-											TypedPerFilterConfig: map[string]*anypb.Any{
-												"foo": testutils.MarshalAny(t, &v3xdsxdstypepb.TypedStruct{
-													TypeUrl: testFilterName,
-													Value: &structpb.Struct{
-														Fields: map[string]*structpb.Value{
-															filterCfgPathFieldName:  {Kind: &structpb.Value_StringValue{StringValue: "foo3"}},
-															filterCfgErrorFieldName: {Kind: &structpb.Value_StringValue{StringValue: ""}},
-														},
-													},
-												}),
-												"bar": testutils.MarshalAny(t, &v3xdsxdstypepb.TypedStruct{
-													TypeUrl: testFilterName,
-													Value: &structpb.Struct{
-														Fields: map[string]*structpb.Value{
-															filterCfgPathFieldName: {Kind: &structpb.Value_StringValue{StringValue: "bar3"}},
-														},
-													},
-												}),
-											},
-										},
-									},
-									TypedPerFilterConfig: map[string]*anypb.Any{
-										"foo": testutils.MarshalAny(t, &v3xdsxdstypepb.TypedStruct{
-											TypeUrl: testFilterName,
-											Value: &structpb.Struct{
-												Fields: map[string]*structpb.Value{
-													filterCfgPathFieldName:  {Kind: &structpb.Value_StringValue{StringValue: "foo2"}},
-													filterCfgErrorFieldName: {Kind: &structpb.Value_StringValue{StringValue: ""}},
-												},
-											},
-										}),
-										"bar": testutils.MarshalAny(t, &v3xdsxdstypepb.TypedStruct{
-											TypeUrl: testFilterName,
-											Value: &structpb.Struct{
-												Fields: map[string]*structpb.Value{
-													filterCfgPathFieldName: {Kind: &structpb.Value_StringValue{StringValue: "bar2"}},
-												},
-											},
-										}),
-									},
-								}},
-							}},
-						HttpFilters: []*v3httppb.HttpFilter{
-							newHTTPFilter(t, "foo", testFilterName, "foo1", "this is overridden to nil"),
-							newHTTPFilter(t, "bar", testFilterName, "bar1", ""),
-							e2e.RouterHTTPFilter,
-						},
-					}),
-				},
-			},
-			rpcRes: map[string][][]string{
-				methodName1: {
-					{"build:foo1", "override:foo2", "build:bar1", "override:bar2", "newstream:foo1", "newstream:bar1", "done:bar1", "done:foo1"},
-					{"build:foo1", "override:foo2", "build:bar1", "override:bar2", "newstream:foo1", "newstream:bar1", "done:bar1", "done:foo1"},
-				},
-				methodName2: {
-					{"build:foo1", "override:foo3", "build:bar1", "override:bar3", "newstream:foo1", "newstream:bar1", "done:bar1", "done:foo1"},
-					{"build:foo1", "override:foo4", "build:bar1", "override:bar4", "newstream:foo1", "newstream:bar1", "done:bar1", "done:foo1"},
-					{"build:foo1", "override:foo3", "build:bar1", "override:bar3", "newstream:foo1", "newstream:bar1", "done:bar1", "done:foo1"},
-					{"build:foo1", "override:foo4", "build:bar1", "override:bar4", "newstream:foo1", "newstream:bar1", "done:bar1", "done:foo1"},
-				},
-			},
+			name:                "EnvVarDisabled_NonTrustedServer_AutoHostRewriteOn",
+			autoHostRewrite:     true,
+			envconfig:           false,
+			wantAutoHostRewrite: false,
 		},
-	}
+		{
+			name:                "EnvVarDisabled_TrustedServer_AutoHostRewriteOff",
+			autoHostRewrite:     false,
+			envconfig:           false,
+			serverfeature:       serverFeature.ServerFeatureTrustedXDSServer,
+			wantAutoHostRewrite: false,
+		},
+		{
+			name:                "EnvVarDisabled_TrustedServer_AutoHostRewriteOn",
+			autoHostRewrite:     true,
+			envconfig:           false,
+			serverfeature:       serverFeature.ServerFeatureTrustedXDSServer,
+			wantAutoHostRewrite: false,
+		},
+		{
+			name:                "EnvVarEnabled_NonTrustedServer_AutoHostRewriteOff",
+			autoHostRewrite:     false,
+			envconfig:           true,
+			wantAutoHostRewrite: false,
+		},
+		{
+			name:                "EnvVarEnabled_NonTrustedServer_AutoHostRewriteOn",
+			autoHostRewrite:     true,
+			envconfig:           true,
+			wantAutoHostRewrite: false,
+		},
+		{
+			name:                "EnvVarEnabled_TrustedServer_AutoHostRewriteOff",
+			autoHostRewrite:     false,
+			envconfig:           true,
+			serverfeature:       serverFeature.ServerFeatureTrustedXDSServer,
+			wantAutoHostRewrite: false,
+		},
+		{
+			name:                "EnvVarEnabled_TrustedServer_AutoHostRewriteOn",
+			autoHostRewrite:     true,
+			envconfig:           true,
+			serverfeature:       serverFeature.ServerFeatureTrustedXDSServer,
+			wantAutoHostRewrite: true,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			testutils.SetEnvConfig(t, &envconfig.XDSAuthorityRewrite, tt.envconfig)
 
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			origNewWRR := rinternal.NewWRR
-			rinternal.NewWRR = testutils.NewTestWRR
-			defer func() { rinternal.NewWRR = origNewWRR }()
-
-			// Register a custom httpFilter builder for the test.
-			fb := &filterBuilder{typeURL: testFilterName}
-			httpfilter.Register(fb)
-
-			// Spin up an xDS management server.
+			// Spin up an xDS management server for the test.
 			ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 			defer cancel()
 			nodeID := uuid.New().String()
-			mgmtServer, _, _, bc := setupManagementServerForTest(t, nodeID)
+			mgmtServer := e2e.StartManagementServer(t, e2e.ManagementServerOptions{AllowResourceSubset: true})
+			defer mgmtServer.Stop()
 
-			// Build an xDS resolver.
-			stateCh, _, _ := buildResolverForTarget(t, resolver.Target{URL: *testutils.MustParseURL("xds:///" + defaultTestServiceName)}, bc)
-
-			cluster := []*v3clusterpb.Cluster{
-				e2e.DefaultCluster("A", "endpoint_A", e2e.SecurityLevelNone),
-				e2e.DefaultCluster("B", "endpoint_B", e2e.SecurityLevelNone),
+			// Configure the management server with a good listener resource and a
+			// route configuration resource, as specified by the test case.
+			resources := e2e.UpdateOptions{
+				NodeID:    nodeID,
+				Listeners: []*v3listenerpb.Listener{e2e.DefaultClientListener(defaultTestServiceName, defaultTestRouteConfigName)},
+				Routes: []*v3routepb.RouteConfiguration{{
+					Name: defaultTestRouteConfigName,
+					VirtualHosts: []*v3routepb.VirtualHost{{
+						Domains: []string{defaultTestServiceName},
+						Routes: []*v3routepb.Route{{
+							Match: &v3routepb.RouteMatch{PathSpecifier: &v3routepb.RouteMatch_Prefix{Prefix: "/"}},
+							Action: &v3routepb.Route_Route{Route: &v3routepb.RouteAction{
+								ClusterSpecifier: &v3routepb.RouteAction_WeightedClusters{WeightedClusters: &v3routepb.WeightedCluster{
+									Clusters: []*v3routepb.WeightedCluster_ClusterWeight{
+										{
+											Name:   defaultTestClusterName,
+											Weight: &wrapperspb.UInt32Value{Value: 100},
+										},
+									},
+								}},
+								HostRewriteSpecifier: &v3routepb.RouteAction_AutoHostRewrite{
+									AutoHostRewrite: &wrapperspb.BoolValue{Value: tt.autoHostRewrite},
+								},
+							}},
+						}},
+					}},
+				}},
+				SkipValidation: true,
 			}
-			endpoints := []*v3endpointpb.ClusterLoadAssignment{
-				e2e.DefaultEndpoint("endpoint_A", defaultTestHostname, defaultTestPort),
-				e2e.DefaultEndpoint("endpoint_B", defaultTestHostname, defaultTestPort),
-			}
-			// Update the management server with a listener resource that
-			// contains an inline route configuration.
-			configureAllResourcesOnManagementServer(ctx, t, mgmtServer, nodeID, []*v3listenerpb.Listener{tc.listener}, nil, cluster, endpoints)
 
-			// Ensure that the resolver pushes a state update to the channel.
+			if err := mgmtServer.Update(ctx, resources); err != nil {
+				t.Fatal(err)
+			}
+
+			trustedXdsServer := "[]"
+			if tt.serverfeature == serverFeature.ServerFeatureTrustedXDSServer {
+				trustedXdsServer = `["trusted_xds_server"]`
+			}
+
+			opts := bootstrap.ConfigOptionsForTesting{
+				Servers: []byte(fmt.Sprintf(`[{
+					"server_uri": %q,
+					"channel_creds": [{"type": "insecure"}],
+					"server_features": %s
+				}]`, mgmtServer.Address, trustedXdsServer)),
+				Node: []byte(fmt.Sprintf(`{"id": "%s"}`, nodeID)),
+			}
+
+			contents, err := bootstrap.NewContentsForTesting(opts)
+			if err != nil {
+				t.Fatalf("Failed to create bootstrap configuration: %v", err)
+			}
+
+			// Build the resolver and read the config selector out of it.
+			stateCh, _, _ := buildResolverForTarget(t, resolver.Target{URL: *testutils.MustParseURL("xds:///" + defaultTestServiceName)}, contents)
 			cs := verifyUpdateFromResolver(ctx, t, stateCh, "")
 
-			for method, wants := range tc.rpcRes {
-				// Order of wants is non-deterministic.
-				remainingWant := make([][]string, len(wants))
-				copy(remainingWant, wants)
-				for n := range wants {
-					res, err := cs.SelectConfig(iresolver.RPCInfo{Method: method, Context: ctx})
-					if err != nil {
-						t.Fatalf("Unexpected error from cs.SelectConfig(_): %v", err)
-					}
+			res, err := cs.SelectConfig(iresolver.RPCInfo{
+				Context: ctx,
+				Method:  "/service/method",
+			})
+			if err != nil {
+				t.Fatalf("cs.SelectConfig(): %v", err)
+			}
 
-					var doneFunc func()
-					_, err = res.Interceptor.NewStream(ctx, iresolver.RPCInfo{}, func() {}, func(_ context.Context, done func()) (iresolver.ClientStream, error) {
-						doneFunc = done
-						return nil, nil
-					})
-					if tc.wantStreamErr != "" {
-						if err == nil || !strings.Contains(err.Error(), tc.wantStreamErr) {
-							t.Errorf("NewStream(...) = _, %v; want _, Contains(%v)", err, tc.wantStreamErr)
-						}
-						if err == nil {
-							res.OnCommitted()
-							doneFunc()
-						}
-						continue
-					}
-					if err != nil {
-						t.Fatalf("unexpected error from Interceptor.NewStream: %v", err)
-
-					}
-					res.OnCommitted()
-					doneFunc()
-
-					gotPaths := fb.paths
-					fb.paths = []string{}
-
-					// Confirm the desired path is found in remainingWant, and remove it.
-					pass := false
-					for i := range remainingWant {
-						if cmp.Equal(gotPaths, remainingWant[i]) {
-							remainingWant[i] = remainingWant[len(remainingWant)-1]
-							remainingWant = remainingWant[:len(remainingWant)-1]
-							pass = true
-							break
-						}
-					}
-					if !pass {
-						t.Errorf("%q:%v - path:\n%v\nwant one of:\n%v", method, n, gotPaths, remainingWant)
-					}
-				}
+			gotAutoHostRewrite := clusterimpl.AutoHostRewriteEnabledForTesting(res.Context)
+			if gotAutoHostRewrite != tt.wantAutoHostRewrite {
+				t.Fatalf("Got autoHostRewrite: %v, want: %v", gotAutoHostRewrite, tt.wantAutoHostRewrite)
 			}
 		})
 	}
-}
-
-func newDurationP(d time.Duration) *time.Duration {
-	return &d
 }

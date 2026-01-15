@@ -23,6 +23,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -203,6 +204,37 @@ func (s) TestParsedTarget_Failure_WithoutCustomDialer(t *testing.T) {
 	}
 }
 
+func (s) TestParsedTarget_Failure_WithoutCustomDialer_WithNewClient(t *testing.T) {
+	tests := []struct {
+		target        string
+		wantErrSubstr string
+	}{
+
+		{target: "", wantErrSubstr: "invalid target address"},
+		{target: "unix://a/b/c", wantErrSubstr: "invalid (non-empty) authority"},
+		{target: "unix://authority", wantErrSubstr: "invalid (non-empty) authority"},
+		{target: "unix-abstract://authority/a/b/c", wantErrSubstr: "invalid (non-empty) authority"},
+		{target: "unix-abstract://authority", wantErrSubstr: "invalid (non-empty) authority"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.target, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+			defer cancel()
+			cc, err := NewClient(test.target, WithTransportCredentials(insecure.NewCredentials()))
+			if err != nil {
+				t.Fatalf("NewClient(%q) failed: %v", test, err)
+			}
+			defer cc.Close()
+			if _, err := cc.NewStream(ctx, &StreamDesc{}, "/my.service.v1.MyService/UnaryCall"); err == nil {
+				t.Fatalf("NewStream() succeeded with target = %q, cc.parsedTarget = %+v, expected to fail", test, cc.parsedTarget)
+			} else if !strings.Contains(err.Error(), test.wantErrSubstr) {
+				t.Fatalf("NewStream() with target = %q returned unexpected error: got %v, want substring %q", test, err, test.wantErrSubstr)
+			}
+		})
+	}
+}
+
 func (s) TestParsedTarget_WithCustomDialer(t *testing.T) {
 	resetInitialResolverState()
 	defScheme := resolver.GetDefaultScheme()
@@ -268,16 +300,21 @@ func (s) TestParsedTarget_WithCustomDialer(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.target, func(t *testing.T) {
 			addrCh := make(chan string, 1)
-			dialer := func(_ context.Context, address string) (net.Conn, error) {
-				addrCh <- address
-				return nil, errors.New("dialer error")
+			dialer := func(ctx context.Context, address string) (net.Conn, error) {
+				select {
+				case addrCh <- address:
+					return nil, errors.New("dialer error")
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				}
 			}
 
-			cc, err := Dial(test.target, WithTransportCredentials(insecure.NewCredentials()), WithContextDialer(dialer))
+			cc, err := NewClient(test.target, WithTransportCredentials(insecure.NewCredentials()), withDefaultScheme(defScheme), WithContextDialer(dialer))
 			if err != nil {
-				t.Fatalf("Dial(%q) failed: %v", test.target, err)
+				t.Fatalf("grpc.NewClient(%q) failed: %v", test.target, err)
 			}
 			defer cc.Close()
+			cc.Connect()
 
 			select {
 			case addr := <-addrCh:

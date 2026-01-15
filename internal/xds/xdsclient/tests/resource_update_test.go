@@ -36,6 +36,7 @@ import (
 	"google.golang.org/grpc/internal/xds/clients"
 	"google.golang.org/grpc/internal/xds/xdsclient"
 	"google.golang.org/grpc/internal/xds/xdsclient/xdsresource"
+	"google.golang.org/grpc/resolver"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/testing/protocmp"
 	"google.golang.org/protobuf/types/known/anypb"
@@ -146,7 +147,7 @@ func (s) TestHandleListenerResponseFromManagementServer(t *testing.T) {
 		desc                     string
 		resourceName             string
 		managementServerResponse *v3discoverypb.DiscoveryResponse
-		wantUpdate               xdsresource.ListenerUpdate
+		wantUpdate               *xdsresource.ListenerUpdate
 		wantErr                  string
 		wantGenericXDSConfig     []*v3statuspb.ClientConfig_GenericXdsConfig
 	}{
@@ -236,7 +237,7 @@ func (s) TestHandleListenerResponseFromManagementServer(t *testing.T) {
 				VersionInfo: "1",
 				Resources:   []*anypb.Any{testutils.MarshalAny(t, resource1)},
 			},
-			wantUpdate: xdsresource.ListenerUpdate{
+			wantUpdate: &xdsresource.ListenerUpdate{
 				RouteConfigName: "route-configuration-name",
 				HTTPFilters:     []xdsresource.HTTPFilter{{Name: "router"}},
 			},
@@ -258,7 +259,7 @@ func (s) TestHandleListenerResponseFromManagementServer(t *testing.T) {
 				VersionInfo: "1",
 				Resources:   []*anypb.Any{testutils.MarshalAny(t, resource1), testutils.MarshalAny(t, resource2)},
 			},
-			wantUpdate: xdsresource.ListenerUpdate{
+			wantUpdate: &xdsresource.ListenerUpdate{
 				RouteConfigName: "route-configuration-name",
 				HTTPFilters:     []xdsresource.HTTPFilter{{Name: "router"}},
 			},
@@ -510,7 +511,7 @@ func (s) TestHandleRouteConfigResponseFromManagementServer(t *testing.T) {
 					{
 						Domains: []string{"lds-target-name"},
 						Routes: []*xdsresource.Route{{Prefix: newStringP(""),
-							WeightedClusters: map[string]xdsresource.WeightedCluster{"cluster-name": {Weight: 1}},
+							WeightedClusters: []xdsresource.WeightedCluster{{Name: "cluster-name", Weight: 1}},
 							ActionType:       xdsresource.RouteActionRoute}},
 					},
 				},
@@ -538,7 +539,7 @@ func (s) TestHandleRouteConfigResponseFromManagementServer(t *testing.T) {
 					{
 						Domains: []string{"lds-target-name"},
 						Routes: []*xdsresource.Route{{Prefix: newStringP(""),
-							WeightedClusters: map[string]xdsresource.WeightedCluster{"cluster-name": {Weight: 1}},
+							WeightedClusters: []xdsresource.WeightedCluster{{Name: "cluster-name", Weight: 1}},
 							ActionType:       xdsresource.RouteActionRoute}},
 					},
 				},
@@ -874,7 +875,7 @@ func (s) TestHandleClusterResponseFromManagementServer(t *testing.T) {
 			// server at that point, hence we do it here before verifying the
 			// received update.
 			if test.wantErr == "" {
-				serverCfg, err := bootstrap.ServerConfigForTesting(bootstrap.ServerConfigTestingOptions{URI: fmt.Sprintf("passthrough:///%s", mgmtServer.Address)})
+				serverCfg, err := bootstrap.ServerConfigForTesting(bootstrap.ServerConfigTestingOptions{URI: fmt.Sprintf("passthrough:///%s", mgmtServer.Address), ServerFeatures: []string{"trusted_xds_server"}})
 				if err != nil {
 					t.Fatalf("Failed to create server config for testing: %v", err)
 				}
@@ -1089,16 +1090,26 @@ func (s) TestHandleEndpointsResponseFromManagementServer(t *testing.T) {
 			wantUpdate: xdsresource.EndpointsUpdate{
 				Localities: []xdsresource.Locality{
 					{
-						Endpoints: []xdsresource.Endpoint{{Addresses: []string{"addr1:314"}, Weight: 1}},
-						ID:        clients.Locality{SubZone: "locality-1"},
-						Priority:  1,
-						Weight:    1,
+						Endpoints: []xdsresource.Endpoint{{
+							ResolverEndpoint: resolver.Endpoint{
+								Addresses: []resolver.Address{{Addr: "addr1:314"}},
+							},
+							Weight: 1,
+						}},
+						ID:       clients.Locality{SubZone: "locality-1"},
+						Priority: 1,
+						Weight:   1,
 					},
 					{
-						Endpoints: []xdsresource.Endpoint{{Addresses: []string{"addr2:159"}, Weight: 1}},
-						ID:        clients.Locality{SubZone: "locality-2"},
-						Priority:  0,
-						Weight:    1,
+						Endpoints: []xdsresource.Endpoint{{
+							ResolverEndpoint: resolver.Endpoint{
+								Addresses: []resolver.Address{{Addr: "addr2:159"}},
+							},
+							Weight: 1,
+						}},
+						ID:       clients.Locality{SubZone: "locality-2"},
+						Priority: 0,
+						Weight:   1,
 					},
 				},
 			},
@@ -1123,16 +1134,26 @@ func (s) TestHandleEndpointsResponseFromManagementServer(t *testing.T) {
 			wantUpdate: xdsresource.EndpointsUpdate{
 				Localities: []xdsresource.Locality{
 					{
-						Endpoints: []xdsresource.Endpoint{{Addresses: []string{"addr1:314"}, Weight: 1}},
-						ID:        clients.Locality{SubZone: "locality-1"},
-						Priority:  1,
-						Weight:    1,
+						Endpoints: []xdsresource.Endpoint{{
+							ResolverEndpoint: resolver.Endpoint{
+								Addresses: []resolver.Address{{Addr: "addr1:314"}},
+							},
+							Weight: 1,
+						}},
+						ID:       clients.Locality{SubZone: "locality-1"},
+						Priority: 1,
+						Weight:   1,
 					},
 					{
-						Endpoints: []xdsresource.Endpoint{{Addresses: []string{"addr2:159"}, Weight: 1}},
-						ID:        clients.Locality{SubZone: "locality-2"},
-						Priority:  0,
-						Weight:    1,
+						Endpoints: []xdsresource.Endpoint{{
+							ResolverEndpoint: resolver.Endpoint{
+								Addresses: []resolver.Address{{Addr: "addr2:159"}},
+							},
+							Weight: 1,
+						}},
+						ID:       clients.Locality{SubZone: "locality-2"},
+						Priority: 0,
+						Weight:   1,
 					},
 				},
 			},

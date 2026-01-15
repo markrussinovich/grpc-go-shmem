@@ -25,13 +25,13 @@ import (
 	"io"
 	"reflect"
 	"strings"
-	"sync/atomic"
 	"testing"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
-	"google.golang.org/grpc/encoding"
+	"google.golang.org/grpc/experimental"
+	"google.golang.org/grpc/internal/grpcutil"
 	"google.golang.org/grpc/internal/stubserver"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
@@ -341,150 +341,6 @@ func (s) TestClientForwardsGrpcAcceptEncodingHeader(t *testing.T) {
 	}
 }
 
-// wrapCompressor is a wrapper of encoding.Compressor which maintains count of
-// Compressor method invokes.
-type wrapCompressor struct {
-	encoding.Compressor
-	compressInvokes int32
-}
-
-func (wc *wrapCompressor) Compress(w io.Writer) (io.WriteCloser, error) {
-	atomic.AddInt32(&wc.compressInvokes, 1)
-	return wc.Compressor.Compress(w)
-}
-
-func setupGzipWrapCompressor(t *testing.T) *wrapCompressor {
-	oldC := encoding.GetCompressor("gzip")
-	c := &wrapCompressor{Compressor: oldC}
-	encoding.RegisterCompressor(c)
-	t.Cleanup(func() {
-		encoding.RegisterCompressor(oldC)
-	})
-	return c
-}
-
-func (s) TestSetSendCompressorSuccess(t *testing.T) {
-	for _, tt := range []struct {
-		name                string
-		desc                string
-		payload             *testpb.Payload
-		dialOpts            []grpc.DialOption
-		resCompressor       string
-		wantCompressInvokes int32
-	}{
-		{
-			name:                "identity_request_and_gzip_response",
-			desc:                "request is uncompressed and response is gzip compressed",
-			payload:             &testpb.Payload{Body: []byte("payload")},
-			resCompressor:       "gzip",
-			wantCompressInvokes: 1,
-		},
-		{
-			name:                "identity_request_and_empty_response",
-			desc:                "request is uncompressed and response is gzip compressed",
-			payload:             nil,
-			resCompressor:       "gzip",
-			wantCompressInvokes: 0,
-		},
-		{
-			name:          "gzip_request_and_identity_response",
-			desc:          "request is gzip compressed and response is uncompressed with identity",
-			payload:       &testpb.Payload{Body: []byte("payload")},
-			resCompressor: "identity",
-			dialOpts: []grpc.DialOption{
-				// Use WithCompressor instead of UseCompressor to avoid counting
-				// the client's compressor usage.
-				grpc.WithCompressor(grpc.NewGZIPCompressor()),
-			},
-			wantCompressInvokes: 0,
-		},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Run("unary", func(t *testing.T) {
-				testUnarySetSendCompressorSuccess(t, tt.payload, tt.resCompressor, tt.wantCompressInvokes, tt.dialOpts)
-			})
-
-			t.Run("stream", func(t *testing.T) {
-				testStreamSetSendCompressorSuccess(t, tt.payload, tt.resCompressor, tt.wantCompressInvokes, tt.dialOpts)
-			})
-		})
-	}
-}
-
-func testUnarySetSendCompressorSuccess(t *testing.T, payload *testpb.Payload, resCompressor string, wantCompressInvokes int32, dialOpts []grpc.DialOption) {
-	wc := setupGzipWrapCompressor(t)
-	ss := &stubserver.StubServer{
-		UnaryCallF: func(ctx context.Context, _ *testpb.SimpleRequest) (*testpb.SimpleResponse, error) {
-			if err := grpc.SetSendCompressor(ctx, resCompressor); err != nil {
-				return nil, err
-			}
-			return &testpb.SimpleResponse{
-				Payload: payload,
-			}, nil
-		},
-	}
-	if err := ss.Start(nil, dialOpts...); err != nil {
-		t.Fatalf("Error starting endpoint server: %v", err)
-	}
-	defer ss.Stop()
-
-	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
-	defer cancel()
-
-	if _, err := ss.Client.UnaryCall(ctx, &testpb.SimpleRequest{}); err != nil {
-		t.Fatalf("Unexpected unary call error, got: %v, want: nil", err)
-	}
-
-	compressInvokes := atomic.LoadInt32(&wc.compressInvokes)
-	if compressInvokes != wantCompressInvokes {
-		t.Fatalf("Unexpected compress invokes, got:%d, want: %d", compressInvokes, wantCompressInvokes)
-	}
-}
-
-func testStreamSetSendCompressorSuccess(t *testing.T, payload *testpb.Payload, resCompressor string, wantCompressInvokes int32, dialOpts []grpc.DialOption) {
-	wc := setupGzipWrapCompressor(t)
-	ss := &stubserver.StubServer{
-		FullDuplexCallF: func(stream testgrpc.TestService_FullDuplexCallServer) error {
-			if _, err := stream.Recv(); err != nil {
-				return err
-			}
-
-			if err := grpc.SetSendCompressor(stream.Context(), resCompressor); err != nil {
-				return err
-			}
-
-			return stream.Send(&testpb.StreamingOutputCallResponse{
-				Payload: payload,
-			})
-		},
-	}
-	if err := ss.Start(nil, dialOpts...); err != nil {
-		t.Fatalf("Error starting endpoint server: %v", err)
-	}
-	defer ss.Stop()
-
-	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
-	defer cancel()
-
-	s, err := ss.Client.FullDuplexCall(ctx)
-	if err != nil {
-		t.Fatalf("Unexpected full duplex call error, got: %v, want: nil", err)
-	}
-
-	if err := s.Send(&testpb.StreamingOutputCallRequest{}); err != nil {
-		t.Fatalf("Unexpected full duplex call send error, got: %v, want: nil", err)
-	}
-
-	if _, err := s.Recv(); err != nil {
-		t.Fatalf("Unexpected full duplex recv error, got: %v, want: nil", err)
-	}
-
-	compressInvokes := atomic.LoadInt32(&wc.compressInvokes)
-	if compressInvokes != wantCompressInvokes {
-		t.Fatalf("Unexpected compress invokes, got:%d, want: %d", compressInvokes, wantCompressInvokes)
-	}
-}
-
 func (s) TestUnregisteredSetSendCompressorFailure(t *testing.T) {
 	resCompressor := "snappy2"
 	wantErr := status.Error(codes.Unknown, "unable to set send compressor: compressor not registered \"snappy2\"")
@@ -679,6 +535,57 @@ func (s) TestClientSupportedCompressors(t *testing.T) {
 	}
 }
 
+func (s) TestAcceptCompressorsCallOption(t *testing.T) {
+	tests := []struct {
+		name       string
+		callOption grpc.CallOption
+		wantHeader string
+	}{
+		{
+			name:       "with AcceptCompressors",
+			callOption: experimental.AcceptCompressors("gzip"),
+			wantHeader: "gzip",
+		},
+		{
+			name:       "without AcceptCompressors uses default",
+			callOption: nil,
+			wantHeader: grpcutil.RegisteredCompressors(),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ss := &stubserver.StubServer{
+				EmptyCallF: func(ctx context.Context, _ *testpb.Empty) (*testpb.Empty, error) {
+					md, _ := metadata.FromIncomingContext(ctx)
+					header := md.Get("grpc-accept-encoding")
+
+					if len(header) != 1 || header[0] != tt.wantHeader {
+						t.Errorf("unexpected grpc-accept-encoding header: got %v, want %v", header, tt.wantHeader)
+					}
+					return &testpb.Empty{}, nil
+				},
+			}
+			if err := ss.Start(nil); err != nil {
+				t.Fatalf("failed to start server: %v", err)
+			}
+			defer ss.Stop()
+
+			ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+			defer cancel()
+
+			opts := []grpc.CallOption{}
+			if tt.callOption != nil {
+				opts = append(opts, tt.callOption)
+			}
+
+			if _, err := ss.Client.EmptyCall(ctx, &testpb.Empty{}, opts...); err != nil {
+				t.Fatalf("EmptyCall failed: %v", err)
+			}
+		})
+	}
+}
+
 func (s) TestCompressorRegister(t *testing.T) {
 	for _, e := range listTestEnv() {
 		testCompressorRegister(t, e)
@@ -783,64 +690,5 @@ func (s) TestGzipBadChecksum(t *testing.T) {
 		status.Code(err) != codes.Internal ||
 		!strings.Contains(status.Convert(err).Message(), gzip.ErrChecksum.Error()) {
 		t.Errorf("ss.Client.UnaryCall(_) = _, %v\n\twant: _, status(codes.Internal, contains %q)", err, gzip.ErrChecksum)
-	}
-}
-
-// fakeCompressor returns a messages of a configured size, irrespective of the
-// input.
-type fakeCompressor struct {
-	decompressedMessageSize int
-}
-
-func (f *fakeCompressor) Compress(w io.Writer) (io.WriteCloser, error) {
-	return nopWriteCloser{w}, nil
-}
-
-func (f *fakeCompressor) Decompress(io.Reader) (io.Reader, error) {
-	return bytes.NewReader(make([]byte, f.decompressedMessageSize)), nil
-}
-
-func (f *fakeCompressor) Name() string {
-	// Use the name of an existing compressor to avoid interactions with other
-	// tests since compressors can't be un-registered.
-	return "gzip"
-}
-
-type nopWriteCloser struct {
-	io.Writer
-}
-
-func (nopWriteCloser) Close() error {
-	return nil
-}
-
-// TestDecompressionExceedsMaxMessageSize uses a fake compressor that produces
-// messages of size 100 bytes on decompression. A server is started with the
-// max receive message size restricted to 99 bytes. The test verifies that the
-// client receives a ResourceExhausted response from the server.
-func (s) TestDecompressionExceedsMaxMessageSize(t *testing.T) {
-	oldC := encoding.GetCompressor("gzip")
-	defer func() {
-		encoding.RegisterCompressor(oldC)
-	}()
-	const messageLen = 100
-	encoding.RegisterCompressor(&fakeCompressor{decompressedMessageSize: messageLen})
-	ss := &stubserver.StubServer{
-		UnaryCallF: func(context.Context, *testpb.SimpleRequest) (*testpb.SimpleResponse, error) {
-			return &testpb.SimpleResponse{}, nil
-		},
-	}
-	if err := ss.Start([]grpc.ServerOption{grpc.MaxRecvMsgSize(messageLen - 1)}); err != nil {
-		t.Fatalf("Error starting endpoint server: %v", err)
-	}
-	defer ss.Stop()
-
-	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
-	defer cancel()
-
-	req := &testpb.SimpleRequest{Payload: &testpb.Payload{}}
-	_, err := ss.Client.UnaryCall(ctx, req, grpc.UseCompressor("gzip"))
-	if got, want := status.Code(err), codes.ResourceExhausted; got != want {
-		t.Errorf("Client.UnaryCall(%+v) returned status %v, want %v", req, got, want)
 	}
 }

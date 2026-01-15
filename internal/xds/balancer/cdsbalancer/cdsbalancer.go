@@ -136,7 +136,8 @@ func (bb) Name() string {
 // for the cdsBalancer.
 type lbConfig struct {
 	serviceconfig.LoadBalancingConfig
-	ClusterName string `json:"Cluster"`
+	ClusterName string `json:"cluster"`
+	IsDynamic   bool   `json:"isDynamic"`
 }
 
 // ParseConfig parses the JSON load balancer config provided into an
@@ -448,7 +449,7 @@ func (b *cdsBalancer) annotateErrorWithNodeID(err error) error {
 // graph is resolved, generates child policy config and pushes it down.
 //
 // Only executed in the context of a serializer callback.
-func (b *cdsBalancer) onClusterUpdate(name string, update xdsresource.ClusterUpdate) {
+func (b *cdsBalancer) onClusterUpdate(name string, update *xdsresource.ClusterUpdate) {
 	state := b.watchers[name]
 	if state == nil {
 		// We are currently not watching this cluster anymore. Return early.
@@ -458,7 +459,7 @@ func (b *cdsBalancer) onClusterUpdate(name string, update xdsresource.ClusterUpd
 	b.logger.Infof("Received Cluster resource: %s", pretty.ToJSON(update))
 
 	// Update the watchers map with the update for the cluster.
-	state.lastUpdate = &update
+	state.lastUpdate = update
 
 	// For an aggregate cluster, always use the security configuration on the
 	// root cluster.

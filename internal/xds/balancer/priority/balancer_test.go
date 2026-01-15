@@ -74,6 +74,12 @@ func init() {
 	balancer.Register(&anotherRR{Builder: balancer.Get(roundrobin.Name)})
 }
 
+func overrideInitTimeout(t *testing.T, val time.Duration) {
+	orig := DefaultPriorityInitTimeout
+	DefaultPriorityInitTimeout = val
+	t.Cleanup(func() { DefaultPriorityInitTimeout = orig })
+}
+
 // When a high priority is ready, adding/removing lower locality doesn't cause
 // changes.
 //
@@ -674,13 +680,7 @@ func (s) TestPriority_InitTimeout(t *testing.T) {
 	defer cancel()
 
 	const testPriorityInitTimeout = 200 * time.Millisecond
-	defer func() func() {
-		old := DefaultPriorityInitTimeout
-		DefaultPriorityInitTimeout = testPriorityInitTimeout
-		return func() {
-			DefaultPriorityInitTimeout = old
-		}
-	}()()
+	overrideInitTimeout(t, testPriorityInitTimeout)
 
 	cc := testutils.NewBalancerClientConn(t)
 	bb := balancer.Get(Name)
@@ -745,13 +745,7 @@ func (s) TestPriority_RemovesAllPriorities(t *testing.T) {
 	defer cancel()
 
 	const testPriorityInitTimeout = 200 * time.Millisecond
-	defer func() func() {
-		old := DefaultPriorityInitTimeout
-		DefaultPriorityInitTimeout = testPriorityInitTimeout
-		return func() {
-			DefaultPriorityInitTimeout = old
-		}
-	}()()
+	overrideInitTimeout(t, testPriorityInitTimeout)
 
 	cc := testutils.NewBalancerClientConn(t)
 	bb := balancer.Get(Name)
@@ -1011,10 +1005,7 @@ func (s) TestPriority_HighPriorityNoEndpoints(t *testing.T) {
 // Test the case where the first and only priority is removed.
 func (s) TestPriority_FirstPriorityUnavailable(t *testing.T) {
 	const testPriorityInitTimeout = 200 * time.Millisecond
-	defer func(t time.Duration) {
-		DefaultPriorityInitTimeout = t
-	}(DefaultPriorityInitTimeout)
-	DefaultPriorityInitTimeout = testPriorityInitTimeout
+	overrideInitTimeout(t, testPriorityInitTimeout)
 
 	cc := testutils.NewBalancerClientConn(t)
 	bb := balancer.Get(Name)
@@ -2105,5 +2096,108 @@ func (s) TestPriority_HighPriorityUpdatesWhenLowInUse(t *testing.T) {
 	// Test pick with 0.
 	if err := cc.WaitForRoundRobinPicker(ctx, sc2); err != nil {
 		t.Fatal(err.Error())
+	}
+}
+
+// Tests that the priority balancer's init timer is not restarted when its child
+// reports a state transition from CONNECTING to CONNECTING.
+func (s) TestPriority_InitTimerNotRestarted_OnConnectingToConnecting(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer cancel()
+
+	initTimerStarted := make(chan struct{}, 1)
+	origTimeAfterFunc := timeAfterFunc
+	timeAfterFunc = func(d time.Duration, f func()) *time.Timer {
+		select {
+		case initTimerStarted <- struct{}{}:
+		case <-ctx.Done():
+			t.Errorf("Timeout waiting to send init timer started signal")
+		}
+		return time.AfterFunc(d, f)
+	}
+	defer func() { timeAfterFunc = origTimeAfterFunc }()
+
+	cc := testutils.NewBalancerClientConn(t)
+	bb := balancer.Get(Name)
+	pb := bb.Build(cc, balancer.BuildOptions{})
+	defer pb.Close()
+
+	// One child, with two backends.
+	ccs := balancer.ClientConnState{
+		ResolverState: resolver.State{
+			Endpoints: []resolver.Endpoint{
+				hierarchy.SetInEndpoint(resolver.Endpoint{Addresses: []resolver.Address{{Addr: testBackendAddrStrs[0]}}}, []string{"child-0"}),
+				hierarchy.SetInEndpoint(resolver.Endpoint{Addresses: []resolver.Address{{Addr: testBackendAddrStrs[1]}}}, []string{"child-0"}),
+			},
+		},
+		BalancerConfig: &LBConfig{
+			Children: map[string]*Child{
+				"child-0": {Config: &internalserviceconfig.BalancerConfig{Name: roundrobin.Name}},
+			},
+			Priorities: []string{"child-0"},
+		},
+	}
+	if err := pb.UpdateClientConnState(ccs); err != nil {
+		t.Fatalf("UpdateClientConnState(%+v) failed: %v", ccs, err)
+	}
+
+	// Wait for child-0 to be started and two subchannels to be created.
+	var sc0, sc1 *testutils.TestSubConn
+	for i := range 2 {
+		var addrs []resolver.Address
+		select {
+		case addrs = <-cc.NewSubConnAddrsCh:
+		case <-ctx.Done():
+			t.Fatalf("Timeout waiting for subconn %d to be created", i)
+		}
+		switch got := addrs[0].Addr; got {
+		case testBackendAddrStrs[0]:
+			sc0 = <-cc.NewSubConnCh
+		case testBackendAddrStrs[1]:
+			sc1 = <-cc.NewSubConnCh
+		default:
+			t.Fatalf("Got unexpected new subconn addr: %q, want %q or %q", got, testBackendAddrStrs[0], testBackendAddrStrs[1])
+		}
+	}
+
+	// Move both subchannels to CONNECTING.
+	sc0.UpdateState(balancer.SubConnState{ConnectivityState: connectivity.Connecting})
+	sc1.UpdateState(balancer.SubConnState{ConnectivityState: connectivity.Connecting})
+
+	// Ensure that the init timer is started only once.
+	select {
+	case <-initTimerStarted:
+	case <-ctx.Done():
+		t.Fatalf("Timeout waiting for init timer to start")
+	}
+	sCtx, sCancel := context.WithTimeout(ctx, defaultTestShortTimeout)
+	defer sCancel()
+	select {
+	case <-initTimerStarted:
+		t.Fatalf("Init timer started when second subchannel moved to CONNECTING")
+	case <-sCtx.Done():
+	}
+
+	// Simulate the connection succeeding (subchannel becoming Ready), and then
+	// failing (subchannel moving to Idle). RR will immediately start connecting
+	// on the failed subchannel, and will therefore reporting an overall state
+	// of Connecting. This should trigger a restart of the init timer.
+	sc0.UpdateState(balancer.SubConnState{ConnectivityState: connectivity.Ready})
+	sc0.UpdateState(balancer.SubConnState{ConnectivityState: connectivity.Idle})
+	select {
+	case <-initTimerStarted:
+	case <-ctx.Done():
+		t.Fatalf("Timeout waiting for init timer to start")
+	}
+
+	// Move the subchannel to CONNECTING again, and ensure that the init timer
+	// is not restarted.
+	sc0.UpdateState(balancer.SubConnState{ConnectivityState: connectivity.Connecting})
+	sCtx, sCancel = context.WithTimeout(ctx, defaultTestShortTimeout)
+	defer sCancel()
+	select {
+	case <-initTimerStarted:
+		t.Fatalf("Init timer restarted when subchannel moved from Ready to Idle")
+	case <-sCtx.Done():
 	}
 }
