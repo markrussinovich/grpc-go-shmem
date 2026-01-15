@@ -66,10 +66,11 @@ type streamingServerStream struct {
 	senderDone chan struct{}
 
 	// Lifecycle
-	recvDone atomic.Bool // set when client closes send
-	sendDone atomic.Bool // set when server closes send
-	done     chan struct{}
-	doneOnce sync.Once
+	recvDone   atomic.Bool   // set when client closes send
+	recvDoneCh chan struct{} // closed when recvDone is set (for select)
+	sendDone   atomic.Bool   // set when server closes send
+	done       chan struct{}
+	doneOnce   sync.Once
 
 	// Reference to server for sending
 	server *ShmStreamingServer
@@ -192,6 +193,7 @@ func (s *ShmStreamingServer) handleNewStream(streamID uint32, hdr HeadersV1) {
 		errCh:      make(chan error, 1),
 		sendQueue:  make(chan []byte, 16), // buffer outgoing messages
 		senderDone: make(chan struct{}),
+		recvDoneCh: make(chan struct{}),
 		done:       make(chan struct{}),
 		server:     s,
 	}
@@ -290,7 +292,10 @@ func (s *ShmStreamingServer) dispatchHalfClose(id uint32) {
 	if stream == nil {
 		return
 	}
-	stream.recvDone.Store(true)
+	// Set recvDone and close the channel to wake any blocked RecvMsg
+	if stream.recvDone.CompareAndSwap(false, true) {
+		close(stream.recvDoneCh)
+	}
 }
 
 // Stream methods
@@ -363,24 +368,38 @@ func (s *streamingServerStream) SendTrailers(statusCode uint32, statusMsg string
 
 // RecvMsg receives a message from the stream (blocking)
 func (s *streamingServerStream) RecvMsg() ([]byte, error) {
+	// Fast path: check for buffered message first
 	select {
 	case msg := <-s.msgCh:
 		return msg, nil
 	default:
 	}
+
+	// Check if recv is already done with no messages pending
 	if s.recvDone.Load() && len(s.msgCh) == 0 {
 		return nil, io.EOF
 	}
 
-	select {
-	case msg := <-s.msgCh:
-		return msg, nil
-	case err := <-s.errCh:
-		return nil, err
-	case <-s.ctx.Done():
-		return nil, s.ctx.Err()
-	case <-s.done:
-		return nil, errors.New("stream closed")
+	// Block waiting for message, error, or recv completion
+	for {
+		select {
+		case msg := <-s.msgCh:
+			return msg, nil
+		case err := <-s.errCh:
+			return nil, err
+		case <-s.recvDoneCh:
+			// Half-close received; drain any remaining messages
+			select {
+			case msg := <-s.msgCh:
+				return msg, nil
+			default:
+				return nil, io.EOF
+			}
+		case <-s.ctx.Done():
+			return nil, s.ctx.Err()
+		case <-s.done:
+			return nil, errors.New("stream closed")
+		}
 	}
 }
 

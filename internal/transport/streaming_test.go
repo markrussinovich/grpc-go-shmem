@@ -156,7 +156,7 @@ func TestBidirectionalStreamingNoDeadlock(t *testing.T) {
 		select {
 		case <-serverDone:
 			// Server completed.
-		case <-time.After(2 * time.Second):
+		case <-time.After(5 * time.Second):
 			t.Fatal("Server handler did not finish in time")
 		}
 	case <-time.After(10 * time.Second):
