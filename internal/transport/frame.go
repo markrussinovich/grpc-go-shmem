@@ -739,7 +739,7 @@ func writeFrameBuffers(ctx context.Context, tx *ShmRing, fh FrameHeader, hdr []b
 // The maxFramePayload parameter specifies the maximum payload size per frame. If
 // zero, it defaults to ringCapacity - frameHeaderSize - safetyMargin. A sensible
 // default is 32KB or (capacity/2) whichever is smaller.
-func writeFrameBuffersChunked(tx *ShmRing, fh FrameHeader, hdr []byte, data mem.BufferSlice, maxFramePayload int, ctx context.Context) error {
+func writeFrameBuffersChunked(ctx context.Context, tx *ShmRing, fh FrameHeader, hdr []byte, data mem.BufferSlice, maxFramePayload int) error {
 	payloadLen := len(hdr) + data.Len()
 
 	// Calculate effective max payload if not specified.

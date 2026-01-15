@@ -96,7 +96,7 @@ func TestChunkedWriteSmallRing(t *testing.T) {
 			data := mem.SliceBuffer(payload)
 			defer data.Free()
 
-			err := writeFrameBuffersChunked(tx, fh, nil, mem.BufferSlice{data}, 0, ctx)
+			err := writeFrameBuffersChunked(ctx, tx, fh, nil, mem.BufferSlice{data}, 0)
 			if err != nil {
 				t.Fatalf("writeFrameBuffersChunked failed: %v", err)
 			}
@@ -201,7 +201,7 @@ func TestChunkedWriteWithHeader(t *testing.T) {
 	data := mem.SliceBuffer(payload)
 	defer data.Free()
 
-	err = writeFrameBuffersChunked(tx, fh, hdr, mem.BufferSlice{data}, 0, ctx)
+	err = writeFrameBuffersChunked(ctx, tx, fh, hdr, mem.BufferSlice{data}, 0)
 	if err != nil {
 		t.Fatalf("writeFrameBuffersChunked failed: %v", err)
 	}
@@ -279,7 +279,7 @@ func TestChunkedWriteFastPath(t *testing.T) {
 	data := mem.SliceBuffer(payload)
 	defer data.Free()
 
-	err = writeFrameBuffersChunked(tx, fh, nil, mem.BufferSlice{data}, 0, ctx)
+	err = writeFrameBuffersChunked(ctx, tx, fh, nil, mem.BufferSlice{data}, 0)
 	if err != nil {
 		t.Fatalf("writeFrameBuffersChunked failed: %v", err)
 	}
@@ -360,7 +360,7 @@ func TestChunkedWriteExplicitChunkSize(t *testing.T) {
 	data := mem.SliceBuffer(payload)
 	defer data.Free()
 
-	err = writeFrameBuffersChunked(tx, fh, nil, mem.BufferSlice{data}, chunkSize, ctx)
+	err = writeFrameBuffersChunked(ctx, tx, fh, nil, mem.BufferSlice{data}, chunkSize)
 	if err != nil {
 		t.Fatalf("writeFrameBuffersChunked failed: %v", err)
 	}
@@ -427,7 +427,7 @@ func BenchmarkChunkedWriteSmallRing(b *testing.B) {
 
 			for i := 0; i < b.N; i++ {
 				data := mem.SliceBuffer(payload)
-				_ = writeFrameBuffersChunked(tx, fh, nil, mem.BufferSlice{data}, 0, ctx)
+				_ = writeFrameBuffersChunked(ctx, tx, fh, nil, mem.BufferSlice{data}, 0)
 				data.Free()
 			}
 

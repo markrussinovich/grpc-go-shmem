@@ -39,7 +39,7 @@ type ShmStreamingClient struct {
 	rx  *ShmRing // server <- client
 
 	nextID   uint32 // odd stream IDs for client
-	streams  map[uint32]*streamingClientStream
+	streams  map[uint32]*StreamingClientStream
 	streamsM sync.Mutex
 
 	writeMu sync.Mutex // serialize frame writes
@@ -49,8 +49,8 @@ type ShmStreamingClient struct {
 	closed     atomic.Bool
 }
 
-// streamingClientStream represents a single bidirectional stream
-type streamingClientStream struct {
+// StreamingClientStream represents a single bidirectional stream.
+type StreamingClientStream struct {
 	id     uint32
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -84,7 +84,7 @@ func NewShmStreamingClient(seg *Segment) *ShmStreamingClient {
 		tx:         NewShmRingFromSegment(seg.A, seg.Mem),
 		rx:         NewShmRingFromSegment(seg.B, seg.Mem),
 		nextID:     1,
-		streams:    make(map[uint32]*streamingClientStream),
+		streams:    make(map[uint32]*StreamingClientStream),
 		readerDone: make(chan struct{}),
 	}
 	return c
@@ -164,8 +164,8 @@ func (c *ShmStreamingClient) startReader() {
 	})
 }
 
-// NewStream creates a new bidirectional stream
-func (c *ShmStreamingClient) NewStream(ctx context.Context, method, authority string, md []KV) (*streamingClientStream, error) {
+// NewStream creates a new bidirectional stream.
+func (c *ShmStreamingClient) NewStream(ctx context.Context, method, authority string, md []KV) (*StreamingClientStream, error) {
 	if c.closed.Load() {
 		return nil, errors.New("client is closed")
 	}
@@ -179,7 +179,7 @@ func (c *ShmStreamingClient) NewStream(ctx context.Context, method, authority st
 	streamCtx, cancel := context.WithCancel(ctx)
 
 	// Create stream
-	s := &streamingClientStream{
+	s := &StreamingClientStream{
 		id:         streamID,
 		ctx:        streamCtx,
 		cancel:     cancel,
@@ -236,7 +236,7 @@ func metadataToKV(md []KV) []KV {
 
 // runStreamSender runs a dedicated sender goroutine for a stream.
 // This prevents write operations from blocking the main flow.
-func (c *ShmStreamingClient) runStreamSender(s *streamingClientStream) {
+func (c *ShmStreamingClient) runStreamSender(s *StreamingClientStream) {
 	defer close(s.senderDone)
 	for {
 		select {
@@ -345,8 +345,8 @@ func (c *ShmStreamingClient) dispatchCancel(id uint32) {
 
 // Stream methods
 
-// SendMsg sends a message on the stream (non-blocking, queued)
-func (s *streamingClientStream) SendMsg(payload []byte) error {
+// SendMsg sends a message on the stream (non-blocking, queued).
+func (s *StreamingClientStream) SendMsg(payload []byte) error {
 	if s.sendDone.Load() {
 		return errors.New("send already closed")
 	}
@@ -360,8 +360,8 @@ func (s *streamingClientStream) SendMsg(payload []byte) error {
 	}
 }
 
-// CloseSend signals that no more messages will be sent
-func (s *streamingClientStream) CloseSend() error {
+// CloseSend signals that no more messages will be sent.
+func (s *StreamingClientStream) CloseSend() error {
 	if !s.sendDone.CompareAndSwap(false, true) {
 		return errors.New("send already closed")
 	}
@@ -375,8 +375,8 @@ func (s *streamingClientStream) CloseSend() error {
 	return s.client.writeFrameSafe(s.ctx, fh, nil)
 }
 
-// RecvMsg receives a message from the stream (blocking)
-func (s *streamingClientStream) RecvMsg() ([]byte, error) {
+// RecvMsg receives a message from the stream (blocking).
+func (s *StreamingClientStream) RecvMsg() ([]byte, error) {
 	for {
 		// Prefer draining buffered messages before observing trailers.
 		select {
@@ -408,8 +408,8 @@ func (s *streamingClientStream) RecvMsg() ([]byte, error) {
 	}
 }
 
-// RecvHeaders receives the initial headers (blocking)
-func (s *streamingClientStream) RecvHeaders() (HeadersV1, error) {
+// RecvHeaders receives the initial headers (blocking).
+func (s *StreamingClientStream) RecvHeaders() (HeadersV1, error) {
 	select {
 	case hdr := <-s.hdrCh:
 		return hdr, nil
@@ -422,8 +422,8 @@ func (s *streamingClientStream) RecvHeaders() (HeadersV1, error) {
 	}
 }
 
-// closeWithError closes the stream with an error
-func (s *streamingClientStream) closeWithError(err error) {
+// closeWithError closes the stream with an error.
+func (s *StreamingClientStream) closeWithError(err error) {
 	s.doneOnce.Do(func() {
 		if err != nil {
 			select {

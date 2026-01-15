@@ -971,7 +971,7 @@ func (t *ShmServerTransport) write(s *ServerStream, hdr []byte, data mem.BufferS
 	// Write frame to server->client ring
 	t.writeMu.Lock()
 	defer t.writeMu.Unlock()
-	if err := writeFrameBuffersChunked(t.serverToClient, fh, hdr, data, 0, context.Background()); err != nil {
+	if err := writeFrameBuffersChunked(context.Background(), t.serverToClient, fh, hdr, data, 0); err != nil {
 		shmDebugf("[ERROR] ShmServerTransport.write: Failed to write frame: %v", err)
 		return err
 	}

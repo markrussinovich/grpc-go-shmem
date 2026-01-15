@@ -39,7 +39,7 @@ import (
 // cycles is typically 1 for a single PAUSE.
 //
 //go:linkname runtime_procyield runtime.procyield
-//nolint:revive // This name must match the Go runtime internal function
+//revive:disable:var-naming This name must match the Go runtime internal function
 func runtime_procyield(cycles uint32)
 
 // Spin-wait constants for adaptive spinning before falling back to futex.
