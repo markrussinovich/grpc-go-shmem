@@ -156,7 +156,7 @@ func (l *ShmListener) Accept() (net.Conn, error) {
 
 	// Read a CONNECT request from the control ring.
 	for {
-		fh, payload, err := readFrame(l.ctlRx, l.ctx)
+		fh, payload, err := readFrame(l.ctx, l.ctlRx)
 		if err != nil {
 			return nil, err
 		}
@@ -164,7 +164,7 @@ func (l *ShmListener) Accept() (net.Conn, error) {
 			continue
 		}
 		if _, err := decodeConnectRequest(payload); err != nil {
-			_ = writeFrame(l.ctlTx, FrameHeader{Type: FrameTypeREJECT}, encodeConnectReject(connectReject{message: err.Error()}), l.ctx)
+			_ = writeFrame(l.ctx, l.ctlTx, FrameHeader{Type: FrameTypeREJECT}, encodeConnectReject(connectReject{message: err.Error()}))
 			continue
 		}
 
@@ -178,13 +178,13 @@ func (l *ShmListener) Accept() (net.Conn, error) {
 			}
 		}
 		if err != nil {
-			_ = writeFrame(l.ctlTx, FrameHeader{Type: FrameTypeREJECT}, encodeConnectReject(connectReject{message: err.Error()}), l.ctx)
+			_ = writeFrame(l.ctx, l.ctlTx, FrameHeader{Type: FrameTypeREJECT}, encodeConnectReject(connectReject{message: err.Error()}))
 			continue
 		}
 		segment.H.SetMaxStreams(atomic.LoadUint32(&l.maxStreams))
 		segment.H.SetServerReady(true)
 
-		if err := writeFrame(l.ctlTx, FrameHeader{Type: FrameTypeACCEPT}, encodeConnectResponse(connectResponse{segmentName: segmentName}), l.ctx); err != nil {
+		if err := writeFrame(l.ctx, l.ctlTx, FrameHeader{Type: FrameTypeACCEPT}, encodeConnectResponse(connectResponse{segmentName: segmentName})); err != nil {
 			segment.Close()
 			return nil, err
 		}

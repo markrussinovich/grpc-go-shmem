@@ -96,7 +96,7 @@ func (c *ShmUnaryClient) startReader() {
 			log.Printf("Client: reader goroutine starting")
 			for !c.closed.Load() {
 				log.Printf("Client: reader attempting to read frame...")
-				fh, payload, err := readFrame(c.rx, ctx)
+				fh, payload, err := readFrame(ctx, c.rx)
 				if err != nil {
 					log.Printf("Client: reader got error: %v", err)
 					// Context cancelled or ring closed
@@ -120,7 +120,7 @@ func (c *ShmUnaryClient) startReader() {
 					log.Printf("Client: reader handling PING for stream %d", fh.StreamID)
 					// Immediately reply with PONG
 					c.writeMu.Lock()
-					_ = writeFrame(c.tx, FrameHeader{StreamID: fh.StreamID, Type: FrameTypePONG}, payload, ctx)
+					_ = writeFrame(ctx, c.tx, FrameHeader{StreamID: fh.StreamID, Type: FrameTypePONG}, payload)
 					c.writeMu.Unlock()
 				case FrameTypeGOAWAY:
 					log.Printf("Client: reader ignoring GOAWAY")
@@ -247,7 +247,7 @@ func (c *ShmUnaryClient) UnaryCall(ctx context.Context, method, authority string
 
 			log.Printf("Client: sendCancel - attempting to write CANCEL frame for stream %d", id)
 			cancelCtx, cancelFn := context.WithTimeout(context.Background(), 200*time.Millisecond)
-			errCancel := writeFrame(c.tx, FrameHeader{StreamID: id, Type: FrameTypeCANCEL}, []byte{1}, cancelCtx)
+			errCancel := writeFrame(cancelCtx, c.tx, FrameHeader{StreamID: id, Type: FrameTypeCANCEL}, []byte{1})
 			cancelFn()
 
 			if errCancel != nil {
@@ -322,7 +322,7 @@ func (c *ShmUnaryClient) UnaryCall(ctx context.Context, method, authority string
 	hbytes := encodeHeaders(hdr)
 	log.Printf("Client: about to send HEADERS frame for stream %d", id)
 	c.writeMu.Lock()
-	if err := writeFrame(c.tx, FrameHeader{StreamID: id, Type: FrameTypeHEADERS, Flags: HeadersFlagINITIAL}, hbytes, ctx); err != nil {
+	if err := writeFrame(ctx, c.tx, FrameHeader{StreamID: id, Type: FrameTypeHEADERS, Flags: HeadersFlagINITIAL}, hbytes); err != nil {
 		c.writeMu.Unlock()
 		log.Printf("Client: HEADERS write failed for stream %d: %v", id, err)
 		close(done) // tell cancel goroutine to exit
@@ -331,7 +331,7 @@ func (c *ShmUnaryClient) UnaryCall(ctx context.Context, method, authority string
 	log.Printf("Client: HEADERS sent successfully for stream %d", id)
 	// Send MESSAGE (single frame for unary)
 	log.Printf("Client: about to send MESSAGE frame for stream %d", id)
-	if err := writeFrame(c.tx, FrameHeader{StreamID: id, Type: FrameTypeMESSAGE}, payload, ctx); err != nil {
+	if err := writeFrame(ctx, c.tx, FrameHeader{StreamID: id, Type: FrameTypeMESSAGE}, payload); err != nil {
 		c.writeMu.Unlock()
 		log.Printf("Client: MESSAGE write failed for stream %d: %v", id, err)
 		close(done)

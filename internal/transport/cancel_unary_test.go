@@ -67,7 +67,7 @@ func TestUnary_CancellationWithSlowServer(t *testing.T) {
 		// Read HEADERS frame with a timeout in case client never sends
 		log.Printf("Server: Reading HEADERS...")
 		ctx1, cancel1 := context.WithTimeout(context.Background(), 5*time.Second)
-		fh, _, err := readFrame(srvRx, ctx1)
+		fh, _, err := readFrame(ctx1, srvRx)
 		cancel1()
 		if err != nil {
 			log.Printf("Server: Failed to read HEADERS: %v", err)
@@ -83,7 +83,7 @@ func TestUnary_CancellationWithSlowServer(t *testing.T) {
 		// Read MESSAGE frame with timeout
 		log.Printf("Server: Reading MESSAGE...")
 		ctx2, cancel2 := context.WithTimeout(context.Background(), 5*time.Second)
-		fh2, msgPayload, err2 := readFrame(srvRx, ctx2)
+		fh2, msgPayload, err2 := readFrame(ctx2, srvRx)
 		cancel2()
 		if err2 != nil {
 			log.Printf("Server: Failed to read MESSAGE: %v", err2)
@@ -107,10 +107,10 @@ func TestUnary_CancellationWithSlowServer(t *testing.T) {
 		log.Printf("Server: Attempting to send HEADERS response...")
 		respHdr := HeadersV1{Version: 1, HdrType: 1}
 		hdrBytes := encodeHeaders(respHdr)
-		err3 := writeFrame(srvTx, FrameHeader{
+		err3 := writeFrame(testCtx, srvTx, FrameHeader{
 			StreamID: streamID,
 			Type:     FrameTypeHEADERS,
-		}, hdrBytes, testCtx)
+		}, hdrBytes)
 
 		if err3 != nil {
 			log.Printf("Server: Failed to write HEADERS response: %v", err3)
@@ -123,7 +123,7 @@ func TestUnary_CancellationWithSlowServer(t *testing.T) {
 		ctx3, cancel3 := context.WithTimeout(context.Background(), 1*time.Second)
 		defer cancel3()
 
-		fh3, _, err4 := readFrame(srvRx, ctx3)
+		fh3, _, err4 := readFrame(ctx3, srvRx)
 		if err4 != nil {
 			log.Printf("Server: Error reading next frame: %v", err4)
 			return

@@ -131,7 +131,7 @@ func (s *ShmStreamingServer) startReader() {
 
 			log.Printf("StreamingServer: reader goroutine starting")
 			for !s.closed.Load() {
-				fh, payload, err := readFrame(s.rx, ctx)
+				fh, payload, err := readFrame(ctx, s.rx)
 				if err != nil {
 					if errors.Is(err, ErrRingClosed) || errors.Is(err, io.EOF) {
 						log.Printf("StreamingServer: reader exiting due to closed ring")
@@ -159,7 +159,7 @@ func (s *ShmStreamingServer) startReader() {
 				case FrameTypePING:
 					// Reply with PONG
 					s.writeMu.Lock()
-					_ = writeFrame(s.tx, FrameHeader{StreamID: fh.StreamID, Type: FrameTypePONG}, payload, ctx)
+					_ = writeFrame(ctx, s.tx, FrameHeader{StreamID: fh.StreamID, Type: FrameTypePONG}, payload)
 					s.writeMu.Unlock()
 				default:
 					log.Printf("StreamingServer: unknown frame type %d", fh.Type)
@@ -236,7 +236,7 @@ func (s *ShmStreamingServer) runStreamSender(stream *streamingServerStream) {
 				StreamID: stream.id,
 				Type:     FrameTypeMESSAGE,
 			}
-			if err := s.writeFrameSafe(fh, msg, stream.ctx); err != nil {
+			if err := s.writeFrameSafe(stream.ctx, fh, msg); err != nil {
 				log.Printf("StreamingServer: failed to send message on stream %d: %v", stream.id, err)
 				stream.closeWithError(err)
 				return
@@ -246,10 +246,10 @@ func (s *ShmStreamingServer) runStreamSender(stream *streamingServerStream) {
 }
 
 // writeFrameSafe writes a frame with mutex protection
-func (s *ShmStreamingServer) writeFrameSafe(fh FrameHeader, payload []byte, ctx context.Context) error {
+func (s *ShmStreamingServer) writeFrameSafe(ctx context.Context, fh FrameHeader, payload []byte) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	return writeFrame(s.tx, fh, payload, ctx)
+	return writeFrame(ctx, s.tx, fh, payload)
 }
 
 // Dispatch methods
@@ -310,7 +310,7 @@ func (s *streamingServerStream) SendHeaders(md []KV) error {
 		Type:     FrameTypeHEADERS,
 	}
 
-	return s.server.writeFrameSafe(fh, payload, s.ctx)
+	return s.server.writeFrameSafe(s.ctx, fh, payload)
 }
 
 // SendMsg sends a message on the stream (non-blocking, queued)
@@ -351,7 +351,7 @@ func (s *streamingServerStream) SendTrailers(statusCode uint32, statusMsg string
 		Flags:    TrailersFlagEndStream,
 	}
 
-	err := s.server.writeFrameSafe(fh, payload, s.ctx)
+	err := s.server.writeFrameSafe(s.ctx, fh, payload)
 
 	// Remove from server's stream map
 	s.server.streamsM.Lock()

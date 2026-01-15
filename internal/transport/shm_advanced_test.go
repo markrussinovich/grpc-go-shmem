@@ -82,7 +82,7 @@ func TestShmPingPongSizes(t *testing.T) {
 				srvTx := NewShmRingFromSegment(seg.B, seg.Mem)
 
 				// Read headers
-				fh, pl, err := readFrame(srvRx, testCtx)
+				fh, pl, err := readFrame(testCtx, srvRx)
 				if err != nil {
 					t.Errorf("server read headers: %v", err)
 					return
@@ -97,7 +97,7 @@ func TestShmPingPongSizes(t *testing.T) {
 				}
 
 				// Read message
-				fh2, msg, err := readFrame(srvRx, testCtx)
+				fh2, msg, err := readFrame(testCtx, srvRx)
 				if err != nil {
 					t.Errorf("server read msg: %v", err)
 					return
@@ -109,10 +109,10 @@ func TestShmPingPongSizes(t *testing.T) {
 
 				// Echo back: HEADERS + MESSAGE + TRAILERS
 				h := HeadersV1{Version: 1, HdrType: 1}
-				_ = writeFrame(srvTx, FrameHeader{StreamID: fh.StreamID, Type: FrameTypeHEADERS, Flags: HeadersFlagINITIAL}, encodeHeaders(h), testCtx)
-				_ = writeFrame(srvTx, FrameHeader{StreamID: fh.StreamID, Type: FrameTypeMESSAGE}, msg, testCtx)
+				_ = writeFrame(testCtx, srvTx, FrameHeader{StreamID: fh.StreamID, Type: FrameTypeHEADERS, Flags: HeadersFlagINITIAL}, encodeHeaders(h))
+				_ = writeFrame(testCtx, srvTx, FrameHeader{StreamID: fh.StreamID, Type: FrameTypeMESSAGE}, msg)
 				tr := TrailersV1{Version: 1, GRPCStatusCode: 0}
-				_ = writeFrame(srvTx, FrameHeader{StreamID: fh.StreamID, Type: FrameTypeTRAILERS, Flags: TrailersFlagEndStream}, encodeTrailers(tr), testCtx)
+				_ = writeFrame(testCtx, srvTx, FrameHeader{StreamID: fh.StreamID, Type: FrameTypeTRAILERS, Flags: TrailersFlagEndStream}, encodeTrailers(tr))
 			}()
 
 			// Client factory
@@ -199,7 +199,7 @@ func TestShmConcurrentStreams(t *testing.T) {
 		}
 		reqs := make([]req, 0, numCalls)
 		for i := 0; i < numCalls; i++ {
-			fh, pl, err := readFrame(srvRx, testCtx)
+			fh, pl, err := readFrame(testCtx, srvRx)
 			if err != nil {
 				t.Errorf("server read headers: %v", err)
 				return
@@ -213,7 +213,7 @@ func TestShmConcurrentStreams(t *testing.T) {
 				return
 			}
 
-			fh2, msg, err := readFrame(srvRx, testCtx)
+			fh2, msg, err := readFrame(testCtx, srvRx)
 			if err != nil {
 				t.Errorf("server read msg: %v", err)
 				return
@@ -229,10 +229,10 @@ func TestShmConcurrentStreams(t *testing.T) {
 		for i := len(reqs) - 1; i >= 0; i-- {
 			r := reqs[i]
 			h := HeadersV1{Version: 1, HdrType: 1}
-			_ = writeFrame(srvTx, FrameHeader{StreamID: r.streamID, Type: FrameTypeHEADERS, Flags: HeadersFlagINITIAL}, encodeHeaders(h), testCtx)
-			_ = writeFrame(srvTx, FrameHeader{StreamID: r.streamID, Type: FrameTypeMESSAGE}, r.msg, testCtx)
+			_ = writeFrame(testCtx, srvTx, FrameHeader{StreamID: r.streamID, Type: FrameTypeHEADERS, Flags: HeadersFlagINITIAL}, encodeHeaders(h))
+			_ = writeFrame(testCtx, srvTx, FrameHeader{StreamID: r.streamID, Type: FrameTypeMESSAGE}, r.msg)
 			tr := TrailersV1{Version: 1, GRPCStatusCode: 0}
-			_ = writeFrame(srvTx, FrameHeader{StreamID: r.streamID, Type: FrameTypeTRAILERS, Flags: TrailersFlagEndStream}, encodeTrailers(tr), testCtx)
+			_ = writeFrame(testCtx, srvTx, FrameHeader{StreamID: r.streamID, Type: FrameTypeTRAILERS, Flags: TrailersFlagEndStream}, encodeTrailers(tr))
 		}
 	}()
 
@@ -332,14 +332,14 @@ func TestShmStreamError(t *testing.T) {
 		srvTx := NewShmRingFromSegment(seg.B, seg.Mem)
 
 		// Read headers
-		fh, _, err := readFrame(srvRx, testCtx)
+		fh, _, err := readFrame(testCtx, srvRx)
 		if err != nil {
 			t.Errorf("server read: %v", err)
 			return
 		}
 
 		// Read message
-		_, _, err = readFrame(srvRx, testCtx)
+		_, _, err = readFrame(testCtx, srvRx)
 		if err != nil {
 			t.Errorf("server read msg: %v", err)
 			return
@@ -347,7 +347,7 @@ func TestShmStreamError(t *testing.T) {
 
 		// Send error TRAILERS
 		tr := TrailersV1{Version: 1, GRPCStatusCode: uint32(codes.Internal), GRPCStatusMsg: "test error"}
-		_ = writeFrame(srvTx, FrameHeader{StreamID: fh.StreamID, Type: FrameTypeTRAILERS, Flags: TrailersFlagEndStream}, encodeTrailers(tr), testCtx)
+		_ = writeFrame(testCtx, srvTx, FrameHeader{StreamID: fh.StreamID, Type: FrameTypeTRAILERS, Flags: TrailersFlagEndStream}, encodeTrailers(tr))
 	}()
 
 	// Client factory

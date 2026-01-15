@@ -84,12 +84,12 @@ func TestWriteReadFrame_HeadersAndTrailers(t *testing.T) {
 		Version: 1, HdrType: 0, Method: "/pkg.Svc/M", Authority: "x", Metadata: nil,
 	})
 	fh := FrameHeader{StreamID: 1, Type: FrameTypeHEADERS, Flags: HeadersFlagINITIAL}
-	if err := writeFrame(ring, fh, hdrPayload, testCtx); err != nil {
+	if err := writeFrame(testCtx, ring, fh, hdrPayload); err != nil {
 		t.Fatalf("writeFrame HEADERS: %v", err)
 	}
 
 	// Read HEADERS
-	gotFH, gotPayload, err := readFrame(ring, testCtx)
+	gotFH, gotPayload, err := readFrame(testCtx, ring)
 	if err != nil {
 		t.Fatalf("readFrame HEADERS: %v", err)
 	}
@@ -103,10 +103,10 @@ func TestWriteReadFrame_HeadersAndTrailers(t *testing.T) {
 	// Write TRAILERS
 	trPayload := encodeTrailers(TrailersV1{Version: 1, GRPCStatusCode: 0, GRPCStatusMsg: "", Metadata: nil})
 	tfh := FrameHeader{StreamID: 1, Type: FrameTypeTRAILERS, Flags: TrailersFlagEndStream}
-	if err := writeFrame(ring, tfh, trPayload, testCtx); err != nil {
+	if err := writeFrame(testCtx, ring, tfh, trPayload); err != nil {
 		t.Fatalf("writeFrame TRAILERS: %v", err)
 	}
-	gotTFH, gotTPayload, err := readFrame(ring, testCtx)
+	gotTFH, gotTPayload, err := readFrame(testCtx, ring)
 	if err != nil {
 		t.Fatalf("readFrame TRAILERS: %v", err)
 	}
@@ -139,22 +139,22 @@ func TestWriteReadFrame_MessageChunkingWithMoreFlag(t *testing.T) {
 	part2 := orig[1700:]
 
 	fh1 := FrameHeader{StreamID: 3, Type: FrameTypeMESSAGE, Flags: MessageFlagMORE}
-	if err := writeFrame(ring, fh1, part1, testCtx); err != nil {
+	if err := writeFrame(testCtx, ring, fh1, part1); err != nil {
 		t.Fatalf("writeFrame part1: %v", err)
 	}
 	fh2 := FrameHeader{StreamID: 3, Type: FrameTypeMESSAGE, Flags: 0}
-	if err := writeFrame(ring, fh2, part2, testCtx); err != nil {
+	if err := writeFrame(testCtx, ring, fh2, part2); err != nil {
 		t.Fatalf("writeFrame part2: %v", err)
 	}
 
-	gfh1, gp1, err := readFrame(ring, testCtx)
+	gfh1, gp1, err := readFrame(testCtx, ring)
 	if err != nil {
 		t.Fatalf("readFrame part1: %v", err)
 	}
 	if gfh1.Type != FrameTypeMESSAGE || gfh1.StreamID != 3 || gfh1.Flags&MessageFlagMORE == 0 {
 		t.Fatalf("unexpected fh1: %+v", gfh1)
 	}
-	gfh2, gp2, err := readFrame(ring, testCtx)
+	gfh2, gp2, err := readFrame(testCtx, ring)
 	if err != nil {
 		t.Fatalf("readFrame part2: %v", err)
 	}
@@ -190,23 +190,23 @@ func TestWriteFrame_PadAlignmentHandled(t *testing.T) {
 	// (16 + payloadLen) % cap = cap-10 -> remaining=10
 	payload1 := make([]byte, cap-26)
 	fh1 := FrameHeader{StreamID: 9, Type: FrameTypeMESSAGE}
-	if err := writeFrame(ring, fh1, payload1, testCtx); err != nil {
+	if err := writeFrame(testCtx, ring, fh1, payload1); err != nil {
 		t.Fatalf("writeFrame payload1: %v", err)
 	}
 
 	// Read first frame (big message) before writing the next one to avoid backpressure deadlock.
-	if _, _, err := readFrame(ring, testCtx); err != nil {
+	if _, _, err := readFrame(testCtx, ring); err != nil {
 		t.Fatalf("readFrame 1: %v", err)
 	}
 
 	// Now write a small HEADERS frame; writeFrame should insert PAD internally
 	hdrPayload := encodeHeaders(HeadersV1{Version: 1, HdrType: 0, Method: "/x.y/z", Authority: "a"})
 	fh2 := FrameHeader{StreamID: 9, Type: FrameTypeHEADERS, Flags: HeadersFlagINITIAL}
-	if err := writeFrame(ring, fh2, hdrPayload, testCtx); err != nil {
+	if err := writeFrame(testCtx, ring, fh2, hdrPayload); err != nil {
 		t.Fatalf("writeFrame headers after wrap: %v", err)
 	}
 	// Next non-PAD frame should be HEADERS (PAD is skipped by readFrame)
-	gotFH, _, err := readFrame(ring, testCtx)
+	gotFH, _, err := readFrame(testCtx, ring)
 	if err != nil {
 		t.Fatalf("readFrame 2: %v", err)
 	}

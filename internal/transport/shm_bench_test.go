@@ -57,7 +57,7 @@ func BenchmarkShmRingWriteRead(b *testing.B) {
 
 			for i := 0; i < b.N; i++ {
 				// Write
-				res, err := ring.ReserveWrite(size, ctx)
+				res, err := ring.ReserveWrite(ctx, size)
 				if err != nil {
 					b.Fatalf("ReserveWrite failed at iter %d: %v", i, err)
 				}
@@ -70,7 +70,7 @@ func BenchmarkShmRingWriteRead(b *testing.B) {
 				}
 
 				// Read
-				first, second, commit, err := ring.ReadSlices(size, ctx)
+				first, second, commit, err := ring.ReadSlices(ctx, size)
 				if err != nil {
 					b.Fatalf("ReadSlices failed at iter %d: %v", i, err)
 				}
@@ -116,7 +116,7 @@ func BenchmarkShmRingThroughput(b *testing.B) {
 			go func() {
 				defer wg.Done()
 				for i := 0; i < b.N; i++ {
-					res, err := ring.ReserveWrite(size, ctx)
+					res, err := ring.ReserveWrite(ctx, size)
 					if err != nil {
 						errCh <- err
 						return
@@ -134,7 +134,7 @@ func BenchmarkShmRingThroughput(b *testing.B) {
 			go func() {
 				defer wg.Done()
 				for i := 0; i < b.N; i++ {
-					first, second, commit, err := ring.ReadSlices(size, ctx)
+					first, second, commit, err := ring.ReadSlices(ctx, size)
 					if err != nil {
 						errCh <- err
 						return
@@ -422,14 +422,14 @@ func BenchmarkShmRingRoundtrip(b *testing.B) {
 
 				for i := 0; i < b.N; i++ {
 					// Read from client
-					first, second, commit, err := clientToServer.ReadSlices(size, ctx)
+					first, second, commit, err := clientToServer.ReadSlices(ctx, size)
 					if err != nil {
 						errCh <- err
 						return
 					}
 
 					// Write to client (echo)
-					res, err := serverToClient.ReserveWrite(size, ctx)
+					res, err := serverToClient.ReserveWrite(ctx, size)
 					if err != nil {
 						errCh <- err
 						return
@@ -450,7 +450,7 @@ func BenchmarkShmRingRoundtrip(b *testing.B) {
 
 			for i := 0; i < b.N; i++ {
 				// Write to server
-				res, err := clientToServer.ReserveWrite(size, ctx)
+				res, err := clientToServer.ReserveWrite(ctx, size)
 				if err != nil {
 					b.Fatalf("ReserveWrite failed: %v", err)
 				}
@@ -458,7 +458,7 @@ func BenchmarkShmRingRoundtrip(b *testing.B) {
 				res.Commit(size)
 
 				// Read from server
-				first, _, commit, err := serverToClient.ReadSlices(size, ctx)
+				first, _, commit, err := serverToClient.ReadSlices(ctx, size)
 				if err != nil {
 					b.Fatalf("ReadSlices failed: %v", err)
 				}
@@ -588,14 +588,14 @@ func BenchmarkShmRingLargePayloads(b *testing.B) {
 				// Sequential write-then-read for payloads that fit in ring
 				for i := 0; i < b.N; i++ {
 					// Write the full payload
-					if err := ring.WriteAll(data, ctx); err != nil {
+					if err := ring.WriteAll(ctx, data); err != nil {
 						b.Fatalf("WriteAll failed at iter %d: %v", i, err)
 					}
 
 					// Read the full payload
 					totalRead := 0
 					for totalRead < size {
-						first, second, commit, err := ring.ReadSlices(min(size-totalRead, 32*1024), ctx)
+						first, second, commit, err := ring.ReadSlices(ctx, min(size-totalRead, 32*1024))
 						if err != nil {
 							b.Fatalf("ReadSlices failed at iter %d, %d/%d: %v", i, totalRead, size, err)
 						}
@@ -617,14 +617,14 @@ func BenchmarkShmRingLargePayloads(b *testing.B) {
 						}
 
 						// Write chunk
-						if err := ring.WriteAll(data[offset:offset+writeSize], ctx); err != nil {
+						if err := ring.WriteAll(ctx, data[offset:offset+writeSize]); err != nil {
 							b.Fatalf("WriteAll chunk failed at iter %d, offset %d: %v", i, offset, err)
 						}
 
 						// Read chunk immediately
 						chunkRead := 0
 						for chunkRead < writeSize {
-							first, second, commit, err := ring.ReadSlices(min(writeSize-chunkRead, 32*1024), ctx)
+							first, second, commit, err := ring.ReadSlices(ctx, min(writeSize-chunkRead, 32*1024))
 							if err != nil {
 								b.Fatalf("ReadSlices chunk failed at iter %d, offset %d: %v", i, offset, err)
 							}
@@ -884,7 +884,7 @@ func BenchmarkShmRingLargePayloadsRoundtrip(b *testing.B) {
 					}
 
 					// Echo back immediately
-					if err := serverToClient.WriteAll(readBuf[:n], ctx); err != nil {
+					if err := serverToClient.WriteAll(ctx, readBuf[:n]); err != nil {
 						select {
 						case errCh <- err:
 						default:
@@ -912,7 +912,7 @@ func BenchmarkShmRingLargePayloadsRoundtrip(b *testing.B) {
 					offset := 0
 					for offset < size {
 						writeSize := min(chunkSize, size-offset)
-						if err := clientToServer.WriteAll(data[offset:offset+writeSize], ctx); err != nil {
+						if err := clientToServer.WriteAll(ctx, data[offset:offset+writeSize]); err != nil {
 							writeErr = err
 							return
 						}

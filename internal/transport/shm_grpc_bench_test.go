@@ -76,13 +76,13 @@ func BenchmarkShmRingLargeMessages(b *testing.B) {
 				close(started)
 
 				for i := 0; i < b.N; i++ {
-					first, second, commit, err := clientToServer.ReadSlices(size, ctx)
+					first, second, commit, err := clientToServer.ReadSlices(ctx, size)
 					if err != nil {
 						errCh <- err
 						return
 					}
 
-					res, err := serverToClient.ReserveWrite(size, ctx)
+					res, err := serverToClient.ReserveWrite(ctx, size)
 					if err != nil {
 						errCh <- err
 						return
@@ -102,7 +102,7 @@ func BenchmarkShmRingLargeMessages(b *testing.B) {
 			b.ResetTimer()
 
 			for i := 0; i < b.N; i++ {
-				res, err := clientToServer.ReserveWrite(size, ctx)
+				res, err := clientToServer.ReserveWrite(ctx, size)
 				if err != nil {
 					b.Fatalf("ReserveWrite failed: %v", err)
 				}
@@ -112,7 +112,7 @@ func BenchmarkShmRingLargeMessages(b *testing.B) {
 				}
 				res.Commit(size)
 
-				first, _, commit, err := serverToClient.ReadSlices(size, ctx)
+				first, _, commit, err := serverToClient.ReadSlices(ctx, size)
 				if err != nil {
 					b.Fatalf("ReadSlices failed: %v", err)
 				}
@@ -172,13 +172,13 @@ func BenchmarkShmConcurrentStreams(b *testing.B) {
 					}
 
 					ctxTimeout, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
-					first, second, commit, err := clientToServer.ReadSlices(messageSize, ctxTimeout)
+					first, second, commit, err := clientToServer.ReadSlices(ctxTimeout, messageSize)
 					cancel()
 					if err != nil {
 						continue
 					}
 
-					res, err := serverToClient.ReserveWrite(messageSize, ctx)
+					res, err := serverToClient.ReserveWrite(ctx, messageSize)
 					if err != nil {
 						return
 					}
@@ -207,7 +207,7 @@ func BenchmarkShmConcurrentStreams(b *testing.B) {
 
 					for i := 0; i < b.N; i++ {
 						// Write request
-						res, err := clientToServer.ReserveWrite(messageSize, ctx)
+						res, err := clientToServer.ReserveWrite(ctx, messageSize)
 						if err != nil {
 							return
 						}
@@ -215,7 +215,7 @@ func BenchmarkShmConcurrentStreams(b *testing.B) {
 						res.Commit(messageSize)
 
 						// Read response
-						_, _, commit, err := serverToClient.ReadSlices(messageSize, ctx)
+						_, _, commit, err := serverToClient.ReadSlices(ctx, messageSize)
 						if err != nil {
 							return
 						}
@@ -265,12 +265,12 @@ func BenchmarkShmLatencyPercentiles(b *testing.B) {
 		close(started)
 
 		for i := 0; i < iterations; i++ {
-			first, second, commit, err := clientToServer.ReadSlices(messageSize, ctx)
+			first, second, commit, err := clientToServer.ReadSlices(ctx, messageSize)
 			if err != nil {
 				return
 			}
 
-			res, err := serverToClient.ReserveWrite(messageSize, ctx)
+			res, err := serverToClient.ReserveWrite(ctx, messageSize)
 			if err != nil {
 				return
 			}
@@ -291,14 +291,14 @@ func BenchmarkShmLatencyPercentiles(b *testing.B) {
 	for i := 0; i < iterations; i++ {
 		start := time.Now()
 
-		res, err := clientToServer.ReserveWrite(messageSize, ctx)
+		res, err := clientToServer.ReserveWrite(ctx, messageSize)
 		if err != nil {
 			b.Fatalf("ReserveWrite failed: %v", err)
 		}
 		copy(res.First, data)
 		res.Commit(messageSize)
 
-		_, _, commit, err := serverToClient.ReadSlices(messageSize, ctx)
+		_, _, commit, err := serverToClient.ReadSlices(ctx, messageSize)
 		if err != nil {
 			b.Fatalf("ReadSlices failed: %v", err)
 		}
@@ -406,7 +406,7 @@ func BenchmarkShmClientStreaming(b *testing.B) {
 				for i := 0; i < b.N; i++ {
 					// Receive all client messages
 					for j := 0; j < count; j++ {
-						_, _, commit, err := clientToServer.ReadSlices(messageSize, ctx)
+						_, _, commit, err := clientToServer.ReadSlices(ctx, messageSize)
 						if err != nil {
 							return
 						}
@@ -414,7 +414,7 @@ func BenchmarkShmClientStreaming(b *testing.B) {
 					}
 
 					// Send single response
-					res, err := serverToClient.ReserveWrite(messageSize, ctx)
+					res, err := serverToClient.ReserveWrite(ctx, messageSize)
 					if err != nil {
 						return
 					}
@@ -431,7 +431,7 @@ func BenchmarkShmClientStreaming(b *testing.B) {
 			for i := 0; i < b.N; i++ {
 				// Send all messages
 				for j := 0; j < count; j++ {
-					res, err := clientToServer.ReserveWrite(messageSize, ctx)
+					res, err := clientToServer.ReserveWrite(ctx, messageSize)
 					if err != nil {
 						b.Fatalf("ReserveWrite failed: %v", err)
 					}
@@ -440,7 +440,7 @@ func BenchmarkShmClientStreaming(b *testing.B) {
 				}
 
 				// Receive single response
-				_, _, commit, err := serverToClient.ReadSlices(messageSize, ctx)
+				_, _, commit, err := serverToClient.ReadSlices(ctx, messageSize)
 				if err != nil {
 					b.Fatalf("ReadSlices failed: %v", err)
 				}
@@ -489,7 +489,7 @@ func BenchmarkShmServerStreaming(b *testing.B) {
 
 				for i := 0; i < b.N; i++ {
 					// Receive single request
-					_, _, commit, err := clientToServer.ReadSlices(messageSize, ctx)
+					_, _, commit, err := clientToServer.ReadSlices(ctx, messageSize)
 					if err != nil {
 						return
 					}
@@ -497,7 +497,7 @@ func BenchmarkShmServerStreaming(b *testing.B) {
 
 					// Send all responses
 					for j := 0; j < count; j++ {
-						res, err := serverToClient.ReserveWrite(messageSize, ctx)
+						res, err := serverToClient.ReserveWrite(ctx, messageSize)
 						if err != nil {
 							return
 						}
@@ -514,7 +514,7 @@ func BenchmarkShmServerStreaming(b *testing.B) {
 
 			for i := 0; i < b.N; i++ {
 				// Send single request
-				res, err := clientToServer.ReserveWrite(messageSize, ctx)
+				res, err := clientToServer.ReserveWrite(ctx, messageSize)
 				if err != nil {
 					b.Fatalf("ReserveWrite failed: %v", err)
 				}
@@ -523,7 +523,7 @@ func BenchmarkShmServerStreaming(b *testing.B) {
 
 				// Receive all responses
 				for j := 0; j < count; j++ {
-					_, _, commit, err := serverToClient.ReadSlices(messageSize, ctx)
+					_, _, commit, err := serverToClient.ReadSlices(ctx, messageSize)
 					if err != nil {
 						b.Fatalf("ReadSlices failed: %v", err)
 					}
@@ -579,7 +579,7 @@ func BenchmarkShmBidirectionalStreaming(b *testing.B) {
 					go func() {
 						defer serverWg.Done()
 						for j := 0; j < count; j++ {
-							_, _, commit, err := clientToServer.ReadSlices(messageSize, ctx)
+							_, _, commit, err := clientToServer.ReadSlices(ctx, messageSize)
 							if err != nil {
 								return
 							}
@@ -592,7 +592,7 @@ func BenchmarkShmBidirectionalStreaming(b *testing.B) {
 					go func() {
 						defer serverWg.Done()
 						for j := 0; j < count; j++ {
-							res, err := serverToClient.ReserveWrite(messageSize, ctx)
+							res, err := serverToClient.ReserveWrite(ctx, messageSize)
 							if err != nil {
 								return
 							}
@@ -618,7 +618,7 @@ func BenchmarkShmBidirectionalStreaming(b *testing.B) {
 				go func() {
 					defer clientWg.Done()
 					for j := 0; j < count; j++ {
-						res, err := clientToServer.ReserveWrite(messageSize, ctx)
+						res, err := clientToServer.ReserveWrite(ctx, messageSize)
 						if err != nil {
 							return
 						}
@@ -632,7 +632,7 @@ func BenchmarkShmBidirectionalStreaming(b *testing.B) {
 				go func() {
 					defer clientWg.Done()
 					for j := 0; j < count; j++ {
-						_, _, commit, err := serverToClient.ReadSlices(messageSize, ctx)
+						_, _, commit, err := serverToClient.ReadSlices(ctx, messageSize)
 						if err != nil {
 							return
 						}
@@ -679,7 +679,7 @@ func BenchmarkShmBackpressure(b *testing.B) {
 		close(started)
 
 		for i := 0; i < b.N; i++ {
-			_, _, commit, err := ring.ReadSlices(messageSize, ctx)
+			_, _, commit, err := ring.ReadSlices(ctx, messageSize)
 			if err != nil {
 				return
 			}
@@ -695,7 +695,7 @@ func BenchmarkShmBackpressure(b *testing.B) {
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		res, err := ring.ReserveWrite(messageSize, ctx)
+		res, err := ring.ReserveWrite(ctx, messageSize)
 		if err != nil {
 			b.Fatalf("ReserveWrite failed: %v", err)
 		}
@@ -739,12 +739,12 @@ func BenchmarkShmVsTCPComparison(b *testing.B) {
 			close(started)
 
 			for i := 0; i < b.N; i++ {
-				first, second, commit, err := clientToServer.ReadSlices(messageSize, ctx)
+				first, second, commit, err := clientToServer.ReadSlices(ctx, messageSize)
 				if err != nil {
 					return
 				}
 
-				res, err := serverToClient.ReserveWrite(messageSize, ctx)
+				res, err := serverToClient.ReserveWrite(ctx, messageSize)
 				if err != nil {
 					return
 				}
@@ -763,14 +763,14 @@ func BenchmarkShmVsTCPComparison(b *testing.B) {
 		b.ResetTimer()
 
 		for i := 0; i < b.N; i++ {
-			res, err := clientToServer.ReserveWrite(messageSize, ctx)
+			res, err := clientToServer.ReserveWrite(ctx, messageSize)
 			if err != nil {
 				b.Fatalf("ReserveWrite failed: %v", err)
 			}
 			copy(res.First, data)
 			res.Commit(messageSize)
 
-			_, _, commit, err := serverToClient.ReadSlices(messageSize, ctx)
+			_, _, commit, err := serverToClient.ReadSlices(ctx, messageSize)
 			if err != nil {
 				b.Fatalf("ReadSlices failed: %v", err)
 			}

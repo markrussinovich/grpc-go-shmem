@@ -47,7 +47,7 @@ func TestSimpleCancellation(t *testing.T) {
 		// Read request HEADERS with timeout
 		log.Printf("Server: Reading HEADERS...")
 		readCtx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-		fh, _, err := readFrame(srvRx, readCtx)
+		fh, _, err := readFrame(readCtx, srvRx)
 		cancel()
 
 		if err != nil {
@@ -64,7 +64,7 @@ func TestSimpleCancellation(t *testing.T) {
 		for i := 0; i < 3; i++ {
 			log.Printf("Server: Reading frame %d...", i+1)
 			readCtx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
-			fh2, payload, err := readFrame(srvRx, readCtx)
+			fh2, payload, err := readFrame(readCtx, srvRx)
 			cancel()
 
 			if err != nil {

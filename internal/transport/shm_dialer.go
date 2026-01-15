@@ -85,10 +85,10 @@ func DialShm(ctx context.Context, addr string, opts *DialOptions) (ClientTranspo
 	ctlTx := NewShmRingFromSegment(ctlSeg.A, ctlSeg.Mem)
 	ctlRx := NewShmRingFromSegment(ctlSeg.B, ctlSeg.Mem)
 
-	if err := writeFrame(ctlTx, FrameHeader{Type: FrameTypeCONNECT}, encodeConnectRequest(connectRequest{}), ctx); err != nil {
+	if err := writeFrame(ctx, ctlTx, FrameHeader{Type: FrameTypeCONNECT}, encodeConnectRequest(connectRequest{})); err != nil {
 		return nil, fmt.Errorf("send connect request: %w", err)
 	}
-	respFH, respPayload, err := readFrame(ctlRx, ctx)
+	respFH, respPayload, err := readFrame(ctx, ctlRx)
 	if err != nil {
 		return nil, fmt.Errorf("read connect response: %w", err)
 	}

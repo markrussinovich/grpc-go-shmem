@@ -100,7 +100,7 @@ func TestRing_ContiguityWait_TailShort(t *testing.T) {
 	prevSpace := hdr.SpaceSequence()
 
 	// Reader consumes 32 bytes to improve contiguity; this increments contigSeq.
-	first, second, commit, err := ring.ReadSlices(32, testCtx)
+	first, second, commit, err := ring.ReadSlices(testCtx, 32)
 	if err != nil {
 		t.Fatalf("ReadSlices: %v", err)
 	}
@@ -168,7 +168,7 @@ func TestRing_SpaceLimited_WaitsOnSpace(t *testing.T) {
 	prevContig := hdr.ContigSequence()
 
 	// Consume 16 bytes; since ring was full, this must increment spaceSeq exactly once
-	first, second, commit, err := ring.ReadSlices(16, testCtx)
+	first, second, commit, err := ring.ReadSlices(testCtx, 16)
 	if err != nil {
 		t.Fatalf("ReadSlices: %v", err)
 	}

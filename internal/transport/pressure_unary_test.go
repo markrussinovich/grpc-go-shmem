@@ -52,7 +52,7 @@ func writeFrameWithContext(ctx context.Context, tx *ShmRing, fh FrameHeader, pay
 
 	// Write payload
 	if len(payload) > 0 {
-		if err := tx.WriteAll(payload, ctx); err != nil {
+		if err := tx.WriteAll(ctx, payload); err != nil {
 			return err
 		}
 	}
@@ -76,20 +76,20 @@ func readFrameWithContext(ctx context.Context, rx *ShmRing) (FrameHeader, []byte
 		remToEnd := rx.capacity - (rIdx & rx.capMask)
 		if remToEnd < frameHeaderSize && remToEnd > 0 {
 			// Consume the tail bytes as PAD payload
-			if _, _, commit, err := rx.ReadSlices(int(remToEnd), ctx); err != nil {
+			if _, _, commit, err := rx.ReadSlices(ctx, int(remToEnd)); err != nil {
 				return FrameHeader{}, nil, err
 			} else {
 				commit.Commit(int(remToEnd))
 			}
 			// Consume the PAD header at offset 0 silently, then continue
-			if _, err := rx.ReadExact(frameHeaderSize, nil, ctx); err != nil {
+			if _, err := rx.ReadExact(ctx, frameHeaderSize, nil); err != nil {
 				return FrameHeader{}, nil, err
 			}
 			continue
 		}
 
 		// Read and parse header at current r
-		hb, err := rx.ReadExact(frameHeaderSize, nil, ctx)
+		hb, err := rx.ReadExact(ctx, frameHeaderSize, nil)
 		if err != nil {
 			return FrameHeader{}, nil, err
 		}
@@ -100,7 +100,7 @@ func readFrameWithContext(ctx context.Context, rx *ShmRing) (FrameHeader, []byte
 		if fh.Type == FrameTypePAD {
 			// Consume PAD payload and continue
 			if fh.Length > 0 {
-				if _, err := rx.ReadExact(int(fh.Length), nil, ctx); err != nil {
+				if _, err := rx.ReadExact(ctx, int(fh.Length), nil); err != nil {
 					return FrameHeader{}, nil, err
 				}
 			}
@@ -110,7 +110,7 @@ func readFrameWithContext(ctx context.Context, rx *ShmRing) (FrameHeader, []byte
 		// Read payload if present
 		var payload []byte
 		if fh.Length > 0 {
-			payload, err = rx.ReadExact(int(fh.Length), nil, ctx)
+			payload, err = rx.ReadExact(ctx, int(fh.Length), nil)
 			if err != nil {
 				return FrameHeader{}, nil, err
 			}
@@ -171,7 +171,7 @@ func TestUnary_BackpressureAndBlocking(t *testing.T) {
 			time.Sleep(20 * time.Millisecond)
 
 			// Read request HEADERS
-			fh, _, err := readFrame(cliTx, testCtx)
+			fh, _, err := readFrame(testCtx, cliTx)
 			if err != nil {
 				serverResult <- fmt.Errorf("server read headers: %v", err)
 				return
@@ -184,7 +184,7 @@ func TestUnary_BackpressureAndBlocking(t *testing.T) {
 			// Read MESSAGE frame(s) - should be chunked due to ring size
 			var acc []byte
 			for {
-				fhm, p, err := readFrame(cliTx, testCtx)
+				fhm, p, err := readFrame(testCtx, cliTx)
 				if err != nil {
 					serverResult <- fmt.Errorf("server read message: %v", err)
 					return
@@ -200,15 +200,15 @@ func TestUnary_BackpressureAndBlocking(t *testing.T) {
 			}
 
 			// Respond with same data
-			if err := writeFrame(cliRx, FrameHeader{StreamID: fh.StreamID, Type: FrameTypeHEADERS, Flags: HeadersFlagINITIAL}, encodeHeaders(HeadersV1{Version: 1, HdrType: 1}), testCtx); err != nil {
+			if err := writeFrame(testCtx, cliRx, FrameHeader{StreamID: fh.StreamID, Type: FrameTypeHEADERS, Flags: HeadersFlagINITIAL}, encodeHeaders(HeadersV1{Version: 1, HdrType: 1})); err != nil {
 				serverResult <- fmt.Errorf("server write headers: %v", err)
 				return
 			}
-			if err := writeFrame(cliRx, FrameHeader{StreamID: fh.StreamID, Type: FrameTypeMESSAGE}, acc, testCtx); err != nil {
+			if err := writeFrame(testCtx, cliRx, FrameHeader{StreamID: fh.StreamID, Type: FrameTypeMESSAGE}, acc); err != nil {
 				serverResult <- fmt.Errorf("server write message: %v", err)
 				return
 			}
-			if err := writeFrame(cliRx, FrameHeader{StreamID: fh.StreamID, Type: FrameTypeTRAILERS, Flags: TrailersFlagEndStream}, encodeTrailers(TrailersV1{Version: 1, GRPCStatusCode: 0}), testCtx); err != nil {
+			if err := writeFrame(testCtx, cliRx, FrameHeader{StreamID: fh.StreamID, Type: FrameTypeTRAILERS, Flags: TrailersFlagEndStream}, encodeTrailers(TrailersV1{Version: 1, GRPCStatusCode: 0})); err != nil {
 				serverResult <- fmt.Errorf("server write trailers: %v", err)
 				return
 			}

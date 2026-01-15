@@ -372,7 +372,7 @@ func TestShmRingNoPolling(t *testing.T) {
 
 	// Fill the ring completely
 	fillData := make([]byte, ring.Capacity())
-	if err := ring.WriteAll(fillData, ctx); err != nil {
+	if err := ring.WriteAll(ctx, fillData); err != nil {
 		t.Fatalf("WriteAll failed: %v", err)
 	}
 
@@ -485,7 +485,7 @@ func TestShmRingStressSPSC(t *testing.T) {
 			msgBytes[3] = byte(csum >> 8)
 			copy(msgBytes[4:], data)
 
-			if err := ring.WriteAll(msgBytes, ctx); err != nil {
+			if err := ring.WriteAll(ctx, msgBytes); err != nil {
 				mu.Lock()
 				producerErr = fmt.Errorf("WriteAll failed at %d: %v", i, err)
 				mu.Unlock()
@@ -504,7 +504,7 @@ func TestShmRingStressSPSC(t *testing.T) {
 
 		for i := 0; i < numOperations; i++ {
 			// Read 4-byte header first
-			header, err := ring.ReadExact(4, nil, ctx)
+			header, err := ring.ReadExact(ctx, 4, nil)
 			if err != nil {
 				if err == io.EOF {
 					// Producer closed the ring, but we expected more data
@@ -524,7 +524,7 @@ func TestShmRingStressSPSC(t *testing.T) {
 			expectedCsum := uint32(header[2]) | (uint32(header[3]) << 8)
 
 			// Read data
-			data, err := ring.ReadExact(length, nil, ctx)
+			data, err := ring.ReadExact(ctx, length, nil)
 			if err != nil {
 				if err == io.EOF {
 					mu.Lock()

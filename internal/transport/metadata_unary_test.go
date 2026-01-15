@@ -54,7 +54,7 @@ func TestUnary_MetadataAndStatus(t *testing.T) {
 		srvTx := NewShmRingFromSegment(seg.B, seg.Mem) // server->client
 
 		// Read HEADERS
-		fh, pl, err := readFrame(srvRx, testCtx)
+		fh, pl, err := readFrame(testCtx, srvRx)
 		if err != nil {
 			t.Errorf("server read headers: %v", err)
 			return
@@ -81,7 +81,7 @@ func TestUnary_MetadataAndStatus(t *testing.T) {
 		}
 
 		// Read MESSAGE
-		fh2, msg, err := readFrame(srvRx, testCtx)
+		fh2, msg, err := readFrame(testCtx, srvRx)
 		if err != nil {
 			t.Errorf("server read msg: %v", err)
 			return
@@ -95,18 +95,18 @@ func TestUnary_MetadataAndStatus(t *testing.T) {
 		echoMD := append([]KV{}, cliMD...)
 		echoMD = append(echoMD, KV{Key: "x-srv", Values: [][]byte{[]byte("ok")}})
 		respH := HeadersV1{Version: 1, HdrType: 1, Metadata: echoMD}
-		if err := writeFrame(srvTx, FrameHeader{StreamID: fh.StreamID, Type: FrameTypeHEADERS, Flags: HeadersFlagINITIAL}, encodeHeaders(respH), testCtx); err != nil {
+		if err := writeFrame(testCtx, srvTx, FrameHeader{StreamID: fh.StreamID, Type: FrameTypeHEADERS, Flags: HeadersFlagINITIAL}, encodeHeaders(respH)); err != nil {
 			t.Errorf("write headers: %v", err)
 			return
 		}
 		// Echo MESSAGE
-		if err := writeFrame(srvTx, FrameHeader{StreamID: fh.StreamID, Type: FrameTypeMESSAGE}, msg, testCtx); err != nil {
+		if err := writeFrame(testCtx, srvTx, FrameHeader{StreamID: fh.StreamID, Type: FrameTypeMESSAGE}, msg); err != nil {
 			t.Errorf("write msg: %v", err)
 			return
 		}
 		// Send TRAILERS with status OK and custom trailer
 		tr := TrailersV1{Version: 1, GRPCStatusCode: 0, Metadata: []KV{{Key: "x-tr", Values: [][]byte{[]byte("trail-ok")}}, {Key: "x-tr-bin", Values: [][]byte{{0xEE, 0xFF}}}}}
-		if err := writeFrame(srvTx, FrameHeader{StreamID: fh.StreamID, Type: FrameTypeTRAILERS, Flags: TrailersFlagEndStream}, encodeTrailers(tr), testCtx); err != nil {
+		if err := writeFrame(testCtx, srvTx, FrameHeader{StreamID: fh.StreamID, Type: FrameTypeTRAILERS, Flags: TrailersFlagEndStream}, encodeTrailers(tr)); err != nil {
 			t.Errorf("write trailers: %v", err)
 			return
 		}

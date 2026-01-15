@@ -111,7 +111,7 @@ func (t *ShmServerTransport) sendGoAway(flags uint8, debugData string) {
 
 	t.writeMu.Lock()
 	defer t.writeMu.Unlock()
-	_ = writeFrame(t.serverToClient, FrameHeader{Type: FrameTypeGOAWAY, Flags: flags}, []byte(debugData), ctx)
+	_ = writeFrame(ctx, t.serverToClient, FrameHeader{Type: FrameTypeGOAWAY, Flags: flags}, []byte(debugData))
 }
 
 func (t *ShmServerTransport) notifyQuotaChangeLocked() {
@@ -135,7 +135,7 @@ func (t *ShmServerTransport) addSendQuota(streamID uint32, delta uint32) {
 	t.sendQuotaMu.Unlock()
 }
 
-func (t *ShmServerTransport) acquireSendQuota(streamID uint32, n int, ctx context.Context) error {
+func (t *ShmServerTransport) acquireSendQuota(ctx context.Context, streamID uint32, n int) error {
 	if n == 0 {
 		return nil
 	}
@@ -175,7 +175,7 @@ func (t *ShmServerTransport) sendWindowUpdate(streamID uint32, delta uint32) {
 	}
 	buf := make([]byte, 4)
 	binary.LittleEndian.PutUint32(buf, delta)
-	_ = writeFrame(t.serverToClient, FrameHeader{Type: FrameTypeWindowUpdate, StreamID: streamID}, buf, context.Background())
+	_ = writeFrame(context.Background(), t.serverToClient, FrameHeader{Type: FrameTypeWindowUpdate, StreamID: streamID}, buf)
 }
 
 func (t *ShmServerTransport) rejectNewStream(streamID uint32, msg string) {
@@ -193,7 +193,7 @@ func (t *ShmServerTransport) rejectNewStream(streamID uint32, msg string) {
 
 	t.writeMu.Lock()
 	defer t.writeMu.Unlock()
-	_ = writeFrame(t.serverToClient, fh, trailers, ctx)
+	_ = writeFrame(ctx, t.serverToClient, fh, trailers)
 }
 
 // NewShmServerTransport creates a new shared memory server transport.
@@ -298,7 +298,7 @@ func (t *ShmServerTransport) processIncomingData(ctx context.Context) {
 			return
 		}
 		shmDebugf("[DEBUG] ShmServerTransport.processIncomingData: waiting for frame from client... widx=%d, ridx=%d", t.clientToServer.header().WriteIndex(), t.clientToServer.header().ReadIndex())
-		fh, payloadBuf, err := readFrameView(t.clientToServer, ctx)
+		fh, payloadBuf, err := readFrameView(ctx, t.clientToServer)
 		if err != nil {
 			shmDebugf("[DEBUG] ShmServerTransport.processIncomingData: readFrameView error: %v", err)
 			if errors.Is(err, ErrRingClosed) || errors.Is(err, io.EOF) || errors.Is(err, context.Canceled) || t.closed.Load() {
@@ -637,7 +637,7 @@ func (t *ShmServerTransport) handlePing(ctx context.Context, payload []byte) {
 	}
 	// Send PONG.
 	t.writeMu.Lock()
-	_ = writeFrame(t.serverToClient, FrameHeader{Type: FrameTypePONG}, payload, ctx)
+	_ = writeFrame(ctx, t.serverToClient, FrameHeader{Type: FrameTypePONG}, payload)
 	t.writeMu.Unlock()
 
 	now := time.Now()
@@ -800,7 +800,7 @@ func (t *ShmServerTransport) Close(err error) {
 		// Hold writeMu to avoid racing with handler goroutines that may still be writing.
 		if t.serverToClient != nil && !segClosed {
 			t.writeMu.Lock()
-			_ = writeFrame(t.serverToClient, FrameHeader{Type: FrameTypeGOAWAY, Flags: GoAwayFlagIMMEDIATE}, []byte("server closing"), context.Background())
+			_ = writeFrame(context.Background(), t.serverToClient, FrameHeader{Type: FrameTypeGOAWAY, Flags: GoAwayFlagIMMEDIATE}, []byte("server closing"))
 			t.writeMu.Unlock()
 		}
 
@@ -924,7 +924,7 @@ func (t *ShmServerTransport) writeHeader(s *ServerStream, md metadata.MD) error 
 	// Write frame to server->client ring
 	t.writeMu.Lock()
 	defer t.writeMu.Unlock()
-	if err := writeFrame(t.serverToClient, fh, payload, context.Background()); err != nil {
+	if err := writeFrame(context.Background(), t.serverToClient, fh, payload); err != nil {
 		shmDebugf("[ERROR] ShmServerTransport.writeHeader: Failed to write frame: %v", err)
 		return err
 	}
@@ -958,7 +958,7 @@ func (t *ShmServerTransport) write(s *ServerStream, hdr []byte, data mem.BufferS
 	shmDebugf("[DEBUG] ShmServerTransport.write: stream=%d, hdr_len=%d, data_bytes=%d", s.id, len(hdr), data.Len())
 
 	// Enforce outbound flow control before writing.
-	if err := t.acquireSendQuota(s.id, payloadLen, s.ctx); err != nil {
+	if err := t.acquireSendQuota(s.ctx, s.id, payloadLen); err != nil {
 		return err
 	}
 
@@ -1031,7 +1031,7 @@ func (t *ShmServerTransport) writeStatus(s *ServerStream, st *status.Status) err
 	// Write frame to server->client ring
 	t.writeMu.Lock()
 	defer t.writeMu.Unlock()
-	if err := writeFrame(t.serverToClient, fh, payload, context.Background()); err != nil {
+	if err := writeFrame(context.Background(), t.serverToClient, fh, payload); err != nil {
 		shmDebugf("[ERROR] ShmServerTransport.writeStatus: Failed to write frame: %v", err)
 		return err
 	}
@@ -1107,7 +1107,7 @@ func (t *ShmServerTransport) sendPing() error {
 	binary.LittleEndian.PutUint64(data[:], uint64(time.Now().UnixNano()))
 	t.writeMu.Lock()
 	defer t.writeMu.Unlock()
-	return writeFrame(t.serverToClient, FrameHeader{Type: FrameTypePING}, data[:], context.Background())
+	return writeFrame(context.Background(), t.serverToClient, FrameHeader{Type: FrameTypePING}, data[:])
 }
 
 // keepalive monitors connection health and enforces server-side policies:

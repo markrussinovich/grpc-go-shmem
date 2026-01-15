@@ -126,7 +126,7 @@ func (c *ShmStreamingClient) startReader() {
 
 			log.Printf("StreamingClient: reader goroutine starting")
 			for !c.closed.Load() {
-				fh, payload, err := readFrame(c.rx, ctx)
+				fh, payload, err := readFrame(ctx, c.rx)
 				if err != nil {
 					if errors.Is(err, ErrRingClosed) || errors.Is(err, io.EOF) {
 						log.Printf("StreamingClient: reader exiting due to closed ring")
@@ -149,7 +149,7 @@ func (c *ShmStreamingClient) startReader() {
 				case FrameTypePING:
 					// Reply with PONG
 					c.writeMu.Lock()
-					_ = writeFrame(c.tx, FrameHeader{StreamID: fh.StreamID, Type: FrameTypePONG}, payload, ctx)
+					_ = writeFrame(ctx, c.tx, FrameHeader{StreamID: fh.StreamID, Type: FrameTypePONG}, payload)
 					c.writeMu.Unlock()
 				case FrameTypeGOAWAY:
 					log.Printf("StreamingClient: received GOAWAY")
@@ -215,7 +215,7 @@ func (c *ShmStreamingClient) NewStream(ctx context.Context, method, authority st
 		Flags:    HeadersFlagINITIAL,
 	}
 
-	if err := c.writeFrameSafe(fh, payload, streamCtx); err != nil {
+	if err := c.writeFrameSafe(streamCtx, fh, payload); err != nil {
 		c.streamsM.Lock()
 		delete(c.streams, streamID)
 		c.streamsM.Unlock()
@@ -253,7 +253,7 @@ func (c *ShmStreamingClient) runStreamSender(s *streamingClientStream) {
 				StreamID: s.id,
 				Type:     FrameTypeMESSAGE,
 			}
-			if err := c.writeFrameSafe(fh, msg, s.ctx); err != nil {
+			if err := c.writeFrameSafe(s.ctx, fh, msg); err != nil {
 				log.Printf("StreamingClient: failed to send message on stream %d: %v", s.id, err)
 				s.closeWithError(err)
 				return
@@ -263,10 +263,10 @@ func (c *ShmStreamingClient) runStreamSender(s *streamingClientStream) {
 }
 
 // writeFrameSafe writes a frame with mutex protection
-func (c *ShmStreamingClient) writeFrameSafe(fh FrameHeader, payload []byte, ctx context.Context) error {
+func (c *ShmStreamingClient) writeFrameSafe(ctx context.Context, fh FrameHeader, payload []byte) error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
-	return writeFrame(c.tx, fh, payload, ctx)
+	return writeFrame(ctx, c.tx, fh, payload)
 }
 
 // Dispatch methods
@@ -372,7 +372,7 @@ func (s *streamingClientStream) CloseSend() error {
 	close(s.sendQueue)
 	<-s.senderDone
 	fh := FrameHeader{StreamID: s.id, Type: FrameTypeHALFCLOSE}
-	return s.client.writeFrameSafe(fh, nil, s.ctx)
+	return s.client.writeFrameSafe(s.ctx, fh, nil)
 }
 
 // RecvMsg receives a message from the stream (blocking)

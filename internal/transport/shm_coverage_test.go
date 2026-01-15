@@ -156,7 +156,7 @@ func TestShmClientWithMisbehavedServer(t *testing.T) {
 		}
 
 		// Read client's HEADERS
-		fh, _, err := readFrame(serverRx, ctx)
+		fh, _, err := readFrame(ctx, serverRx)
 		if err != nil {
 			t.Fatalf("Failed to read HEADERS: %v", err)
 		}
@@ -173,10 +173,10 @@ func TestShmClientWithMisbehavedServer(t *testing.T) {
 
 		// Send multiple MESSAGE frames rapidly (simulating flow control violation)
 		for i := 0; i < 3; i++ {
-			err := writeFrame(serverTx, FrameHeader{
+			err := writeFrame(ctx, serverTx, FrameHeader{
 				StreamID: stream.id,
 				Type:     FrameTypeMESSAGE,
-			}, largePayload, ctx)
+			}, largePayload)
 			if err != nil {
 				// Ring might be full - that's acceptable
 				break
@@ -223,10 +223,10 @@ func TestShmClientWithMisbehavedServer(t *testing.T) {
 
 		// Send an invalid frame type (using a reserved/unknown type)
 		invalidFrameType := FrameType(0xFF)
-		err = writeFrame(serverTx, FrameHeader{
+		err = writeFrame(ctx, serverTx, FrameHeader{
 			StreamID: 1,
 			Type:     invalidFrameType,
-		}, []byte("invalid"), ctx)
+		}, []byte("invalid"))
 		if err != nil {
 			t.Fatalf("Failed to write invalid frame: %v", err)
 		}
@@ -302,11 +302,11 @@ func TestShmServerWithMisbehavedClient(t *testing.T) {
 			Method:    "/test/Invalid",
 			Authority: "localhost",
 		}
-		err = writeFrame(clientTx, FrameHeader{
+		err = writeFrame(ctx, clientTx, FrameHeader{
 			StreamID: invalidStreamID,
 			Type:     FrameTypeHEADERS,
 			Flags:    HeadersFlagINITIAL,
-		}, encodeHeaders(hdr), ctx)
+		}, encodeHeaders(hdr))
 		if err != nil {
 			t.Fatalf("Failed to write invalid stream: %v", err)
 		}
@@ -316,11 +316,11 @@ func TestShmServerWithMisbehavedClient(t *testing.T) {
 
 		// Now send a valid stream
 		validStreamID := uint32(1)
-		err = writeFrame(clientTx, FrameHeader{
+		err = writeFrame(ctx, clientTx, FrameHeader{
 			StreamID: validStreamID,
 			Type:     FrameTypeHEADERS,
 			Flags:    HeadersFlagINITIAL,
-		}, encodeHeaders(hdr), ctx)
+		}, encodeHeaders(hdr))
 		if err != nil {
 			t.Fatalf("Failed to write valid stream: %v", err)
 		}
@@ -374,10 +374,10 @@ func TestShmServerWithMisbehavedClient(t *testing.T) {
 		})
 
 		// Send MESSAGE for stream ID 999 (never created)
-		err = writeFrame(clientTx, FrameHeader{
+		err = writeFrame(ctx, clientTx, FrameHeader{
 			StreamID: 999,
 			Type:     FrameTypeMESSAGE,
-		}, []byte("orphan message"), ctx)
+		}, []byte("orphan message"))
 		if err != nil {
 			t.Fatalf("Failed to write orphan message: %v", err)
 		}
@@ -506,11 +506,11 @@ func TestShmInvalidHeaderField(t *testing.T) {
 			{Key: "content-type", Values: [][]byte{[]byte("invalid/content-type")}},
 		},
 	}
-	err = writeFrame(clientTx, FrameHeader{
+	err = writeFrame(ctx, clientTx, FrameHeader{
 		StreamID: 1,
 		Type:     FrameTypeHEADERS,
 		Flags:    HeadersFlagINITIAL,
-	}, encodeHeaders(hdr), ctx)
+	}, encodeHeaders(hdr))
 	if err != nil {
 		t.Fatalf("Failed to write headers: %v", err)
 	}
@@ -521,7 +521,7 @@ func TestShmInvalidHeaderField(t *testing.T) {
 		t.Log("Server accepted stream (may validate content-type later)")
 	case <-time.After(500 * time.Millisecond):
 		// Check if server sent an error response
-		fh, payload, err := readFrame(clientRx, ctx)
+		fh, payload, err := readFrame(ctx, clientRx)
 		if err != nil {
 			t.Logf("No response from server (timeout): acceptable for strict validation")
 			return
@@ -852,13 +852,13 @@ func TestShmPingPong(t *testing.T) {
 	go func() {
 		defer close(serverDone)
 		for {
-			fh, payload, err := readFrame(serverRx, ctx)
+			fh, payload, err := readFrame(ctx, serverRx)
 			if err != nil {
 				return
 			}
 			if fh.Type == FrameTypePING {
 				// Echo back as PONG
-				writeFrame(serverTx, FrameHeader{Type: FrameTypePONG}, payload, ctx)
+				writeFrame(ctx, serverTx, FrameHeader{Type: FrameTypePONG}, payload)
 				return // Exit after responding to one PING
 			}
 		}
@@ -866,13 +866,13 @@ func TestShmPingPong(t *testing.T) {
 
 	// Send PING
 	pingData := []byte{1, 2, 3, 4, 5, 6, 7, 8}
-	err = writeFrame(clientTx, FrameHeader{Type: FrameTypePING}, pingData, ctx)
+	err = writeFrame(ctx, clientTx, FrameHeader{Type: FrameTypePING}, pingData)
 	if err != nil {
 		t.Fatalf("Failed to send PING: %v", err)
 	}
 
 	// Wait for PONG
-	fh, pongData, err := readFrame(clientRx, ctx)
+	fh, pongData, err := readFrame(ctx, clientRx)
 	if err != nil {
 		t.Fatalf("Failed to read PONG: %v", err)
 	}

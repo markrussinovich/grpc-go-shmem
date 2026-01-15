@@ -542,7 +542,7 @@ func decodeTrailers(b []byte) (TrailersV1, error) {
 // writeFrame writes one frame (header + payload) to the ring. It blocks if
 // necessary and never spins. Headers may straddle wraps; ReserveFrameHeader
 // can return split slices which are both written.
-func writeFrame(tx *ShmRing, fh FrameHeader, payload []byte, ctx context.Context) error {
+func writeFrame(ctx context.Context, tx *ShmRing, fh FrameHeader, payload []byte) error {
 	// Fill header fields consistently and set reserved to zero
 	fh.Length = uint32(len(payload))
 	fh.Reserved = 0
@@ -555,7 +555,7 @@ func writeFrame(tx *ShmRing, fh FrameHeader, payload []byte, ctx context.Context
 	// and then block waiting for the full payload length, preventing it from
 	// consuming any bytes and freeing space for the writer.
 	total := frameHeaderSize + len(payload)
-	res, err := tx.ReserveWrite(total, ctx)
+	res, err := tx.ReserveWrite(ctx, total)
 	if err != nil {
 		return err
 	}
@@ -596,10 +596,10 @@ func writeFrame(tx *ShmRing, fh FrameHeader, payload []byte, ctx context.Context
 // writeFramesBatched writes multiple frames in a single ring buffer commit.
 // This reduces the number of futex wakes and mutex acquisitions for small messages.
 // Each frame is a (FrameHeader, payload) pair. All frames share the same streamID.
-func writeFramesBatched(tx *ShmRing, frames []struct {
+func writeFramesBatched(ctx context.Context, tx *ShmRing, frames []struct {
 	fh      FrameHeader
 	payload []byte
-}, ctx context.Context) error {
+}) error {
 	if len(frames) == 0 {
 		return nil
 	}
@@ -611,7 +611,7 @@ func writeFramesBatched(tx *ShmRing, frames []struct {
 	}
 
 	// Reserve space for all frames at once
-	res, err := tx.ReserveWrite(total, ctx)
+	res, err := tx.ReserveWrite(ctx, total)
 	if err != nil {
 		return err
 	}
@@ -666,7 +666,7 @@ func writeFramesBatched(tx *ShmRing, frames []struct {
 // writeFrameBuffers writes a frame whose payload is composed of an optional
 // header prefix plus a BufferSlice. It avoids building an intermediate
 // contiguous payload, reducing allocations and copies on the hot path.
-func writeFrameBuffers(tx *ShmRing, fh FrameHeader, hdr []byte, payload mem.BufferSlice, ctx context.Context) error {
+func writeFrameBuffers(ctx context.Context, tx *ShmRing, fh FrameHeader, hdr []byte, payload mem.BufferSlice) error {
 	dataLen := payload.Len()
 	payloadLen := len(hdr) + dataLen
 	fh.Length = uint32(payloadLen)
@@ -674,7 +674,7 @@ func writeFrameBuffers(tx *ShmRing, fh FrameHeader, hdr []byte, payload mem.Buff
 	fh.Reserved2 = 0
 
 	total := frameHeaderSize + payloadLen
-	res, err := tx.ReserveWrite(total, ctx)
+	res, err := tx.ReserveWrite(ctx, total)
 	if err != nil {
 		return err
 	}
@@ -755,7 +755,7 @@ func writeFrameBuffersChunked(tx *ShmRing, fh FrameHeader, hdr []byte, data mem.
 
 	// Fast path: payload fits in a single frame.
 	if payloadLen <= maxFramePayload {
-		return writeFrameBuffers(tx, fh, hdr, data, ctx)
+		return writeFrameBuffers(ctx, tx, fh, hdr, data)
 	}
 
 	// Slow path: need to chunk the payload.
@@ -783,7 +783,7 @@ func writeFrameBuffersChunked(tx *ShmRing, fh FrameHeader, hdr []byte, data mem.
 			chunkFH.Flags |= MessageFlagMORE
 		}
 
-		if err := writeFrame(tx, chunkFH, chunk, ctx); err != nil {
+		if err := writeFrame(ctx, tx, chunkFH, chunk); err != nil {
 			return err
 		}
 	}
@@ -793,10 +793,10 @@ func writeFrameBuffersChunked(tx *ShmRing, fh FrameHeader, hdr []byte, data mem.
 
 // readFrame reads one non-PAD frame (skipping any PAD frames). It blocks if
 // necessary and never spins.
-func readFrame(rx *ShmRing, ctx context.Context) (FrameHeader, []byte, error) {
+func readFrame(ctx context.Context, rx *ShmRing) (FrameHeader, []byte, error) {
 	for {
 		// Read exactly the header size, but allow it to straddle the wrap
-		first, second, commit, err := rx.ReadSlices(frameHeaderSize, ctx)
+		first, second, commit, err := rx.ReadSlices(ctx, frameHeaderSize)
 		if err != nil {
 			return FrameHeader{}, nil, err
 		}
@@ -822,7 +822,7 @@ func readFrame(rx *ShmRing, ctx context.Context) (FrameHeader, []byte, error) {
 		// Skip PAD frames transparently (no geometry tricks needed)
 		if fh.Type == FrameTypePAD {
 			if fh.Length > 0 {
-				if _, err := rx.ReadExact(int(fh.Length), nil, ctx); err != nil {
+				if _, err := rx.ReadExact(ctx, int(fh.Length), nil); err != nil {
 					return FrameHeader{}, nil, err
 				}
 			}
@@ -832,7 +832,7 @@ func readFrame(rx *ShmRing, ctx context.Context) (FrameHeader, []byte, error) {
 		// Read payload
 		var payload []byte
 		if fh.Length > 0 {
-			p, err := rx.ReadExact(int(fh.Length), nil, ctx)
+			p, err := rx.ReadExact(ctx, int(fh.Length), nil)
 			if err != nil {
 				return FrameHeader{}, nil, err
 			}
@@ -845,9 +845,9 @@ func readFrame(rx *ShmRing, ctx context.Context) (FrameHeader, []byte, error) {
 // readFrameView reads a frame and returns a zero-copy payload view when
 // possible. The returned mem.Buffer must be freed by the caller to release the
 // underlying ring reservation.
-func readFrameView(rx *ShmRing, ctx context.Context) (FrameHeader, mem.Buffer, error) {
+func readFrameView(ctx context.Context, rx *ShmRing) (FrameHeader, mem.Buffer, error) {
 	for {
-		first, second, commitHeader, err := rx.ReadSlices(frameHeaderSize, ctx)
+		first, second, commitHeader, err := rx.ReadSlices(ctx, frameHeaderSize)
 		if err != nil {
 			return FrameHeader{}, nil, err
 		}
@@ -872,7 +872,7 @@ func readFrameView(rx *ShmRing, ctx context.Context) (FrameHeader, mem.Buffer, e
 
 		if fh.Type == FrameTypePAD {
 			if fh.Length > 0 {
-				if _, err := rx.ReadExact(int(fh.Length), nil, ctx); err != nil {
+				if _, err := rx.ReadExact(ctx, int(fh.Length), nil); err != nil {
 					return FrameHeader{}, nil, err
 				}
 			}
@@ -884,7 +884,7 @@ func readFrameView(rx *ShmRing, ctx context.Context) (FrameHeader, mem.Buffer, e
 		}
 
 		payloadLen := int(fh.Length)
-		pFirst, pSecond, commitPayload, err := rx.ReadSlices(payloadLen, ctx)
+		pFirst, pSecond, commitPayload, err := rx.ReadSlices(ctx, payloadLen)
 		if err != nil {
 			return FrameHeader{}, nil, err
 		}
@@ -919,7 +919,7 @@ func readFrameView(rx *ShmRing, ctx context.Context) (FrameHeader, mem.Buffer, e
 // writeMessageChunked writes a MESSAGE payload split across multiple frames if needed.
 // For all but the last chunk, the MORE flag is set. Chunking allows backpressure
 // and smaller ring capacities to be exercised without requiring a single large frame.
-func writeMessageChunked(tx *ShmRing, streamID uint32, payload []byte, chunkSize int, ctx context.Context) error {
+func writeMessageChunked(ctx context.Context, tx *ShmRing, streamID uint32, payload []byte, chunkSize int) error {
 	if chunkSize <= 0 {
 		chunkSize = 32 * 1024
 	}
@@ -935,7 +935,7 @@ func writeMessageChunked(tx *ShmRing, streamID uint32, payload []byte, chunkSize
 		if len(remaining) > 0 {
 			flags = MessageFlagMORE
 		}
-		if err := writeFrame(tx, FrameHeader{StreamID: streamID, Type: FrameTypeMESSAGE, Flags: flags}, chunk, ctx); err != nil {
+		if err := writeFrame(ctx, tx, FrameHeader{StreamID: streamID, Type: FrameTypeMESSAGE, Flags: flags}, chunk); err != nil {
 			return err
 		}
 	}

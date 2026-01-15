@@ -89,7 +89,7 @@ func TestChunkedWriteSmallRing(t *testing.T) {
 
 			go func() {
 				defer close(readDone)
-				received, readErr = readChunkedMessage(rx, ctx)
+				received, readErr = readChunkedMessage(ctx, rx)
 			}()
 
 			// Write the message (using nil header and BufferSlice for test)
@@ -129,11 +129,11 @@ func TestChunkedWriteSmallRing(t *testing.T) {
 }
 
 // readChunkedMessage reads a potentially chunked MESSAGE and reassembles it.
-func readChunkedMessage(rx *ShmRing, ctx context.Context) ([]byte, error) {
+func readChunkedMessage(ctx context.Context, rx *ShmRing) ([]byte, error) {
 	var result []byte
 
 	for {
-		fh, payload, err := readFrame(rx, ctx)
+		fh, payload, err := readFrame(ctx, rx)
 		if err != nil {
 			return nil, fmt.Errorf("readFrame failed: %w", err)
 		}
@@ -194,7 +194,7 @@ func TestChunkedWriteWithHeader(t *testing.T) {
 
 	go func() {
 		defer close(readDone)
-		received, readErr = readChunkedMessage(rx, ctx)
+		received, readErr = readChunkedMessage(ctx, rx)
 	}()
 
 	// Write with header
@@ -262,7 +262,7 @@ func TestChunkedWriteFastPath(t *testing.T) {
 
 	go func() {
 		defer close(readDone)
-		fhRead, payload, err := readFrame(rx, ctx)
+		fhRead, payload, err := readFrame(ctx, rx)
 		if err != nil {
 			readErr = err
 			return
@@ -343,7 +343,7 @@ func TestChunkedWriteExplicitChunkSize(t *testing.T) {
 	go func() {
 		defer close(readDone)
 		for {
-			fhRead, p, err := readFrame(rx, ctx)
+			fhRead, p, err := readFrame(ctx, rx)
 			if err != nil {
 				readErr = err
 				return
@@ -418,7 +418,7 @@ func BenchmarkChunkedWriteSmallRing(b *testing.B) {
 			go func() {
 				defer close(done)
 				for i := 0; i < b.N; i++ {
-					_, _ = readChunkedMessage(rx, ctx)
+					_, _ = readChunkedMessage(ctx, rx)
 				}
 			}()
 

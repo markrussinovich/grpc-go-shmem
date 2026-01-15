@@ -75,7 +75,7 @@ func TestDebug256MBRoundtrip(t *testing.T) {
 			atomic.AddInt64(&serverBytesRead, int64(n))
 
 			atomic.StoreInt32(&serverWriting, 1)
-			res, err := serverToClient.ReserveWrite(n, ctx)
+			res, err := serverToClient.ReserveWrite(ctx, n)
 			atomic.StoreInt32(&serverWriting, 0)
 			if err != nil {
 				t.Logf("Server write err: %v (total written %dMB)", err, atomic.LoadInt64(&serverBytesWritten)/(1024*1024))
@@ -140,7 +140,7 @@ func TestDebug256MBRoundtrip(t *testing.T) {
 		for offset < dataSize {
 			writeSize := min(chunkSize, dataSize-offset)
 			atomic.StoreInt32(&clientWriting, 1)
-			res, err := clientToServer.ReserveWrite(writeSize, ctx)
+			res, err := clientToServer.ReserveWrite(ctx, writeSize)
 			atomic.StoreInt32(&clientWriting, 0)
 			if err != nil {
 				t.Logf("Client write err at %dMB: %v", offset/(1024*1024), err)

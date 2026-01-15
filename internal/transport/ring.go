@@ -1006,7 +1006,7 @@ func (wr *WriteReservation) Commit(written int) error {
 // ReserveWrite blocks until at least n bytes of contiguous space is available, then returns
 // the writable slice(s) and a commit function. This enables zero-copy writes directly into
 // the ring buffer memory. Headers may span across wrap boundaries via First+Second slices.
-func (r *ShmRing) ReserveWrite(n int, ctx context.Context) (WriteReservation, error) {
+func (r *ShmRing) ReserveWrite(ctx context.Context, n int) (WriteReservation, error) {
 	if n <= 0 {
 		return WriteReservation{}, errors.New("reservation size must be positive")
 	}
@@ -1192,7 +1192,7 @@ func (r *ShmRing) ReserveWrite(n int, ctx context.Context) (WriteReservation, er
 // ReadSlices blocks until at least n bytes are available to read; returns slices spanning wrap.
 // This enables proper reconstruction of headers that may straddle wrap boundaries.
 // The caller must call commit.Commit() with the number of bytes consumed.
-func (r *ShmRing) ReadSlices(n int, ctx context.Context) (first, second []byte, commit *ReadCommit, err error) {
+func (r *ShmRing) ReadSlices(ctx context.Context, n int) (first, second []byte, commit *ReadCommit, err error) {
 	if n <= 0 {
 		return nil, nil, nil, errors.New("read size must be positive")
 	}
@@ -1400,7 +1400,7 @@ func (r *ShmRing) ReadSlices(n int, ctx context.Context) (first, second []byte, 
 // WriteAll writes all bytes to the ring buffer, blocking as needed.
 // This is a convenience method that handles multiple reservations if needed.
 // Supports chunking when message > available space.
-func (r *ShmRing) WriteAll(p []byte, ctx context.Context) error {
+func (r *ShmRing) WriteAll(ctx context.Context, p []byte) error {
 	if len(p) == 0 {
 		return nil
 	}
@@ -1413,7 +1413,7 @@ func (r *ShmRing) WriteAll(p []byte, ctx context.Context) error {
 			toWrite = int(r.capacity)
 		}
 
-		reservation, err := r.ReserveWrite(toWrite, ctx)
+		reservation, err := r.ReserveWrite(ctx, toWrite)
 		if err != nil {
 			return err
 		}
@@ -1443,7 +1443,7 @@ func (r *ShmRing) WriteAll(p []byte, ctx context.Context) error {
 // ReadExact reads exactly n bytes into dst, blocking as needed.
 // If len(dst) >= n, it uses dst as the buffer (alloc-free).
 // Otherwise, it allocates a new slice. Handles header reconstruction across wraps.
-func (r *ShmRing) ReadExact(n int, dst []byte, ctx context.Context) ([]byte, error) {
+func (r *ShmRing) ReadExact(ctx context.Context, n int, dst []byte) ([]byte, error) {
 	if n <= 0 {
 		return nil, errors.New("read size must be positive")
 	}
@@ -1461,7 +1461,7 @@ func (r *ShmRing) ReadExact(n int, dst []byte, ctx context.Context) ([]byte, err
 		remaining := n - totalRead
 
 		// Read slices for the remaining bytes
-		first, second, commit, err := r.ReadSlices(remaining, ctx)
+		first, second, commit, err := r.ReadSlices(ctx, remaining)
 		if err != nil {
 			return nil, err
 		}
@@ -1502,5 +1502,5 @@ func (r *ShmRing) ReadExact(n int, dst []byte, ctx context.Context) ([]byte, err
 //	writer: memcpy header -> atomic.Store(w,new) [release] -> AddUint32(dataSeq) -> futex_wake
 //	reader: atomic.Load(w) [acquire] -> copy -> atomic.Store(r,new) [release] -> AddUint32(spaceSeq) -> futex_wake
 func (r *ShmRing) ReserveFrameHeader(ctx context.Context) (WriteReservation, error) {
-	return r.ReserveWrite(frameHeaderSize, ctx)
+	return r.ReserveWrite(ctx, frameHeaderSize)
 }
