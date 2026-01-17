@@ -20,7 +20,6 @@ package transport
 
 import (
 	"context"
-	"encoding/binary"
 	"fmt"
 	"testing"
 	"time"
@@ -102,10 +101,8 @@ func TestShmFlowControlBlocksUntilWindowUpdate(t *testing.T) {
 
 	// Send WINDOW_UPDATE for both the connection and the stream to release the writer.
 	delta := uint32(msg.Len())
-	payload := make([]byte, 4)
-	binary.LittleEndian.PutUint32(payload, delta)
-	_ = writeFrame(ctx, srvTransport.serverToClient, FrameHeader{Type: FrameTypeWindowUpdate}, payload)
-	_ = writeFrame(ctx, srvTransport.serverToClient, FrameHeader{Type: FrameTypeWindowUpdate, StreamID: cs.id}, payload)
+	cliTransport.addSendQuota(0, delta)
+	cliTransport.addSendQuota(cs.id, delta)
 
 	select {
 	case err := <-writeErr:

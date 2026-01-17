@@ -23,6 +23,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -236,6 +237,9 @@ func (s) TestParsedTarget_Failure_WithoutCustomDialer_WithNewClient(t *testing.T
 }
 
 func (s) TestParsedTarget_WithCustomDialer(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unix domain socket targets are not supported on Windows")
+	}
 	resetInitialResolverState()
 	defScheme := resolver.GetDefaultScheme()
 	tests := []struct {

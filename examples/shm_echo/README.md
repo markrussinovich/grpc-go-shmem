@@ -24,7 +24,7 @@ This directory now tracks the end-to-end state of the shared memory transport, i
 
 ## Remaining Gaps
 
-- Linux-only: futex-based synchronization is guarded by `//go:build linux`; other platforms fall back to stubs and are not exercised yet.
+- Linux and Windows: the shared memory transport implements futex-like synchronization using futex on Linux and WaitOnAddress on Windows. Examples now build on both OSes.
 - Stats hooks: server-side message recv counter is still stubbed; tracing/metrics parity with TCP is incomplete.
 - Legacy TODOs: `processFrameData` placeholder is unused but still present; ring-capacity investigation noted in tests (`shm_integration_test.go`).
 - Ergonomics: users must opt into `grpc.WithShmTransport` and manually create a shm listener (no automatic scheme-to-listener wiring yet).

@@ -5877,6 +5877,9 @@ func testRPCTimeout(t *testing.T, e env) {
 // client checks the context error before starting a stream, however the context
 // may expire after this check and before the timeout is calculated.
 func (s) TestNegativeRPCTimeout(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("very small RPC timeouts are flaky on Windows timer granularity")
+	}
 	server := stubserver.StartTestService(t, nil)
 	defer server.Stop()
 

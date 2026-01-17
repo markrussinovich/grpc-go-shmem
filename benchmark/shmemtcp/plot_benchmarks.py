@@ -6,6 +6,7 @@ Generate benchmark comparison plots for SHM vs TCP vs Unix socket transport perf
 import matplotlib.pyplot as plt
 import numpy as np
 import os
+import sys
 
 # Benchmark data from actual test runs
 sizes = ['64B', '256B', '1KB', '4KB', '16KB', '64KB']
@@ -28,8 +29,9 @@ shm_rt_latency = [650, 637, 679, 925]  # With spin-wait optimization (avg of 3 r
 tcp_rt_latency = [18500, 18100, 18600, 20100]  # Average of 3 runs
 unix_rt_latency = [9500, 9600, 9650, 11400]    # Average of 3 runs
 
-# Output directory
-out_dir = os.path.join(os.path.dirname(__file__), 'out')
+# Output directory (segmented per-platform)
+platform_dir = "windows" if os.name == "nt" else ("linux" if sys.platform.startswith("linux") else sys.platform)
+out_dir = os.path.join(os.path.dirname(__file__), 'out', platform_dir)
 os.makedirs(out_dir, exist_ok=True)
 
 # Set style

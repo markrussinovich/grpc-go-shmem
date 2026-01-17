@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"os"
 	"path"
+	"runtime"
 	"testing"
 	"time"
 
@@ -375,6 +376,9 @@ func (s) TestProvider_UpdateSuccessWithSymlink(t *testing.T) {
 			}
 			symLinkName := path.Join(tmpdir, "test_symlink")
 			if err := os.Symlink(dir1, symLinkName); err != nil {
+				if runtime.GOOS == "windows" {
+					t.Skipf("symlink creation not permitted: %v", err)
+				}
 				t.Fatalf("Failed to create symlink to %q: %v", dir1, err)
 			}
 
@@ -414,9 +418,15 @@ func (s) TestProvider_UpdateSuccessWithSymlink(t *testing.T) {
 			// Update the symlink to point to dir2.
 			symLinkTmpName := path.Join(tmpdir, "test_symlink.tmp")
 			if err := os.Symlink(dir2, symLinkTmpName); err != nil {
+				if runtime.GOOS == "windows" {
+					t.Skipf("symlink creation not permitted: %v", err)
+				}
 				t.Fatalf("Failed to create symlink to %q: %v", dir2, err)
 			}
 			if err := os.Rename(symLinkTmpName, symLinkName); err != nil {
+				if runtime.GOOS == "windows" {
+					t.Skipf("symlink rename not permitted: %v", err)
+				}
 				t.Fatalf("Failed to update symlink: %v", err)
 			}
 

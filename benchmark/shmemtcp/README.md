@@ -17,7 +17,7 @@ python3 benchmark_runner.py --plot-only
 
 ## Output Files
 
-All outputs are stored in the `out/` directory:
+Outputs are segmented per-platform under `out/<platform>/` (e.g., `out/linux/` and `out/windows/`):
 
 | File | Description |
 |------|-------------|
@@ -163,13 +163,16 @@ benchmark/shmemtcp/
 ├── generate_benchmark_plots.py   # Static visualization from cached data
 ├── main.go                       # Go benchmark harness
 └── out/
-    ├── benchmark_results.json          # Cached results from benchmark_runner.py
-    ├── benchmark_results.txt           # Raw Go benchmark output
-    ├── benchmark_comprehensive.png     # 6-panel comprehensive dashboard
-    ├── benchmark_latency_distribution.png  # Latency histograms/CDFs
-    ├── benchmark_use_cases.png         # Use case recommendation matrix
-    ├── benchmark_patterns.png          # Pattern-based comparison plots
-    └── benchmark_summary.png           # Summary dashboard
+    └── linux/
+        ├── benchmark_results.json          # Cached results from benchmark_runner.py
+        ├── benchmark_results.txt           # Raw Go benchmark output
+        ├── benchmark_comprehensive.png     # 6-panel comprehensive dashboard
+        ├── benchmark_latency_distribution.png  # Latency histograms/CDFs
+        ├── benchmark_use_cases.png         # Use case recommendation matrix
+        ├── benchmark_patterns.png          # Pattern-based comparison plots
+        └── benchmark_summary.png           # Summary dashboard
+    └── windows/
+        └── ... # Windows-generated artifacts
 ```
 
 ## Scripts

@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux || windows
 
 /*
  * Copyright 2025 gRPC authors.
@@ -23,6 +23,8 @@ package main
 import (
 	"flag"
 	"fmt"
+	"os"
+	"os/signal"
 )
 
 var (
@@ -52,6 +54,9 @@ func main() {
 	fmt.Println()
 	fmt.Println("Press Ctrl+C to exit")
 
-	// Block forever
-	select {}
+	// Block forever (wait for interrupt signal)
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt)
+	<-sigCh
+	fmt.Println("\nShutting down...")
 }

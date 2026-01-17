@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux || windows
 
 /*
  * Copyright 2025 gRPC authors.
@@ -24,10 +24,28 @@ import (
 	"io"
 	"net"
 	"os"
+	"path/filepath"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
 )
+
+func newUnixSocket(b *testing.B, prefix string) (string, net.Listener, func()) {
+	path := filepath.Join(os.TempDir(), fmt.Sprintf("%s%d.sock", prefix, time.Now().UnixNano()))
+	lis, err := net.Listen("unix", path)
+	if err != nil {
+		if runtime.GOOS == "windows" {
+			b.Skipf("unix domain sockets unavailable on windows: %v", err)
+		}
+		b.Fatalf("Listen failed: %v", err)
+	}
+	cleanup := func() {
+		lis.Close()
+		os.Remove(path)
+	}
+	return path, lis, cleanup
+}
 
 // BenchmarkShmRingWriteRead measures raw ring buffer throughput
 func BenchmarkShmRingWriteRead(b *testing.B) {
@@ -231,14 +249,8 @@ func BenchmarkUnixSocketRoundtrip(b *testing.B) {
 
 	for _, size := range sizes {
 		b.Run(fmt.Sprintf("size=%d", size), func(b *testing.B) {
-			sockPath := fmt.Sprintf("/tmp/bench-unix-rt-%d.sock", time.Now().UnixNano())
-			defer os.Remove(sockPath)
-
-			listener, err := net.Listen("unix", sockPath)
-			if err != nil {
-				b.Fatalf("Listen failed: %v", err)
-			}
-			defer listener.Close()
+			sockPath, listener, cleanup := newUnixSocket(b, "bench-unix-rt-")
+			defer cleanup()
 
 			data := make([]byte, size)
 			recvBuf := make([]byte, size)
@@ -482,13 +494,8 @@ func BenchmarkUnixSocketLoopback(b *testing.B) {
 
 	for _, size := range sizes {
 		b.Run(fmt.Sprintf("size=%d", size), func(b *testing.B) {
-			sockPath := fmt.Sprintf("/tmp/bench-unix-%d.sock", time.Now().UnixNano())
-
-			listener, err := net.Listen("unix", sockPath)
-			if err != nil {
-				b.Fatalf("Listen failed: %v", err)
-			}
-			defer listener.Close()
+			sockPath, listener, cleanup := newUnixSocket(b, "bench-unix-")
+			defer cleanup()
 
 			data := make([]byte, size)
 			recvBuf := make([]byte, size)
@@ -747,16 +754,8 @@ func BenchmarkUnixLargePayloads(b *testing.B) {
 	for _, size := range sizes {
 		sizeMB := size / (1024 * 1024)
 		b.Run(fmt.Sprintf("size=%dMB", sizeMB), func(b *testing.B) {
-			sockPath := fmt.Sprintf("/tmp/bench-unix-large-%d.sock", time.Now().UnixNano())
-
-			listener, err := net.Listen("unix", sockPath)
-			if err != nil {
-				b.Fatalf("Listen failed: %v", err)
-			}
-			defer func() {
-				listener.Close()
-				os.Remove(sockPath)
-			}()
+			sockPath, listener, cleanup := newUnixSocket(b, "bench-unix-large-")
+			defer cleanup()
 
 			data := make([]byte, size)
 			for i := range data {
@@ -1104,16 +1103,8 @@ func BenchmarkUnixLargePayloadsRoundtrip(b *testing.B) {
 	for _, size := range sizes {
 		sizeMB := size / (1024 * 1024)
 		b.Run(fmt.Sprintf("size=%dMB", sizeMB), func(b *testing.B) {
-			sockPath := fmt.Sprintf("/tmp/bench-unix-large-rt-%d.sock", time.Now().UnixNano())
-
-			listener, err := net.Listen("unix", sockPath)
-			if err != nil {
-				b.Fatalf("Listen failed: %v", err)
-			}
-			defer func() {
-				listener.Close()
-				os.Remove(sockPath)
-			}()
+			sockPath, listener, cleanup := newUnixSocket(b, "bench-unix-large-rt-")
+			defer cleanup()
 
 			data := make([]byte, size)
 			for i := range data {

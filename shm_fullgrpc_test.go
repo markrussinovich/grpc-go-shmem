@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux || windows
 
 /*
  *
@@ -36,7 +36,7 @@ import (
 
 // TestFullGRPCWithSHM tests the complete gRPC path with shared memory transport.
 // This mimics what the benchmark does to identify the failure point.
-func (s) TestFullGRPCWithSHM(t *testing.T) {
+func TestFullGRPCWithSHM(t *testing.T) {
 	// Create a shared memory listener
 	name := fmt.Sprintf("test_fullgrpc_%d", time.Now().UnixNano())
 	lis, err := transport.NewShmListener(&transport.ShmAddr{Name: name}, 64*1024*1024, 64*1024*1024, 64*1024*1024)

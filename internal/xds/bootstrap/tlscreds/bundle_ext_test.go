@@ -24,6 +24,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -74,34 +75,34 @@ func (s) TestValidTlsBuilder(t *testing.T) {
 		},
 		{
 			name: "Only CA certificate chain",
-			jd:   fmt.Sprintf(`{"ca_certificate_file": "%s"}`, caCert),
+			jd:   fmt.Sprintf(`{"ca_certificate_file": %q}`, filepath.ToSlash(caCert)),
 		},
 		{
 			name: "Only private key and certificate chain",
-			jd:   fmt.Sprintf(`{"certificate_file":"%s","private_key_file":"%s"}`, clientCert, clientKey),
+			jd:   fmt.Sprintf(`{"certificate_file":%q,"private_key_file":%q}`, filepath.ToSlash(clientCert), filepath.ToSlash(clientKey)),
 		},
 		{
 			name: "CA chain, private key and certificate chain",
-			jd:   fmt.Sprintf(`{"ca_certificate_file":"%s","certificate_file":"%s","private_key_file":"%s"}`, caCert, clientCert, clientKey),
+			jd:   fmt.Sprintf(`{"ca_certificate_file":%q,"certificate_file":%q,"private_key_file":%q}`, filepath.ToSlash(caCert), filepath.ToSlash(clientCert), filepath.ToSlash(clientKey)),
 		},
 		{
 			name: "Only refresh interval", jd: `{"refresh_interval": "1s"}`,
 		},
 		{
 			name: "Refresh interval and CA certificate chain",
-			jd:   fmt.Sprintf(`{"refresh_interval": "1s","ca_certificate_file": "%s"}`, caCert),
+			jd:   fmt.Sprintf(`{"refresh_interval": "1s","ca_certificate_file": %q}`, filepath.ToSlash(caCert)),
 		},
 		{
 			name: "Refresh interval, private key and certificate chain",
-			jd:   fmt.Sprintf(`{"refresh_interval": "1s","certificate_file":"%s","private_key_file":"%s"}`, clientCert, clientKey),
+			jd:   fmt.Sprintf(`{"refresh_interval": "1s","certificate_file":%q,"private_key_file":%q}`, filepath.ToSlash(clientCert), filepath.ToSlash(clientKey)),
 		},
 		{
 			name: "Refresh interval, CA chain, private key and certificate chain",
-			jd:   fmt.Sprintf(`{"refresh_interval": "1s","ca_certificate_file":"%s","certificate_file":"%s","private_key_file":"%s"}`, caCert, clientCert, clientKey),
+			jd:   fmt.Sprintf(`{"refresh_interval": "1s","ca_certificate_file":%q,"certificate_file":%q,"private_key_file":%q}`, filepath.ToSlash(caCert), filepath.ToSlash(clientCert), filepath.ToSlash(clientKey)),
 		},
 		{
 			name: "Refresh interval, CA chain, private key, certificate chain, spiffe bundle",
-			jd:   fmt.Sprintf(`{"refresh_interval": "1s","ca_certificate_file":"%s","certificate_file":"%s","private_key_file":"%s","spiffe_trust_bundle_map_file":"%s"}`, caCert, clientCert, clientKey, clientSpiffeBundle),
+			jd:   fmt.Sprintf(`{"refresh_interval": "1s","ca_certificate_file":%q,"certificate_file":%q,"private_key_file":%q,"spiffe_trust_bundle_map_file":%q}`, filepath.ToSlash(caCert), filepath.ToSlash(clientCert), filepath.ToSlash(clientKey), filepath.ToSlash(clientSpiffeBundle)),
 		},
 		{
 			name: "Unknown field",
@@ -131,7 +132,7 @@ func (s) TestInvalidTlsBuilder(t *testing.T) {
 			wantErrPrefix: "failed to unmarshal config:"},
 		{
 			name:          "Missing private key",
-			jd:            fmt.Sprintf(`{"certificate_file":"%s"}`, testdata.Path("x509/server_cert.pem")),
+			jd:            fmt.Sprintf(`{"certificate_file":%q}`, filepath.ToSlash(testdata.Path("x509/server_cert.pem"))),
 			wantErrPrefix: "pemfile: private key file and identity cert file should be both specified or not specified",
 		},
 	}
@@ -162,9 +163,9 @@ func (s) TestCaReloading(t *testing.T) {
 		t.Fatalf("Failed to write test CA cert: %v", err)
 	}
 	cfg := fmt.Sprintf(`{
-		"ca_certificate_file": "%s",
+		"ca_certificate_file": %q,
 		"refresh_interval": ".01s"
-	}`, caPath)
+	}`, filepath.ToSlash(caPath))
 	tlsBundle, stop, err := tlscreds.NewBundle([]byte(cfg))
 	if err != nil {
 		t.Fatalf("Failed to create TLS bundle: %v", err)
@@ -250,9 +251,9 @@ func (s) Test_SPIFFE_Reloading(t *testing.T) {
 		t.Fatalf("Failed to write test SPIFFE Bundle %v: %v", clientSPIFFEBundle, err)
 	}
 	cfg := fmt.Sprintf(`{
-		"spiffe_trust_bundle_map_file": "%s",
+		"spiffe_trust_bundle_map_file": %q,
 		"refresh_interval": ".01s"
-	}`, spiffePath)
+	}`, filepath.ToSlash(spiffePath))
 	tlsBundle, stop, err := tlscreds.NewBundle([]byte(cfg))
 	if err != nil {
 		t.Fatalf("Failed to create TLS bundle: %v", err)
@@ -330,13 +331,13 @@ func (s) TestMTLS(t *testing.T) {
 	defer s.Stop()
 
 	cfg := fmt.Sprintf(`{
-		"ca_certificate_file": "%s",
-		"certificate_file": "%s",
-		"private_key_file": "%s"
+		"ca_certificate_file": %q,
+		"certificate_file": %q,
+		"private_key_file": %q
 	}`,
-		testdata.Path("x509/server_ca_cert.pem"),
-		testdata.Path("x509/client1_cert.pem"),
-		testdata.Path("x509/client1_key.pem"))
+		filepath.ToSlash(testdata.Path("x509/server_ca_cert.pem")),
+		filepath.ToSlash(testdata.Path("x509/client1_cert.pem")),
+		filepath.ToSlash(testdata.Path("x509/client1_key.pem")))
 	tlsBundle, stop, err := tlscreds.NewBundle([]byte(cfg))
 	if err != nil {
 		t.Fatalf("Failed to create TLS bundle: %v", err)
@@ -379,13 +380,13 @@ func (s) Test_MTLS_SPIFFE(t *testing.T) {
 			defer s.Stop()
 
 			cfg := fmt.Sprintf(`{
-	"certificate_file": "%s",
-	"private_key_file": "%s",
-	"spiffe_trust_bundle_map_file": "%s"
+	"certificate_file": %q,
+	"private_key_file": %q,
+	"spiffe_trust_bundle_map_file": %q
 }`,
-				testdata.Path("spiffe_end2end/client_spiffe.pem"),
-				testdata.Path("spiffe_end2end/client.key"),
-				testdata.Path("spiffe_end2end/client_spiffebundle.json"))
+				filepath.ToSlash(testdata.Path("spiffe_end2end/client_spiffe.pem")),
+				filepath.ToSlash(testdata.Path("spiffe_end2end/client.key")),
+				filepath.ToSlash(testdata.Path("spiffe_end2end/client_spiffebundle.json")))
 			tlsBundle, stop, err := tlscreds.NewBundle([]byte(cfg))
 			if err != nil {
 				t.Fatalf("Failed to create TLS bundle: %v", err)
@@ -417,13 +418,13 @@ func (s) Test_MTLS_SPIFFE_FlagDisabled(t *testing.T) {
 	defer s.Stop()
 
 	cfg := fmt.Sprintf(`{
-"certificate_file": "%s",
-"private_key_file": "%s",
-"spiffe_trust_bundle_map_file": "%s"
+"certificate_file": %q,
+"private_key_file": %q,
+"spiffe_trust_bundle_map_file": %q
 }`,
-		testdata.Path("spiffe_end2end/client_spiffe.pem"),
-		testdata.Path("spiffe_end2end/client.key"),
-		testdata.Path("spiffe_end2end/client_spiffebundle.json"))
+		filepath.ToSlash(testdata.Path("spiffe_end2end/client_spiffe.pem")),
+		filepath.ToSlash(testdata.Path("spiffe_end2end/client.key")),
+		filepath.ToSlash(testdata.Path("spiffe_end2end/client_spiffebundle.json")))
 	tlsBundle, stop, err := tlscreds.NewBundle([]byte(cfg))
 	if err != nil {
 		t.Fatalf("Failed to create TLS bundle: %v", err)
@@ -486,13 +487,13 @@ func (s) Test_MTLS_SPIFFE_Failure(t *testing.T) {
 			s := stubserver.StartTestService(t, nil, tc.serverOption)
 			defer s.Stop()
 			cfg := fmt.Sprintf(`{
-"certificate_file": "%s",
-"private_key_file": "%s",
-"spiffe_trust_bundle_map_file": "%s"
+"certificate_file": %q,
+"private_key_file": %q,
+"spiffe_trust_bundle_map_file": %q
 }`,
-				testdata.Path(tc.certFile),
-				testdata.Path(tc.keyFile),
-				testdata.Path(tc.spiffeBundleFile))
+				filepath.ToSlash(testdata.Path(tc.certFile)),
+				filepath.ToSlash(testdata.Path(tc.keyFile)),
+				filepath.ToSlash(testdata.Path(tc.spiffeBundleFile)))
 			tlsBundle, stop, err := tlscreds.NewBundle([]byte(cfg))
 			if err != nil {
 				t.Fatalf("Failed to create TLS bundle: %v", err)

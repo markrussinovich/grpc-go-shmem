@@ -21,6 +21,7 @@ package jwtcreds
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -77,7 +78,7 @@ func (s) TestNewCallCredentialsWithInvalidConfig(t *testing.T) {
 func (s) TestNewCallCredentialsWithValidConfig(t *testing.T) {
 	token := createTestJWT(t)
 	tokenFile := writeTempFile(t, token)
-	config := `{"jwt_token_file": "` + tokenFile + `"}`
+	config := fmt.Sprintf(`{"jwt_token_file": %q}`, filepath.ToSlash(tokenFile))
 
 	callCreds, cleanup, err := NewCallCredentials(json.RawMessage(config))
 	if err != nil {
@@ -117,7 +118,7 @@ func (s) TestNewCallCredentialsWithValidConfig(t *testing.T) {
 func (s) TestCallCredentials_Cleanup(t *testing.T) {
 	token := createTestJWT(t)
 	tokenFile := writeTempFile(t, token)
-	config := `{"jwt_token_file": "` + tokenFile + `"}`
+	config := fmt.Sprintf(`{"jwt_token_file": %q}`, filepath.ToSlash(tokenFile))
 	_, cleanup, err := NewCallCredentials(json.RawMessage(config))
 	if err != nil {
 		t.Fatalf("NewCallCredentials(%s) failed: %v", config, err)

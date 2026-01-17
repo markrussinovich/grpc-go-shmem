@@ -22,7 +22,9 @@ import numpy as np
 
 # Directory setup
 SCRIPT_DIR = Path(__file__).parent.absolute()
-OUT_DIR = SCRIPT_DIR / "out"
+OUT_ROOT = SCRIPT_DIR / "out"
+PLATFORM_NAME = "windows" if os.name == "nt" else ("linux" if sys.platform.startswith("linux") else sys.platform)
+OUT_DIR = OUT_ROOT / PLATFORM_NAME
 RESULTS_FILE = OUT_DIR / "benchmark_results.json"
 
 
@@ -116,6 +118,9 @@ def run_benchmarks() -> dict:
     print("-" * 70)
     print(f"Parsed {len(results['benchmarks'])} benchmark types")
 
+    if not results["benchmarks"]:
+        print("WARNING: No benchmark lines parsed. This platform may not build the shared memory benchmarks (e.g., Linux-only build tags).")
+
     return results
 
 
@@ -131,13 +136,18 @@ def save_results(results: dict):
 
 def load_results() -> dict:
     """Load benchmark results from JSON file."""
-    if not RESULTS_FILE.exists():
-        return None
+    target_file = RESULTS_FILE
+    legacy_file = OUT_ROOT / "benchmark_results.json"
+    if not target_file.exists():
+        if legacy_file.exists():
+            target_file = legacy_file
+        else:
+            return None
 
-    with open(RESULTS_FILE, 'r') as f:
+    with open(target_file, 'r') as f:
         results = json.load(f)
 
-    print(f"Loaded results from: {RESULTS_FILE}")
+    print(f"Loaded results from: {target_file}")
     print(f"  Timestamp: {results.get('timestamp', 'unknown')}")
     print(f"  CPU: {results.get('cpu', 'unknown')}")
 
@@ -215,6 +225,25 @@ def extract_data(results: dict) -> dict:
     data["unix_large_rt_latency"] = get_latency("BenchmarkUnixLargePayloadsRoundtrip", large_sizes)
 
     return data
+
+
+def _filter_numeric(seq):
+    """Return only numeric entries from a sequence."""
+    return [v for v in seq if isinstance(v, (int, float))]
+
+
+def _has_numeric(seq) -> bool:
+    """True if the sequence contains at least one numeric value."""
+    return bool(_filter_numeric(seq))
+
+
+def _safe_number(seq, idx):
+    """Return a numeric value at idx or None."""
+    if idx < len(seq):
+        v = seq[idx]
+        if isinstance(v, (int, float)):
+            return v
+    return None
 
 
 def generate_plots(data: dict):
@@ -1033,9 +1062,9 @@ def generate_consolidated_plot(data: dict):
 
     # Peak Throughput by Transport
     ax = fig.add_subplot(gs[5, 0])
-    if shm_tp and tcp_tp and unix_tp:
+    if _has_numeric(shm_tp) and _has_numeric(tcp_tp) and _has_numeric(unix_tp):
         transports = ['SHM', 'TCP', 'Unix']
-        peak_tp = [max(shm_tp), max(tcp_tp), max(unix_tp)]
+        peak_tp = [max(_filter_numeric(shm_tp)), max(_filter_numeric(tcp_tp)), max(_filter_numeric(unix_tp))]
         bar_colors = [colors['shm'], colors['tcp'], colors['unix']]
 
         bars = ax.bar(transports, peak_tp, color=bar_colors, edgecolor='black', linewidth=0.5)
@@ -1049,9 +1078,9 @@ def generate_consolidated_plot(data: dict):
 
     # Minimum Latency by Transport
     ax = fig.add_subplot(gs[5, 1])
-    if shm_lat and tcp_lat and unix_lat:
+    if _has_numeric(shm_lat) and _has_numeric(tcp_lat) and _has_numeric(unix_lat):
         transports = ['SHM', 'TCP', 'Unix']
-        min_lat = [min(shm_lat), min(tcp_lat), min(unix_lat)]
+        min_lat = [min(_filter_numeric(shm_lat)), min(_filter_numeric(tcp_lat)), min(_filter_numeric(unix_lat))]
         bar_colors = [colors['shm'], colors['tcp'], colors['unix']]
 
         bars = ax.bar(transports, min_lat, color=bar_colors, edgecolor='black', linewidth=0.5)
@@ -1064,64 +1093,85 @@ def generate_consolidated_plot(data: dict):
 
     # Overall Speedup Summary
     ax = fig.add_subplot(gs[5, 2])
-    if shm_lat and tcp_lat and unix_lat and shm_rt and tcp_rt:
+    if _has_numeric(shm_lat) and _has_numeric(tcp_lat) and _has_numeric(unix_lat) and _has_numeric(shm_rt) and _has_numeric(tcp_rt):
         categories = ['Unary\n(1KB)', 'Stream\n(1MB)', 'Large Stream\n(64MB)', 'Large Unary\n(64MB)']
 
         speedups_tcp = []
         speedups_unix = []
 
         # Unary 1KB
-        if shm_rt[2] and tcp_rt[2]:
-            speedups_tcp.append(tcp_rt[2] / shm_rt[2])
-            speedups_unix.append(unix_rt[2] / shm_rt[2])
+        unary_shm = _safe_number(shm_rt, 2)
+        unary_tcp = _safe_number(tcp_rt, 2)
+        unary_unix = _safe_number(unix_rt, 2)
+        if unary_shm and unary_tcp:
+            speedups_tcp.append(unary_tcp / unary_shm)
+            speedups_unix.append(unary_unix / unary_shm if unary_unix else 0)
         else:
             speedups_tcp.append(0)
             speedups_unix.append(0)
 
-        # Stream 1MB
-        if shm_lat[-1] and tcp_lat[-1]:
-            speedups_tcp.append(tcp_lat[-1] / shm_lat[-1])
-            speedups_unix.append(unix_lat[-1] / shm_lat[-1])
+        # Stream 1MB (last index)
+        stream_shm = _safe_number(shm_lat, len(shm_lat) - 1)
+        stream_tcp = _safe_number(tcp_lat, len(tcp_lat) - 1)
+        stream_unix = _safe_number(unix_lat, len(unix_lat) - 1)
+        if stream_shm and stream_tcp:
+            speedups_tcp.append(stream_tcp / stream_shm)
+            speedups_unix.append(stream_unix / stream_shm if stream_unix else 0)
         else:
             speedups_tcp.append(0)
             speedups_unix.append(0)
 
         # Large Stream 64MB (index 3)
         if 3 in valid_stream_idx:
-            shm_l = shm_large_stream_lat[3] if shm_large_stream_lat[3] else 1
-            tcp_l = tcp_large_stream_lat[3] if tcp_large_stream_lat[3] else shm_l
-            unix_l = unix_large_stream_lat[3] if unix_large_stream_lat[3] else shm_l
-            speedups_tcp.append(tcp_l / shm_l)
-            speedups_unix.append(unix_l / shm_l)
+            shm_l = _safe_number(shm_large_stream_lat, 3)
+            tcp_l = _safe_number(tcp_large_stream_lat, 3) or shm_l
+            unix_l = _safe_number(unix_large_stream_lat, 3) or shm_l
+            if shm_l:
+                speedups_tcp.append(tcp_l / shm_l)
+                speedups_unix.append(unix_l / shm_l)
+            else:
+                speedups_tcp.append(0)
+                speedups_unix.append(0)
         else:
             speedups_tcp.append(0)
             speedups_unix.append(0)
 
         # Large Unary 64MB (index 3)
         if 3 in valid_rt_idx:
-            shm_l = shm_large_rt_lat[3] if shm_large_rt_lat[3] else 1
-            tcp_l = tcp_large_rt_lat[3] if tcp_large_rt_lat[3] else shm_l
-            unix_l = unix_large_rt_lat[3] if unix_large_rt_lat[3] else shm_l
-            speedups_tcp.append(tcp_l / shm_l)
-            speedups_unix.append(unix_l / shm_l)
+            shm_l = _safe_number(shm_large_rt_lat, 3)
+            tcp_l = _safe_number(tcp_large_rt_lat, 3) or shm_l
+            unix_l = _safe_number(unix_large_rt_lat, 3) or shm_l
+            if shm_l:
+                speedups_tcp.append(tcp_l / shm_l)
+                speedups_unix.append(unix_l / shm_l)
+            else:
+                speedups_tcp.append(0)
+                speedups_unix.append(0)
         else:
             speedups_tcp.append(0)
             speedups_unix.append(0)
 
-        x_summ = np.arange(len(categories))
-        ax.bar(x_summ - 0.15, speedups_tcp, 0.3, label='vs TCP', color=colors['tcp'], edgecolor='black', linewidth=0.5)
-        ax.bar(x_summ + 0.15, speedups_unix, 0.3, label='vs Unix', color=colors['unix'], edgecolor='black', linewidth=0.5)
-        ax.set_ylabel('Speedup Factor')
-        ax.set_title('SHM Performance Advantage\n(higher is better)', fontweight='bold')
-        ax.set_xticks(x_summ)
-        ax.set_xticklabels(categories)
-        ax.legend(loc='upper right', fontsize=8)
-        ax.axhline(y=1, color='gray', linestyle='--', alpha=0.5)
+        if any(v > 0 for v in speedups_tcp + speedups_unix):
+            x_summ = np.arange(len(categories))
+            ax.bar(x_summ - 0.15, speedups_tcp, 0.3, label='vs TCP', color=colors['tcp'], edgecolor='black', linewidth=0.5)
+            ax.bar(x_summ + 0.15, speedups_unix, 0.3, label='vs Unix', color=colors['unix'], edgecolor='black', linewidth=0.5)
+            ax.set_ylabel('Speedup Factor')
+            ax.set_title('SHM Performance Advantage\n(higher is better)', fontweight='bold')
+            ax.set_xticks(x_summ)
+            ax.set_xticklabels(categories)
+            ax.legend(loc='upper right', fontsize=8)
+            ax.axhline(y=1, color='gray', linestyle='--', alpha=0.5)
 
-        for i, (tcp_s, unix_s) in enumerate(zip(speedups_tcp, speedups_unix)):
-            if tcp_s > 0:
-                ax.annotate(f'{tcp_s:.1f}x', xy=(i - 0.15, tcp_s), xytext=(0, 3),
-                           textcoords='offset points', ha='center', fontsize=8, fontweight='bold')
+            for i, (tcp_s, unix_s) in enumerate(zip(speedups_tcp, speedups_unix)):
+                if tcp_s > 0:
+                    ax.annotate(f'{tcp_s:.1f}x', xy=(i - 0.15, tcp_s), xytext=(0, 3),
+                               textcoords='offset points', ha='center', fontsize=8, fontweight='bold')
+        else:
+            ax.text(0.5, 0.5, 'No data', ha='center', va='center', transform=ax.transAxes)
+            ax.set_title('SHM Performance Advantage')
+    else:
+        ax.text(0.5, 0.5, 'No data', ha='center', va='center', transform=ax.transAxes)
+        ax.set_title('SHM Performance Advantage')
 
     # ============================================================
     # ROW 7: Text Summary
@@ -1220,6 +1270,9 @@ Examples:
             else:
                 print("ERROR: Benchmark run failed")
                 sys.exit(1)
+
+    if not results.get("benchmarks"):
+        print("WARNING: No benchmark data found; plots will contain placeholders only.")
 
     # Extract data and generate plots
     data = extract_data(results)
