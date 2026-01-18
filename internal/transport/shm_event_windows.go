@@ -1,4 +1,4 @@
-//go:build windows
+﻿//go:build windows
 
 /*
  *
@@ -329,20 +329,20 @@ func openOrCreateNamedEvent(name string) (windows.Handle, error) {
 	if err == nil {
 		return handle, nil
 	}
-	
+
 	// If open failed, try to create
 	handle, err = createNamedEvent(name)
 	if err == nil {
 		return handle, nil
 	}
-	
+
 	// If create failed, maybe it was created between our open and create attempts
 	// Try to open one more time
 	handle, err = openNamedEvent(name)
 	if err == nil {
 		return handle, nil
 	}
-	
+
 	return 0, fmt.Errorf("failed to open or create event %s: %w", name, err)
 }
 
