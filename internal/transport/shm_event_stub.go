@@ -30,12 +30,12 @@ import (
 type RingEvents struct{}
 
 // CreateRingEvents returns nil on Linux - futex is used directly.
-func CreateRingEvents(segmentName string, ringID string) (*RingEvents, error) {
+func CreateRingEvents(_ string, _ string) (*RingEvents, error) {
 	return nil, nil
 }
 
 // OpenRingEvents returns nil on Linux - futex is used directly.
-func OpenRingEvents(segmentName string, ringID string) (*RingEvents, error) {
+func OpenRingEvents(_ string, _ string) (*RingEvents, error) {
 	return nil, nil
 }
 
@@ -54,22 +54,22 @@ func (e *RingEvents) SignalSpace() {}
 func (e *RingEvents) SignalContig() {}
 
 // WaitData is not used on Linux - futex wait is used directly.
-func (e *RingEvents) WaitData(addr *uint32, val uint32, timeout time.Duration) error {
+func (e *RingEvents) WaitData(_ *uint32, _ uint32, _ time.Duration) error {
 	return nil
 }
 
 // WaitSpace is not used on Linux - futex wait is used directly.
-func (e *RingEvents) WaitSpace(addr *uint32, val uint32, timeout time.Duration) error {
+func (e *RingEvents) WaitSpace(_ *uint32, _ uint32, _ time.Duration) error {
 	return nil
 }
 
 // WaitContig is not used on Linux - futex wait is used directly.
-func (e *RingEvents) WaitContig(addr *uint32, val uint32, timeout time.Duration) error {
+func (e *RingEvents) WaitContig(_ *uint32, _ uint32, _ time.Duration) error {
 	return nil
 }
 
 // GetRingEvents returns nil on Linux - events are not used.
-func GetRingEvents(segmentName string, ringID string) *RingEvents {
+func GetRingEvents(_ string, _ string) *RingEvents {
 	return nil
 }
 
@@ -79,7 +79,7 @@ type RingEventHandle struct {
 }
 
 // NewRingEventHandle returns an empty handle on Linux.
-func NewRingEventHandle(events *RingEvents) RingEventHandle {
+func NewRingEventHandle(_ *RingEvents) RingEventHandle {
 	return RingEventHandle{}
 }
 
@@ -92,30 +92,30 @@ func (h RingEventHandle) Events() *RingEvents {
 type HandshakeEvents struct{}
 
 // CreateHandshakeEvents returns nil on Linux - futex is used directly.
-func CreateHandshakeEvents(segmentName string) (*HandshakeEvents, error) {
+func CreateHandshakeEvents(_ string) (*HandshakeEvents, error) {
 	return nil, nil
 }
 
 // OpenHandshakeEvents returns nil on Linux - futex is used directly.
-func OpenHandshakeEvents(segmentName string) (*HandshakeEvents, error) {
+func OpenHandshakeEvents(_ string) (*HandshakeEvents, error) {
 	return nil, nil
 }
 
 // SignalClientReady is a no-op on Linux - futex wake is used directly.
-func SignalClientReady(segmentName string) {}
+func SignalClientReady(_ string) {}
 
 // SignalServerReady is a no-op on Linux - futex wake is used directly.
-func SignalServerReady(segmentName string) {}
+func SignalServerReady(_ string) {}
 
 // WaitClientReady is a no-op on Linux - futex wait is used directly.
-func WaitClientReady(ctx context.Context, segmentName string) error {
+func WaitClientReady(_ context.Context, _ string) error {
 	return nil
 }
 
 // WaitServerReady is a no-op on Linux - futex wait is used directly.
-func WaitServerReady(ctx context.Context, segmentName string) error {
+func WaitServerReady(_ context.Context, _ string) error {
 	return nil
 }
 
 // CloseHandshakeEvents is a no-op on Linux.
-func CloseHandshakeEvents(segmentName string) {}
+func CloseHandshakeEvents(_ string) {}
