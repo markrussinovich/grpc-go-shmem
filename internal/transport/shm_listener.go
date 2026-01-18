@@ -54,11 +54,11 @@ type ShmListener struct {
 	baseName string        // Base name for segment creation
 	connID   atomic.Uint64 // Atomic counter for connection IDs
 
-	ctlSegment   *Segment
-	ctlRx        *ShmRing    // client->server control
-	ctlTx        *ShmRing    // server->client control
-	ctlRxEvents  *RingEvents // Events for control rings (Windows)
-	ctlTxEvents  *RingEvents
+	ctlSegment  *Segment
+	ctlRx       *ShmRing    // client->server control
+	ctlTx       *ShmRing    // server->client control
+	ctlRxEvents *RingEvents // Events for control rings (Windows)
+	ctlTxEvents *RingEvents
 
 	// Lifecycle management
 	ctx       context.Context
@@ -417,6 +417,7 @@ func (c *shmConn) SetWriteDeadline(_ time.Time) error {
 func (c *shmConn) GetServerTransport() ServerTransport {
 	return c.transport
 }
+
 // ReadRing returns the read ring (client->server) with events attached.
 // For tests that need direct ring access.
 func (c *shmConn) ReadRing() *ShmRing {
@@ -428,4 +429,3 @@ func (c *shmConn) ReadRing() *ShmRing {
 func (c *shmConn) WriteRing() *ShmRing {
 	return c.writeRing
 }
-

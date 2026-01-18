@@ -33,16 +33,16 @@ var ErrConnectionClosed = errors.New("connection closed")
 // Server: read from ring A (client->server), write to ring B (server->client)
 // Client: read from ring B (server->client), write to ring A (client->server)
 type ShmConn struct {
-	seg          *Segment
-	readR        *ShmRing
-	writeR       *ShmRing
-	readView     *ringView // For accessing close/increment methods
-	writeView    *ringView // For accessing close/increment methods
-	readEvents   *RingEvents
-	writeEvents  *RingEvents
-	closed       atomic.Bool
-	isServer     bool   // true if this is the server side
-	segmentName  string // segment name for event naming
+	seg         *Segment
+	readR       *ShmRing
+	writeR      *ShmRing
+	readView    *ringView // For accessing close/increment methods
+	writeView   *ringView // For accessing close/increment methods
+	readEvents  *RingEvents
+	writeEvents *RingEvents
+	closed      atomic.Bool
+	isServer    bool   // true if this is the server side
+	segmentName string // segment name for event naming
 }
 
 // extractSegmentName extracts the segment name from the file path.
