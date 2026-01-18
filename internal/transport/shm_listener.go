@@ -428,3 +428,4 @@ func (c *shmConn) ReadRing() *ShmRing {
 func (c *shmConn) WriteRing() *ShmRing {
 	return c.writeRing
 }
+
