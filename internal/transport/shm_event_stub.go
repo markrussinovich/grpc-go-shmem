@@ -29,14 +29,14 @@ import (
 // RingEvents is a no-op on Linux where futex works natively across mappings.
 type RingEvents struct{}
 
-// CreateRingEvents is a no-op on Linux.
+// CreateRingEvents returns nil on Linux - futex is used directly.
 func CreateRingEvents(segmentName string, ringID string) (*RingEvents, error) {
-	return &RingEvents{}, nil
+	return nil, nil
 }
 
-// OpenRingEvents is a no-op on Linux.
+// OpenRingEvents returns nil on Linux - futex is used directly.
 func OpenRingEvents(segmentName string, ringID string) (*RingEvents, error) {
-	return &RingEvents{}, nil
+	return nil, nil
 }
 
 // Close is a no-op on Linux.
@@ -91,14 +91,14 @@ func (h RingEventHandle) Events() *RingEvents {
 // HandshakeEvents is a no-op on Linux where futex works natively.
 type HandshakeEvents struct{}
 
-// CreateHandshakeEvents is a no-op on Linux.
+// CreateHandshakeEvents returns nil on Linux - futex is used directly.
 func CreateHandshakeEvents(segmentName string) (*HandshakeEvents, error) {
-	return &HandshakeEvents{}, nil
+	return nil, nil
 }
 
-// OpenHandshakeEvents is a no-op on Linux.
+// OpenHandshakeEvents returns nil on Linux - futex is used directly.
 func OpenHandshakeEvents(segmentName string) (*HandshakeEvents, error) {
-	return &HandshakeEvents{}, nil
+	return nil, nil
 }
 
 // SignalClientReady is a no-op on Linux - futex wake is used directly.
