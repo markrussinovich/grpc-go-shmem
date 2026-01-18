@@ -325,19 +325,6 @@ func (r *ShmRing) signalContig(addr *uint32) {
 	}
 }
 
-// signalAll signals all events (used during close).
-func (r *ShmRing) signalAll(hdr *RingHeader) {
-	if r.events != nil {
-		r.events.SignalData()
-		r.events.SignalSpace()
-		r.events.SignalContig()
-	} else {
-		r.signalData(&hdr.dataSeq)
-		r.signalSpace(&hdr.spaceSeq)
-		r.signalContig(&hdr.contigSeq)
-	}
-}
-
 // WriteBlocking writes data to the ring buffer using an event-driven producer algorithm.
 // Blocks until space is available or the ring is closed.
 //

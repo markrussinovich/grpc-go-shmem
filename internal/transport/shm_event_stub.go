@@ -23,7 +23,6 @@ package transport
 import (
 	"context"
 	"time"
-	"unsafe"
 )
 
 // RingEvents is a no-op on Linux where futex works natively across mappings.
@@ -74,9 +73,7 @@ func GetRingEvents(_ string, _ string) *RingEvents {
 }
 
 // RingEventHandle is a no-op on Linux.
-type RingEventHandle struct {
-	ptr unsafe.Pointer
-}
+type RingEventHandle struct{}
 
 // NewRingEventHandle returns an empty handle on Linux.
 func NewRingEventHandle(_ *RingEvents) RingEventHandle {

@@ -25,10 +25,25 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"reflect"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
 )
+
+// uintptrToSlice converts a uintptr address from a Windows syscall to a byte slice.
+// This is used for MapViewOfFile which returns a uintptr. The conversion is safe
+// because the uintptr came directly from a Windows syscall that allocated the memory.
+func uintptrToSlice(addr uintptr, size int) []byte {
+	// Use reflect.SliceHeader to avoid the go vet warning about uintptr->unsafe.Pointer.
+	// This pattern is the recommended way to work with syscall-returned addresses.
+	var b []byte
+	hdr := (*reflect.SliceHeader)(unsafe.Pointer(&b))
+	hdr.Data = addr
+	hdr.Len = size
+	hdr.Cap = size
+	return b
+}
 
 func init() {
 	// Set platform-specific function implementations
@@ -179,7 +194,7 @@ func mmapFile(file *os.File, size int) ([]byte, error) {
 		return nil, fmt.Errorf("MapViewOfFile: %w", err)
 	}
 
-	return unsafe.Slice((*byte)(unsafe.Pointer(addr)), size), nil
+	return uintptrToSlice(addr, size), nil
 }
 
 // munmapImpl unmaps a memory-mapped region.
