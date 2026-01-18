@@ -50,9 +50,9 @@ func TestSelection_ChoosesSHM_and_ExecutesUnary(t *testing.T) {
 			return
 		}
 		defer c.Close()
-		seg := c.(*shmConn).segment
-		srvRx := NewShmRingFromSegment(seg.A, seg.Mem)
-		srvTx := NewShmRingFromSegment(seg.B, seg.Mem)
+		conn := c.(*shmConn)
+		srvRx := conn.ReadRing()
+		srvTx := conn.WriteRing()
 		fh, pl, err := readFrame(testCtx, srvRx)
 		if err != nil {
 			t.Errorf("server read headers: %v", err)

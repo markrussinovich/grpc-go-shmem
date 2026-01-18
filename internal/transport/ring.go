@@ -111,6 +111,10 @@ type ShmRing struct {
 
 	// Pre-allocated commit context for read operations (reads are single-threaded).
 	readCommit ReadCommit
+
+	// events holds Windows named event handles for cross-mapping synchronization.
+	// On Linux, this is nil and futex is used directly.
+	events *RingEvents
 }
 
 // ReadCommit holds the state needed to commit a read operation.
@@ -148,14 +152,14 @@ func (rc *ReadCommit) Commit(consumed int) {
 	if consumed > 0 {
 		hdr.IncrementContigSequence()
 		if hdr.ContigWaiters() > 0 {
-			futexWake(&hdr.contigSeq, 1)
+			rc.ring.signalContig(&hdr.contigSeq)
 		}
 	}
 	// Space: always wake waiters if any are waiting.
 	// This is conservative but avoids potential races in the waiter registration.
 	if consumed > 0 && hdr.SpaceWaiters() > 0 {
 		hdr.IncrementSpaceSequence()
-		futexWake(&hdr.spaceSeq, 1)
+		rc.ring.signalSpace(&hdr.spaceSeq)
 	}
 }
 
@@ -194,6 +198,12 @@ func NewShmRingFromSegment(ringView *ringView, mem []byte) *ShmRing {
 	return r
 }
 
+// SetEvents sets the Windows event handles for cross-mapping synchronization.
+// On Linux, this is a no-op since futex works natively across mappings.
+func (r *ShmRing) SetEvents(events *RingEvents) {
+	r.events = events
+}
+
 // header returns a pointer to the RingHeader in shared memory
 func (r *ShmRing) header() *RingHeader {
 	return (*RingHeader)(unsafe.Pointer(uintptr(unsafe.Pointer(&r.mem[0])) + r.hdrOff))
@@ -211,7 +221,16 @@ func (r *ShmRing) Capacity() uint64 {
 
 // DebugState returns a snapshot of the current ring state for debugging and diagnostics.
 // All values are read atomically for consistent state observation.
+// Returns a zero state if the ring is closed locally.
 func (r *ShmRing) DebugState() RingState {
+	// Check local closed flag first to avoid accessing unmapped memory
+	if atomic.LoadUint32(&r.closed) != 0 {
+		return RingState{
+			Capacity: r.capacity,
+			Closed:   1,
+		}
+	}
+
 	hdr := r.header()
 	shmDebugf("DebugState: ring=%p, hdr=%p, &dataSeq=%p, &spaceSeq=%p", r, hdr, &hdr.dataSeq, &hdr.spaceSeq)
 
@@ -237,6 +256,85 @@ func (r *ShmRing) DebugState() RingState {
 		Closed:       closed,
 		DataWaiters:  hdr.DataWaiters(),
 		SpaceWaiters: hdr.SpaceWaiters(),
+	}
+}
+
+// waitForData waits until data is available.
+// On Windows, uses named events. On Linux, uses futex.
+func (r *ShmRing) waitForData(addr *uint32, val uint32, timeout time.Duration) error {
+	if r.events != nil {
+		return r.events.WaitData(addr, val, timeout)
+	}
+	if timeout > 0 {
+		return futexWaitTimeout(addr, val, timeout.Nanoseconds())
+	}
+	return futexWait(addr, val)
+}
+
+// waitForSpace waits until space is available.
+// On Windows, uses named events. On Linux, uses futex.
+func (r *ShmRing) waitForSpace(addr *uint32, val uint32, timeout time.Duration) error {
+	if r.events != nil {
+		return r.events.WaitSpace(addr, val, timeout)
+	}
+	if timeout > 0 {
+		return futexWaitTimeout(addr, val, timeout.Nanoseconds())
+	}
+	return futexWait(addr, val)
+}
+
+// waitForContig waits until contiguous space improves.
+// On Windows, uses named events. On Linux, uses futex.
+func (r *ShmRing) waitForContig(addr *uint32, val uint32, timeout time.Duration) error {
+	if r.events != nil {
+		return r.events.WaitContig(addr, val, timeout)
+	}
+	if timeout > 0 {
+		return futexWaitTimeout(addr, val, timeout.Nanoseconds())
+	}
+	return futexWait(addr, val)
+}
+
+// signalData signals that new data is available.
+// On Windows, signals the named event. On Linux, uses futex wake.
+func (r *ShmRing) signalData(addr *uint32) {
+	if r.events != nil {
+		r.events.SignalData()
+	} else {
+		futexWake(addr, 1)
+	}
+}
+
+// signalSpace signals that space is available.
+// On Windows, signals the named event. On Linux, uses futex wake.
+func (r *ShmRing) signalSpace(addr *uint32) {
+	if r.events != nil {
+		r.events.SignalSpace()
+	} else {
+		futexWake(addr, 1)
+	}
+}
+
+// signalContig signals that contiguous space improved.
+// On Windows, signals the named event. On Linux, uses futex wake.
+func (r *ShmRing) signalContig(addr *uint32) {
+	if r.events != nil {
+		r.events.SignalContig()
+	} else {
+		futexWake(addr, 1)
+	}
+}
+
+// signalAll signals all events (used during close).
+func (r *ShmRing) signalAll(hdr *RingHeader) {
+	if r.events != nil {
+		r.events.SignalData()
+		r.events.SignalSpace()
+		r.events.SignalContig()
+	} else {
+		r.signalData(&hdr.dataSeq)
+		r.signalSpace(&hdr.spaceSeq)
+		r.signalContig(&hdr.contigSeq)
 	}
 }
 
@@ -313,7 +411,7 @@ func (r *ShmRing) WriteBlocking(data []byte) error {
 				hdr.IncrementDataSequence()
 				// Only wake if readers are actually blocked on futex (not spinning)
 				if hdr.DataWaiters() > 0 {
-					futexWake(&hdr.dataSeq, 1)
+					r.signalData(&hdr.dataSeq)
 				}
 			}
 
@@ -365,7 +463,7 @@ func (r *ShmRing) WriteBlocking(data []byte) error {
 				hdr.DecSpaceWaiters()
 				continue
 			}
-			_ = futexWait(&hdr.spaceSeq, exp)
+			_ = r.waitForSpace(&hdr.spaceSeq, exp, 0)
 			hdr.DecSpaceWaiters()
 			// Re-check closure after wake to avoid infinite loop
 			if hdr.Closed() {
@@ -410,7 +508,7 @@ func (r *ShmRing) WriteBlocking(data []byte) error {
 			hdr.DecContigWaiters()
 			continue
 		}
-		_ = futexWait(&hdr.contigSeq, exp)
+		_ = r.waitForContig(&hdr.contigSeq, exp, 0)
 		hdr.DecContigWaiters()
 		// Re-check closure after wake to avoid infinite loop
 		if hdr.Closed() {
@@ -499,7 +597,7 @@ func (r *ShmRing) ReadBlocking(buf []byte) (int, error) {
 				// Contiguity: always bump after any positive read commit
 				hdr.IncrementContigSequence()
 				if hdr.ContigWaiters() > 0 {
-					futexWake(&hdr.contigSeq, 1)
+					r.signalContig(&hdr.contigSeq)
 				}
 			}
 
@@ -507,7 +605,7 @@ func (r *ShmRing) ReadBlocking(buf []byte) (int, error) {
 			if prevUsed == r.capacity {
 				hdr.IncrementSpaceSequence()
 				if hdr.SpaceWaiters() > 0 {
-					futexWake(&hdr.spaceSeq, 1)
+					r.signalSpace(&hdr.spaceSeq)
 				}
 			}
 
@@ -560,7 +658,7 @@ func (r *ShmRing) ReadBlocking(buf []byte) (int, error) {
 				hdr.DecDataWaiters()
 				return 0, io.EOF
 			}
-			if err := futexWait(&hdr.dataSeq, dataSeq); err != nil {
+			if err := r.waitForData(&hdr.dataSeq, dataSeq, 0); err != nil {
 				// Spurious wake or other wake reasons - just continue the loop
 				_ = err // silence staticcheck SA9003
 			}
@@ -592,35 +690,50 @@ func (r *ShmRing) Close() error {
 	hdr.IncrementDataSequence()
 	hdr.IncrementSpaceSequence()
 	hdr.IncrementContigSequence()
-	futexWake(&hdr.dataSeq, 1)
-	futexWake(&hdr.spaceSeq, 1)
-	futexWake(&hdr.contigSeq, 1)
+	r.signalData(&hdr.dataSeq)
+	r.signalSpace(&hdr.spaceSeq)
+	r.signalContig(&hdr.contigSeq)
 
 	return nil
 }
 
 // Available returns the number of bytes available for writing
 func (r *ShmRing) Available() uint64 {
+	if atomic.LoadUint32(&r.closed) != 0 {
+		return 0
+	}
 	return r.header().Available()
 }
 
 // Used returns the number of bytes currently used in the ring
 func (r *ShmRing) Used() uint64 {
+	if atomic.LoadUint32(&r.closed) != 0 {
+		return 0
+	}
 	return r.header().Used()
 }
 
 // IsClosed returns true if the ring is closed for writing
 func (r *ShmRing) IsClosed() bool {
+	if atomic.LoadUint32(&r.closed) != 0 {
+		return true
+	}
 	return r.header().Closed()
 }
 
 // IsEmpty returns true if the ring contains no data
 func (r *ShmRing) IsEmpty() bool {
+	if atomic.LoadUint32(&r.closed) != 0 {
+		return true
+	}
 	return r.header().Used() == 0
 }
 
 // IsFull returns true if the ring is completely full
 func (r *ShmRing) IsFull() bool {
+	if atomic.LoadUint32(&r.closed) != 0 {
+		return false
+	}
 	return r.header().Available() == 0
 }
 
@@ -692,7 +805,7 @@ func (r *ShmRing) WriteBlockingContext(ctx context.Context, data []byte) error {
 				hdr.IncrementDataSequence()
 				// Only wake if readers are actually blocked on futex (not spinning)
 				if hdr.DataWaiters() > 0 {
-					futexWake(&hdr.dataSeq, 1)
+					r.signalData(&hdr.dataSeq)
 				}
 			}
 
@@ -732,7 +845,7 @@ func (r *ShmRing) WriteBlockingContext(ctx context.Context, data []byte) error {
 					hdr.DecSpaceWaiters()
 					continue
 				}
-				err = futexWaitTimeout(&hdr.spaceSeq, exp, timeoutNs)
+				err = r.waitForSpace(&hdr.spaceSeq, exp, time.Duration(timeoutNs))
 				hdr.DecSpaceWaiters()
 			} else {
 				hdr.IncContigWaiters()
@@ -744,7 +857,7 @@ func (r *ShmRing) WriteBlockingContext(ctx context.Context, data []byte) error {
 					hdr.DecContigWaiters()
 					continue
 				}
-				err = futexWaitTimeout(&hdr.contigSeq, exp, timeoutNs)
+				err = r.waitForContig(&hdr.contigSeq, exp, time.Duration(timeoutNs))
 				hdr.DecContigWaiters()
 			}
 		} else {
@@ -766,7 +879,7 @@ func (r *ShmRing) WriteBlockingContext(ctx context.Context, data []byte) error {
 					hdr.DecSpaceWaiters()
 					continue
 				}
-				err = futexWait(&hdr.spaceSeq, exp)
+				err = r.waitForSpace(&hdr.spaceSeq, exp, 0)
 				hdr.DecSpaceWaiters()
 			} else {
 				hdr.IncContigWaiters()
@@ -778,7 +891,7 @@ func (r *ShmRing) WriteBlockingContext(ctx context.Context, data []byte) error {
 					hdr.DecContigWaiters()
 					continue
 				}
-				err = futexWait(&hdr.contigSeq, exp)
+				err = r.waitForContig(&hdr.contigSeq, exp, 0)
 				hdr.DecContigWaiters()
 			}
 		}
@@ -862,7 +975,7 @@ func (r *ShmRing) ReadBlockingContext(ctx context.Context, buf []byte) (int, err
 				// ContigWaiters are waiting for "more space" (not full ring), so wake on every read.
 				hdr.IncrementContigSequence()
 				if hdr.ContigWaiters() > 0 {
-					futexWake(&hdr.contigSeq, 1)
+					r.signalContig(&hdr.contigSeq)
 				}
 			}
 
@@ -873,7 +986,7 @@ func (r *ShmRing) ReadBlockingContext(ctx context.Context, buf []byte) (int, err
 				newSeq := hdr.SpaceSequence()
 				shmDebugf("READBLOCKING_SPACE_WAKE: freed %d bytes, new spaceSeq=%d, waking waiters",
 					bytesRead, newSeq)
-				futexWake(&hdr.spaceSeq, 1)
+				r.signalSpace(&hdr.spaceSeq)
 			}
 
 			return bytesRead, nil
@@ -922,9 +1035,9 @@ func (r *ShmRing) ReadBlockingContext(ctx context.Context, buf []byte) (int, err
 		// Wait for data with timeout
 		var err error
 		if timeoutNs > 0 {
-			err = futexWaitTimeout(&hdr.dataSeq, dataSeq, timeoutNs)
+			err = r.waitForData(&hdr.dataSeq, dataSeq, time.Duration(timeoutNs))
 		} else {
-			err = futexWait(&hdr.dataSeq, dataSeq)
+			err = r.waitForData(&hdr.dataSeq, dataSeq, 0)
 		}
 		// Check if ring is still valid before decrementing - segment may
 		// have been unmapped while we were blocked on futexWait
@@ -1007,7 +1120,7 @@ func (wr *WriteReservation) Commit(written int) error {
 		// Only wake if there are waiters - avoids unnecessary syscalls
 		if waiters > 0 {
 			shmDebugf("COMMIT_DATA_WAKE: waking 1 waiter")
-			futexWake(&hdr.dataSeq, 1)
+			wr.ring.signalData(&hdr.dataSeq)
 		}
 	}
 
@@ -1026,6 +1139,11 @@ func (r *ShmRing) ReserveWrite(ctx context.Context, n int) (WriteReservation, er
 		return WriteReservation{}, errors.New("reservation larger than ring capacity")
 	}
 
+	// Check local closed flag first - this is safe even if memory is unmapped
+	if atomic.LoadUint32(&r.closed) != 0 {
+		return WriteReservation{}, ErrRingClosed
+	}
+
 	hdr := r.header()
 
 	for {
@@ -1036,7 +1154,12 @@ func (r *ShmRing) ReserveWrite(ctx context.Context, n int) (WriteReservation, er
 		default:
 		}
 
-		// Check for closure - do this after context check to avoid race with segment cleanup
+		// Check local closed flag - this is safe even if memory is unmapped
+		if atomic.LoadUint32(&r.closed) != 0 {
+			return WriteReservation{}, ErrRingClosed
+		}
+
+		// Check for closure in shared memory
 		if hdr.Closed() {
 			return WriteReservation{}, ErrRingClosed
 		}
@@ -1141,10 +1264,10 @@ func (r *ShmRing) ReserveWrite(ctx context.Context, n int) (WriteReservation, er
 					return WriteReservation{}, context.DeadlineExceeded
 				}
 				shmDebugf("FUTEX_ENTER: exp=%d, rem=%v", exp, rem)
-				err = futexWaitTimeout(&hdr.spaceSeq, exp, rem.Nanoseconds())
+				err = r.waitForSpace(&hdr.spaceSeq, exp, rem)
 				shmDebugf("FUTEX_EXIT: exp=%d, err=%v, newSeq=%d", exp, err, hdr.SpaceSequence())
 			} else {
-				err = futexWait(&hdr.spaceSeq, exp)
+				err = r.waitForSpace(&hdr.spaceSeq, exp, 0)
 			}
 			hdr.DecSpaceWaiters()
 			if err != nil {
@@ -1179,9 +1302,9 @@ func (r *ShmRing) ReserveWrite(ctx context.Context, n int) (WriteReservation, er
 				hdr.DecContigWaiters()
 				return WriteReservation{}, context.DeadlineExceeded
 			}
-			err = futexWaitTimeout(&hdr.contigSeq, exp, rem.Nanoseconds())
+			err = r.waitForContig(&hdr.contigSeq, exp, rem)
 		} else {
-			err = futexWait(&hdr.contigSeq, exp)
+			err = r.waitForContig(&hdr.contigSeq, exp, 0)
 		}
 		hdr.DecContigWaiters()
 		if err != nil {
@@ -1208,6 +1331,15 @@ func (r *ShmRing) ReadSlices(ctx context.Context, n int) (first, second []byte, 
 		return nil, nil, nil, errors.New("read size must be positive")
 	}
 
+	// Check local closed flag first - this is safe even if memory is unmapped
+	// If closed, we should still try to drain remaining data
+	localClosed := atomic.LoadUint32(&r.closed) != 0
+	if localClosed {
+		// Can't safely access shared memory if locally closed
+		// (memory may be unmapped), so return EOF
+		return nil, nil, nil, io.EOF
+	}
+
 	hdr := r.header()
 
 	for {
@@ -1218,10 +1350,13 @@ func (r *ShmRing) ReadSlices(ctx context.Context, n int) (first, second []byte, 
 		default:
 		}
 
-		// Check closed state - but always allow reading remaining data first.
-		// The local closed flag (r.closed) is set when this ring is closed,
-		// but we should still drain any remaining data before returning EOF.
-		localClosed := atomic.LoadUint32(&r.closed) != 0
+		// Check local closed flag - this is safe even if memory is unmapped
+		localClosed = atomic.LoadUint32(&r.closed) != 0
+		if localClosed {
+			return nil, nil, nil, io.EOF
+		}
+
+		// Check closed state in shared memory - but always allow reading remaining data first.
 		headerClosed := hdr.Closed()
 
 		// Use pendingReadIdx for availability (allows read-ahead while buffers are held)
@@ -1385,18 +1520,18 @@ func (r *ShmRing) ReadSlices(ctx context.Context, n int) (first, second []byte, 
 				}
 				return nil, nil, nil, context.DeadlineExceeded
 			}
-			shmDebugf("[DEBUG] Ring read: calling futexWaitTimeout with timeout=%v", rem)
-			err = futexWaitTimeout(&hdr.dataSeq, dataSeq, rem.Nanoseconds())
+			shmDebugf("[DEBUG] Ring read: calling waitForData with timeout=%v", rem)
+			err = r.waitForData(&hdr.dataSeq, dataSeq, rem)
 		} else {
-			shmDebugf("[DEBUG] Ring read: calling futexWait (no timeout)")
-			err = futexWait(&hdr.dataSeq, dataSeq)
+			shmDebugf("[DEBUG] Ring read: calling waitForData (no timeout)")
+			err = r.waitForData(&hdr.dataSeq, dataSeq, 0)
 		}
 		// Check if ring is still valid before decrementing - the segment may have
 		// been unmapped while we were blocked on futexWait
 		if atomic.LoadUint32(&r.closed) == 0 {
 			hdr.DecDataWaiters()
 		}
-		shmDebugf("[DEBUG] Ring read: futex returned, err=%v", err)
+		shmDebugf("[DEBUG] Ring read: wait returned, err=%v", err)
 
 		if err != nil {
 			// Translate futex timeout to context timeout; keep going on spurious wake.

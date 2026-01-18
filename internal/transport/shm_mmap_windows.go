@@ -146,6 +146,10 @@ func OpenSegment(name string) (*Segment, error) {
 	}
 
 	segment.H.SetClientPID(uint32(os.Getpid()))
+	// Note: We set the clientReady flag here but DON'T signal the event.
+	// The caller (DialShm) will open handshake events and call
+	// SetClientReadyAndSignal() after WaitForServer completes.
+	// This ensures the event exists before we try to signal it.
 	segment.H.SetClientReady(true)
 
 	return segment, nil

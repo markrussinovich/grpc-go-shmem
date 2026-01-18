@@ -54,9 +54,11 @@ type ShmListener struct {
 	baseName string        // Base name for segment creation
 	connID   atomic.Uint64 // Atomic counter for connection IDs
 
-	ctlSegment *Segment
-	ctlRx      *ShmRing // client->server control
-	ctlTx      *ShmRing // server->client control
+	ctlSegment   *Segment
+	ctlRx        *ShmRing    // client->server control
+	ctlTx        *ShmRing    // server->client control
+	ctlRxEvents  *RingEvents // Events for control rings (Windows)
+	ctlTxEvents  *RingEvents
 
 	// Lifecycle management
 	ctx       context.Context
@@ -87,6 +89,12 @@ type shmConn struct {
 	localAddr   net.Addr
 	remoteAddr  net.Addr
 	transport   *ShmServerTransport
+
+	// Rings with events for cross-mapping synchronization
+	readRing    *ShmRing
+	writeRing   *ShmRing
+	readEvents  *RingEvents
+	writeEvents *RingEvents
 
 	// Connection state
 	established atomic.Bool
@@ -129,11 +137,27 @@ func NewShmListener(addr *ShmAddr, segmentSize, ringASize, ringBSize uint64) (*S
 		cancel()
 		return nil, fmt.Errorf("create control segment: %w", err)
 	}
-	ctlSeg.H.SetServerReady(true)
+
+	// Create handshake events for the control segment (Windows).
+	// This must be done before SetServerReady so clients can wait on the event.
+	ctlEventName := l.baseName + shmControlSuffix
+	_, _ = CreateHandshakeEvents(ctlEventName)
+
+	// Signal server ready with event
+	ctlSeg.SetServerReadyAndSignal(true)
+
 	// Ring A is client->server; ring B is server->client.
 	l.ctlSegment = ctlSeg
 	l.ctlRx = NewShmRingFromSegment(ctlSeg.A, ctlSeg.Mem)
 	l.ctlTx = NewShmRingFromSegment(ctlSeg.B, ctlSeg.Mem)
+
+	// Create events for control rings (Windows). On Linux, these are no-ops.
+	l.ctlRxEvents, _ = CreateRingEvents(ctlEventName, "A")
+	l.ctlTxEvents, _ = CreateRingEvents(ctlEventName, "B")
+
+	// Attach events to control rings
+	l.ctlRx.SetEvents(l.ctlRxEvents)
+	l.ctlTx.SetEvents(l.ctlTxEvents)
 
 	return l, nil
 }
@@ -182,15 +206,44 @@ func (l *ShmListener) Accept() (net.Conn, error) {
 			continue
 		}
 		segment.H.SetMaxStreams(atomic.LoadUint32(&l.maxStreams))
-		segment.H.SetServerReady(true)
+
+		// Create handshake events for the data segment (Windows).
+		_, _ = CreateHandshakeEvents(segmentName)
+		segment.SetServerReadyAndSignal(true)
+
+		// Create rings and events BEFORE sending ACCEPT, so events exist
+		// when client opens the segment and creates its transport.
+		readRing := NewShmRingFromSegment(segment.A, segment.Mem)
+		writeRing := NewShmRingFromSegment(segment.B, segment.Mem)
+
+		// Create events for this segment. On Linux, these are no-ops.
+		// Must happen before ACCEPT so client's OpenRingEvents finds them.
+		readEvents, _ := CreateRingEvents(segmentName, "A")
+		writeEvents, _ := CreateRingEvents(segmentName, "B")
+
+		// Attach events to rings
+		readRing.SetEvents(readEvents)
+		writeRing.SetEvents(writeEvents)
 
 		if err := writeFrame(l.ctx, l.ctlTx, FrameHeader{Type: FrameTypeACCEPT}, encodeConnectResponse(connectResponse{segmentName: segmentName})); err != nil {
+			if readEvents != nil {
+				readEvents.Close()
+			}
+			if writeEvents != nil {
+				writeEvents.Close()
+			}
 			segment.Close()
 			return nil, err
 		}
 
 		// Wait for client to map the segment.
 		if err := segment.WaitForClient(l.ctx); err != nil {
+			if readEvents != nil {
+				readEvents.Close()
+			}
+			if writeEvents != nil {
+				writeEvents.Close()
+			}
 			segment.Close()
 			return nil, err
 		}
@@ -201,6 +254,10 @@ func (l *ShmListener) Accept() (net.Conn, error) {
 			listener:    l,
 			localAddr:   l.addr,
 			remoteAddr:  &ShmAddr{Name: segmentName + "_client"},
+			readRing:    readRing,
+			writeRing:   writeRing,
+			readEvents:  readEvents,
+			writeEvents: writeEvents,
 		}
 
 		serverTransport, err := NewShmServerTransport(segment, l.addr, conn.remoteAddr)
@@ -359,4 +416,15 @@ func (c *shmConn) SetWriteDeadline(_ time.Time) error {
 // GetServerTransport returns the server transport for this connection
 func (c *shmConn) GetServerTransport() ServerTransport {
 	return c.transport
+}
+// ReadRing returns the read ring (client->server) with events attached.
+// For tests that need direct ring access.
+func (c *shmConn) ReadRing() *ShmRing {
+	return c.readRing
+}
+
+// WriteRing returns the write ring (server->client) with events attached.
+// For tests that need direct ring access.
+func (c *shmConn) WriteRing() *ShmRing {
+	return c.writeRing
 }

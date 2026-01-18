@@ -78,12 +78,33 @@ func DialShm(ctx context.Context, addr string, opts *DialOptions) (ClientTranspo
 		return nil, fmt.Errorf("open control segment %q: %w", ctlName, err)
 	}
 	defer ctlSeg.Close()
+
+	// Open handshake events for the control segment (Windows).
+	// This must be done before WaitForServer so we can wait on the event.
+	_, _ = OpenHandshakeEvents(ctlName)
+
 	if err := ctlSeg.WaitForServer(ctx); err != nil {
 		return nil, fmt.Errorf("wait for control server: %w", err)
 	}
 
 	ctlTx := NewShmRingFromSegment(ctlSeg.A, ctlSeg.Mem)
 	ctlRx := NewShmRingFromSegment(ctlSeg.B, ctlSeg.Mem)
+
+	// Create events for control rings (Windows). On Linux, these are no-ops.
+	ctlTxEvents, _ := OpenRingEvents(ctlName, "A")
+	ctlRxEvents, _ := OpenRingEvents(ctlName, "B")
+	defer func() {
+		if ctlTxEvents != nil {
+			ctlTxEvents.Close()
+		}
+		if ctlRxEvents != nil {
+			ctlRxEvents.Close()
+		}
+	}()
+
+	// Attach events to control rings
+	ctlTx.SetEvents(ctlTxEvents)
+	ctlRx.SetEvents(ctlRxEvents)
 
 	if err := writeFrame(ctx, ctlTx, FrameHeader{Type: FrameTypeCONNECT}, encodeConnectRequest(connectRequest{})); err != nil {
 		return nil, fmt.Errorf("send connect request: %w", err)
@@ -103,11 +124,19 @@ func DialShm(ctx context.Context, addr string, opts *DialOptions) (ClientTranspo
 		if err != nil {
 			return nil, fmt.Errorf("open data segment %q: %w", segName, err)
 		}
-		// Wait for server readiness via futex (event-driven).
+
+		// Open handshake events for the data segment (Windows).
+		_, _ = OpenHandshakeEvents(segName)
+
+		// Wait for server readiness via named event (Windows) or futex (Linux).
 		if err := segment.WaitForServer(ctx); err != nil {
 			segment.Close()
 			return nil, fmt.Errorf("wait for server ready: %w", err)
 		}
+
+		// Signal to the server that the client has mapped the segment.
+		// This unblocks the server's WaitForClient in Accept().
+		segment.SetClientReadyAndSignal(true)
 
 		localAddr := &ShmAddr{Name: segName + "_client"}
 		remoteAddr := &ShmAddr{Name: segName}

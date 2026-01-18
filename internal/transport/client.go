@@ -46,6 +46,10 @@ type ShmUnaryClient struct {
 	readerOnce sync.Once
 	readerDone chan struct{}
 	closed     atomic.Bool
+
+	// Windows event handles for cross-mapping synchronization
+	txEvents *RingEvents
+	rxEvents *RingEvents
 }
 
 type unaryStream struct {
@@ -58,13 +62,29 @@ type unaryStream struct {
 
 // NewShmUnaryClient constructs a unary client over an existing segment.
 func NewShmUnaryClient(seg *Segment) *ShmUnaryClient {
+	segmentName := extractSegmentName(seg.Path)
+
+	tx := NewShmRingFromSegment(seg.A, seg.Mem)
+	rx := NewShmRingFromSegment(seg.B, seg.Mem)
+
+	// Open events for cross-mapping synchronization (Windows).
+	// Client opens events created by server. On Linux, these are no-ops.
+	txEvents, _ := OpenRingEvents(segmentName, "A")
+	rxEvents, _ := OpenRingEvents(segmentName, "B")
+
+	// Attach events to rings
+	tx.SetEvents(txEvents)
+	rx.SetEvents(rxEvents)
+
 	c := &ShmUnaryClient{
 		seg:        seg,
-		tx:         NewShmRingFromSegment(seg.A, seg.Mem),
-		rx:         NewShmRingFromSegment(seg.B, seg.Mem),
+		tx:         tx,
+		rx:         rx,
 		nextID:     1,
 		streams:    make(map[uint32]*unaryStream),
 		readerDone: make(chan struct{}),
+		txEvents:   txEvents,
+		rxEvents:   rxEvents,
 	}
 	return c
 }
@@ -80,6 +100,14 @@ func (c *ShmUnaryClient) Close() error {
 
 	// Wait for reader goroutine to exit before closing segment
 	<-c.readerDone
+
+	// Close the named events (Windows)
+	if c.txEvents != nil {
+		c.txEvents.Close()
+	}
+	if c.rxEvents != nil {
+		c.rxEvents.Close()
+	}
 
 	return c.seg.Close()
 }

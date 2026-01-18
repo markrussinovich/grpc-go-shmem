@@ -49,6 +49,10 @@ type ShmServerTransport struct {
 	serverToClient *ShmRing // Ring for server->client data
 	clientToServer *ShmRing // Ring for client->server data
 
+	// Windows event handles for cross-mapping synchronization
+	readEvents  *RingEvents
+	writeEvents *RingEvents
+
 	// Connection state
 	localAddr  net.Addr
 	remoteAddr net.Addr
@@ -201,10 +205,22 @@ func NewShmServerTransport(segment *Segment, localAddr, remoteAddr net.Addr) (*S
 		return nil, errors.New("segment cannot be nil")
 	}
 
+	// Extract segment name for event naming
+	segmentName := extractSegmentName(segment.Path)
+
 	// Create rings for bidirectional communication
 	// Ring A: client->server, Ring B: server->client
 	clientToServer := NewShmRingFromSegment(segment.A, segment.Mem)
 	serverToClient := NewShmRingFromSegment(segment.B, segment.Mem)
+
+	// Create events for cross-mapping synchronization (Windows).
+	// Server creates events. On Linux, these are no-ops returning nil events.
+	readEvents, _ := CreateRingEvents(segmentName, "A")
+	writeEvents, _ := CreateRingEvents(segmentName, "B")
+
+	// Attach events to rings
+	clientToServer.SetEvents(readEvents)
+	serverToClient.SetEvents(writeEvents)
 
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -212,6 +228,8 @@ func NewShmServerTransport(segment *Segment, localAddr, remoteAddr net.Addr) (*S
 		segment:        segment,
 		serverToClient: serverToClient,
 		clientToServer: clientToServer,
+		readEvents:     readEvents,
+		writeEvents:    writeEvents,
 		localAddr:      localAddr,
 		remoteAddr:     remoteAddr,
 		peer: &peer.Peer{
@@ -811,6 +829,14 @@ func (t *ShmServerTransport) Close(err error) {
 		if !segClosed {
 			t.serverToClient.Close()
 			t.clientToServer.Close()
+		}
+
+		// Close the named events (Windows)
+		if t.readEvents != nil {
+			t.readEvents.Close()
+		}
+		if t.writeEvents != nil {
+			t.writeEvents.Close()
 		}
 
 		// Wait for reader goroutine to exit before unmapping.

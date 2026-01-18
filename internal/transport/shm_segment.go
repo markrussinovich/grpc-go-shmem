@@ -596,6 +596,28 @@ func (s *Segment) Close() error {
 	return firstErr
 }
 
+// SetServerReadyAndSignal sets the server ready flag and signals any waiters.
+// This is the preferred method to use instead of s.H.SetServerReady() as it
+// handles cross-process signaling on Windows via named events.
+func (s *Segment) SetServerReadyAndSignal(ready bool) {
+	s.H.SetServerReady(ready)
+	if ready {
+		segmentName := extractSegmentName(s.Path)
+		SignalServerReady(segmentName)
+	}
+}
+
+// SetClientReadyAndSignal sets the client ready flag and signals any waiters.
+// This is the preferred method to use instead of s.H.SetClientReady() as it
+// handles cross-process signaling on Windows via named events.
+func (s *Segment) SetClientReadyAndSignal(ready bool) {
+	s.H.SetClientReady(ready)
+	if ready {
+		segmentName := extractSegmentName(s.Path)
+		SignalClientReady(segmentName)
+	}
+}
+
 // hdrView methods - provide typed access to the segment header
 
 // header returns a pointer to the SegmentHeader

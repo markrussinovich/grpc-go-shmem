@@ -21,6 +21,8 @@ package transport
 import (
 	"context"
 	"errors"
+	"path/filepath"
+	"strings"
 	"sync/atomic"
 )
 
@@ -31,36 +33,85 @@ var ErrConnectionClosed = errors.New("connection closed")
 // Server: read from ring A (client->server), write to ring B (server->client)
 // Client: read from ring B (server->client), write to ring A (client->server)
 type ShmConn struct {
-	seg       *Segment
-	readR     *ShmRing
-	writeR    *ShmRing
-	readView  *ringView // For accessing close/increment methods
-	writeView *ringView // For accessing close/increment methods
-	closed    atomic.Bool
-	isServer  bool // true if this is the server side
+	seg          *Segment
+	readR        *ShmRing
+	writeR       *ShmRing
+	readView     *ringView // For accessing close/increment methods
+	writeView    *ringView // For accessing close/increment methods
+	readEvents   *RingEvents
+	writeEvents  *RingEvents
+	closed       atomic.Bool
+	isServer     bool   // true if this is the server side
+	segmentName  string // segment name for event naming
+}
+
+// extractSegmentName extracts the segment name from the file path.
+// e.g., "/dev/shm/grpc_shm_foo" or "C:\Temp\grpc_shm_foo" -> "foo"
+func extractSegmentName(path string) string {
+	base := filepath.Base(path)
+	const prefix = "grpc_shm_"
+	if strings.HasPrefix(base, prefix) {
+		return base[len(prefix):]
+	}
+	return base
 }
 
 // NewServerConn creates a new server-side connection
 func NewServerConn(seg *Segment) *ShmConn {
+	segmentName := extractSegmentName(seg.Path)
+
+	readR := NewShmRingFromSegment(seg.A, seg.Mem)
+	writeR := NewShmRingFromSegment(seg.B, seg.Mem)
+
+	// Create events for cross-mapping synchronization (Windows).
+	// Server creates events. On Linux, these are no-ops.
+	readEvents, _ := CreateRingEvents(segmentName, "A")
+	writeEvents, _ := CreateRingEvents(segmentName, "B")
+
+	// Attach events to rings
+	readR.SetEvents(readEvents)
+	writeR.SetEvents(writeEvents)
+
 	return &ShmConn{
-		seg:       seg,
-		readR:     NewShmRingFromSegment(seg.A, seg.Mem), // Server reads from A (client->server)
-		writeR:    NewShmRingFromSegment(seg.B, seg.Mem), // Server writes to B (server->client)
-		readView:  seg.A,
-		writeView: seg.B,
-		isServer:  true,
+		seg:         seg,
+		readR:       readR,
+		writeR:      writeR,
+		readView:    seg.A,
+		writeView:   seg.B,
+		readEvents:  readEvents,
+		writeEvents: writeEvents,
+		isServer:    true,
+		segmentName: segmentName,
 	}
 }
 
 // NewClientConn creates a new client-side connection
 func NewClientConn(seg *Segment) *ShmConn {
+	segmentName := extractSegmentName(seg.Path)
+
+	readR := NewShmRingFromSegment(seg.B, seg.Mem)
+	writeR := NewShmRingFromSegment(seg.A, seg.Mem)
+
+	// Open events for cross-mapping synchronization (Windows).
+	// Client opens existing events created by server.
+	// Note: Client reads from B, writes to A (opposite of server).
+	readEvents, _ := OpenRingEvents(segmentName, "B")
+	writeEvents, _ := OpenRingEvents(segmentName, "A")
+
+	// Attach events to rings
+	readR.SetEvents(readEvents)
+	writeR.SetEvents(writeEvents)
+
 	return &ShmConn{
-		seg:       seg,
-		readR:     NewShmRingFromSegment(seg.B, seg.Mem), // Client reads from B (server->client)
-		writeR:    NewShmRingFromSegment(seg.A, seg.Mem), // Client writes to A (client->server)
-		readView:  seg.B,
-		writeView: seg.A,
-		isServer:  false,
+		seg:         seg,
+		readR:       readR,
+		writeR:      writeR,
+		readView:    seg.B,
+		writeView:   seg.A,
+		readEvents:  readEvents,
+		writeEvents: writeEvents,
+		isServer:    false,
+		segmentName: segmentName,
 	}
 }
 
@@ -186,6 +237,14 @@ func (c *ShmConn) Close() error {
 	// Increment data sequence numbers and wake any waiters
 	c.readView.IncrementDataSequence()
 	c.writeView.IncrementDataSequence()
+
+	// Close the named events (Windows)
+	if c.readEvents != nil {
+		c.readEvents.Close()
+	}
+	if c.writeEvents != nil {
+		c.writeEvents.Close()
+	}
 
 	// If this is the server (segment creator), it owns the segment and cleans up
 	if c.isServer {

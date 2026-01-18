@@ -77,9 +77,9 @@ func TestShmPingPongSizes(t *testing.T) {
 					return
 				}
 				defer c.Close()
-				seg := c.(*shmConn).segment
-				srvRx := NewShmRingFromSegment(seg.A, seg.Mem)
-				srvTx := NewShmRingFromSegment(seg.B, seg.Mem)
+				conn := c.(*shmConn)
+				srvRx := conn.ReadRing()
+				srvTx := conn.WriteRing()
 
 				// Read headers
 				fh, pl, err := readFrame(testCtx, srvRx)
@@ -189,9 +189,9 @@ func TestShmConcurrentStreams(t *testing.T) {
 			return
 		}
 		defer c.Close()
-		seg := c.(*shmConn).segment
-		srvRx := NewShmRingFromSegment(seg.A, seg.Mem)
-		srvTx := NewShmRingFromSegment(seg.B, seg.Mem)
+		conn := c.(*shmConn)
+		srvRx := conn.ReadRing()
+		srvTx := conn.WriteRing()
 
 		type req struct {
 			streamID uint32
@@ -327,9 +327,9 @@ func TestShmStreamError(t *testing.T) {
 			return
 		}
 		defer c.Close()
-		seg := c.(*shmConn).segment
-		srvRx := NewShmRingFromSegment(seg.A, seg.Mem)
-		srvTx := NewShmRingFromSegment(seg.B, seg.Mem)
+		conn := c.(*shmConn)
+		srvRx := conn.ReadRing()
+		srvTx := conn.WriteRing()
 
 		// Read headers
 		fh, _, err := readFrame(testCtx, srvRx)
