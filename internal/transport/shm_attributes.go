@@ -26,16 +26,16 @@ import (
 	"google.golang.org/grpc/resolver"
 )
 
-// ShmemLocalityKey is the attribute key used to indicate that an endpoint
+// ShmLocalityKey is the attribute key used to indicate that an endpoint
 // supports shared memory transport and is co-located on the same host.
 // This enables the Name Resolver and Load Balancer to participate in
 // transport selection as per RFC A73.
-type ShmemLocalityKey struct{}
+type ShmLocalityKey struct{}
 
-// ShmemCapability describes the shared memory transport capability of an endpoint.
+// ShmCapability describes the shared memory transport capability of an endpoint.
 // When present in resolver.Address.Attributes, it signals that the endpoint
 // can be reached via shared memory transport.
-type ShmemCapability struct {
+type ShmCapability struct {
 	// Enabled indicates whether shared memory transport is available for this endpoint.
 	Enabled bool
 
@@ -45,18 +45,18 @@ type ShmemCapability struct {
 	SegmentName string
 
 	// Preferred indicates whether shared memory should be preferred over
-	// network transport when both are available. When false, shmem is used
+	// network transport when both are available. When false, shm is used
 	// only if explicitly requested or if network transport fails.
 	Preferred bool
 
-	// Required indicates that shmem MUST be used - no fallback to HTTP/2.
-	// RFC A73: When true, connection will fail if shmem cannot be established.
+	// Required indicates that shm MUST be used - no fallback to HTTP/2.
+	// RFC A73: When true, connection will fail if shm cannot be established.
 	Required bool
 }
 
 // Equal implements the Equal method for use in attributes comparison.
-func (c ShmemCapability) Equal(o any) bool {
-	oc, ok := o.(ShmemCapability)
+func (c ShmCapability) Equal(o any) bool {
+	oc, ok := o.(ShmCapability)
 	if !ok {
 		return false
 	}
@@ -67,114 +67,114 @@ func (c ShmemCapability) Equal(o any) bool {
 }
 
 // String implements fmt.Stringer for debugging.
-func (c ShmemCapability) String() string {
-	return fmt.Sprintf("ShmemCapability{Enabled:%v, SegmentName:%q, Preferred:%v, Required:%v}",
+func (c ShmCapability) String() string {
+	return fmt.Sprintf("ShmCapability{Enabled:%v, SegmentName:%q, Preferred:%v, Required:%v}",
 		c.Enabled, c.SegmentName, c.Preferred, c.Required)
 }
 
-// GetShmemCapability extracts the ShmemCapability from the address attributes.
-// Returns nil if no shmem capability is set.
-func GetShmemCapability(addr resolver.Address) *ShmemCapability {
+// GetShmCapability extracts the ShmCapability from the address attributes.
+// Returns nil if no shm capability is set.
+func GetShmCapability(addr resolver.Address) *ShmCapability {
 	if addr.Attributes == nil {
 		return nil
 	}
-	v := addr.Attributes.Value(ShmemLocalityKey{})
+	v := addr.Attributes.Value(ShmLocalityKey{})
 	if v == nil {
 		return nil
 	}
-	cap, ok := v.(ShmemCapability)
+	cap, ok := v.(ShmCapability)
 	if !ok {
 		return nil
 	}
 	return &cap
 }
 
-// SetShmemCapability returns a new address with the ShmemCapability set in its attributes.
-func SetShmemCapability(addr resolver.Address, cap ShmemCapability) resolver.Address {
-	addr.Attributes = addr.Attributes.WithValue(ShmemLocalityKey{}, cap)
+// SetShmCapability returns a new address with the ShmCapability set in its attributes.
+func SetShmCapability(addr resolver.Address, cap ShmCapability) resolver.Address {
+	addr.Attributes = addr.Attributes.WithValue(ShmLocalityKey{}, cap)
 	return addr
 }
 
-// IsShmemEnabled is a convenience function that checks if an address has
+// IsShmEnabled is a convenience function that checks if an address has
 // shared memory transport enabled.
-func IsShmemEnabled(addr resolver.Address) bool {
-	cap := GetShmemCapability(addr)
+func IsShmEnabled(addr resolver.Address) bool {
+	cap := GetShmCapability(addr)
 	return cap != nil && cap.Enabled
 }
 
-// IsShmemPreferred is a convenience function that checks if shared memory
+// IsShmPreferred is a convenience function that checks if shared memory
 // transport is both enabled and preferred for an address.
-func IsShmemPreferred(addr resolver.Address) bool {
-	cap := GetShmemCapability(addr)
+func IsShmPreferred(addr resolver.Address) bool {
+	cap := GetShmCapability(addr)
 	return cap != nil && cap.Enabled && cap.Preferred
 }
 
-// ShmemTransportHintKey is the attribute key used to signal transport
+// ShmTransportHintKey is the attribute key used to signal transport
 // preference at the subchannel level. This allows the LB policy to
 // communicate its transport decision to the transport layer.
-type ShmemTransportHintKey struct{}
+type ShmTransportHintKey struct{}
 
-// ShmemTransportHint describes the transport hint for subchannel creation.
-type ShmemTransportHint struct {
-	// PreferShmem indicates the LB policy's preference for shared memory.
-	PreferShmem bool
+// ShmTransportHint describes the transport hint for subchannel creation.
+type ShmTransportHint struct {
+	// PreferShm indicates the LB policy's preference for shared memory.
+	PreferShm bool
 
 	// FallbackAllowed indicates whether falling back to network transport
-	// is permitted if shmem connection fails.
+	// is permitted if shm connection fails.
 	FallbackAllowed bool
 }
 
 // Equal implements the Equal method for use in attributes comparison.
-func (h ShmemTransportHint) Equal(o any) bool {
-	oh, ok := o.(ShmemTransportHint)
+func (h ShmTransportHint) Equal(o any) bool {
+	oh, ok := o.(ShmTransportHint)
 	if !ok {
 		return false
 	}
-	return h.PreferShmem == oh.PreferShmem && h.FallbackAllowed == oh.FallbackAllowed
+	return h.PreferShm == oh.PreferShm && h.FallbackAllowed == oh.FallbackAllowed
 }
 
 // String implements fmt.Stringer for debugging.
-func (h ShmemTransportHint) String() string {
-	return fmt.Sprintf("ShmemTransportHint{PreferShmem:%v, FallbackAllowed:%v}",
-		h.PreferShmem, h.FallbackAllowed)
+func (h ShmTransportHint) String() string {
+	return fmt.Sprintf("ShmTransportHint{PreferShm:%v, FallbackAllowed:%v}",
+		h.PreferShm, h.FallbackAllowed)
 }
 
-// GetShmemTransportHint extracts the ShmemTransportHint from the address attributes.
-func GetShmemTransportHint(addr resolver.Address) *ShmemTransportHint {
+// GetShmTransportHint extracts the ShmTransportHint from the address attributes.
+func GetShmTransportHint(addr resolver.Address) *ShmTransportHint {
 	if addr.Attributes == nil {
 		return nil
 	}
-	v := addr.Attributes.Value(ShmemTransportHintKey{})
+	v := addr.Attributes.Value(ShmTransportHintKey{})
 	if v == nil {
 		return nil
 	}
-	hint, ok := v.(ShmemTransportHint)
+	hint, ok := v.(ShmTransportHint)
 	if !ok {
 		return nil
 	}
 	return &hint
 }
 
-// SetShmemTransportHint returns a new address with the ShmemTransportHint set.
-func SetShmemTransportHint(addr resolver.Address, hint ShmemTransportHint) resolver.Address {
-	addr.Attributes = addr.Attributes.WithValue(ShmemTransportHintKey{}, hint)
+// SetShmTransportHint returns a new address with the ShmTransportHint set.
+func SetShmTransportHint(addr resolver.Address, hint ShmTransportHint) resolver.Address {
+	addr.Attributes = addr.Attributes.WithValue(ShmTransportHintKey{}, hint)
 	return addr
 }
 
-// IsFallbackAllowed checks if fallback from shmem to HTTP/2 is allowed for the address.
+// IsFallbackAllowed checks if fallback from shm to HTTP/2 is allowed for the address.
 // RFC A73: This is used during transport selection to determine if HTTP/2 fallback
-// should be attempted when shmem connection fails.
+// should be attempted when shm connection fails.
 func IsFallbackAllowed(addr resolver.Address) bool {
 	// Check transport hint first
-	hint := GetShmemTransportHint(addr)
+	hint := GetShmTransportHint(addr)
 	if hint != nil {
 		return hint.FallbackAllowed
 	}
 
 	// Check capability
-	cap := GetShmemCapability(addr)
+	cap := GetShmCapability(addr)
 	if cap != nil && cap.Required {
-		// If shmem is marked as required, no fallback
+		// If shm is marked as required, no fallback
 		return false
 	}
 

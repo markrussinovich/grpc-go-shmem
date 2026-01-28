@@ -1,4 +1,4 @@
-/*
+﻿/*
  *
  * Copyright 2014 gRPC authors.
  *
@@ -1516,29 +1516,29 @@ func (ac *addrConn) createTransport(ctx context.Context, addr resolver.Address, 
 	copts.ChannelzParent = ac.channelz
 
 	// RFC A73: Transport selection based on address attributes.
-	// Check if shmem transport should be used for this address.
+	// Check if shm transport should be used for this address.
 	var newTr transport.ClientTransport
 	var err error
 
-	if transport.IsShmemEnabled(addr) {
-		// Try shmem transport first
-		newTr, err = transport.NewShmemClient(connectCtx, ac.cc.ctx, addr, copts, onClose)
+	if transport.IsShmEnabled(addr) {
+		// Try shm transport first
+		newTr, err = transport.NewShmClient(connectCtx, ac.cc.ctx, addr, copts, onClose)
 		if err != nil {
 			// Use fallback handler to determine next action
 			fallbackAllowed := transport.IsFallbackAllowed(addr)
 
 			if fallbackAllowed {
 				if logger.V(2) {
-					logger.Infof("Shmem transport failed for %q (retryable=%v), falling back to HTTP/2: %v",
-						addr, transport.IsShmemErrorRetryable(err), err)
+					logger.Infof("Shm transport failed for %q (retryable=%v), falling back to HTTP/2: %v",
+						addr, transport.IsShmErrorRetryable(err), err)
 				}
 				// Fall back to HTTP/2
 				newTr, err = transport.NewHTTP2Client(connectCtx, ac.cc.ctx, addr, copts, onClose)
 			} else {
-				// Shmem is required but failed - report structured error
+				// Shm is required but failed - report structured error
 				if logger.V(2) {
-					logger.Infof("Shmem transport required but failed for %q (permanent=%v): %v",
-						addr, transport.IsShmemErrorPermanent(err), err)
+					logger.Infof("Shm transport required but failed for %q (permanent=%v): %v",
+						addr, transport.IsShmErrorPermanent(err), err)
 				}
 				// err remains set, will be returned below
 			}

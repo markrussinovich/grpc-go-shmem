@@ -81,13 +81,13 @@ func (r *shmResolver) start() {
 		ServerName: r.segmentName,
 	}
 
-	// Set ShmemCapability attribute to signal that this endpoint supports
+	// Set ShmCapability attribute to signal that this endpoint supports
 	// shared memory transport. This enables RFC A73 compliant transport
 	// selection by the Load Balancer.
-	addr = SetShmemCapability(addr, ShmemCapability{
+	addr = SetShmCapability(addr, ShmCapability{
 		Enabled:     true,
 		SegmentName: r.segmentName,
-		Preferred:   true, // shm:// scheme explicitly requests shmem
+		Preferred:   true, // shm:// scheme explicitly requests shm
 	})
 
 	// Update the ClientConn with the resolved address

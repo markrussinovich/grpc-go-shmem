@@ -1,4 +1,4 @@
-//go:build linux || windows
+﻿//go:build linux || windows
 
 /*
  *
@@ -114,7 +114,7 @@ type ShmClientTransport struct {
 
 func (t *ShmClientTransport) setGoAwayReason(flags uint8, debug string) {
 	t.goAwayOnce.Do(func() {
-		// Shmem GOAWAY frames do not carry an HTTP/2 error code or debug data.
+		// shm GOAWAY frames do not carry an HTTP/2 error code or debug data.
 		// Mirror the http2 client default when a GOAWAY is received.
 		t.goAwayReason = GoAwayNoReason
 		if debug == "" {

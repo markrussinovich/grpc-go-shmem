@@ -136,19 +136,19 @@ func TestShmResolverBuild(t *testing.T) {
 				t.Errorf("Expected ServerName=%s, got %s", tt.wantSegment, addr.ServerName)
 			}
 
-			// RFC A73: Verify that ShmemCapability attribute is set
-			if !IsShmemEnabled(addr) {
-				t.Error("Expected IsShmemEnabled to be true for resolved address")
+			// RFC A73: Verify that ShmCapability attribute is set
+			if !IsShmEnabled(addr) {
+				t.Error("Expected IsShmEnabled to be true for resolved address")
 			}
-			if !IsShmemPreferred(addr) {
-				t.Error("Expected IsShmemPreferred to be true for shm:// scheme")
+			if !IsShmPreferred(addr) {
+				t.Error("Expected IsShmPreferred to be true for shm:// scheme")
 			}
-			cap := GetShmemCapability(addr)
+			cap := GetShmCapability(addr)
 			if cap == nil {
-				t.Fatal("Expected ShmemCapability attribute to be set")
+				t.Fatal("Expected ShmCapability attribute to be set")
 			}
 			if cap.SegmentName != tt.wantSegment {
-				t.Errorf("Expected ShmemCapability.SegmentName=%s, got %s", tt.wantSegment, cap.SegmentName)
+				t.Errorf("Expected ShmCapability.SegmentName=%s, got %s", tt.wantSegment, cap.SegmentName)
 			}
 		})
 	}
@@ -231,25 +231,25 @@ func TestShmResolverIntegration(t *testing.T) {
 		t.Errorf("ServerName mismatch: expected %s, got %s", segmentName, addr.ServerName)
 	}
 
-	// RFC A73: Verify that ShmemCapability is set correctly
-	cap := GetShmemCapability(addr)
+	// RFC A73: Verify that ShmCapability is set correctly
+	cap := GetShmCapability(addr)
 	if cap == nil {
-		t.Fatal("ShmemCapability attribute not set on resolved address")
+		t.Fatal("ShmCapability attribute not set on resolved address")
 	}
 	if !cap.Enabled {
-		t.Error("ShmemCapability.Enabled should be true")
+		t.Error("ShmCapability.Enabled should be true")
 	}
 	if cap.SegmentName != segmentName {
-		t.Errorf("ShmemCapability.SegmentName: expected %s, got %s", segmentName, cap.SegmentName)
+		t.Errorf("ShmCapability.SegmentName: expected %s, got %s", segmentName, cap.SegmentName)
 	}
 	if !cap.Preferred {
-		t.Error("ShmemCapability.Preferred should be true for shm:// scheme")
+		t.Error("ShmCapability.Preferred should be true for shm:// scheme")
 	}
 
-	// Test that the ShouldUseShmem method works correctly with resolved addresses
-	cfg := DefaultShmemServiceConfig()
-	if !cfg.ShouldUseShmem(IsShmemEnabled(addr)) {
-		t.Error("ShouldUseShmem should return true for addresses with ShmemCapability")
+	// Test that the ShouldUseShm method works correctly with resolved addresses
+	cfg := DefaultShmServiceConfig()
+	if !cfg.ShouldUseShm(IsShmEnabled(addr)) {
+		t.Error("ShouldUseShm should return true for addresses with ShmCapability")
 	}
 }
 
@@ -277,7 +277,7 @@ func TestShmResolverRFCA73Attributes(t *testing.T) {
 			wantSegment:       "test_segment",
 			wantEnabled:       true,
 			wantPreferred:     true,
-			serviceConfigJSON: `{"shmemPolicy":"auto"}`,
+			serviceConfigJSON: `{"shmPolicy":"auto"}`,
 			wantShouldUse:     true,
 		},
 		{
@@ -286,7 +286,7 @@ func TestShmResolverRFCA73Attributes(t *testing.T) {
 			wantSegment:       "preferred_segment",
 			wantEnabled:       true,
 			wantPreferred:     true,
-			serviceConfigJSON: `{"shmemPolicy":"preferred"}`,
+			serviceConfigJSON: `{"shmPolicy":"preferred"}`,
 			wantShouldUse:     true,
 		},
 		{
@@ -295,7 +295,7 @@ func TestShmResolverRFCA73Attributes(t *testing.T) {
 			wantSegment:       "disabled_segment",
 			wantEnabled:       true,
 			wantPreferred:     true,
-			serviceConfigJSON: `{"shmemPolicy":"disabled"}`,
+			serviceConfigJSON: `{"shmPolicy":"disabled"}`,
 			wantShouldUse:     false, // disabled policy overrides capability
 		},
 	}
@@ -318,9 +318,9 @@ func TestShmResolverRFCA73Attributes(t *testing.T) {
 			addr := cc.state.Addresses[0]
 
 			// Verify capability attribute
-			cap := GetShmemCapability(addr)
+			cap := GetShmCapability(addr)
 			if cap == nil {
-				t.Fatal("ShmemCapability attribute not set")
+				t.Fatal("ShmCapability attribute not set")
 			}
 			if cap.Enabled != tt.wantEnabled {
 				t.Errorf("Enabled: got %v, want %v", cap.Enabled, tt.wantEnabled)
@@ -333,30 +333,30 @@ func TestShmResolverRFCA73Attributes(t *testing.T) {
 			}
 
 			// Verify helper functions
-			if IsShmemEnabled(addr) != tt.wantEnabled {
-				t.Errorf("IsShmemEnabled: got %v, want %v", IsShmemEnabled(addr), tt.wantEnabled)
+			if IsShmEnabled(addr) != tt.wantEnabled {
+				t.Errorf("IsShmEnabled: got %v, want %v", IsShmEnabled(addr), tt.wantEnabled)
 			}
-			if IsShmemPreferred(addr) != (tt.wantEnabled && tt.wantPreferred) {
-				t.Errorf("IsShmemPreferred: got %v, want %v", IsShmemPreferred(addr), tt.wantEnabled && tt.wantPreferred)
+			if IsShmPreferred(addr) != (tt.wantEnabled && tt.wantPreferred) {
+				t.Errorf("IsShmPreferred: got %v, want %v", IsShmPreferred(addr), tt.wantEnabled && tt.wantPreferred)
 			}
 
 			// Verify service config integration
-			cfg, err := ParseShmemServiceConfig(tt.serviceConfigJSON)
+			cfg, err := ParseShmServiceConfig(tt.serviceConfigJSON)
 			if err != nil {
 				t.Fatalf("Failed to parse service config: %v", err)
 			}
 
-			shouldUse := cfg.ShouldUseShmem(IsShmemEnabled(addr))
+			shouldUse := cfg.ShouldUseShm(IsShmEnabled(addr))
 			if shouldUse != tt.wantShouldUse {
-				t.Errorf("ShouldUseShmem: got %v, want %v (policy=%s, hasCapability=%v)",
-					shouldUse, tt.wantShouldUse, cfg.Policy, IsShmemEnabled(addr))
+				t.Errorf("ShouldUseShm: got %v, want %v (policy=%s, hasCapability=%v)",
+					shouldUse, tt.wantShouldUse, cfg.Policy, IsShmEnabled(addr))
 			}
 		})
 	}
 }
 
-// TestShmResolverWithTransportHint tests that ShmemTransportHint can be applied
-// alongside ShmemCapability on resolved addresses.
+// TestShmResolverWithTransportHint tests that ShmTransportHint can be applied
+// alongside ShmCapability on resolved addresses.
 func TestShmResolverWithTransportHint(t *testing.T) {
 	builder := resolver.Get("shm")
 	if builder == nil {
@@ -380,30 +380,30 @@ func TestShmResolverWithTransportHint(t *testing.T) {
 	addr := cc.state.Addresses[0]
 
 	// Verify capability is set by resolver
-	if !IsShmemEnabled(addr) {
-		t.Fatal("Expected ShmemCapability to be set by resolver")
+	if !IsShmEnabled(addr) {
+		t.Fatal("Expected ShmCapability to be set by resolver")
 	}
 
 	// Simulate what an LB policy would do: add a transport hint
-	hint := ShmemTransportHint{
-		PreferShmem:     true,
+	hint := ShmTransportHint{
+		PreferShm:       true,
 		FallbackAllowed: true,
 	}
-	addr = SetShmemTransportHint(addr, hint)
+	addr = SetShmTransportHint(addr, hint)
 
 	// Both attributes should coexist
-	cap := GetShmemCapability(addr)
+	cap := GetShmCapability(addr)
 	if cap == nil {
-		t.Fatal("ShmemCapability lost after adding hint")
+		t.Fatal("ShmCapability lost after adding hint")
 	}
 
-	gotHint := GetShmemTransportHint(addr)
+	gotHint := GetShmTransportHint(addr)
 	if gotHint == nil {
-		t.Fatal("ShmemTransportHint not set")
+		t.Fatal("ShmTransportHint not set")
 	}
 
-	if !gotHint.PreferShmem {
-		t.Error("PreferShmem should be true")
+	if !gotHint.PreferShm {
+		t.Error("PreferShm should be true")
 	}
 	if !gotHint.FallbackAllowed {
 		t.Error("FallbackAllowed should be true")

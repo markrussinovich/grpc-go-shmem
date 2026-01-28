@@ -1,4 +1,4 @@
-//go:build linux || windows
+﻿//go:build linux || windows
 
 /*
  *
@@ -34,7 +34,7 @@ func TestTransportType(t *testing.T) {
 		expected string
 	}{
 		{"HTTP2", TransportTypeHTTP2, "HTTP2"},
-		{"Shmem", TransportTypeShmem, "Shmem"},
+		{"Shm", TransportTypeShm, "Shm"},
 		{"Unknown", TransportType(99), "TransportType(99)"},
 	}
 
@@ -52,7 +52,7 @@ func TestTransportSelectorBasic(t *testing.T) {
 	tests := []struct {
 		name     string
 		addr     resolver.Address
-		config   *ShmemServiceConfig
+		config   *ShmServiceConfig
 		expected TransportType
 	}{
 		{
@@ -62,52 +62,52 @@ func TestTransportSelectorBasic(t *testing.T) {
 			expected: TransportTypeHTTP2,
 		},
 		{
-			name: "Shmem enabled - Shmem selected",
-			addr: SetShmemCapability(resolver.Address{Addr: "localhost:8080"}, ShmemCapability{
+			name: "Shm enabled - shm selected",
+			addr: SetShmCapability(resolver.Address{Addr: "localhost:8080"}, ShmCapability{
 				Enabled:     true,
 				SegmentName: "test_segment",
 			}),
 			config:   nil,
-			expected: TransportTypeShmem,
+			expected: TransportTypeShm,
 		},
 		{
-			name: "Shmem enabled but policy disabled - HTTP2",
-			addr: SetShmemCapability(resolver.Address{Addr: "localhost:8080"}, ShmemCapability{
+			name: "Shm enabled but policy disabled - HTTP2",
+			addr: SetShmCapability(resolver.Address{Addr: "localhost:8080"}, ShmCapability{
 				Enabled:     true,
 				SegmentName: "test_segment",
 			}),
-			config:   &ShmemServiceConfig{Policy: ShmemPolicyDisabled},
+			config:   &ShmServiceConfig{Policy: ShmPolicyDisabled},
 			expected: TransportTypeHTTP2,
 		},
 		{
 			// When policy is required but address has no capability,
-			// we still try shmem (and let it fail) rather than silently fall back to HTTP2.
+			// we still try shm (and let it fail) rather than silently fall back to HTTP2.
 			// This is intentional - "required" means we should not use HTTP2.
-			name:   "Shmem not enabled, policy required - still attempts Shmem (will fail)",
+			name:   "Shm not enabled, policy required - still attempts shm (will fail)",
 			addr:   resolver.Address{Addr: "localhost:8080"},
-			config: &ShmemServiceConfig{Policy: ShmemPolicyRequired},
-			expected: TransportTypeShmem,
+			config: &ShmServiceConfig{Policy: ShmPolicyRequired},
+			expected: TransportTypeShm,
 		},
 		{
-			name: "Transport hint prefers shmem",
-			addr: SetShmemTransportHint(
-				SetShmemCapability(resolver.Address{Addr: "localhost:8080"}, ShmemCapability{
+			name: "Transport hint prefers shm",
+			addr: SetShmTransportHint(
+				SetShmCapability(resolver.Address{Addr: "localhost:8080"}, ShmCapability{
 					Enabled:     true,
 					SegmentName: "test_segment",
 				}),
-				ShmemTransportHint{PreferShmem: true, FallbackAllowed: true},
+				ShmTransportHint{PreferShm: true, FallbackAllowed: true},
 			),
 			config:   nil,
-			expected: TransportTypeShmem,
+			expected: TransportTypeShm,
 		},
 		{
 			name: "Transport hint prefers HTTP2",
-			addr: SetShmemTransportHint(
-				SetShmemCapability(resolver.Address{Addr: "localhost:8080"}, ShmemCapability{
+			addr: SetShmTransportHint(
+				SetShmCapability(resolver.Address{Addr: "localhost:8080"}, ShmCapability{
 					Enabled:     true,
 					SegmentName: "test_segment",
 				}),
-				ShmemTransportHint{PreferShmem: false, FallbackAllowed: true},
+				ShmTransportHint{PreferShm: false, FallbackAllowed: true},
 			),
 			config:   nil,
 			expected: TransportTypeHTTP2,
@@ -130,7 +130,7 @@ func TestTransportSelectorWithDetails(t *testing.T) {
 	tests := []struct {
 		name            string
 		addr            resolver.Address
-		config          *ShmemServiceConfig
+		config          *ShmServiceConfig
 		expectedType    TransportType
 		expectedFallback bool
 		expectedSegment string
@@ -144,24 +144,24 @@ func TestTransportSelectorWithDetails(t *testing.T) {
 			expectedSegment:  "",
 		},
 		{
-			name: "Shmem with fallback allowed",
-			addr: SetShmemCapability(resolver.Address{Addr: "localhost:8080"}, ShmemCapability{
+			name: "Shm with fallback allowed",
+			addr: SetShmCapability(resolver.Address{Addr: "localhost:8080"}, ShmCapability{
 				Enabled:     true,
 				SegmentName: "my_segment",
 			}),
 			config:           nil,
-			expectedType:     TransportTypeShmem,
+			expectedType:     TransportTypeShm,
 			expectedFallback: true,
 			expectedSegment:  "my_segment",
 		},
 		{
-			name: "Shmem required - no fallback",
-			addr: SetShmemCapability(resolver.Address{Addr: "localhost:8080"}, ShmemCapability{
+			name: "Shm required - no fallback",
+			addr: SetShmCapability(resolver.Address{Addr: "localhost:8080"}, ShmCapability{
 				Enabled:     true,
 				SegmentName: "required_segment",
 			}),
-			config:           &ShmemServiceConfig{Policy: ShmemPolicyRequired},
-			expectedType:     TransportTypeShmem,
+			config:           &ShmServiceConfig{Policy: ShmPolicyRequired},
+			expectedType:     TransportTypeShm,
 			expectedFallback: false,
 			expectedSegment:  "required_segment",
 		},
@@ -194,7 +194,7 @@ func TestGetSegmentName(t *testing.T) {
 	}{
 		{
 			name: "From capability attribute",
-			addr: SetShmemCapability(resolver.Address{Addr: "localhost:8080"}, ShmemCapability{
+			addr: SetShmCapability(resolver.Address{Addr: "localhost:8080"}, ShmCapability{
 				Enabled:     true,
 				SegmentName: "cap_segment",
 			}),
@@ -241,26 +241,26 @@ func TestIsFallbackAllowed(t *testing.T) {
 		},
 		{
 			name: "Hint allows fallback",
-			addr: SetShmemTransportHint(resolver.Address{Addr: "localhost:8080"},
-				ShmemTransportHint{PreferShmem: true, FallbackAllowed: true}),
+			addr: SetShmTransportHint(resolver.Address{Addr: "localhost:8080"},
+				ShmTransportHint{PreferShm: true, FallbackAllowed: true}),
 			expected: true,
 		},
 		{
 			name: "Hint disallows fallback",
-			addr: SetShmemTransportHint(resolver.Address{Addr: "localhost:8080"},
-				ShmemTransportHint{PreferShmem: true, FallbackAllowed: false}),
+			addr: SetShmTransportHint(resolver.Address{Addr: "localhost:8080"},
+				ShmTransportHint{PreferShm: true, FallbackAllowed: false}),
 			expected: false,
 		},
 		{
 			name: "Capability required - no fallback",
-			addr: SetShmemCapability(resolver.Address{Addr: "localhost:8080"},
-				ShmemCapability{Enabled: true, Required: true}),
+			addr: SetShmCapability(resolver.Address{Addr: "localhost:8080"},
+				ShmCapability{Enabled: true, Required: true}),
 			expected: false,
 		},
 		{
 			name: "Capability not required - fallback allowed",
-			addr: SetShmemCapability(resolver.Address{Addr: "localhost:8080"},
-				ShmemCapability{Enabled: true, Required: false}),
+			addr: SetShmCapability(resolver.Address{Addr: "localhost:8080"},
+				ShmCapability{Enabled: true, Required: false}),
 			expected: true,
 		},
 	}
@@ -275,8 +275,8 @@ func TestIsFallbackAllowed(t *testing.T) {
 	}
 }
 
-// TestCanUseShmemForAddress tests the quick shmem availability check.
-func TestCanUseShmemForAddress(t *testing.T) {
+// TestCanUseShmForAddress tests the quick shm availability check.
+func TestCanUseShmForAddress(t *testing.T) {
 	tests := []struct {
 		name     string
 		addr     resolver.Address
@@ -289,34 +289,34 @@ func TestCanUseShmemForAddress(t *testing.T) {
 		},
 		{
 			name: "Capability enabled - true",
-			addr: SetShmemCapability(resolver.Address{Addr: "localhost:8080"},
-				ShmemCapability{Enabled: true}),
+			addr: SetShmCapability(resolver.Address{Addr: "localhost:8080"},
+				ShmCapability{Enabled: true}),
 			expected: true,
 		},
 		{
 			name: "Capability disabled - false",
-			addr: SetShmemCapability(resolver.Address{Addr: "localhost:8080"},
-				ShmemCapability{Enabled: false}),
+			addr: SetShmCapability(resolver.Address{Addr: "localhost:8080"},
+				ShmCapability{Enabled: false}),
 			expected: false,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := CanUseShmemForAddress(tt.addr)
+			got := CanUseShmForAddress(tt.addr)
 			if got != tt.expected {
-				t.Errorf("CanUseShmemForAddress() = %v, want %v", got, tt.expected)
+				t.Errorf("CanUseShmForAddress() = %v, want %v", got, tt.expected)
 			}
 		})
 	}
 }
 
-// TestMustUseShmemForAddress tests the required shmem check.
-func TestMustUseShmemForAddress(t *testing.T) {
+// TestMustUseShmForAddress tests the required shm check.
+func TestMustUseShmForAddress(t *testing.T) {
 	tests := []struct {
 		name     string
 		addr     resolver.Address
-		config   *ShmemServiceConfig
+		config   *ShmServiceConfig
 		expected bool
 	}{
 		{
@@ -328,20 +328,20 @@ func TestMustUseShmemForAddress(t *testing.T) {
 		{
 			name:     "Config required - true",
 			addr:     resolver.Address{Addr: "localhost:8080"},
-			config:   &ShmemServiceConfig{Policy: ShmemPolicyRequired},
+			config:   &ShmServiceConfig{Policy: ShmPolicyRequired},
 			expected: true,
 		},
 		{
-			name: "Hint requires shmem - true",
-			addr: SetShmemTransportHint(resolver.Address{Addr: "localhost:8080"},
-				ShmemTransportHint{PreferShmem: true, FallbackAllowed: false}),
+			name: "Hint requires shm - true",
+			addr: SetShmTransportHint(resolver.Address{Addr: "localhost:8080"},
+				ShmTransportHint{PreferShm: true, FallbackAllowed: false}),
 			config:   nil,
 			expected: true,
 		},
 		{
 			name: "Hint prefers but allows fallback - false",
-			addr: SetShmemTransportHint(resolver.Address{Addr: "localhost:8080"},
-				ShmemTransportHint{PreferShmem: true, FallbackAllowed: true}),
+			addr: SetShmTransportHint(resolver.Address{Addr: "localhost:8080"},
+				ShmTransportHint{PreferShm: true, FallbackAllowed: true}),
 			config:   nil,
 			expected: false,
 		},
@@ -349,17 +349,17 @@ func TestMustUseShmemForAddress(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := MustUseShmemForAddress(tt.addr, tt.config)
+			got := MustUseShmForAddress(tt.addr, tt.config)
 			if got != tt.expected {
-				t.Errorf("MustUseShmemForAddress() = %v, want %v", got, tt.expected)
+				t.Errorf("MustUseShmForAddress() = %v, want %v", got, tt.expected)
 			}
 		})
 	}
 }
 
-// TestShmemAwareDialerShouldUseShmem tests the dialer's transport selection.
-func TestShmemAwareDialerShouldUseShmem(t *testing.T) {
-	dialer := NewShmemAwareDialer(nil, nil)
+// TestShmAwareDialerShouldUseShm tests the dialer's transport selection.
+func TestShmAwareDialerShouldUseShm(t *testing.T) {
+	dialer := NewShmAwareDialer(nil, nil)
 
 	tests := []struct {
 		name     string
@@ -373,17 +373,17 @@ func TestShmemAwareDialerShouldUseShmem(t *testing.T) {
 		},
 		{
 			name: "Capability enabled - true",
-			addr: SetShmemCapability(resolver.Address{Addr: "localhost:8080"},
-				ShmemCapability{Enabled: true, SegmentName: "test"}),
+			addr: SetShmCapability(resolver.Address{Addr: "localhost:8080"},
+				ShmCapability{Enabled: true, SegmentName: "test"}),
 			expected: true,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := dialer.ShouldUseShmem(tt.addr)
+			got := dialer.ShouldUseShm(tt.addr)
 			if got != tt.expected {
-				t.Errorf("ShouldUseShmem() = %v, want %v", got, tt.expected)
+				t.Errorf("ShouldUseShm() = %v, want %v", got, tt.expected)
 			}
 		})
 	}
@@ -401,7 +401,7 @@ func TestNewTransportSelector(t *testing.T) {
 	}
 
 	// With config
-	cfg := &ShmemServiceConfig{Policy: ShmemPolicyPreferred}
+	cfg := &ShmServiceConfig{Policy: ShmPolicyPreferred}
 	s2 := NewTransportSelector(cfg)
 	if s2.ServiceConfig != cfg {
 		t.Error("ServiceConfig not set correctly")

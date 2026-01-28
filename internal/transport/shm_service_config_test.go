@@ -1,4 +1,4 @@
-//go:build linux || windows
+﻿//go:build linux || windows
 
 /*
  *
@@ -25,56 +25,56 @@ import (
 	"testing"
 )
 
-func TestDefaultShmemServiceConfig(t *testing.T) {
-	cfg := DefaultShmemServiceConfig()
+func TestDefaultShmServiceConfig(t *testing.T) {
+	cfg := DefaultShmServiceConfig()
 	if cfg == nil {
-		t.Fatal("DefaultShmemServiceConfig() returned nil")
+		t.Fatal("DefaultShmServiceConfig() returned nil")
 	}
-	if cfg.Policy != ShmemPolicyAuto {
-		t.Errorf("Default Policy: got %q, want %q", cfg.Policy, ShmemPolicyAuto)
+	if cfg.Policy != ShmPolicyAuto {
+		t.Errorf("Default Policy: got %q, want %q", cfg.Policy, ShmPolicyAuto)
 	}
 	if !cfg.IsFallbackEnabled() {
 		t.Error("Default IsFallbackEnabled() should be true")
 	}
 }
 
-func TestParseShmemServiceConfig(t *testing.T) {
+func TestParseShmServiceConfig(t *testing.T) {
 	tests := []struct {
 		name        string
 		json        string
-		wantPolicy  ShmemTransportPolicy
+		wantPolicy  ShmTransportPolicy
 		wantErr     bool
 		wantSegSize uint64
 	}{
 		{
 			name:       "empty string",
 			json:       "",
-			wantPolicy: ShmemPolicyAuto,
+			wantPolicy: ShmPolicyAuto,
 		},
 		{
 			name:       "policy disabled",
-			json:       `{"shmemPolicy":"disabled"}`,
-			wantPolicy: ShmemPolicyDisabled,
+			json:       `{"ShmPolicy":"disabled"}`,
+			wantPolicy: ShmPolicyDisabled,
 		},
 		{
 			name:       "policy preferred",
-			json:       `{"shmemPolicy":"preferred"}`,
-			wantPolicy: ShmemPolicyPreferred,
+			json:       `{"ShmPolicy":"preferred"}`,
+			wantPolicy: ShmPolicyPreferred,
 		},
 		{
 			name:       "policy required",
-			json:       `{"shmemPolicy":"required"}`,
-			wantPolicy: ShmemPolicyRequired,
+			json:       `{"ShmPolicy":"required"}`,
+			wantPolicy: ShmPolicyRequired,
 		},
 		{
 			name:       "policy auto",
-			json:       `{"shmemPolicy":"auto"}`,
-			wantPolicy: ShmemPolicyAuto,
+			json:       `{"ShmPolicy":"auto"}`,
+			wantPolicy: ShmPolicyAuto,
 		},
 		{
 			name:        "with segment size",
-			json:        `{"shmemPolicy":"preferred","shmemSegmentSizeBytes":1048576}`,
-			wantPolicy:  ShmemPolicyPreferred,
+			json:        `{"ShmPolicy":"preferred","ShmSegmentSizeBytes":1048576}`,
+			wantPolicy:  ShmPolicyPreferred,
 			wantSegSize: 1048576,
 		},
 		{
@@ -86,7 +86,7 @@ func TestParseShmemServiceConfig(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			cfg, err := ParseShmemServiceConfig(tt.json)
+			cfg, err := ParseShmServiceConfig(tt.json)
 			if tt.wantErr {
 				if err == nil {
 					t.Error("Expected error, got nil")
@@ -106,10 +106,10 @@ func TestParseShmemServiceConfig(t *testing.T) {
 	}
 }
 
-func TestShmemServiceConfigValidate(t *testing.T) {
+func TestShmServiceConfigValidate(t *testing.T) {
 	tests := []struct {
 		name    string
-		cfg     *ShmemServiceConfig
+		cfg     *ShmServiceConfig
 		wantErr bool
 	}{
 		{
@@ -119,32 +119,32 @@ func TestShmemServiceConfigValidate(t *testing.T) {
 		},
 		{
 			name:    "valid disabled",
-			cfg:     &ShmemServiceConfig{Policy: ShmemPolicyDisabled},
+			cfg:     &ShmServiceConfig{Policy: ShmPolicyDisabled},
 			wantErr: false,
 		},
 		{
 			name:    "valid preferred",
-			cfg:     &ShmemServiceConfig{Policy: ShmemPolicyPreferred},
+			cfg:     &ShmServiceConfig{Policy: ShmPolicyPreferred},
 			wantErr: false,
 		},
 		{
 			name:    "valid required",
-			cfg:     &ShmemServiceConfig{Policy: ShmemPolicyRequired},
+			cfg:     &ShmServiceConfig{Policy: ShmPolicyRequired},
 			wantErr: false,
 		},
 		{
 			name:    "valid auto",
-			cfg:     &ShmemServiceConfig{Policy: ShmemPolicyAuto},
+			cfg:     &ShmServiceConfig{Policy: ShmPolicyAuto},
 			wantErr: false,
 		},
 		{
 			name:    "empty policy (valid, defaults to auto)",
-			cfg:     &ShmemServiceConfig{},
+			cfg:     &ShmServiceConfig{},
 			wantErr: false,
 		},
 		{
 			name:    "invalid policy",
-			cfg:     &ShmemServiceConfig{Policy: "invalid_policy"},
+			cfg:     &ShmServiceConfig{Policy: "invalid_policy"},
 			wantErr: true,
 		},
 	}
@@ -162,89 +162,89 @@ func TestShmemServiceConfigValidate(t *testing.T) {
 	}
 }
 
-func TestShmemServiceConfigShouldUseShmem(t *testing.T) {
+func TestShmServiceConfigShouldUseShm(t *testing.T) {
 	tests := []struct {
 		name                  string
-		cfg                   *ShmemServiceConfig
-		addrHasShmemCapability bool
+		cfg                   *ShmServiceConfig
+		addrHasShmCapability bool
 		want                  bool
 	}{
 		{
 			name:                  "nil config auto - addr has capability",
 			cfg:                   nil,
-			addrHasShmemCapability: true,
+			addrHasShmCapability: true,
 			want:                  true,
 		},
 		{
 			name:                  "nil config auto - addr no capability",
 			cfg:                   nil,
-			addrHasShmemCapability: false,
+			addrHasShmCapability: false,
 			want:                  false,
 		},
 		{
 			name:                  "disabled - addr has capability",
-			cfg:                   &ShmemServiceConfig{Policy: ShmemPolicyDisabled},
-			addrHasShmemCapability: true,
+			cfg:                   &ShmServiceConfig{Policy: ShmPolicyDisabled},
+			addrHasShmCapability: true,
 			want:                  false,
 		},
 		{
 			name:                  "disabled - addr no capability",
-			cfg:                   &ShmemServiceConfig{Policy: ShmemPolicyDisabled},
-			addrHasShmemCapability: false,
+			cfg:                   &ShmServiceConfig{Policy: ShmPolicyDisabled},
+			addrHasShmCapability: false,
 			want:                  false,
 		},
 		{
 			name:                  "preferred - addr has capability",
-			cfg:                   &ShmemServiceConfig{Policy: ShmemPolicyPreferred},
-			addrHasShmemCapability: true,
+			cfg:                   &ShmServiceConfig{Policy: ShmPolicyPreferred},
+			addrHasShmCapability: true,
 			want:                  true,
 		},
 		{
 			name:                  "preferred - addr no capability",
-			cfg:                   &ShmemServiceConfig{Policy: ShmemPolicyPreferred},
-			addrHasShmemCapability: false,
+			cfg:                   &ShmServiceConfig{Policy: ShmPolicyPreferred},
+			addrHasShmCapability: false,
 			want:                  true, // preferred always attempts
 		},
 		{
 			name:                  "required - addr has capability",
-			cfg:                   &ShmemServiceConfig{Policy: ShmemPolicyRequired},
-			addrHasShmemCapability: true,
+			cfg:                   &ShmServiceConfig{Policy: ShmPolicyRequired},
+			addrHasShmCapability: true,
 			want:                  true,
 		},
 		{
 			name:                  "required - addr no capability",
-			cfg:                   &ShmemServiceConfig{Policy: ShmemPolicyRequired},
-			addrHasShmemCapability: false,
+			cfg:                   &ShmServiceConfig{Policy: ShmPolicyRequired},
+			addrHasShmCapability: false,
 			want:                  true, // required always attempts (will fail if unavailable)
 		},
 		{
 			name:                  "auto - addr has capability",
-			cfg:                   &ShmemServiceConfig{Policy: ShmemPolicyAuto},
-			addrHasShmemCapability: true,
+			cfg:                   &ShmServiceConfig{Policy: ShmPolicyAuto},
+			addrHasShmCapability: true,
 			want:                  true,
 		},
 		{
 			name:                  "auto - addr no capability",
-			cfg:                   &ShmemServiceConfig{Policy: ShmemPolicyAuto},
-			addrHasShmemCapability: false,
+			cfg:                   &ShmServiceConfig{Policy: ShmPolicyAuto},
+			addrHasShmCapability: false,
 			want:                  false,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := tt.cfg.ShouldUseShmem(tt.addrHasShmemCapability)
+			got := tt.cfg.ShouldUseShm(tt.addrHasShmCapability)
 			if got != tt.want {
-				t.Errorf("ShouldUseShmem(%v): got %v, want %v", tt.addrHasShmemCapability, got, tt.want)
+				t.Errorf("ShouldUseShm(%v): got %v, want %v", tt.addrHasShmCapability, got, tt.want)
 			}
 		})
 	}
 }
 
-func TestShmemServiceConfigIsFallbackEnabled(t *testing.T) {
+func TestShmServiceConfigIsFallbackEnabled(t *testing.T) {
 	tests := []struct {
 		name string
-		cfg  *ShmemServiceConfig
+		cfg  *ShmServiceConfig
 		want bool
 	}{
 		{
@@ -254,17 +254,17 @@ func TestShmemServiceConfigIsFallbackEnabled(t *testing.T) {
 		},
 		{
 			name: "nil FallbackEnabled field",
-			cfg:  &ShmemServiceConfig{Policy: ShmemPolicyPreferred},
+			cfg:  &ShmServiceConfig{Policy: ShmPolicyPreferred},
 			want: true,
 		},
 		{
 			name: "FallbackEnabled true",
-			cfg:  &ShmemServiceConfig{FallbackEnabled: boolPtr(true)},
+			cfg:  &ShmServiceConfig{FallbackEnabled: boolPtr(true)},
 			want: true,
 		},
 		{
 			name: "FallbackEnabled false",
-			cfg:  &ShmemServiceConfig{FallbackEnabled: boolPtr(false)},
+			cfg:  &ShmServiceConfig{FallbackEnabled: boolPtr(false)},
 			want: false,
 		},
 	}
@@ -283,9 +283,9 @@ func boolPtr(b bool) *bool {
 	return &b
 }
 
-func TestShmemServiceConfigMarshalJSON(t *testing.T) {
-	cfg := &ShmemServiceConfig{
-		Policy:              ShmemPolicyPreferred,
+func TestShmServiceConfigMarshalJSON(t *testing.T) {
+	cfg := &ShmServiceConfig{
+		Policy:              ShmPolicyPreferred,
 		SegmentSizeBytes:    2097152,
 		RingBufferSizeBytes: 524288,
 		FallbackEnabled:     boolPtr(true),
@@ -298,7 +298,7 @@ func TestShmemServiceConfigMarshalJSON(t *testing.T) {
 	}
 
 	// Unmarshal and verify round-trip
-	var parsed ShmemServiceConfig
+	var parsed ShmServiceConfig
 	if err := json.Unmarshal(data, &parsed); err != nil {
 		t.Fatalf("Unmarshal failed: %v", err)
 	}
@@ -317,32 +317,32 @@ func TestShmemServiceConfigMarshalJSON(t *testing.T) {
 	}
 }
 
-func TestShmemServiceConfigString(t *testing.T) {
+func TestShmServiceConfigString(t *testing.T) {
 	tests := []struct {
 		name string
-		cfg  *ShmemServiceConfig
+		cfg  *ShmServiceConfig
 		want string
 	}{
 		{
 			name: "nil config",
 			cfg:  nil,
-			want: "ShmemServiceConfig{nil}",
+			want: "ShmServiceConfig{nil}",
 		},
 		{
 			name: "basic config",
-			cfg:  &ShmemServiceConfig{Policy: ShmemPolicyPreferred},
-			want: `ShmemServiceConfig{Policy:"preferred", SegmentSize:0, RingBufferSize:0, Fallback:nil, MaxStreams:0}`,
+			cfg:  &ShmServiceConfig{Policy: ShmPolicyPreferred},
+			want: `ShmServiceConfig{Policy:"preferred", SegmentSize:0, RingBufferSize:0, Fallback:nil, MaxStreams:0}`,
 		},
 		{
 			name: "full config",
-			cfg: &ShmemServiceConfig{
-				Policy:              ShmemPolicyRequired,
+			cfg: &ShmServiceConfig{
+				Policy:              ShmPolicyRequired,
 				SegmentSizeBytes:    1048576,
 				RingBufferSizeBytes: 65536,
 				FallbackEnabled:     boolPtr(false),
 				MaxConcurrentStreams: 50,
 			},
-			want: `ShmemServiceConfig{Policy:"required", SegmentSize:1048576, RingBufferSize:65536, Fallback:false, MaxStreams:50}`,
+			want: `ShmServiceConfig{Policy:"required", SegmentSize:1048576, RingBufferSize:65536, Fallback:false, MaxStreams:50}`,
 		},
 	}
 	for _, tt := range tests {
@@ -355,16 +355,16 @@ func TestShmemServiceConfigString(t *testing.T) {
 	}
 }
 
-func TestShmemServiceConfigUnknownPolicy(t *testing.T) {
-	// Test ShouldUseShmem with unknown policy (should default to auto behavior)
-	cfg := &ShmemServiceConfig{Policy: "unknown_policy"}
+func TestShmServiceConfigUnknownPolicy(t *testing.T) {
+	// Test ShouldUseShm with unknown policy (should default to auto behavior)
+	cfg := &ShmServiceConfig{Policy: "unknown_policy"}
 	
-	// With capability, should use shmem (auto behavior)
-	if !cfg.ShouldUseShmem(true) {
-		t.Error("Unknown policy should default to auto behavior (use shmem when capable)")
+	// With capability, should use shm (auto behavior)
+	if !cfg.ShouldUseShm(true) {
+		t.Error("Unknown policy should default to auto behavior (use shm when capable)")
 	}
-	// Without capability, should not use shmem
-	if cfg.ShouldUseShmem(false) {
-		t.Error("Unknown policy should default to auto behavior (don't use shmem when not capable)")
+	// Without capability, should not use shm
+	if cfg.ShouldUseShm(false) {
+		t.Error("Unknown policy should default to auto behavior (don't use shm when not capable)")
 	}
 }

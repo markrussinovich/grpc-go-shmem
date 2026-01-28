@@ -548,7 +548,7 @@ func TestShmEncodingRequiredStatus(t *testing.T) {
 	defer cancel()
 
 	// Special status message that requires proper encoding
-	specialStatus := status.New(codes.Internal, "\n\t\r special chars: 你好")
+	specialStatus := status.New(codes.Internal, "\n\t\r special chars: ä½ å¥½")
 
 	// Start server that returns the special status
 	go st.HandleStreams(ctx, func(s *ServerStream) {

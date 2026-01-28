@@ -1,4 +1,4 @@
-//go:build linux || windows
+﻿//go:build linux || windows
 
 /*
  *
@@ -37,8 +37,8 @@ const (
 	// TransportTypeHTTP2 indicates standard HTTP/2 over TCP transport.
 	TransportTypeHTTP2 TransportType = iota
 
-	// TransportTypeShmem indicates shared memory transport.
-	TransportTypeShmem
+	// TransportTypeShm indicates shared memory transport.
+	TransportTypeShm
 )
 
 // String returns a string representation of the transport type.
@@ -46,8 +46,8 @@ func (t TransportType) String() string {
 	switch t {
 	case TransportTypeHTTP2:
 		return "HTTP2"
-	case TransportTypeShmem:
-		return "Shmem"
+	case TransportTypeShm:
+		return "Shm"
 	default:
 		return fmt.Sprintf("TransportType(%d)", t)
 	}
@@ -56,39 +56,39 @@ func (t TransportType) String() string {
 // TransportSelector determines which transport type to use for an address.
 // This implements RFC A73 compliant transport selection at the subchannel level.
 type TransportSelector struct {
-	// ServiceConfig holds the shmem service configuration.
+	// ServiceConfig holds the shm service configuration.
 	// If nil, defaults to auto policy.
-	ServiceConfig *ShmemServiceConfig
+	ServiceConfig *ShmServiceConfig
 
-	// fallbackHandler handles fallback logic when shmem transport fails.
+	// fallbackHandler handles fallback logic when shm transport fails.
 	// Initialized lazily on first use.
-	fallbackHandler *ShmemFallbackHandler
+	fallbackHandler *ShmFallbackHandler
 }
 
 // NewTransportSelector creates a new transport selector with the given config.
-func NewTransportSelector(cfg *ShmemServiceConfig) *TransportSelector {
+func NewTransportSelector(cfg *ShmServiceConfig) *TransportSelector {
 	return &TransportSelector{
 		ServiceConfig: cfg,
 	}
 }
 
 // SelectTransport determines which transport to use for the given address.
-// It checks the address attributes for ShmemCapability and uses the
+// It checks the address attributes for ShmCapability and uses the
 // service config policy to make the decision.
 //
 // This is the main entry point for RFC A73 compliant transport selection.
 func (s *TransportSelector) SelectTransport(addr resolver.Address) TransportType {
-	// Check if address has shmem capability
-	cap := GetShmemCapability(addr)
+	// Check if address has shm capability
+	cap := GetShmCapability(addr)
 	hasCapability := cap != nil && cap.Enabled
 
 	// Check transport hint from LB policy (if present)
-	hint := GetShmemTransportHint(addr)
+	hint := GetShmTransportHint(addr)
 	if hint != nil {
-		if hint.PreferShmem && hasCapability {
-			return TransportTypeShmem
+		if hint.PreferShm && hasCapability {
+			return TransportTypeShm
 		}
-		if !hint.PreferShmem {
+		if !hint.PreferShm {
 			return TransportTypeHTTP2
 		}
 	}
@@ -96,21 +96,21 @@ func (s *TransportSelector) SelectTransport(addr resolver.Address) TransportType
 	// Use service config policy to decide
 	cfg := s.ServiceConfig
 	if cfg == nil {
-		cfg = DefaultShmemServiceConfig()
+		cfg = DefaultShmServiceConfig()
 	}
 
-	if cfg.ShouldUseShmem(hasCapability) {
-		return TransportTypeShmem
+	if cfg.ShouldUseShm(hasCapability) {
+		return TransportTypeShm
 	}
 
 	return TransportTypeHTTP2
 }
 
 // GetSegmentName extracts the shared memory segment name from an address.
-// It checks the ShmemCapability first, then falls back to parsing the address.
+// It checks the ShmCapability first, then falls back to parsing the address.
 func GetSegmentName(addr resolver.Address) string {
 	// First check capability attribute
-	cap := GetShmemCapability(addr)
+	cap := GetShmCapability(addr)
 	if cap != nil && cap.SegmentName != "" {
 		return cap.SegmentName
 	}
@@ -128,47 +128,47 @@ func GetSegmentName(addr resolver.Address) string {
 	return addr.Addr
 }
 
-// ShmemAwareDialer wraps the standard dialer and shmem dialer to provide
+// ShmAwareDialer wraps the standard dialer and shm dialer to provide
 // RFC A73 compliant transport selection at connection time.
-type ShmemAwareDialer struct {
+type ShmAwareDialer struct {
 	// Selector determines which transport to use.
 	Selector *TransportSelector
 
-	// ShmemDialer is used when shmem transport is selected.
-	ShmemDialer *ShmDialer
+	// ShmDialer is used when shm transport is selected.
+	ShmDialer *ShmDialer
 
 	// OnTransportSelected is called when a transport type is selected.
 	// This can be used for logging or metrics.
 	OnTransportSelected func(addr resolver.Address, transportType TransportType)
 }
 
-// NewShmemAwareDialer creates a new shmem-aware dialer with the given options.
-func NewShmemAwareDialer(cfg *ShmemServiceConfig, shmemOpts *DialOptions) *ShmemAwareDialer {
-	return &ShmemAwareDialer{
+// NewShmAwareDialer creates a new shm-aware dialer with the given options.
+func NewShmAwareDialer(cfg *ShmServiceConfig, ShmOpts *DialOptions) *ShmAwareDialer {
+	return &ShmAwareDialer{
 		Selector:    NewTransportSelector(cfg),
-		ShmemDialer: NewShmDialer(shmemOpts),
+		ShmDialer: NewShmDialer(ShmOpts),
 	}
 }
 
-// ShouldUseShmem determines if shmem transport should be used for the address.
+// ShouldUseShm determines if shm transport should be used for the address.
 // This is a convenience method that delegates to the selector.
-func (d *ShmemAwareDialer) ShouldUseShmem(addr resolver.Address) bool {
-	return d.Selector.SelectTransport(addr) == TransportTypeShmem
+func (d *ShmAwareDialer) ShouldUseShm(addr resolver.Address) bool {
+	return d.Selector.SelectTransport(addr) == TransportTypeShm
 }
 
-// DialShmem creates a shmem transport to the given address.
+// DialShm creates a shm transport to the given address.
 // Returns the transport and any error that occurred.
-func (d *ShmemAwareDialer) DialShmem(ctx context.Context, addr resolver.Address) (ClientTransport, error) {
+func (d *ShmAwareDialer) DialShm(ctx context.Context, addr resolver.Address) (ClientTransport, error) {
 	segmentName := GetSegmentName(addr)
 	if segmentName == "" {
-		return nil, fmt.Errorf("shmem: no segment name for address %s", addr.Addr)
+		return nil, fmt.Errorf("shm: no segment name for address %s", addr.Addr)
 	}
 
 	if d.OnTransportSelected != nil {
-		d.OnTransportSelected(addr, TransportTypeShmem)
+		d.OnTransportSelected(addr, TransportTypeShm)
 	}
 
-	return DialShm(ctx, segmentName, d.ShmemDialer.opts)
+	return DialShm(ctx, segmentName, d.ShmDialer.opts)
 }
 
 // TransportSelectionResult contains the result of transport selection.
@@ -176,7 +176,7 @@ type TransportSelectionResult struct {
 	// Type is the selected transport type.
 	Type TransportType
 
-	// SegmentName is the shmem segment name (only for shmem transport).
+	// SegmentName is the shm segment name (only for shm transport).
 	SegmentName string
 
 	// FallbackAllowed indicates if fallback to HTTP2 is allowed.
@@ -191,11 +191,11 @@ func (s *TransportSelector) SelectTransportWithDetails(addr resolver.Address) Tr
 		FallbackAllowed: true,
 	}
 
-	cap := GetShmemCapability(addr)
+	cap := GetShmCapability(addr)
 	hasCapability := cap != nil && cap.Enabled
 
 	// Check transport hint
-	hint := GetShmemTransportHint(addr)
+	hint := GetShmTransportHint(addr)
 	if hint != nil {
 		result.FallbackAllowed = hint.FallbackAllowed
 	}
@@ -203,16 +203,16 @@ func (s *TransportSelector) SelectTransportWithDetails(addr resolver.Address) Tr
 	// Use service config policy
 	cfg := s.ServiceConfig
 	if cfg == nil {
-		cfg = DefaultShmemServiceConfig()
+		cfg = DefaultShmServiceConfig()
 	}
 
-	if cfg.ShouldUseShmem(hasCapability) {
-		result.Type = TransportTypeShmem
+	if cfg.ShouldUseShm(hasCapability) {
+		result.Type = TransportTypeShm
 		result.SegmentName = GetSegmentName(addr)
 		result.FallbackAllowed = cfg.IsFallbackEnabled()
 
 		// Override fallback if policy is required
-		if cfg.Policy == ShmemPolicyRequired {
+		if cfg.Policy == ShmPolicyRequired {
 			result.FallbackAllowed = false
 		}
 	}
@@ -220,40 +220,40 @@ func (s *TransportSelector) SelectTransportWithDetails(addr resolver.Address) Tr
 	return result
 }
 
-// CanUseShmemForAddress is a quick check to see if shmem is possible for an address.
+// CanUseShmForAddress is a quick check to see if shm is possible for an address.
 // This doesn't consider the service config policy, just the address capability.
-func CanUseShmemForAddress(addr resolver.Address) bool {
-	return IsShmemEnabled(addr)
+func CanUseShmForAddress(addr resolver.Address) bool {
+	return IsShmEnabled(addr)
 }
 
-// MustUseShmemForAddress checks if shmem is required (no fallback allowed).
-func MustUseShmemForAddress(addr resolver.Address, cfg *ShmemServiceConfig) bool {
-	if cfg != nil && cfg.Policy == ShmemPolicyRequired {
+// MustUseShmForAddress checks if shm is required (no fallback allowed).
+func MustUseShmForAddress(addr resolver.Address, cfg *ShmServiceConfig) bool {
+	if cfg != nil && cfg.Policy == ShmPolicyRequired {
 		return true
 	}
-	hint := GetShmemTransportHint(addr)
-	if hint != nil && hint.PreferShmem && !hint.FallbackAllowed {
+	hint := GetShmTransportHint(addr)
+	if hint != nil && hint.PreferShm && !hint.FallbackAllowed {
 		return true
 	}
 	return false
 }
 
-// NewShmemClient creates a new shared memory client transport.
+// NewShmClient creates a new shared memory client transport.
 // This function has a similar signature to NewHTTP2Client to allow
 // transparent substitution in clientconn.go for RFC A73 compliance.
 //
 // Parameters:
 //   - connectCtx: Context for connection establishment (with deadline)
 //   - ctx: Long-lived context for the transport
-//   - addr: Resolver address containing shmem capability attributes
-//   - opts: Connect options (currently unused for shmem but included for API compatibility)
+//   - addr: Resolver address containing shm capability attributes
+//   - opts: Connect options (currently unused for shm but included for API compatibility)
 //   - onClose: Callback invoked when transport is closed
 //
 // Returns the ClientTransport or an error if connection fails.
-func NewShmemClient(connectCtx, ctx context.Context, addr resolver.Address, opts ConnectOptions, onClose func(GoAwayReason)) (ClientTransport, error) {
+func NewShmClient(connectCtx, ctx context.Context, addr resolver.Address, opts ConnectOptions, onClose func(GoAwayReason)) (ClientTransport, error) {
 	segmentName := GetSegmentName(addr)
 	if segmentName == "" {
-		return nil, fmt.Errorf("shmem: no segment name available for address %q", addr.Addr)
+		return nil, fmt.Errorf("shm: no segment name available for address %q", addr.Addr)
 	}
 
 	// Configure dial options from connect options

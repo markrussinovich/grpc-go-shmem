@@ -1,4 +1,4 @@
-/*
+﻿/*
  *
  * Copyright 2026 gRPC authors.
  *
@@ -28,64 +28,64 @@ import (
 	"google.golang.org/grpc/resolver"
 )
 
-// ShmemErrorCode represents the type of shared memory transport error.
-type ShmemErrorCode int
+// ShmErrorCode represents the type of shared memory transport error.
+type ShmErrorCode int
 
 const (
-	// ShmemErrUnknown is an unknown error.
-	ShmemErrUnknown ShmemErrorCode = iota
-	// ShmemErrSegmentNotFound indicates the shared memory segment doesn't exist.
-	ShmemErrSegmentNotFound
-	// ShmemErrPermissionDenied indicates permission issues accessing the segment.
-	ShmemErrPermissionDenied
-	// ShmemErrConnectionRefused indicates the server is not listening on the segment.
-	ShmemErrConnectionRefused
-	// ShmemErrProtocolMismatch indicates incompatible protocol versions.
-	ShmemErrProtocolMismatch
-	// ShmemErrInvalidConfig indicates invalid configuration.
-	ShmemErrInvalidConfig
-	// ShmemErrTimeout indicates a timeout during connection.
-	ShmemErrTimeout
-	// ShmemErrResourceExhausted indicates no available resources (e.g., full buffer).
-	ShmemErrResourceExhausted
+	// ShmErrUnknown is an unknown error.
+	ShmErrUnknown ShmErrorCode = iota
+	// ShmErrSegmentNotFound indicates the shared memory segment doesn't exist.
+	ShmErrSegmentNotFound
+	// ShmErrPermissionDenied indicates permission issues accessing the segment.
+	ShmErrPermissionDenied
+	// ShmErrConnectionRefused indicates the server is not listening on the segment.
+	ShmErrConnectionRefused
+	// ShmErrProtocolMismatch indicates incompatible protocol versions.
+	ShmErrProtocolMismatch
+	// ShmErrInvalidConfig indicates invalid configuration.
+	ShmErrInvalidConfig
+	// ShmErrTimeout indicates a timeout during connection.
+	ShmErrTimeout
+	// ShmErrResourceExhausted indicates no available resources (e.g., full buffer).
+	ShmErrResourceExhausted
 )
 
-// ShmemError represents an error from the shared memory transport layer.
-type ShmemError struct {
-	Code    ShmemErrorCode
+// ShmError represents an error from the shared memory transport layer.
+type ShmError struct {
+	Code    ShmErrorCode
 	Message string
 	Cause   error
 }
 
 // Error implements the error interface.
-func (e *ShmemError) Error() string {
+func (e *ShmError) Error() string {
 	if e.Cause != nil {
-		return fmt.Sprintf("shmem error [%s]: %s: %v", e.codeName(), e.Message, e.Cause)
+		return fmt.Sprintf("shm error [%s]: %s: %v", e.codeName(), e.Message, e.Cause)
 	}
-	return fmt.Sprintf("shmem error [%s]: %s", e.codeName(), e.Message)
+	return fmt.Sprintf("shm error [%s]: %s", e.codeName(), e.Message)
 }
 
 // Unwrap returns the underlying error.
-func (e *ShmemError) Unwrap() error {
+func (e *ShmError) Unwrap() error {
 	return e.Cause
 }
 
 // codeName returns a string representation of the error code.
-func (e *ShmemError) codeName() string {
+func (e *ShmError) codeName() string {
 	switch e.Code {
-	case ShmemErrSegmentNotFound:
+	case ShmErrSegmentNotFound:
 		return "SEGMENT_NOT_FOUND"
-	case ShmemErrPermissionDenied:
+	case ShmErrPermissionDenied:
 		return "PERMISSION_DENIED"
-	case ShmemErrConnectionRefused:
+	case ShmErrConnectionRefused:
 		return "CONNECTION_REFUSED"
-	case ShmemErrProtocolMismatch:
+	case ShmErrProtocolMismatch:
 		return "PROTOCOL_MISMATCH"
-	case ShmemErrInvalidConfig:
+	case ShmErrInvalidConfig:
 		return "INVALID_CONFIG"
-	case ShmemErrTimeout:
+	case ShmErrTimeout:
 		return "TIMEOUT"
-	case ShmemErrResourceExhausted:
+	case ShmErrResourceExhausted:
 		return "RESOURCE_EXHAUSTED"
 	default:
 		return "UNKNOWN"
@@ -93,12 +93,12 @@ func (e *ShmemError) codeName() string {
 }
 
 // IsRetryable returns true if this error type should trigger a retry.
-func (e *ShmemError) IsRetryable() bool {
+func (e *ShmError) IsRetryable() bool {
 	switch e.Code {
-	case ShmemErrSegmentNotFound, ShmemErrPermissionDenied, ShmemErrConnectionRefused,
-		ShmemErrTimeout, ShmemErrResourceExhausted, ShmemErrUnknown:
+	case ShmErrSegmentNotFound, ShmErrPermissionDenied, ShmErrConnectionRefused,
+		ShmErrTimeout, ShmErrResourceExhausted, ShmErrUnknown:
 		return true
-	case ShmemErrProtocolMismatch, ShmemErrInvalidConfig:
+	case ShmErrProtocolMismatch, ShmErrInvalidConfig:
 		return false
 	default:
 		return true
@@ -106,57 +106,57 @@ func (e *ShmemError) IsRetryable() bool {
 }
 
 // IsPermanent returns true if this error type is permanent and should not be retried.
-func (e *ShmemError) IsPermanent() bool {
+func (e *ShmError) IsPermanent() bool {
 	switch e.Code {
-	case ShmemErrProtocolMismatch, ShmemErrInvalidConfig:
+	case ShmErrProtocolMismatch, ShmErrInvalidConfig:
 		return true
 	default:
 		return false
 	}
 }
 
-// NewShmemError creates a new ShmemError.
-func NewShmemError(code ShmemErrorCode, message string) *ShmemError {
-	return &ShmemError{
+// NewShmError creates a new ShmError.
+func NewShmError(code ShmErrorCode, message string) *ShmError {
+	return &ShmError{
 		Code:    code,
 		Message: message,
 	}
 }
 
-// NewShmemErrorWithCause creates a new ShmemError with an underlying cause.
-func NewShmemErrorWithCause(code ShmemErrorCode, message string, cause error) *ShmemError {
-	return &ShmemError{
+// NewShmErrorWithCause creates a new ShmError with an underlying cause.
+func NewShmErrorWithCause(code ShmErrorCode, message string, cause error) *ShmError {
+	return &ShmError{
 		Code:    code,
 		Message: message,
 		Cause:   cause,
 	}
 }
 
-// IsShmemErrorRetryable checks if an error is a retryable shmem error.
+// IsShmErrorRetryable checks if an error is a retryable shm error.
 // Generic errors are considered retryable by default.
-func IsShmemErrorRetryable(err error) bool {
+func IsShmErrorRetryable(err error) bool {
 	if err == nil {
 		return false
 	}
 
-	var shmemErr *ShmemError
-	if errors.As(err, &shmemErr) {
-		return shmemErr.IsRetryable()
+	var ShmErr *ShmError
+	if errors.As(err, &ShmErr) {
+		return ShmErr.IsRetryable()
 	}
 
 	// Generic errors are retryable (might be transient)
 	return true
 }
 
-// IsShmemErrorPermanent checks if an error is a permanent shmem error.
-func IsShmemErrorPermanent(err error) bool {
+// IsShmErrorPermanent checks if an error is a permanent shm error.
+func IsShmErrorPermanent(err error) bool {
 	if err == nil {
 		return false
 	}
 
-	var shmemErr *ShmemError
-	if errors.As(err, &shmemErr) {
-		return shmemErr.IsPermanent()
+	var ShmErr *ShmError
+	if errors.As(err, &ShmErr) {
+		return ShmErr.IsPermanent()
 	}
 
 	// Generic errors are not permanent
@@ -167,24 +167,24 @@ func IsShmemErrorPermanent(err error) bool {
 type FallbackResult struct {
 	// ShouldFallback indicates whether to fall back to HTTP/2.
 	ShouldFallback bool
-	// Error is set if fallback is not allowed and shmem failed.
+	// Error is set if fallback is not allowed and shm failed.
 	Error error
-	// OriginalError is the original shmem error.
+	// OriginalError is the original shm error.
 	OriginalError error
 }
 
-// ShmemFallbackHandler handles fallback logic when shmem transport fails.
-type ShmemFallbackHandler struct {
+// ShmFallbackHandler handles fallback logic when shm transport fails.
+type ShmFallbackHandler struct {
 	fallbackCount atomic.Int64
 }
 
-// NewShmemFallbackHandler creates a new fallback handler.
-func NewShmemFallbackHandler() *ShmemFallbackHandler {
-	return &ShmemFallbackHandler{}
+// NewShmFallbackHandler creates a new fallback handler.
+func NewShmFallbackHandler() *ShmFallbackHandler {
+	return &ShmFallbackHandler{}
 }
 
-// HandleShmemError determines whether to fall back to HTTP/2 after a shmem error.
-func (h *ShmemFallbackHandler) HandleShmemError(err error, fallbackAllowed bool) FallbackResult {
+// HandleShmError determines whether to fall back to HTTP/2 after a shm error.
+func (h *ShmFallbackHandler) HandleShmError(err error, fallbackAllowed bool) FallbackResult {
 	if err == nil {
 		return FallbackResult{
 			ShouldFallback: false,
@@ -204,18 +204,18 @@ func (h *ShmemFallbackHandler) HandleShmemError(err error, fallbackAllowed bool)
 	// Fallback not allowed - return the error
 	return FallbackResult{
 		ShouldFallback: false,
-		Error:          fmt.Errorf("shmem transport failed and fallback not allowed: %w", err),
+		Error:          fmt.Errorf("shm transport failed and fallback not allowed: %w", err),
 		OriginalError:  err,
 	}
 }
 
 // FallbackCount returns the number of fallbacks that have occurred.
-func (h *ShmemFallbackHandler) FallbackCount() int64 {
+func (h *ShmFallbackHandler) FallbackCount() int64 {
 	return h.fallbackCount.Load()
 }
 
 // ResetMetrics resets the fallback counter.
-func (h *ShmemFallbackHandler) ResetMetrics() {
+func (h *ShmFallbackHandler) ResetMetrics() {
 	h.fallbackCount.Store(0)
 }
 
@@ -223,11 +223,11 @@ func (h *ShmemFallbackHandler) ResetMetrics() {
 // This is called by TransportSelector when a transport error occurs.
 func (s *TransportSelector) HandleTransportError(err error, addr resolver.Address) FallbackResult {
 	if s.fallbackHandler == nil {
-		s.fallbackHandler = NewShmemFallbackHandler()
+		s.fallbackHandler = NewShmFallbackHandler()
 	}
 
 	fallbackAllowed := IsFallbackAllowed(addr)
-	return s.fallbackHandler.HandleShmemError(err, fallbackAllowed)
+	return s.fallbackHandler.HandleShmError(err, fallbackAllowed)
 }
 
 // TransportDialer is an interface for dialing transports.
@@ -244,41 +244,41 @@ type TransportCreatorResult struct {
 
 // FallbackTransportCreator creates transports with fallback support.
 type FallbackTransportCreator struct {
-	shmemDialer   TransportDialer
+	ShmDialer   TransportDialer
 	http2Dialer   TransportDialer
 	selector      *TransportSelector
-	fallbackHandler *ShmemFallbackHandler
+	fallbackHandler *ShmFallbackHandler
 }
 
 // NewFallbackTransportCreator creates a new fallback-aware transport creator.
-func NewFallbackTransportCreator(shmemDialer, http2Dialer TransportDialer) *FallbackTransportCreator {
+func NewFallbackTransportCreator(ShmDialer, http2Dialer TransportDialer) *FallbackTransportCreator {
 	return &FallbackTransportCreator{
-		shmemDialer:     shmemDialer,
+		ShmDialer:     ShmDialer,
 		http2Dialer:     http2Dialer,
 		selector:        NewTransportSelector(nil),
-		fallbackHandler: NewShmemFallbackHandler(),
+		fallbackHandler: NewShmFallbackHandler(),
 	}
 }
 
 // CreateTransport creates a transport for the given address, falling back if necessary.
 func (c *FallbackTransportCreator) CreateTransport(ctx context.Context, addr resolver.Address) (*TransportCreatorResult, error) {
-	// Check if shmem should be attempted
+	// Check if shm should be attempted
 	transportType := c.selector.SelectTransport(addr)
 
-	if transportType == TransportTypeShmem {
-		// Try shmem first
-		transport, err := c.shmemDialer.Dial(ctx, addr)
+	if transportType == TransportTypeShm {
+		// Try shm first
+		transport, err := c.ShmDialer.Dial(ctx, addr)
 		if err == nil {
 			return &TransportCreatorResult{
 				Transport:     transport,
-				TransportName: "shmem",
+				TransportName: "Shm",
 				WasFallback:   false,
 			}, nil
 		}
 
-		// Shmem failed - check if fallback is allowed
+		// shm failed - check if fallback is allowed
 		fallbackAllowed := IsFallbackAllowed(addr)
-		result := c.fallbackHandler.HandleShmemError(err, fallbackAllowed)
+		result := c.fallbackHandler.HandleShmError(err, fallbackAllowed)
 
 		if !result.ShouldFallback {
 			return nil, result.Error
@@ -287,7 +287,7 @@ func (c *FallbackTransportCreator) CreateTransport(ctx context.Context, addr res
 		// Fall back to HTTP/2
 		transport, err = c.http2Dialer.Dial(ctx, addr)
 		if err != nil {
-			return nil, fmt.Errorf("http2 fallback also failed: %w (original shmem error: %v)",
+			return nil, fmt.Errorf("http2 fallback also failed: %w (original shm error: %v)",
 				err, result.OriginalError)
 		}
 

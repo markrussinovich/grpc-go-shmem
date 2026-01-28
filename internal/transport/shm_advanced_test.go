@@ -69,7 +69,7 @@ func TestShmPingPongSizes(t *testing.T) {
 			}
 			defer lis.Close()
 
-			// Server responder goroutine (HEADERS→echo MESSAGE→TRAILERS OK)
+			// Server responder goroutine (HEADERSâ†’echo MESSAGEâ†’TRAILERS OK)
 			go func() {
 				c, err := lis.Accept()
 				if err != nil {

@@ -26,32 +26,32 @@ import (
 	"google.golang.org/grpc/resolver"
 )
 
-func TestShmemCapabilitySetGet(t *testing.T) {
+func TestShmCapabilitySetGet(t *testing.T) {
 	addr := resolver.Address{
 		Addr:       "shm:test_segment",
 		ServerName: "test_segment",
 	}
 
 	// Initially no capability
-	if cap := GetShmemCapability(addr); cap != nil {
+	if cap := GetShmCapability(addr); cap != nil {
 		t.Error("Expected nil capability for address without attributes")
 	}
-	if IsShmemEnabled(addr) {
-		t.Error("Expected IsShmemEnabled to be false for address without attributes")
+	if IsShmEnabled(addr) {
+		t.Error("Expected IsShmEnabled to be false for address without attributes")
 	}
 
 	// Set capability
-	cap := ShmemCapability{
+	cap := ShmCapability{
 		Enabled:     true,
 		SegmentName: "my_segment",
 		Preferred:   true,
 	}
-	addr = SetShmemCapability(addr, cap)
+	addr = SetShmCapability(addr, cap)
 
 	// Retrieve and verify
-	got := GetShmemCapability(addr)
+	got := GetShmCapability(addr)
 	if got == nil {
-		t.Fatal("Expected non-nil capability after SetShmemCapability")
+		t.Fatal("Expected non-nil capability after SetShmCapability")
 	}
 	if got.Enabled != cap.Enabled {
 		t.Errorf("Enabled: got %v, want %v", got.Enabled, cap.Enabled)
@@ -64,65 +64,65 @@ func TestShmemCapabilitySetGet(t *testing.T) {
 	}
 
 	// Helper functions
-	if !IsShmemEnabled(addr) {
-		t.Error("Expected IsShmemEnabled to be true")
+	if !IsShmEnabled(addr) {
+		t.Error("Expected IsShmEnabled to be true")
 	}
-	if !IsShmemPreferred(addr) {
-		t.Error("Expected IsShmemPreferred to be true")
+	if !IsShmPreferred(addr) {
+		t.Error("Expected IsShmPreferred to be true")
 	}
 }
 
-func TestShmemCapabilityDisabled(t *testing.T) {
+func TestShmCapabilityDisabled(t *testing.T) {
 	addr := resolver.Address{Addr: "tcp:localhost:8080"}
-	cap := ShmemCapability{
+	cap := ShmCapability{
 		Enabled:     false,
 		SegmentName: "",
 		Preferred:   false,
 	}
-	addr = SetShmemCapability(addr, cap)
+	addr = SetShmCapability(addr, cap)
 
-	if IsShmemEnabled(addr) {
-		t.Error("Expected IsShmemEnabled to be false when Enabled=false")
+	if IsShmEnabled(addr) {
+		t.Error("Expected IsShmEnabled to be false when Enabled=false")
 	}
-	if IsShmemPreferred(addr) {
-		t.Error("Expected IsShmemPreferred to be false when Preferred=false")
+	if IsShmPreferred(addr) {
+		t.Error("Expected IsShmPreferred to be false when Preferred=false")
 	}
 }
 
-func TestShmemCapabilityEqual(t *testing.T) {
+func TestShmCapabilityEqual(t *testing.T) {
 	tests := []struct {
 		name  string
-		a, b  ShmemCapability
+		a, b  ShmCapability
 		equal bool
 	}{
 		{
 			name:  "identical",
-			a:     ShmemCapability{Enabled: true, SegmentName: "seg", Preferred: true, Required: false},
-			b:     ShmemCapability{Enabled: true, SegmentName: "seg", Preferred: true, Required: false},
+			a:     ShmCapability{Enabled: true, SegmentName: "seg", Preferred: true, Required: false},
+			b:     ShmCapability{Enabled: true, SegmentName: "seg", Preferred: true, Required: false},
 			equal: true,
 		},
 		{
 			name:  "different enabled",
-			a:     ShmemCapability{Enabled: true, SegmentName: "seg"},
-			b:     ShmemCapability{Enabled: false, SegmentName: "seg"},
+			a:     ShmCapability{Enabled: true, SegmentName: "seg"},
+			b:     ShmCapability{Enabled: false, SegmentName: "seg"},
 			equal: false,
 		},
 		{
 			name:  "different segment",
-			a:     ShmemCapability{Enabled: true, SegmentName: "seg1"},
-			b:     ShmemCapability{Enabled: true, SegmentName: "seg2"},
+			a:     ShmCapability{Enabled: true, SegmentName: "seg1"},
+			b:     ShmCapability{Enabled: true, SegmentName: "seg2"},
 			equal: false,
 		},
 		{
 			name:  "different preferred",
-			a:     ShmemCapability{Enabled: true, Preferred: true},
-			b:     ShmemCapability{Enabled: true, Preferred: false},
+			a:     ShmCapability{Enabled: true, Preferred: true},
+			b:     ShmCapability{Enabled: true, Preferred: false},
 			equal: false,
 		},
 		{
 			name:  "different required",
-			a:     ShmemCapability{Enabled: true, Required: true},
-			b:     ShmemCapability{Enabled: true, Required: false},
+			a:     ShmCapability{Enabled: true, Required: true},
+			b:     ShmCapability{Enabled: true, Required: false},
 			equal: false,
 		},
 	}
@@ -136,56 +136,56 @@ func TestShmemCapabilityEqual(t *testing.T) {
 	}
 }
 
-func TestShmemTransportHintSetGet(t *testing.T) {
+func TestShmTransportHintSetGet(t *testing.T) {
 	addr := resolver.Address{Addr: "shm:test"}
 
 	// Initially no hint
-	if hint := GetShmemTransportHint(addr); hint != nil {
+	if hint := GetShmTransportHint(addr); hint != nil {
 		t.Error("Expected nil hint for address without attributes")
 	}
 
 	// Set hint
-	hint := ShmemTransportHint{
-		PreferShmem:     true,
+	hint := ShmTransportHint{
+		PreferShm:       true,
 		FallbackAllowed: true,
 	}
-	addr = SetShmemTransportHint(addr, hint)
+	addr = SetShmTransportHint(addr, hint)
 
 	// Retrieve and verify
-	got := GetShmemTransportHint(addr)
+	got := GetShmTransportHint(addr)
 	if got == nil {
-		t.Fatal("Expected non-nil hint after SetShmemTransportHint")
+		t.Fatal("Expected non-nil hint after SetShmTransportHint")
 	}
-	if got.PreferShmem != hint.PreferShmem {
-		t.Errorf("PreferShmem: got %v, want %v", got.PreferShmem, hint.PreferShmem)
+	if got.PreferShm != hint.PreferShm {
+		t.Errorf("PreferShm: got %v, want %v", got.PreferShm, hint.PreferShm)
 	}
 	if got.FallbackAllowed != hint.FallbackAllowed {
 		t.Errorf("FallbackAllowed: got %v, want %v", got.FallbackAllowed, hint.FallbackAllowed)
 	}
 }
 
-func TestShmemTransportHintEqual(t *testing.T) {
+func TestShmTransportHintEqual(t *testing.T) {
 	tests := []struct {
 		name  string
-		a, b  ShmemTransportHint
+		a, b  ShmTransportHint
 		equal bool
 	}{
 		{
 			name:  "identical",
-			a:     ShmemTransportHint{PreferShmem: true, FallbackAllowed: true},
-			b:     ShmemTransportHint{PreferShmem: true, FallbackAllowed: true},
+			a:     ShmTransportHint{PreferShm: true, FallbackAllowed: true},
+			b:     ShmTransportHint{PreferShm: true, FallbackAllowed: true},
 			equal: true,
 		},
 		{
 			name:  "different prefer",
-			a:     ShmemTransportHint{PreferShmem: true},
-			b:     ShmemTransportHint{PreferShmem: false},
+			a:     ShmTransportHint{PreferShm: true},
+			b:     ShmTransportHint{PreferShm: false},
 			equal: false,
 		},
 		{
 			name:  "different fallback",
-			a:     ShmemTransportHint{FallbackAllowed: true},
-			b:     ShmemTransportHint{FallbackAllowed: false},
+			a:     ShmTransportHint{FallbackAllowed: true},
+			b:     ShmTransportHint{FallbackAllowed: false},
 			equal: false,
 		},
 	}
@@ -203,15 +203,15 @@ func TestCombinedAttributes(t *testing.T) {
 	// Test that both capability and hint can coexist on the same address
 	addr := resolver.Address{Addr: "shm:combined_test"}
 
-	cap := ShmemCapability{Enabled: true, SegmentName: "combined", Preferred: true}
-	hint := ShmemTransportHint{PreferShmem: true, FallbackAllowed: true}
+	cap := ShmCapability{Enabled: true, SegmentName: "combined", Preferred: true}
+	hint := ShmTransportHint{PreferShm: true, FallbackAllowed: true}
 
-	addr = SetShmemCapability(addr, cap)
-	addr = SetShmemTransportHint(addr, hint)
+	addr = SetShmCapability(addr, cap)
+	addr = SetShmTransportHint(addr, hint)
 
 	// Both should be retrievable
-	gotCap := GetShmemCapability(addr)
-	gotHint := GetShmemTransportHint(addr)
+	gotCap := GetShmCapability(addr)
+	gotHint := GetShmTransportHint(addr)
 
 	if gotCap == nil || gotHint == nil {
 		t.Fatal("Both capability and hint should be present")
@@ -219,31 +219,31 @@ func TestCombinedAttributes(t *testing.T) {
 	if gotCap.SegmentName != "combined" {
 		t.Errorf("Capability segment: got %q, want %q", gotCap.SegmentName, "combined")
 	}
-	if !gotHint.PreferShmem {
-		t.Error("Hint PreferShmem should be true")
+	if !gotHint.PreferShm {
+		t.Error("Hint PreferShm should be true")
 	}
 }
 
-func TestShmemCapabilityString(t *testing.T) {
+func TestShmCapabilityString(t *testing.T) {
 	tests := []struct {
 		name string
-		cap  ShmemCapability
+		cap  ShmCapability
 		want string
 	}{
 		{
 			name: "enabled and preferred",
-			cap:  ShmemCapability{Enabled: true, SegmentName: "my_seg", Preferred: true},
-			want: `ShmemCapability{Enabled:true, SegmentName:"my_seg", Preferred:true, Required:false}`,
+			cap:  ShmCapability{Enabled: true, SegmentName: "my_seg", Preferred: true},
+			want: `ShmCapability{Enabled:true, SegmentName:"my_seg", Preferred:true, Required:false}`,
 		},
 		{
 			name: "disabled",
-			cap:  ShmemCapability{Enabled: false, SegmentName: "", Preferred: false},
-			want: `ShmemCapability{Enabled:false, SegmentName:"", Preferred:false, Required:false}`,
+			cap:  ShmCapability{Enabled: false, SegmentName: "", Preferred: false},
+			want: `ShmCapability{Enabled:false, SegmentName:"", Preferred:false, Required:false}`,
 		},
 		{
 			name: "with required",
-			cap:  ShmemCapability{Enabled: true, SegmentName: "seg", Preferred: true, Required: true},
-			want: `ShmemCapability{Enabled:true, SegmentName:"seg", Preferred:true, Required:true}`,
+			cap:  ShmCapability{Enabled: true, SegmentName: "seg", Preferred: true, Required: true},
+			want: `ShmCapability{Enabled:true, SegmentName:"seg", Preferred:true, Required:true}`,
 		},
 	}
 	for _, tt := range tests {
@@ -256,19 +256,19 @@ func TestShmemCapabilityString(t *testing.T) {
 	}
 }
 
-func TestShmemTransportHintString(t *testing.T) {
-	hint := ShmemTransportHint{PreferShmem: true, FallbackAllowed: false}
-	want := `ShmemTransportHint{PreferShmem:true, FallbackAllowed:false}`
+func TestShmTransportHintString(t *testing.T) {
+	hint := ShmTransportHint{PreferShm: true, FallbackAllowed: false}
+	want := `ShmTransportHint{PreferShm:true, FallbackAllowed:false}`
 	got := hint.String()
 	if got != want {
 		t.Errorf("String(): got %q, want %q", got, want)
 	}
 }
 
-func TestShmemCapabilityEqualWrongType(t *testing.T) {
-	cap := ShmemCapability{Enabled: true, SegmentName: "seg", Preferred: true}
+func TestShmCapabilityEqualWrongType(t *testing.T) {
+	cap := ShmCapability{Enabled: true, SegmentName: "seg", Preferred: true}
 	// Equal should return false for wrong type
-	if cap.Equal("not a ShmemCapability") {
+	if cap.Equal("not a ShmCapability") {
 		t.Error("Equal(string) should return false")
 	}
 	if cap.Equal(42) {
@@ -279,33 +279,33 @@ func TestShmemCapabilityEqualWrongType(t *testing.T) {
 	}
 }
 
-func TestShmemTransportHintEqualWrongType(t *testing.T) {
-	hint := ShmemTransportHint{PreferShmem: true}
+func TestShmTransportHintEqualWrongType(t *testing.T) {
+	hint := ShmTransportHint{PreferShm: true}
 	if hint.Equal("wrong type") {
 		t.Error("Equal(string) should return false")
 	}
-	if hint.Equal(ShmemCapability{Enabled: true}) {
-		t.Error("Equal(ShmemCapability) should return false")
+	if hint.Equal(ShmCapability{Enabled: true}) {
+		t.Error("Equal(ShmCapability) should return false")
 	}
 }
 
-func TestGetShmemCapabilityWrongType(t *testing.T) {
+func TestGetShmCapabilityWrongType(t *testing.T) {
 	// Test retrieving when attribute contains wrong type
 	addr := resolver.Address{Addr: "test"}
 	// Manually set wrong type in attributes
-	addr.Attributes = addr.Attributes.WithValue(ShmemLocalityKey{}, "wrong type")
+	addr.Attributes = addr.Attributes.WithValue(ShmLocalityKey{}, "wrong type")
 
-	cap := GetShmemCapability(addr)
+	cap := GetShmCapability(addr)
 	if cap != nil {
 		t.Error("Expected nil when attribute has wrong type")
 	}
 }
 
-func TestGetShmemTransportHintWrongType(t *testing.T) {
+func TestGetShmTransportHintWrongType(t *testing.T) {
 	addr := resolver.Address{Addr: "test"}
-	addr.Attributes = addr.Attributes.WithValue(ShmemTransportHintKey{}, 12345)
+	addr.Attributes = addr.Attributes.WithValue(ShmTransportHintKey{}, 12345)
 
-	hint := GetShmemTransportHint(addr)
+	hint := GetShmTransportHint(addr)
 	if hint != nil {
 		t.Error("Expected nil when attribute has wrong type")
 	}
