@@ -27,6 +27,7 @@ import (
 	"net"
 	"time"
 
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/keepalive"
 )
 
@@ -46,6 +47,10 @@ type DialOptions struct {
 
 	// KeepaliveParams stores the keepalive parameters for the client.
 	KeepaliveParams keepalive.ClientParameters
+
+	// Handshaker is the security handshaker for the client.
+	// If nil, no security handshake is performed.
+	Handshaker *ShmSecurityHandshaker
 }
 
 // DefaultDialOptions returns sensible defaults for dialing
@@ -142,10 +147,43 @@ func DialShm(ctx context.Context, addr string, opts *DialOptions) (ClientTranspo
 
 		localAddr := &ShmAddr{Name: segName + "_client"}
 		remoteAddr := &ShmAddr{Name: segName}
+
+		// Perform security handshake if configured
+		var authInfo credentials.AuthInfo
+		if opts.Handshaker != nil {
+			// Create rings for handshake - client writes to A, reads from B
+			txRing := NewShmRingFromSegment(segment.A, segment.Mem)
+			rxRing := NewShmRingFromSegment(segment.B, segment.Mem)
+
+			// Open events for rings (Windows)
+			txEvents, _ := OpenRingEvents(segName, "A")
+			rxEvents, _ := OpenRingEvents(segName, "B")
+			txRing.SetEvents(txEvents)
+			rxRing.SetEvents(rxEvents)
+
+			hsCtx, hsCancel := context.WithTimeout(ctx, HandshakeTimeout)
+			authInfo, err = opts.Handshaker.ClientHandshake(hsCtx, rxRing, txRing)
+			hsCancel()
+			if err != nil {
+				if txEvents != nil {
+					txEvents.Close()
+				}
+				if rxEvents != nil {
+					rxEvents.Close()
+				}
+				segment.Close()
+				return nil, NewShmErrorWithCause(ShmErrUnknown, "security handshake failed", err)
+			}
+		}
+
 		clientTransport, err := NewShmClientTransport(segment, localAddr, remoteAddr)
 		if err != nil {
 			segment.Close()
 			return nil, NewShmErrorWithCause(ShmErrUnknown, "failed to create client transport", err)
+		}
+		// Store auth info on transport
+		if authInfo != nil {
+			clientTransport.SetAuthInfo(authInfo)
 		}
 		// Configure keepalive if params are provided.
 		clientTransport.ConfigureKeepalive(opts.KeepaliveParams)
@@ -183,11 +221,13 @@ func (d *ShmDialer) Dial(ctx context.Context, addr string) (net.Conn, error) {
 		return nil, err
 	}
 
+	shmTransport := clientTransport.(*ShmClientTransport)
 	// Wrap the transport in a connection-like interface
 	return &shmClientConn{
-		transport:  clientTransport.(*ShmClientTransport),
-		localAddr:  clientTransport.(*ShmClientTransport).localAddr,
-		remoteAddr: clientTransport.(*ShmClientTransport).remoteAddr,
+		transport:  shmTransport,
+		localAddr:  shmTransport.localAddr,
+		remoteAddr: shmTransport.remoteAddr,
+		authInfo:   shmTransport.GetAuthInfo(),
 	}, nil
 }
 
@@ -197,6 +237,7 @@ type shmClientConn struct {
 	localAddr  net.Addr
 	remoteAddr net.Addr
 	closed     bool
+	authInfo   credentials.AuthInfo
 }
 
 // Read implements net.Conn - not used directly in gRPC
@@ -253,4 +294,10 @@ func (c *shmClientConn) SetWriteDeadline(_ time.Time) error {
 // GetClientTransport returns the underlying client transport
 func (c *shmClientConn) GetClientTransport() ClientTransport {
 	return c.transport
+}
+
+// AuthInfo returns the authentication information for this connection.
+// This is set after a successful security handshake.
+func (c *shmClientConn) AuthInfo() credentials.AuthInfo {
+	return c.authInfo
 }

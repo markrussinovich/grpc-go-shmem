@@ -30,6 +30,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/keepalive"
 )
 
@@ -79,6 +80,9 @@ type ShmListener struct {
 	// Keepalive configuration for server transports
 	kp  keepalive.ServerParameters
 	kep keepalive.EnforcementPolicy
+
+	// Security handshake configuration
+	handshaker *ShmSecurityHandshaker
 }
 
 // shmConn represents a shared memory connection
@@ -100,6 +104,9 @@ type shmConn struct {
 	established atomic.Bool
 	closed      atomic.Bool
 	closeOnce   sync.Once
+
+	// Security handshake result
+	authInfo credentials.AuthInfo
 }
 
 // NewShmListener creates a new shared memory listener
@@ -260,6 +267,27 @@ func (l *ShmListener) Accept() (net.Conn, error) {
 			writeEvents: writeEvents,
 		}
 
+		// Perform security handshake if configured
+		l.mu.RLock()
+		handshaker := l.handshaker
+		l.mu.RUnlock()
+		if handshaker != nil {
+			hsCtx, hsCancel := context.WithTimeout(l.ctx, HandshakeTimeout)
+			authInfo, err := handshaker.ServerHandshake(hsCtx, readRing, writeRing)
+			hsCancel()
+			if err != nil {
+				if readEvents != nil {
+					readEvents.Close()
+				}
+				if writeEvents != nil {
+					writeEvents.Close()
+				}
+				segment.Close()
+				return nil, fmt.Errorf("security handshake failed: %v", err)
+			}
+			conn.authInfo = authInfo
+		}
+
 		serverTransport, err := NewShmServerTransport(segment, l.addr, conn.remoteAddr)
 		if err != nil {
 			l.mu.Lock()
@@ -331,6 +359,15 @@ func (l *ShmListener) SetKeepaliveParams(kp keepalive.ServerParameters, kep keep
 	defer l.mu.Unlock()
 	l.kp = kp
 	l.kep = kep
+}
+
+// SetHandshaker sets the security handshaker for server transports.
+// This must be called before Accept is called.
+// If nil, no security handshake is performed.
+func (l *ShmListener) SetHandshaker(h *ShmSecurityHandshaker) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.handshaker = h
 }
 
 // shmConn net.Conn implementation
@@ -428,4 +465,10 @@ func (c *shmConn) ReadRing() *ShmRing {
 // For tests that need direct ring access.
 func (c *shmConn) WriteRing() *ShmRing {
 	return c.writeRing
+}
+
+// AuthInfo returns the authentication information for this connection.
+// This is set after a successful security handshake.
+func (c *shmConn) AuthInfo() credentials.AuthInfo {
+	return c.authInfo
 }

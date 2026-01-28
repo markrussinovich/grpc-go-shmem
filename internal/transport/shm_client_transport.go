@@ -33,6 +33,7 @@ import (
 
 	"golang.org/x/net/http2"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/internal/grpcutil"
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/mem"
@@ -110,6 +111,9 @@ type ShmClientTransport struct {
 	// This is used by ClientConn/addrConn to track connectivity state.
 	// RFC A73: Required for proper subchannel lifecycle management.
 	onClose func(GoAwayReason)
+
+	// authInfo stores the authentication information from security handshake.
+	authInfo credentials.AuthInfo
 }
 
 func (t *ShmClientTransport) setGoAwayReason(flags uint8, debug string) {
@@ -297,6 +301,20 @@ func (t *ShmClientTransport) ConfigureKeepalive(kp keepalive.ClientParameters) {
 		t.keepaliveEnabled = true
 		go t.keepalive()
 	}
+}
+
+// SetAuthInfo sets the authentication information from security handshake.
+func (t *ShmClientTransport) SetAuthInfo(authInfo credentials.AuthInfo) {
+	t.mu.Lock()
+	t.authInfo = authInfo
+	t.mu.Unlock()
+}
+
+// GetAuthInfo returns the authentication information from security handshake.
+func (t *ShmClientTransport) GetAuthInfo() credentials.AuthInfo {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.authInfo
 }
 
 // processIncomingData reads data from the server->client ring and processes gRPC frames
