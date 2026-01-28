@@ -2,7 +2,7 @@
 
 /*
  *
- * Copyright 2025 gRPC authors.
+ * Copyright 2026 gRPC authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -314,5 +314,57 @@ func TestShmemServiceConfigMarshalJSON(t *testing.T) {
 	}
 	if parsed.MaxConcurrentStreams != cfg.MaxConcurrentStreams {
 		t.Errorf("MaxConcurrentStreams round-trip: got %d, want %d", parsed.MaxConcurrentStreams, cfg.MaxConcurrentStreams)
+	}
+}
+
+func TestShmemServiceConfigString(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  *ShmemServiceConfig
+		want string
+	}{
+		{
+			name: "nil config",
+			cfg:  nil,
+			want: "ShmemServiceConfig{nil}",
+		},
+		{
+			name: "basic config",
+			cfg:  &ShmemServiceConfig{Policy: ShmemPolicyPreferred},
+			want: `ShmemServiceConfig{Policy:"preferred", SegmentSize:0, RingBufferSize:0, Fallback:nil, MaxStreams:0}`,
+		},
+		{
+			name: "full config",
+			cfg: &ShmemServiceConfig{
+				Policy:              ShmemPolicyRequired,
+				SegmentSizeBytes:    1048576,
+				RingBufferSizeBytes: 65536,
+				FallbackEnabled:     boolPtr(false),
+				MaxConcurrentStreams: 50,
+			},
+			want: `ShmemServiceConfig{Policy:"required", SegmentSize:1048576, RingBufferSize:65536, Fallback:false, MaxStreams:50}`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := tt.cfg.String()
+			if got != tt.want {
+				t.Errorf("String(): got %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestShmemServiceConfigUnknownPolicy(t *testing.T) {
+	// Test ShouldUseShmem with unknown policy (should default to auto behavior)
+	cfg := &ShmemServiceConfig{Policy: "unknown_policy"}
+	
+	// With capability, should use shmem (auto behavior)
+	if !cfg.ShouldUseShmem(true) {
+		t.Error("Unknown policy should default to auto behavior (use shmem when capable)")
+	}
+	// Without capability, should not use shmem
+	if cfg.ShouldUseShmem(false) {
+		t.Error("Unknown policy should default to auto behavior (don't use shmem when not capable)")
 	}
 }

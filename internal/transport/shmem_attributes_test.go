@@ -2,7 +2,7 @@
 
 /*
  *
- * Copyright 2025 gRPC authors.
+ * Copyright 2026 gRPC authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -215,5 +215,87 @@ func TestCombinedAttributes(t *testing.T) {
 	}
 	if !gotHint.PreferShmem {
 		t.Error("Hint PreferShmem should be true")
+	}
+}
+
+func TestShmemCapabilityString(t *testing.T) {
+	tests := []struct {
+		name string
+		cap  ShmemCapability
+		want string
+	}{
+		{
+			name: "enabled and preferred",
+			cap:  ShmemCapability{Enabled: true, SegmentName: "my_seg", Preferred: true},
+			want: `ShmemCapability{Enabled:true, SegmentName:"my_seg", Preferred:true}`,
+		},
+		{
+			name: "disabled",
+			cap:  ShmemCapability{Enabled: false, SegmentName: "", Preferred: false},
+			want: `ShmemCapability{Enabled:false, SegmentName:"", Preferred:false}`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := tt.cap.String()
+			if got != tt.want {
+				t.Errorf("String(): got %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestShmemTransportHintString(t *testing.T) {
+	hint := ShmemTransportHint{PreferShmem: true, FallbackAllowed: false}
+	want := `ShmemTransportHint{PreferShmem:true, FallbackAllowed:false}`
+	got := hint.String()
+	if got != want {
+		t.Errorf("String(): got %q, want %q", got, want)
+	}
+}
+
+func TestShmemCapabilityEqualWrongType(t *testing.T) {
+	cap := ShmemCapability{Enabled: true, SegmentName: "seg", Preferred: true}
+	// Equal should return false for wrong type
+	if cap.Equal("not a ShmemCapability") {
+		t.Error("Equal(string) should return false")
+	}
+	if cap.Equal(42) {
+		t.Error("Equal(int) should return false")
+	}
+	if cap.Equal(nil) {
+		t.Error("Equal(nil) should return false")
+	}
+}
+
+func TestShmemTransportHintEqualWrongType(t *testing.T) {
+	hint := ShmemTransportHint{PreferShmem: true}
+	if hint.Equal("wrong type") {
+		t.Error("Equal(string) should return false")
+	}
+	if hint.Equal(ShmemCapability{Enabled: true}) {
+		t.Error("Equal(ShmemCapability) should return false")
+	}
+}
+
+func TestGetShmemCapabilityWrongType(t *testing.T) {
+	// Test retrieving when attribute contains wrong type
+	addr := resolver.Address{Addr: "test"}
+	// Manually set wrong type in attributes
+	addr.Attributes = addr.Attributes.WithValue(ShmemLocalityKey{}, "wrong type")
+
+	cap := GetShmemCapability(addr)
+	if cap != nil {
+		t.Error("Expected nil when attribute has wrong type")
+	}
+}
+
+func TestGetShmemTransportHintWrongType(t *testing.T) {
+	addr := resolver.Address{Addr: "test"}
+	addr.Attributes = addr.Attributes.WithValue(ShmemTransportHintKey{}, 12345)
+
+	hint := GetShmemTransportHint(addr)
+	if hint != nil {
+		t.Error("Expected nil when attribute has wrong type")
 	}
 }

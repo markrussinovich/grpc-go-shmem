@@ -2,7 +2,7 @@
 
 /*
  *
- * Copyright 2025 gRPC authors.
+ * Copyright 2026 gRPC authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -152,4 +152,17 @@ func (c *ShmemServiceConfig) Validate() error {
 	}
 
 	return nil
+}
+
+// String implements fmt.Stringer for debugging.
+func (c *ShmemServiceConfig) String() string {
+	if c == nil {
+		return "ShmemServiceConfig{nil}"
+	}
+	fallback := "nil"
+	if c.FallbackEnabled != nil {
+		fallback = fmt.Sprintf("%v", *c.FallbackEnabled)
+	}
+	return fmt.Sprintf("ShmemServiceConfig{Policy:%q, SegmentSize:%d, RingBufferSize:%d, Fallback:%s, MaxStreams:%d}",
+		c.Policy, c.SegmentSizeBytes, c.RingBufferSizeBytes, fallback, c.MaxConcurrentStreams)
 }

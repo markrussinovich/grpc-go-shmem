@@ -2,7 +2,7 @@
 
 /*
  *
- * Copyright 2025 gRPC authors.
+ * Copyright 2026 gRPC authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -21,6 +21,8 @@
 package transport
 
 import (
+	"fmt"
+
 	"google.golang.org/grpc/resolver"
 )
 
@@ -57,6 +59,12 @@ func (c ShmemCapability) Equal(o any) bool {
 	return c.Enabled == oc.Enabled &&
 		c.SegmentName == oc.SegmentName &&
 		c.Preferred == oc.Preferred
+}
+
+// String implements fmt.Stringer for debugging.
+func (c ShmemCapability) String() string {
+	return fmt.Sprintf("ShmemCapability{Enabled:%v, SegmentName:%q, Preferred:%v}",
+		c.Enabled, c.SegmentName, c.Preferred)
 }
 
 // GetShmemCapability extracts the ShmemCapability from the address attributes.
@@ -118,6 +126,12 @@ func (h ShmemTransportHint) Equal(o any) bool {
 		return false
 	}
 	return h.PreferShmem == oh.PreferShmem && h.FallbackAllowed == oh.FallbackAllowed
+}
+
+// String implements fmt.Stringer for debugging.
+func (h ShmemTransportHint) String() string {
+	return fmt.Sprintf("ShmemTransportHint{PreferShmem:%v, FallbackAllowed:%v}",
+		h.PreferShmem, h.FallbackAllowed)
 }
 
 // GetShmemTransportHint extracts the ShmemTransportHint from the address attributes.
