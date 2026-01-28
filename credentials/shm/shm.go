@@ -114,7 +114,7 @@ func (c *shmTC) ClientHandshake(ctx context.Context, authority string, conn net.
 	// For shared memory, the handshake is performed at the transport level
 	// using the ShmSecurityHandshaker. Here we just return the AuthInfo.
 	// The actual handshake frames are exchanged in the transport layer.
-	
+
 	// Check if AuthInfo was already set by transport-level handshake
 	if shmConn, ok := conn.(interface{ AuthInfo() credentials.AuthInfo }); ok {
 		if authInfo := shmConn.AuthInfo(); authInfo != nil {

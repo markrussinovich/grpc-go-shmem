@@ -43,13 +43,13 @@ const (
 // Handshake protocol version
 const (
 	handshakeVersion = uint8(1)
-	
+
 	// NonceSize is the size of the nonce in bytes
 	NonceSize = 16
-	
+
 	// MaxIdentitySize is the maximum size of an identity token
 	MaxIdentitySize = 256
-	
+
 	// HandshakeTimeout is the default timeout for security handshake
 	HandshakeTimeout = 5 * time.Second
 )
