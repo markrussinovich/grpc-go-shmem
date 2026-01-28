@@ -321,7 +321,8 @@ func TestShmFallbackIntegration(t *testing.T) {
 
 // TestCreateTransportWithFallback tests the createTransportWithFallback function.
 func TestCreateTransportWithFallback(t *testing.T) {
-	ctx := context.Background()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
 	tests := []struct {
 		name               string
