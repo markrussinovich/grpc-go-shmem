@@ -405,7 +405,7 @@ type mockDialer struct {
 	called   bool
 }
 
-func (m *mockDialer) Dial(ctx context.Context, addr resolver.Address) (interface{}, error) {
+func (m *mockDialer) Dial(ctx context.Context, addr resolver.Address) (any, error) {
 	m.called = true
 	if m.succeeds {
 		return &mockTransport{name: m.name}, nil

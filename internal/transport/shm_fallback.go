@@ -232,12 +232,12 @@ func (s *TransportSelector) HandleTransportError(err error, addr resolver.Addres
 
 // TransportDialer is an interface for dialing transports.
 type TransportDialer interface {
-	Dial(ctx context.Context, addr resolver.Address) (interface{}, error)
+	Dial(ctx context.Context, addr resolver.Address) (any, error)
 }
 
 // TransportCreatorResult contains the result of transport creation.
 type TransportCreatorResult struct {
-	Transport     interface{}
+	Transport     any
 	TransportName string
 	WasFallback   bool
 }
