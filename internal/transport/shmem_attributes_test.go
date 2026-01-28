@@ -97,8 +97,8 @@ func TestShmemCapabilityEqual(t *testing.T) {
 	}{
 		{
 			name:  "identical",
-			a:     ShmemCapability{Enabled: true, SegmentName: "seg", Preferred: true},
-			b:     ShmemCapability{Enabled: true, SegmentName: "seg", Preferred: true},
+			a:     ShmemCapability{Enabled: true, SegmentName: "seg", Preferred: true, Required: false},
+			b:     ShmemCapability{Enabled: true, SegmentName: "seg", Preferred: true, Required: false},
 			equal: true,
 		},
 		{
@@ -117,6 +117,12 @@ func TestShmemCapabilityEqual(t *testing.T) {
 			name:  "different preferred",
 			a:     ShmemCapability{Enabled: true, Preferred: true},
 			b:     ShmemCapability{Enabled: true, Preferred: false},
+			equal: false,
+		},
+		{
+			name:  "different required",
+			a:     ShmemCapability{Enabled: true, Required: true},
+			b:     ShmemCapability{Enabled: true, Required: false},
 			equal: false,
 		},
 	}
@@ -227,12 +233,17 @@ func TestShmemCapabilityString(t *testing.T) {
 		{
 			name: "enabled and preferred",
 			cap:  ShmemCapability{Enabled: true, SegmentName: "my_seg", Preferred: true},
-			want: `ShmemCapability{Enabled:true, SegmentName:"my_seg", Preferred:true}`,
+			want: `ShmemCapability{Enabled:true, SegmentName:"my_seg", Preferred:true, Required:false}`,
 		},
 		{
 			name: "disabled",
 			cap:  ShmemCapability{Enabled: false, SegmentName: "", Preferred: false},
-			want: `ShmemCapability{Enabled:false, SegmentName:"", Preferred:false}`,
+			want: `ShmemCapability{Enabled:false, SegmentName:"", Preferred:false, Required:false}`,
+		},
+		{
+			name: "with required",
+			cap:  ShmemCapability{Enabled: true, SegmentName: "seg", Preferred: true, Required: true},
+			want: `ShmemCapability{Enabled:true, SegmentName:"seg", Preferred:true, Required:true}`,
 		},
 	}
 	for _, tt := range tests {

@@ -105,6 +105,11 @@ type ShmClientTransport struct {
 	// Guarded by mu.
 	kpDormancyCond *sync.Cond
 	kpDormant      bool
+
+	// onClose is a callback invoked when the transport is closed.
+	// This is used by ClientConn/addrConn to track connectivity state.
+	// RFC A73: Required for proper subchannel lifecycle management.
+	onClose func(GoAwayReason)
 }
 
 func (t *ShmClientTransport) setGoAwayReason(flags uint8, debug string) {
@@ -269,6 +274,12 @@ func NewShmClientTransport(segment *Segment, localAddr, remoteAddr net.Addr) (*S
 	}
 
 	return t, nil
+}
+
+// SetOnClose sets the callback to be invoked when the transport is closed.
+// RFC A73: This integrates with gRPC's ClientConn connectivity state management.
+func (t *ShmClientTransport) SetOnClose(f func(GoAwayReason)) {
+	t.onClose = f
 }
 
 // ConfigureKeepalive sets keepalive parameters and starts the keepalive
@@ -588,6 +599,12 @@ func (t *ShmClientTransport) Close(err error) {
 
 		// Signal closure
 		close(t.errCh)
+
+		// RFC A73: Invoke onClose callback to notify ClientConn of transport closure.
+		// This allows the addrConn to update connectivity state properly.
+		if t.onClose != nil {
+			t.onClose(t.goAwayReason)
+		}
 	})
 }
 

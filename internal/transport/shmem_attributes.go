@@ -48,6 +48,10 @@ type ShmemCapability struct {
 	// network transport when both are available. When false, shmem is used
 	// only if explicitly requested or if network transport fails.
 	Preferred bool
+
+	// Required indicates that shmem MUST be used - no fallback to HTTP/2.
+	// RFC A73: When true, connection will fail if shmem cannot be established.
+	Required bool
 }
 
 // Equal implements the Equal method for use in attributes comparison.
@@ -58,13 +62,14 @@ func (c ShmemCapability) Equal(o any) bool {
 	}
 	return c.Enabled == oc.Enabled &&
 		c.SegmentName == oc.SegmentName &&
-		c.Preferred == oc.Preferred
+		c.Preferred == oc.Preferred &&
+		c.Required == oc.Required
 }
 
 // String implements fmt.Stringer for debugging.
 func (c ShmemCapability) String() string {
-	return fmt.Sprintf("ShmemCapability{Enabled:%v, SegmentName:%q, Preferred:%v}",
-		c.Enabled, c.SegmentName, c.Preferred)
+	return fmt.Sprintf("ShmemCapability{Enabled:%v, SegmentName:%q, Preferred:%v, Required:%v}",
+		c.Enabled, c.SegmentName, c.Preferred, c.Required)
 }
 
 // GetShmemCapability extracts the ShmemCapability from the address attributes.
@@ -154,4 +159,25 @@ func GetShmemTransportHint(addr resolver.Address) *ShmemTransportHint {
 func SetShmemTransportHint(addr resolver.Address, hint ShmemTransportHint) resolver.Address {
 	addr.Attributes = addr.Attributes.WithValue(ShmemTransportHintKey{}, hint)
 	return addr
+}
+
+// IsFallbackAllowed checks if fallback from shmem to HTTP/2 is allowed for the address.
+// RFC A73: This is used during transport selection to determine if HTTP/2 fallback
+// should be attempted when shmem connection fails.
+func IsFallbackAllowed(addr resolver.Address) bool {
+	// Check transport hint first
+	hint := GetShmemTransportHint(addr)
+	if hint != nil {
+		return hint.FallbackAllowed
+	}
+
+	// Check capability
+	cap := GetShmemCapability(addr)
+	if cap != nil && cap.Required {
+		// If shmem is marked as required, no fallback
+		return false
+	}
+
+	// Default: allow fallback
+	return true
 }

@@ -1,7 +1,7 @@
 //go:build linux || windows
 
 /*
- * Copyright 2025 gRPC authors.
+ * Copyright 2026 gRPC authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,56 +18,47 @@
 
 /*
 Package main demonstrates RFC A73 compliant transport selection using
-the ShmemCapability and ShmemServiceConfig APIs.
+the ShmemCapability, ShmemServiceConfig, and TransportSelector APIs.
 
 RFC A73 Compliance:
 
-This example shows how the Name Resolver can signal shared memory transport
-capability via resolver.Address.Attributes. The Load Balancer can then use
-this information to select the appropriate transport.
+This example shows how:
+1. The Name Resolver signals shared memory capability via attributes
+2. The TransportSelector chooses transport type based on attributes and policy
+3. The clientconn uses NewShmemClient() when appropriate
 
 Key Concepts:
 
 1. ShmemCapability Attribute:
-   When a resolver returns addresses, it can annotate them with ShmemCapability
-   to indicate whether the endpoint supports shared memory transport:
+   When a resolver returns addresses, it can annotate them with ShmemCapability:
 
        cap := transport.ShmemCapability{
            Enabled:     true,
            SegmentName: "my_segment",
            Preferred:   true,
+           Required:    false,
        }
        addr = transport.SetShmemCapability(addr, cap)
 
-2. Checking Shmem Support:
-   Load balancers and transport layers can check if an address supports shmem:
+2. TransportSelector (Phase 2):
+   The TransportSelector determines transport type based on attributes:
 
-       if transport.IsShmemEnabled(addr) {
-           // Use shared memory transport
-       }
-       if transport.IsShmemPreferred(addr) {
-           // Shmem is available AND preferred
-       }
+       selector := transport.NewTransportSelector(cfg)
+       transportType := selector.SelectTransport(addr)
+       // Returns TransportTypeHTTP2 or TransportTypeShmem
 
-3. ShmemServiceConfig:
-   Applications can configure transport selection policy via service config:
+3. Fallback Logic:
+   IsFallbackAllowed() determines if HTTP/2 fallback is allowed:
 
-       cfg := &transport.ShmemServiceConfig{
-           Policy: transport.ShmemPolicyPreferred, // or "disabled", "required", "auto"
-           FallbackEnabled: &fallback,
+       if transport.IsFallbackAllowed(addr) {
+           // Can fall back to HTTP/2 if shmem fails
        }
 
-4. Transport Selection Decision:
-   The ShouldUseShmem method combines policy and capability:
-
-       if cfg.ShouldUseShmem(transport.IsShmemEnabled(addr)) {
-           // Proceed with shared memory transport
-       }
+4. NewShmemClient():
+   Creates shmem transport with same signature as NewHTTP2Client for
+   seamless integration in clientconn.go.
 
 Running This Example:
-
-This example demonstrates the attribute flow. For full gRPC integration,
-see the shm_fullgrpc_test.go tests in the repository root.
 
     go run examples/rfc_a73_attributes/main.go
 */
@@ -83,6 +74,7 @@ import (
 func main() {
 	fmt.Println("╔════════════════════════════════════════════════════════════╗")
 	fmt.Println("║    RFC A73 Compliant Transport Selection Demo             ║")
+	fmt.Println("║    Phase 1: Attributes  +  Phase 2: Transport Selection   ║")
 	fmt.Println("╚════════════════════════════════════════════════════════════╝")
 	fmt.Println()
 
@@ -91,6 +83,9 @@ func main() {
 
 	// Demonstrate ShmemServiceConfig usage
 	demonstrateServiceConfig()
+
+	// Demonstrate TransportSelector (Phase 2)
+	demonstrateTransportSelector()
 
 	// Demonstrate the full decision flow
 	demonstrateTransportSelection()
@@ -108,7 +103,7 @@ func demonstrateCapabilityAttributes() {
 
 	fmt.Printf("   Initial address: %s\n", addr.Addr)
 	fmt.Printf("   IsShmemEnabled: %v\n", transport.IsShmemEnabled(addr))
-	fmt.Printf("   IsShmemPreferred: %v\n", transport.IsShmemPreferred(addr))
+	fmt.Printf("   IsFallbackAllowed: %v\n", transport.IsFallbackAllowed(addr))
 	fmt.Println()
 
 	// Add shmem capability (as a resolver would do)
@@ -116,16 +111,19 @@ func demonstrateCapabilityAttributes() {
 		Enabled:     true,
 		SegmentName: "my_service_segment",
 		Preferred:   true,
+		Required:    false, // Phase 2: fallback allowed
 	}
 	addr = transport.SetShmemCapability(addr, cap)
 
 	fmt.Println("   After resolver adds ShmemCapability:")
 	fmt.Printf("   IsShmemEnabled: %v\n", transport.IsShmemEnabled(addr))
 	fmt.Printf("   IsShmemPreferred: %v\n", transport.IsShmemPreferred(addr))
+	fmt.Printf("   IsFallbackAllowed: %v\n", transport.IsFallbackAllowed(addr))
 
 	retrieved := transport.GetShmemCapability(addr)
 	if retrieved != nil {
 		fmt.Printf("   SegmentName: %s\n", retrieved.SegmentName)
+		fmt.Printf("   Required: %v\n", retrieved.Required)
 	}
 	fmt.Println()
 }
@@ -163,7 +161,7 @@ func demonstrateServiceConfig() {
 
 	for _, policy := range policies {
 		testCfg := &transport.ShmemServiceConfig{Policy: policy}
-		fmt.Printf("   %s: ShouldUseShmem(hasCapability=true)=%v, ShouldUseShmem(hasCapability=false)=%v\n",
+		fmt.Printf("   %s: ShouldUseShmem(capable=true)=%v, ShouldUseShmem(capable=false)=%v\n",
 			policy,
 			testCfg.ShouldUseShmem(true),
 			testCfg.ShouldUseShmem(false))
@@ -171,14 +169,58 @@ func demonstrateServiceConfig() {
 	fmt.Println()
 }
 
+func demonstrateTransportSelector() {
+	fmt.Println("3. TransportSelector Demo (Phase 2)")
+	fmt.Println("   ─────────────────────────────────────────────────────────")
+
+	// Create addresses with different capabilities
+	localAddr := resolver.Address{Addr: "localhost:50051"}
+	localAddr = transport.SetShmemCapability(localAddr, transport.ShmemCapability{
+		Enabled:     true,
+		SegmentName: "local_segment",
+	})
+
+	remoteAddr := resolver.Address{Addr: "remote-host:50051"}
+
+	// Create selector with default config
+	selector := transport.NewTransportSelector(nil)
+
+	fmt.Println("   Transport selection results:")
+	fmt.Printf("   Local address (%s):\n", localAddr.Addr)
+	fmt.Printf("     CanUseShmem: %v\n", transport.CanUseShmemForAddress(localAddr))
+	fmt.Printf("     SelectedTransport: %s\n", selector.SelectTransport(localAddr))
+
+	fmt.Printf("   Remote address (%s):\n", remoteAddr.Addr)
+	fmt.Printf("     CanUseShmem: %v\n", transport.CanUseShmemForAddress(remoteAddr))
+	fmt.Printf("     SelectedTransport: %s\n", selector.SelectTransport(remoteAddr))
+	fmt.Println()
+
+	// Show detailed selection
+	fmt.Println("   Detailed selection for local address:")
+	result := selector.SelectTransportWithDetails(localAddr)
+	fmt.Printf("     Type: %s\n", result.Type)
+	fmt.Printf("     SegmentName: %s\n", result.SegmentName)
+	fmt.Printf("     FallbackAllowed: %v\n", result.FallbackAllowed)
+	fmt.Println()
+
+	// Show with Required policy
+	requiredCfg := &transport.ShmemServiceConfig{Policy: transport.ShmemPolicyRequired}
+	requiredSelector := transport.NewTransportSelector(requiredCfg)
+	result = requiredSelector.SelectTransportWithDetails(localAddr)
+	fmt.Println("   With Policy=Required:")
+	fmt.Printf("     Type: %s\n", result.Type)
+	fmt.Printf("     FallbackAllowed: %v (no fallback when required)\n", result.FallbackAllowed)
+	fmt.Println()
+}
+
 func demonstrateTransportSelection() {
-	fmt.Println("3. Transport Selection Decision Flow")
+	fmt.Println("4. Full Transport Selection Decision Flow")
 	fmt.Println("   ─────────────────────────────────────────────────────────")
 
 	// Simulate addresses from resolver - some with shmem capability, some without
 	addresses := []resolver.Address{
-		{Addr: "localhost:50051", ServerName: "local-svc"},     // Will get shmem capability
-		{Addr: "remote-host:50051", ServerName: "remote-svc"},  // No shmem capability
+		{Addr: "localhost:50051", ServerName: "local-svc"},
+		{Addr: "remote-host:50051", ServerName: "remote-svc"},
 	}
 
 	// Local address gets shmem capability
@@ -188,35 +230,41 @@ func demonstrateTransportSelection() {
 		Preferred:   true,
 	})
 
-	// Service config with "auto" policy
-	cfg := transport.DefaultShmemServiceConfig() // Policy: auto
+	// Create selector with auto policy
+	cfg := transport.DefaultShmemServiceConfig()
+	selector := transport.NewTransportSelector(cfg)
 
 	fmt.Printf("   Service Config Policy: %s\n", cfg.Policy)
 	fmt.Println()
 
 	for _, addr := range addresses {
-		hasCap := transport.IsShmemEnabled(addr)
-		shouldUse := cfg.ShouldUseShmem(hasCap)
+		transportType := selector.SelectTransport(addr)
+		fallback := transport.IsFallbackAllowed(addr)
 
 		fmt.Printf("   Address: %s\n", addr.Addr)
-		fmt.Printf("     HasShmemCapability: %v\n", hasCap)
-		fmt.Printf("     ShouldUseShmem: %v\n", shouldUse)
+		fmt.Printf("     CanUseShmem: %v\n", transport.CanUseShmemForAddress(addr))
+		fmt.Printf("     SelectedTransport: %s\n", transportType)
+		fmt.Printf("     FallbackAllowed: %v\n", fallback)
 
-		if shouldUse {
+		if transportType == transport.TransportTypeShmem {
 			cap := transport.GetShmemCapability(addr)
 			if cap != nil {
-				fmt.Printf("     → Use SharedMemory transport (segment: %s)\n", cap.SegmentName)
+				fmt.Printf("     → clientconn calls NewShmemClient (segment: %s)\n", cap.SegmentName)
 			}
 		} else {
-			fmt.Printf("     → Use Network transport\n")
+			fmt.Printf("     → clientconn calls NewHTTP2Client\n")
 		}
 		fmt.Println()
 	}
 
 	fmt.Println("   ─────────────────────────────────────────────────────────")
-	fmt.Println("   This demonstrates RFC A73 compliant transport selection:")
-	fmt.Println("   • Resolver annotates addresses with locality/capability")
-	fmt.Println("   • Service config defines policy (auto/preferred/required/disabled)")
-	fmt.Println("   • LB policy uses ShouldUseShmem() for transport selection")
+	fmt.Println("   RFC A73 Transport Selection Flow:")
+	fmt.Println("   1. Resolver annotates addresses with ShmemCapability")
+	fmt.Println("   2. Service config defines policy (auto/preferred/required)")
+	fmt.Println("   3. TransportSelector.SelectTransport() chooses type")
+	fmt.Println("   4. clientconn.createTransport() uses appropriate client:")
+	fmt.Println("      - NewShmemClient() for shmem addresses")
+	fmt.Println("      - NewHTTP2Client() for network addresses")
+	fmt.Println("      - Falls back to HTTP/2 if shmem fails (when allowed)")
 	fmt.Println()
 }

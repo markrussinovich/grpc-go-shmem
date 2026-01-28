@@ -1515,7 +1515,29 @@ func (ac *addrConn) createTransport(ctx context.Context, addr resolver.Address, 
 	defer cancel()
 	copts.ChannelzParent = ac.channelz
 
-	newTr, err := transport.NewHTTP2Client(connectCtx, ac.cc.ctx, addr, copts, onClose)
+	// RFC A73: Transport selection based on address attributes.
+	// Check if shmem transport should be used for this address.
+	var newTr transport.ClientTransport
+	var err error
+
+	if transport.IsShmemEnabled(addr) {
+		// Try shmem transport first
+		newTr, err = transport.NewShmemClient(connectCtx, ac.cc.ctx, addr, copts, onClose)
+		if err != nil {
+			// Check if fallback to HTTP/2 is allowed
+			if transport.IsFallbackAllowed(addr) {
+				if logger.V(2) {
+					logger.Infof("Shmem transport failed for %q, falling back to HTTP/2: %v", addr, err)
+				}
+				// Fall back to HTTP/2
+				newTr, err = transport.NewHTTP2Client(connectCtx, ac.cc.ctx, addr, copts, onClose)
+			}
+		}
+	} else {
+		// Use standard HTTP/2 transport
+		newTr, err = transport.NewHTTP2Client(connectCtx, ac.cc.ctx, addr, copts, onClose)
+	}
+
 	if err != nil {
 		if logger.V(2) {
 			logger.Infof("Creating new client transport to %q: %v", addr, err)
