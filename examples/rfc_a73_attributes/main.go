@@ -74,7 +74,7 @@ import (
 func main() {
 	fmt.Println("╔════════════════════════════════════════════════════════════╗")
 	fmt.Println("║    RFC A73 Compliant Transport Selection Demo             ║")
-	fmt.Println("║    Phase 1: Attributes  +  Phase 2: Transport Selection   ║")
+	fmt.Println("║    Phases 1-3: Attributes, Selection, Fallback            ║")
 	fmt.Println("╚════════════════════════════════════════════════════════════╝")
 	fmt.Println()
 
@@ -89,6 +89,9 @@ func main() {
 
 	// Demonstrate the full decision flow
 	demonstrateTransportSelection()
+
+	// Demonstrate fallback error handling (Phase 3)
+	demonstrateFallbackErrorHandling()
 }
 
 func demonstrateCapabilityAttributes() {
@@ -266,5 +269,91 @@ func demonstrateTransportSelection() {
 	fmt.Println("      - NewShmemClient() for shmem addresses")
 	fmt.Println("      - NewHTTP2Client() for network addresses")
 	fmt.Println("      - Falls back to HTTP/2 if shmem fails (when allowed)")
+	fmt.Println()
+}
+
+func demonstrateFallbackErrorHandling() {
+	fmt.Println("5. Fallback Error Handling Demo (Phase 3)")
+	fmt.Println("   ─────────────────────────────────────────────────────────")
+
+	// Demonstrate ShmemError types
+	fmt.Println("   ShmemError Types:")
+	errorCodes := []transport.ShmemErrorCode{
+		transport.ShmemErrSegmentNotFound,
+		transport.ShmemErrPermissionDenied,
+		transport.ShmemErrConnectionRefused,
+		transport.ShmemErrTimeout,
+		transport.ShmemErrProtocolMismatch,
+		transport.ShmemErrUnknown,
+	}
+
+	for _, code := range errorCodes {
+		err := transport.NewShmemError(code, "example error")
+		fmt.Printf("     %d: Retryable=%v, Permanent=%v\n",
+			code, transport.IsShmemErrorRetryable(err), transport.IsShmemErrorPermanent(err))
+	}
+	fmt.Println()
+
+	// Demonstrate fallback handler
+	fmt.Println("   ShmemFallbackHandler Demo:")
+	handler := transport.NewShmemFallbackHandler()
+
+	// Simulate different error scenarios
+	scenarios := []struct {
+		name            string
+		err             error
+		fallbackAllowed bool
+	}{
+		{
+			name:            "Segment not found (fallback allowed)",
+			err:             transport.NewShmemError(transport.ShmemErrSegmentNotFound, "segment missing"),
+			fallbackAllowed: true,
+		},
+		{
+			name:            "Permission denied (fallback NOT allowed)",
+			err:             transport.NewShmemError(transport.ShmemErrPermissionDenied, "access denied"),
+			fallbackAllowed: false,
+		},
+		{
+			name:            "Connection refused (fallback allowed)",
+			err:             transport.NewShmemError(transport.ShmemErrConnectionRefused, "server not ready"),
+			fallbackAllowed: true,
+		},
+	}
+
+	for _, s := range scenarios {
+		result := handler.HandleShmemError(s.err, s.fallbackAllowed)
+		fmt.Printf("     %s:\n", s.name)
+		fmt.Printf("       ShouldFallback: %v\n", result.ShouldFallback)
+		if result.Error != nil {
+			fmt.Printf("       Error: %v\n", result.Error)
+		}
+	}
+	fmt.Println()
+
+	// Show fallback count
+	fmt.Printf("   Total fallbacks: %d\n", handler.FallbackCount())
+	fmt.Println()
+
+	// Demonstrate with address-based fallback decision
+	fmt.Println("   Address-based Fallback Demo:")
+	addr1 := transport.SetShmemCapability(resolver.Address{Addr: "localhost:50051"},
+		transport.ShmemCapability{Enabled: true, SegmentName: "test1", Required: false})
+	addr2 := transport.SetShmemCapability(resolver.Address{Addr: "localhost:50052"},
+		transport.ShmemCapability{Enabled: true, SegmentName: "test2", Required: true})
+
+	fmt.Printf("   Preferred address: IsFallbackAllowed=%v\n", transport.IsFallbackAllowed(addr1))
+	fmt.Printf("   Required address:  IsFallbackAllowed=%v\n", transport.IsFallbackAllowed(addr2))
+	fmt.Println()
+
+	fmt.Println("   ─────────────────────────────────────────────────────────")
+	fmt.Println("   RFC A73 Phase 3 Fallback Flow:")
+	fmt.Println("   1. clientconn.createTransport() attempts shmem (if selected)")
+	fmt.Println("   2. If shmem fails, error is classified as ShmemError")
+	fmt.Println("   3. IsShmemErrorRetryable() determines retry behavior")
+	fmt.Println("   4. If IsFallbackAllowed() and not Required policy:")
+	fmt.Println("      → Falls back to HTTP/2 transparently")
+	fmt.Println("   5. If Required policy and shmem fails:")
+	fmt.Println("      → Returns error (no fallback)")
 	fmt.Println()
 }

@@ -59,6 +59,10 @@ type TransportSelector struct {
 	// ServiceConfig holds the shmem service configuration.
 	// If nil, defaults to auto policy.
 	ServiceConfig *ShmemServiceConfig
+
+	// fallbackHandler handles fallback logic when shmem transport fails.
+	// Initialized lazily on first use.
+	fallbackHandler *ShmemFallbackHandler
 }
 
 // NewTransportSelector creates a new transport selector with the given config.

@@ -75,7 +75,8 @@ func DialShm(ctx context.Context, addr string, opts *DialOptions) (ClientTranspo
 	ctlName := addr + shmControlSuffix
 	ctlSeg, err := OpenSegment(ctlName)
 	if err != nil {
-		return nil, fmt.Errorf("open control segment %q: %w", ctlName, err)
+		return nil, NewShmemErrorWithCause(ShmemErrSegmentNotFound,
+			fmt.Sprintf("open control segment %q", ctlName), err)
 	}
 	defer ctlSeg.Close()
 
@@ -84,7 +85,7 @@ func DialShm(ctx context.Context, addr string, opts *DialOptions) (ClientTranspo
 	_, _ = OpenHandshakeEvents(ctlName)
 
 	if err := ctlSeg.WaitForServer(ctx); err != nil {
-		return nil, fmt.Errorf("wait for control server: %w", err)
+		return nil, NewShmemErrorWithCause(ShmemErrConnectionRefused, "wait for control server", err)
 	}
 
 	ctlTx := NewShmRingFromSegment(ctlSeg.A, ctlSeg.Mem)
@@ -107,22 +108,23 @@ func DialShm(ctx context.Context, addr string, opts *DialOptions) (ClientTranspo
 	ctlRx.SetEvents(ctlRxEvents)
 
 	if err := writeFrame(ctx, ctlTx, FrameHeader{Type: FrameTypeCONNECT}, encodeConnectRequest(connectRequest{})); err != nil {
-		return nil, fmt.Errorf("send connect request: %w", err)
+		return nil, NewShmemErrorWithCause(ShmemErrConnectionRefused, "send connect request", err)
 	}
 	respFH, respPayload, err := readFrame(ctx, ctlRx)
 	if err != nil {
-		return nil, fmt.Errorf("read connect response: %w", err)
+		return nil, NewShmemErrorWithCause(ShmemErrConnectionRefused, "read connect response", err)
 	}
 	switch respFH.Type {
 	case FrameTypeACCEPT:
 		resp, err := decodeConnectResponse(respPayload)
 		if err != nil {
-			return nil, fmt.Errorf("decode accept: %w", err)
+			return nil, NewShmemErrorWithCause(ShmemErrProtocolMismatch, "decode accept", err)
 		}
 		segName := resp.segmentName
 		segment, err := OpenSegment(segName)
 		if err != nil {
-			return nil, fmt.Errorf("open data segment %q: %w", segName, err)
+			return nil, NewShmemErrorWithCause(ShmemErrSegmentNotFound,
+				fmt.Sprintf("open data segment %q", segName), err)
 		}
 
 		// Open handshake events for the data segment (Windows).
@@ -131,7 +133,7 @@ func DialShm(ctx context.Context, addr string, opts *DialOptions) (ClientTranspo
 		// Wait for server readiness via named event (Windows) or futex (Linux).
 		if err := segment.WaitForServer(ctx); err != nil {
 			segment.Close()
-			return nil, fmt.Errorf("wait for server ready: %w", err)
+			return nil, NewShmemErrorWithCause(ShmemErrTimeout, "wait for server ready", err)
 		}
 
 		// Signal to the server that the client has mapped the segment.
@@ -143,7 +145,7 @@ func DialShm(ctx context.Context, addr string, opts *DialOptions) (ClientTranspo
 		clientTransport, err := NewShmClientTransport(segment, localAddr, remoteAddr)
 		if err != nil {
 			segment.Close()
-			return nil, fmt.Errorf("failed to create client transport: %v", err)
+			return nil, NewShmemErrorWithCause(ShmemErrUnknown, "failed to create client transport", err)
 		}
 		// Configure keepalive if params are provided.
 		clientTransport.ConfigureKeepalive(opts.KeepaliveParams)
@@ -151,11 +153,11 @@ func DialShm(ctx context.Context, addr string, opts *DialOptions) (ClientTranspo
 	case FrameTypeREJECT:
 		r, err := decodeConnectReject(respPayload)
 		if err != nil {
-			return nil, fmt.Errorf("connect rejected (decode): %w", err)
+			return nil, NewShmemErrorWithCause(ShmemErrProtocolMismatch, "connect rejected (decode)", err)
 		}
-		return nil, fmt.Errorf("connect rejected: %s", r.message)
+		return nil, NewShmemError(ShmemErrConnectionRefused, fmt.Sprintf("connect rejected: %s", r.message))
 	default:
-		return nil, fmt.Errorf("unexpected control frame type %d", respFH.Type)
+		return nil, NewShmemError(ShmemErrProtocolMismatch, fmt.Sprintf("unexpected control frame type %d", respFH.Type))
 	}
 }
 

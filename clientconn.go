@@ -1524,13 +1524,23 @@ func (ac *addrConn) createTransport(ctx context.Context, addr resolver.Address, 
 		// Try shmem transport first
 		newTr, err = transport.NewShmemClient(connectCtx, ac.cc.ctx, addr, copts, onClose)
 		if err != nil {
-			// Check if fallback to HTTP/2 is allowed
-			if transport.IsFallbackAllowed(addr) {
+			// Use fallback handler to determine next action
+			fallbackAllowed := transport.IsFallbackAllowed(addr)
+
+			if fallbackAllowed {
 				if logger.V(2) {
-					logger.Infof("Shmem transport failed for %q, falling back to HTTP/2: %v", addr, err)
+					logger.Infof("Shmem transport failed for %q (retryable=%v), falling back to HTTP/2: %v",
+						addr, transport.IsShmemErrorRetryable(err), err)
 				}
 				// Fall back to HTTP/2
 				newTr, err = transport.NewHTTP2Client(connectCtx, ac.cc.ctx, addr, copts, onClose)
+			} else {
+				// Shmem is required but failed - report structured error
+				if logger.V(2) {
+					logger.Infof("Shmem transport required but failed for %q (permanent=%v): %v",
+						addr, transport.IsShmemErrorPermanent(err), err)
+				}
+				// err remains set, will be returned below
 			}
 		}
 	} else {
