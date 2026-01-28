@@ -70,6 +70,10 @@ const (
 	// GOAWAY flags
 	GoAwayFlagDRAINING  = uint8(0x01)
 	GoAwayFlagIMMEDIATE = uint8(0x02)
+
+	// PING flags (RFC A73 Phase 5: Flow Control)
+	PingFlagBDP = uint8(0x01) // Indicates this is a BDP estimation ping
+	PingFlagACK = uint8(0x02) // Indicates this is a ping acknowledgment
 )
 
 // FrameHeader represents the on-wire 16B header.

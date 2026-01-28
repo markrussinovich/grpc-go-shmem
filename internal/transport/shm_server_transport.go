@@ -84,6 +84,11 @@ type ShmServerTransport struct {
 	connInFlow      trInFlow
 	streamInFlow    map[uint32]*inFlow
 
+	// BDP estimation and dynamic flow control (RFC A73 Phase 5)
+	bdpEst            *shmBDPEstimator
+	initialWindowSize int32
+	streamScheduler   *StreamScheduler
+
 	// Error handling
 	closeOnce sync.Once
 	errCh     chan struct{}
@@ -181,6 +186,32 @@ func (t *ShmServerTransport) sendWindowUpdate(streamID uint32, delta uint32) {
 	_ = writeFrame(context.Background(), t.serverToClient, FrameHeader{Type: FrameTypeWindowUpdate, StreamID: streamID}, buf)
 }
 
+// updateFlowControl updates the incoming flow control windows for the
+// transport and all active streams based on the current BDP estimation.
+// This mirrors HTTP/2's dynamic window adjustment behavior.
+func (t *ShmServerTransport) updateFlowControl(n uint32) {
+	t.mu.Lock()
+	t.initialWindowSize = int32(n)
+	for _, s := range t.streams {
+		s.fc.newLimit(n)
+	}
+	t.mu.Unlock()
+
+	// Send connection-level window update
+	if wu := t.connInFlow.newLimit(n); wu > 0 {
+		t.sendWindowUpdate(0, wu)
+	}
+}
+
+// sendBDPPing sends a BDP estimation ping to the client.
+func (t *ShmServerTransport) sendBDPPing() {
+	if t.closed.Load() {
+		return
+	}
+	t.bdpEst.timesnap()
+	_ = writeFrame(context.Background(), t.serverToClient, FrameHeader{Type: FrameTypePING, Flags: PingFlagBDP}, bdpPing.data[:])
+}
+
 func (t *ShmServerTransport) rejectNewStream(streamID uint32, msg string) {
 	if t.closed.Load() || t.serverToClient == nil {
 		return
@@ -251,6 +282,13 @@ func NewShmServerTransport(segment *Segment, localAddr, remoteAddr net.Addr) (*S
 	t.connSendQuota = int64(maxWindowSize)
 	t.connInFlow = trInFlow{limit: uint32(maxWindowSize)}
 	t.connInFlow.updateEffectiveWindowSize()
+
+	// Initialize BDP estimation for dynamic flow control (RFC A73 Phase 5).
+	// This aligns with HTTP/2's BDP-based window adjustment.
+	t.initialWindowSize = initialWindowSize
+	t.bdpEst = newShmBDPEstimator(uint32(initialWindowSize), t.updateFlowControl)
+	t.streamScheduler = NewStreamScheduler()
+
 	max := segment.H.MaxStreams()
 	if max == 0 {
 		max = uint32(math.MaxUint32)
@@ -410,7 +448,13 @@ func (t *ShmServerTransport) processIncomingData(ctx context.Context) {
 			release()
 			continue
 		case FrameTypePONG:
-			// No-op for now; could be used for keepalive bookkeeping.
+			// Handle BDP ping acknowledgment if applicable
+			if t.bdpEst != nil && len(payload) >= 1 {
+				// Check if this PONG corresponds to a BDP ping
+				if payload[0]&PingFlagACK != 0 {
+					t.bdpEst.calculate()
+				}
+			}
 			release()
 			continue
 		default:
@@ -542,6 +586,13 @@ func (t *ShmServerTransport) handleHeaders(ctx context.Context, streamID uint32,
 	}
 	t.streams[streamID] = s
 	t.streamInFlow[streamID] = &s.fc
+	// Add stream to scheduler with default priority
+	if t.streamScheduler != nil {
+		t.streamScheduler.AddStream(StreamPriority{
+			StreamID: streamID,
+			Weight:   16, // Default HTTP/2 weight
+		})
+	}
 	// Clear idle time when we have active streams.
 	t.idle = time.Time{}
 	// Reset ping strikes when streams become active.
@@ -575,12 +626,28 @@ func (t *ShmServerTransport) handleMessage(streamID uint32, flags uint8, payload
 	}
 
 	sz := uint32(len(payload))
+
+	// BDP estimation: track bytes received and trigger BDP ping if needed
+	var sendBDPPing bool
+	if t.bdpEst != nil {
+		sendBDPPing = t.bdpEst.add(sz)
+	}
+
 	if wu := t.connInFlow.onData(sz); wu > 0 {
 		t.sendWindowUpdate(0, wu)
 	}
 	if err := s.fc.onData(sz); err != nil {
 		s.write(recvMsg{err: err})
 		return
+	}
+
+	// Send BDP ping if BDP estimator requests it
+	if sendBDPPing {
+		// Send window update before BDP ping to avoid excessive ping detection
+		if wu := t.connInFlow.reset(); wu > 0 {
+			t.sendWindowUpdate(0, wu)
+		}
+		t.sendBDPPing()
 	}
 
 	// Write the message data to the stream's receive buffer
@@ -613,6 +680,13 @@ func (t *ShmServerTransport) handleMessageBuffer(streamID uint32, flags uint8, b
 	}
 
 	sz := uint32(len(payload))
+
+	// BDP estimation: track bytes received and trigger BDP ping if needed
+	var sendBDPPing bool
+	if t.bdpEst != nil {
+		sendBDPPing = t.bdpEst.add(sz)
+	}
+
 	if wu := t.connInFlow.onData(sz); wu > 0 {
 		t.sendWindowUpdate(0, wu)
 	}
@@ -620,6 +694,14 @@ func (t *ShmServerTransport) handleMessageBuffer(streamID uint32, flags uint8, b
 		buf.Free()
 		s.write(recvMsg{err: err})
 		return
+	}
+
+	// Send BDP ping if BDP estimator requests it
+	if sendBDPPing {
+		if wu := t.connInFlow.reset(); wu > 0 {
+			t.sendWindowUpdate(0, wu)
+		}
+		t.sendBDPPing()
 	}
 
 	s.write(recvMsg{buffer: buf})
@@ -722,6 +804,9 @@ func (t *ShmServerTransport) handleTrailers(streamID uint32, payload []byte) {
 	t.mu.Lock()
 	delete(t.streams, streamID)
 	delete(t.streamInFlow, streamID)
+	if t.streamScheduler != nil {
+		t.streamScheduler.RemoveStream(streamID)
+	}
 	// Mark idle when no more active streams.
 	if len(t.streams) == 0 {
 		t.idle = time.Now()
@@ -760,6 +845,9 @@ func (t *ShmServerTransport) handleCancel(streamID uint32) {
 	t.mu.Lock()
 	delete(t.streams, streamID)
 	delete(t.streamInFlow, streamID)
+	if t.streamScheduler != nil {
+		t.streamScheduler.RemoveStream(streamID)
+	}
 	// Mark idle when no more active streams.
 	if len(t.streams) == 0 {
 		t.idle = time.Now()
@@ -1056,6 +1144,9 @@ func (t *ShmServerTransport) writeStatus(s *ServerStream, st *status.Status) err
 	t.mu.Lock()
 	delete(t.streams, s.id)
 	delete(t.streamInFlow, s.id)
+	if t.streamScheduler != nil {
+		t.streamScheduler.RemoveStream(s.id)
+	}
 	// Mark idle when no more active streams.
 	if len(t.streams) == 0 {
 		t.idle = time.Now()

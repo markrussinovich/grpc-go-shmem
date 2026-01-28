@@ -86,6 +86,11 @@ type ShmClientTransport struct {
 	streamsQuotaAvailable chan struct{}
 	waitingStreams        uint32
 
+	// BDP estimation and dynamic flow control (RFC A73 Phase 5)
+	bdpEst            *shmBDPEstimator
+	initialWindowSize int32
+	streamScheduler   *StreamScheduler
+
 	// Error handling
 	closeOnce sync.Once
 	errCh     chan struct{}
@@ -198,6 +203,32 @@ func (t *ShmClientTransport) sendWindowUpdate(streamID uint32, delta uint32) {
 	_ = writeFrame(context.Background(), t.clientToServer, FrameHeader{Type: FrameTypeWindowUpdate, StreamID: streamID}, buf)
 }
 
+// updateFlowControl updates the incoming flow control windows for the
+// transport and all active streams based on the current BDP estimation.
+// This mirrors HTTP/2's dynamic window adjustment behavior.
+func (t *ShmClientTransport) updateFlowControl(n uint32) {
+	t.mu.Lock()
+	t.initialWindowSize = int32(n)
+	for _, s := range t.streams {
+		s.fc.newLimit(n)
+	}
+	t.mu.Unlock()
+
+	// Send connection-level window update
+	if wu := t.connInFlow.newLimit(n); wu > 0 {
+		t.sendWindowUpdate(0, wu)
+	}
+}
+
+// sendBDPPing sends a BDP estimation ping to the server.
+func (t *ShmClientTransport) sendBDPPing() {
+	if t.closed.Load() {
+		return
+	}
+	t.bdpEst.timesnap()
+	_ = writeFrame(context.Background(), t.clientToServer, FrameHeader{Type: FrameTypePING, Flags: PingFlagBDP}, bdpPing.data[:])
+}
+
 // test hook: allow disabling the background reader in tests to avoid
 // interference when a different client is used on the same segment.
 var enableClientReader atomic.Bool
@@ -261,6 +292,13 @@ func NewShmClientTransport(segment *Segment, localAddr, remoteAddr net.Addr) (*S
 	t.connSendQuota = int64(maxWindowSize)
 	t.connInFlow = trInFlow{limit: uint32(maxWindowSize)}
 	t.connInFlow.updateEffectiveWindowSize()
+
+	// Initialize BDP estimation for dynamic flow control (RFC A73 Phase 5).
+	// This aligns with HTTP/2's BDP-based window adjustment.
+	t.initialWindowSize = initialWindowSize
+	t.bdpEst = newShmBDPEstimator(uint32(initialWindowSize), t.updateFlowControl)
+	t.streamScheduler = NewStreamScheduler()
+
 	max := segment.H.MaxStreams()
 	if max == 0 {
 		max = uint32(math.MaxUint32)
@@ -462,6 +500,13 @@ func (t *ShmClientTransport) processIncomingData(ctx context.Context) {
 			// Server sent a message. Apply inbound flow control before delivering.
 			shmDebugf("[DEBUG] ShmClientTransport: MESSAGE handler entered for stream %d, payload size=%d", fh.StreamID, len(payload))
 			sz := uint32(len(payload))
+
+			// BDP estimation: track bytes received and trigger BDP ping if needed
+			var sendBDPPing bool
+			if t.bdpEst != nil {
+				sendBDPPing = t.bdpEst.add(sz)
+			}
+
 			if wu := t.connInFlow.onData(sz); wu > 0 {
 				t.sendWindowUpdate(0, wu)
 			}
@@ -470,6 +515,15 @@ func (t *ShmClientTransport) processIncomingData(ctx context.Context) {
 				release()
 				t.closeStream(stream, err, true, http2.ErrCodeFlowControl, status.New(codes.Internal, err.Error()), nil, false)
 				continue
+			}
+
+			// Send BDP ping if BDP estimator requests it
+			if sendBDPPing {
+				// Send window update before BDP ping to avoid excessive ping detection
+				if wu := t.connInFlow.reset(); wu > 0 {
+					t.sendWindowUpdate(0, wu)
+				}
+				t.sendBDPPing()
 			}
 
 			// Transfer ownership of the ring-backed buffer to the stream for zero-copy delivery.
@@ -487,11 +541,18 @@ func (t *ShmClientTransport) processIncomingData(ctx context.Context) {
 
 		case FrameTypePING:
 			// Respond with PONG carrying the same opaque data.
-			_ = writeFrame(context.Background(), t.clientToServer, FrameHeader{Type: FrameTypePONG}, payload)
+			_ = writeFrame(context.Background(), t.clientToServer, FrameHeader{Type: FrameTypePONG, Flags: fh.Flags}, payload)
 			release()
 
 		case FrameTypePONG:
-			// No-op for now; keepalive callbacks not yet wired.
+			// Check if this is a BDP ping acknowledgment
+			if t.bdpEst != nil && len(payload) >= 8 {
+				var data [8]byte
+				copy(data[:], payload[:8])
+				if data == bdpPing.data {
+					t.bdpEst.calculate()
+				}
+			}
 			release()
 			continue
 
@@ -747,6 +808,14 @@ func (t *ShmClientTransport) NewStream(ctx context.Context, callHdr *CallHdr) (*
 		if t.kpDormant {
 			t.kpDormancyCond.Signal()
 		}
+
+		// Add stream to scheduler with default priority
+		if t.streamScheduler != nil {
+			t.streamScheduler.AddStream(StreamPriority{
+				StreamID: streamID,
+				Weight:   16, // Default HTTP/2 weight
+			})
+		}
 		t.mu.Unlock()
 
 		break
@@ -816,6 +885,9 @@ func (t *ShmClientTransport) NewStream(ctx context.Context, callHdr *CallHdr) (*
 		t.mu.Lock()
 		delete(t.streams, streamID)
 		delete(t.streamTransport, s)
+		if t.streamScheduler != nil {
+			t.streamScheduler.RemoveStream(streamID)
+		}
 		t.streamQuota++
 		if t.streamQuota > 0 && t.waitingStreams > 0 {
 			select {
@@ -939,6 +1011,9 @@ func (t *ShmClientTransport) closeStream(s *ClientStream, err error, rst bool, _
 	t.mu.Lock()
 	delete(t.streams, s.id)
 	delete(t.streamTransport, s)
+	if t.streamScheduler != nil {
+		t.streamScheduler.RemoveStream(s.id)
+	}
 	t.sendQuotaMu.Lock()
 	delete(t.streamSendQuota, s.id)
 	t.sendQuotaMu.Unlock()
