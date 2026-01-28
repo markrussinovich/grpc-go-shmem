@@ -27,10 +27,9 @@ import (
 	"time"
 )
 
-// TestStep5Implementation tests the complete Step 5 implementation:
-// handshake and ShmConn functionality
-func TestStep5Implementation(t *testing.T) {
-	name := fmt.Sprintf("test-step5-implementation-%d", time.Now().UnixNano())
+// TestShmConnImplementation tests the handshake and ShmConn functionality
+func TestShmConnImplementation(t *testing.T) {
+	name := fmt.Sprintf("test-shm-conn-%d", time.Now().UnixNano())
 	ringCapA := uint64(8192)
 	ringCapB := uint64(8192)
 
@@ -139,11 +138,11 @@ func TestStep5Implementation(t *testing.T) {
 		t.Errorf("Expected ErrConnectionClosed after server close, got: %v", err)
 	}
 
-	t.Log("✅ Step 5 implementation: handshake and ShmConn working correctly")
+	t.Log("✅ ShmConn: handshake and bidirectional communication working correctly")
 }
 
-// TestStep5HandshakeScenarios tests various handshake scenarios
-func TestStep5HandshakeScenarios(t *testing.T) {
+// TestShmConnHandshakeScenarios tests various handshake scenarios
+func TestShmConnHandshakeScenarios(t *testing.T) {
 	testCases := []struct {
 		name        string
 		serverFirst bool
