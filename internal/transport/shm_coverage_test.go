@@ -928,10 +928,12 @@ func TestShmClientMix(t *testing.T) {
 	defer RemoveSegment(segName)
 
 	// Server goroutine: echo handler
+	serverCtx, serverCancel := context.WithCancel(context.Background())
+	defer serverCancel()
 	serverDone := make(chan struct{})
 	go func() {
 		defer close(serverDone)
-		st.HandleStreams(context.Background(), func(s *ServerStream) {
+		st.HandleStreams(serverCtx, func(s *ServerStream) {
 			// Read incoming message (use a reasonable default size)
 			msg, err := s.Read(1024)
 			if err != nil && err != io.EOF {
@@ -1031,9 +1033,11 @@ func TestShmLargeMessageWithDelayRead(t *testing.T) {
 	serverDone := make(chan struct{})
 
 	// Server goroutine with delayed read
+	serverCtx, serverCancel := context.WithCancel(context.Background())
+	defer serverCancel()
 	go func() {
 		defer close(serverDone)
-		st.HandleStreams(context.Background(), func(s *ServerStream) {
+		st.HandleStreams(serverCtx, func(s *ServerStream) {
 			close(serverReady)
 
 			// Wait before reading to cause client to block on flow control
@@ -1131,10 +1135,12 @@ func TestShmLargeMessageSuspension(t *testing.T) {
 	defer RemoveSegment(segName)
 
 	// Server that never reads - will cause client to block
+	serverCtx, serverCancel := context.WithCancel(context.Background())
+	defer serverCancel()
 	serverDone := make(chan struct{})
 	go func() {
 		defer close(serverDone)
-		st.HandleStreams(context.Background(), func(s *ServerStream) {
+		st.HandleStreams(serverCtx, func(s *ServerStream) {
 			// Do nothing - let client timeout
 			time.Sleep(5 * time.Second)
 		})
@@ -1194,12 +1200,14 @@ func TestShmReadGivesSameError(t *testing.T) {
 	defer cleanup()
 	defer RemoveSegment(segName)
 
+	serverCtx, serverCancel := context.WithCancel(context.Background())
+	defer serverCancel()
 	serverDone := make(chan struct{})
 
 	// Server that returns an error status
 	go func() {
 		defer close(serverDone)
-		st.HandleStreams(context.Background(), func(s *ServerStream) {
+		st.HandleStreams(serverCtx, func(s *ServerStream) {
 			// Send error status
 			_ = s.WriteStatus(status.New(codes.Internal, "test error"))
 		})

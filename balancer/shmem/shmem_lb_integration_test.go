@@ -94,7 +94,7 @@ func TestPickerPrefersShmem(t *testing.T) {
 	case picker := <-cc.NewPickerCh:
 		// Pick multiple times and verify shmem is always selected
 		for i := 0; i < 10; i++ {
-			result, err := picker.Pick(balancer.PickInfo{Ctx: context.Background()})
+			result, err := picker.Pick(balancer.PickInfo{Ctx: ctx})
 			if err != nil {
 				t.Fatalf("Pick failed: %v", err)
 			}
@@ -152,7 +152,7 @@ func TestPickerFallsBackToTCP(t *testing.T) {
 		// Pick multiple times - should work with TCP endpoints
 		pickedSCs := make(map[balancer.SubConn]int)
 		for i := 0; i < 10; i++ {
-			result, err := picker.Pick(balancer.PickInfo{Ctx: context.Background()})
+			result, err := picker.Pick(balancer.PickInfo{Ctx: ctx})
 			if err != nil {
 				t.Fatalf("Pick failed: %v", err)
 			}
@@ -235,7 +235,7 @@ func TestMixedEndpointsIntegration(t *testing.T) {
 	// Wait for picker and verify shmem is preferred
 	select {
 	case picker := <-cc.NewPickerCh:
-		result, err := picker.Pick(balancer.PickInfo{Ctx: context.Background()})
+		result, err := picker.Pick(balancer.PickInfo{Ctx: ctx})
 		if err != nil {
 			t.Fatalf("Pick failed: %v", err)
 		}
@@ -307,7 +307,8 @@ func BenchmarkShmemPicker(b *testing.B) {
 		allSCs:   []balancer.SubConn{shmemSC, tcpSC},
 	}
 
-	ctx := context.Background()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	info := balancer.PickInfo{Ctx: ctx}
 
 	b.ResetTimer()
@@ -327,7 +328,8 @@ func BenchmarkShmemPickerParallel(b *testing.B) {
 		allSCs:   []balancer.SubConn{shmemSC, tcpSC},
 	}
 
-	ctx := context.Background()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	info := balancer.PickInfo{Ctx: ctx}
 
 	b.ResetTimer()
