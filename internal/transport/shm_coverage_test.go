@@ -415,7 +415,7 @@ func TestShmStreamIDExhaustion(t *testing.T) {
 	// Artificially set streamID near max to test exhaustion.
 	// This avoids modifying the global MaxStreamID which would cause races.
 	ct.mu.Lock()
-	ct.streamID = MaxStreamID - 2 // Next stream will be MaxStreamID-1, then MaxStreamID+1
+	ct.streamID = MaxStreamID - 2 // Next stream gets MaxStreamID-2, then MaxStreamID
 	ct.mu.Unlock()
 
 	callHdr := &CallHdr{
@@ -423,32 +423,33 @@ func TestShmStreamIDExhaustion(t *testing.T) {
 		Method: "/test/Small",
 	}
 
-	// First stream should succeed (ID = MaxStreamID - 1)
+	// First stream should succeed (ID = MaxStreamID - 2)
 	s1, err := ct.NewStream(ctx, callHdr)
 	if err != nil {
 		t.Fatalf("ct.NewStream() = %v", err)
 	}
-	expectedID1 := MaxStreamID - 1
+	expectedID1 := MaxStreamID - 2
 	if s1.id != expectedID1 {
 		t.Fatalf("Stream id: %d, want: %d", s1.id, expectedID1)
 	}
 
-	// Transport should NOT be draining yet (next ID = MaxStreamID+1 hasn't been assigned)
+	// Transport should NOT be draining yet (nextID = MaxStreamID, not exceeded)
 	if ct.draining.Load() {
 		t.Fatalf("Transport draining after first stream, want not draining")
 	}
 
-	// Second stream should succeed (ID = MaxStreamID + 1) and trigger draining
+	// Second stream should succeed (ID = MaxStreamID) and trigger draining
+	// because next ID would be MaxStreamID + 2 > MaxStreamID
 	s2, err := ct.NewStream(ctx, callHdr)
 	if err != nil {
 		t.Fatalf("ct.NewStream() = %v", err)
 	}
-	expectedID2 := MaxStreamID + 1
+	expectedID2 := MaxStreamID
 	if s2.id != expectedID2 {
 		t.Fatalf("Stream id: %d, want: %d", s2.id, expectedID2)
 	}
 
-	// Transport should now be draining (stream ID exceeded MaxStreamID)
+	// Transport should now be draining (next stream ID would exceed MaxStreamID)
 	if !ct.draining.Load() {
 		t.Fatalf("Transport not draining after stream ID exhaustion, want draining")
 	}
