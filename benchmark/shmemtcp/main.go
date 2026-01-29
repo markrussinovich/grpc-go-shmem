@@ -41,7 +41,6 @@ import (
 	"google.golang.org/grpc/benchmark"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/internal/transport"
-	testgrpc "google.golang.org/grpc/interop/grpc_testing"
 	testpb "google.golang.org/grpc/interop/grpc_testing"
 )
 
@@ -84,7 +83,7 @@ type benchEnv struct {
 	listener net.Listener
 	stopSrv  func()
 	conn     *grpc.ClientConn
-	client   testgrpc.BenchmarkServiceClient
+	client   testpb.BenchmarkServiceClient
 	cleanup  func()
 }
 
@@ -235,7 +234,7 @@ func startBenchEnv(kind transportKind, ringSize, segmentSize uint64) (*benchEnv,
 	}
 
 	env.conn = conn
-	env.client = testgrpc.NewBenchmarkServiceClient(conn)
+	env.client = testpb.NewBenchmarkServiceClient(conn)
 	env.cleanup = func() {
 		_ = env.conn.Close()
 		if env.stopSrv != nil {
@@ -252,7 +251,7 @@ func startBenchEnv(kind transportKind, ringSize, segmentSize uint64) (*benchEnv,
 	return env, nil
 }
 
-func measureUnary(ctx context.Context, client testgrpc.BenchmarkServiceClient, payloadSize, iterations int) (time.Duration, error) {
+func measureUnary(ctx context.Context, client testpb.BenchmarkServiceClient, payloadSize, iterations int) (time.Duration, error) {
 	if iterations <= 0 {
 		iterations = 1
 	}
@@ -281,7 +280,7 @@ func measureUnary(ctx context.Context, client testgrpc.BenchmarkServiceClient, p
 	return elapsed / time.Duration(iterations), nil
 }
 
-func measureStreaming(ctx context.Context, client testgrpc.BenchmarkServiceClient, payloadSize, iterations int) (time.Duration, float64, error) {
+func measureStreaming(ctx context.Context, client testpb.BenchmarkServiceClient, payloadSize, iterations int) (time.Duration, float64, error) {
 	if iterations <= 0 {
 		iterations = 1
 	}

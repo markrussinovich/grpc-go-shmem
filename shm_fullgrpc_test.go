@@ -30,7 +30,6 @@ import (
 	"google.golang.org/grpc/benchmark"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/internal/transport"
-	testgrpc "google.golang.org/grpc/interop/grpc_testing"
 	testpb "google.golang.org/grpc/interop/grpc_testing"
 )
 
@@ -74,7 +73,7 @@ func (s) TestFullGRPCWithSHM(t *testing.T) {
 
 	t.Log("gRPC client connected")
 
-	client := testgrpc.NewBenchmarkServiceClient(conn)
+	client := testpb.NewBenchmarkServiceClient(conn)
 
 	// Make a simple unary call
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
