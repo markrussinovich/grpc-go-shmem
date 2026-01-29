@@ -18,65 +18,73 @@
  *
  */
 
-// Package main demonstrates how to use grpc.NewClient with shared memory transport
+// Package main demonstrates how to use grpc.NewClient with shared memory transport.
+// This is a complete working example that connects to shm_server_usage.
 package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"log"
 	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
-	"google.golang.org/grpc/internal/transport"
+	pb "google.golang.org/grpc/examples/helloworld/helloworld"
+)
+
+var (
+	shmName = flag.String("shm_name", "usage_demo", "Shared memory segment name")
+	name    = flag.String("name", "World", "Name to greet")
 )
 
 func main() {
-	// Example 1: Basic usage with default options
-	fmt.Println("Example 1: Creating client with default shared memory transport options")
+	flag.Parse()
 
-	_, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+	fmt.Println("╔══════════════════════════════════════════════════════════╗")
+	fmt.Println("║        Shared Memory Client Usage Example                ║")
+	fmt.Println("╚══════════════════════════════════════════════════════════╝")
+	fmt.Printf("Connecting to shm://%s\n\n", *shmName)
 
-	// This creates a client that will use shared memory transport when connecting to shm:// addresses
+	// Create a client connection using shared memory transport.
+	// Key options:
+	//   - grpc.WithShmTransport(): enables the shared memory transport
+	//   - Target format: "shm://<segment_name>"
 	conn, err := grpc.NewClient(
-		"shm://my_service_segment",
+		"shm://"+*shmName,
 		grpc.WithShmTransport(),
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 	)
 	if err != nil {
-		log.Printf("Note: Connection will fail without a running server: %v", err)
-	} else {
-		defer conn.Close()
-		fmt.Println("Client created successfully with shared memory transport")
+		log.Fatalf("failed to connect: %v", err)
+	}
+	defer conn.Close()
+
+	fmt.Println("✓ Connected to server via shared memory")
+
+	// Create the greeter client
+	client := pb.NewGreeterClient(conn)
+
+	// Make multiple RPC calls to demonstrate the connection works
+	for i := 1; i <= 3; i++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+
+		greeting := fmt.Sprintf("%s #%d", *name, i)
+		resp, err := client.SayHello(ctx, &pb.HelloRequest{Name: greeting})
+		cancel()
+
+		if err != nil {
+			log.Fatalf("SayHello failed: %v", err)
+		}
+		fmt.Printf("Call %d: %s\n", i, resp.GetMessage())
 	}
 
-	// Example 2: Custom options
-	fmt.Println("\nExample 2: Creating client with custom shared memory transport options")
-
-	customOpts := &transport.DialOptions{
-		SegmentSize:    2 * 1024 * 1024, // 2MB total
-		RingASize:      512 * 1024,      // 512KB client->server
-		RingBSize:      512 * 1024,      // 512KB server->client
-		ConnectTimeout: 10 * time.Second,
-	}
-
-	conn2, err := grpc.NewClient(
-		"shm://large_segment",
-		grpc.WithShmTransportAndOptions(customOpts),
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-	)
-	if err != nil {
-		log.Printf("Note: Connection will fail without a running server: %v", err)
-	} else {
-		defer conn2.Close()
-		fmt.Println("Client created successfully with custom options")
-	}
-
-	fmt.Println("\nTo use this client for actual RPC calls:")
-	fmt.Println("1. Start a server using grpc.NewServer().Serve(shmListener)")
-	fmt.Println("2. Generate protobuf stubs for your service")
-	fmt.Println("3. Call methods like: client.MyMethod(ctx, request)")
-	fmt.Println("\nSee examples/helloworld for a complete working example")
+	fmt.Println()
+	fmt.Println("✓ All RPC calls completed successfully!")
+	fmt.Println()
+	fmt.Println("Key takeaways:")
+	fmt.Println("  1. Use grpc.WithShmTransport() to enable shared memory")
+	fmt.Println("  2. Target format is shm://<segment_name>")
+	fmt.Println("  3. Everything else works exactly like TCP gRPC")
 }

@@ -18,114 +18,84 @@
  *
  */
 
-// Package main demonstrates using the shared memory transport with grpc.NewServer()
+// Package main demonstrates how to use grpc.NewServer with shared memory transport.
+// This is a complete working example that pairs with shm_client_usage.
 package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"log"
-	"time"
 
 	"google.golang.org/grpc"
+	pb "google.golang.org/grpc/examples/helloworld/helloworld"
 	"google.golang.org/grpc/internal/transport"
 )
 
-// Example demonstrates server-side shared memory transport usage
+var (
+	shmName     = flag.String("shm_name", "usage_demo", "Shared memory segment name")
+	segmentSize = flag.Uint64("seg_size", 2*1024*1024, "Segment size in bytes (default 2MB)")
+	ringASize   = flag.Uint64("ring_a", 512*1024, "Ring A size in bytes (default 512KB)")
+	ringBSize   = flag.Uint64("ring_b", 512*1024, "Ring B size in bytes (default 512KB)")
+)
+
+// server implements the Greeter service
+type server struct {
+	pb.UnimplementedGreeterServer
+}
+
+// SayHello implements helloworld.GreeterServer
+func (s *server) SayHello(_ context.Context, in *pb.HelloRequest) (*pb.HelloReply, error) {
+	log.Printf("Received: %v", in.GetName())
+	return &pb.HelloReply{Message: "Hello " + in.GetName()}, nil
+}
+
 func main() {
-	fmt.Println("gRPC Shared Memory Transport - Server Example")
-	fmt.Println("==============================================")
+	flag.Parse()
+
+	fmt.Println("╔══════════════════════════════════════════════════════════╗")
+	fmt.Println("║        Shared Memory Server Usage Example                ║")
+	fmt.Println("╚══════════════════════════════════════════════════════════╝")
 	fmt.Println()
 
-	// Configuration
-	segmentName := "my_segment"
-	segmentSize := uint64(2 * 1024 * 1024) // 2MB
-	ringASize := uint64(512 * 1024)        // 512KB
-	ringBSize := uint64(512 * 1024)        // 512KB
-
-	fmt.Printf("Configuration:\n")
-	fmt.Printf("  Segment Name: %s\n", segmentName)
-	fmt.Printf("  Segment Size: %d bytes (%.1f MB)\n", segmentSize, float64(segmentSize)/(1024*1024))
-	fmt.Printf("  Ring A Size:  %d bytes (%.1f KB)\n", ringASize, float64(ringASize)/1024)
-	fmt.Printf("  Ring B Size:  %d bytes (%.1f KB)\n", ringBSize, float64(ringBSize)/1024)
-	fmt.Println()
-
-	// Create shared memory listener
-	fmt.Println("Creating shared memory listener...")
-	addr := &transport.ShmAddr{Name: segmentName}
-	listener, err := transport.NewShmListener(addr, segmentSize, ringASize, ringBSize)
+	// Create a shared memory listener.
+	// Key steps:
+	//   1. Create an ShmAddr with the segment name
+	//   2. Call NewShmListener with size parameters
+	//   3. Pass the listener to grpc.Server.Serve()
+	addr := &transport.ShmAddr{Name: *shmName}
+	lis, err := transport.NewShmListener(addr, *segmentSize, *ringASize, *ringBSize)
 	if err != nil {
-		log.Fatalf("Failed to create listener: %v", err)
+		log.Fatalf("failed to create shm listener: %v", err)
 	}
-	defer listener.Close()
+	defer lis.Close()
 
-	fmt.Printf("✓ Listener created and ready\n")
-	fmt.Printf("  Address: %s\n", listener.Addr())
+	fmt.Printf("✓ Created shared memory listener\n")
+	fmt.Printf("  Segment name: %s\n", *shmName)
+	fmt.Printf("  Segment size: %d bytes (%.1f MB)\n", *segmentSize, float64(*segmentSize)/(1024*1024))
+	fmt.Printf("  Ring A size:  %d bytes (%.1f KB)\n", *ringASize, float64(*ringASize)/1024)
+	fmt.Printf("  Ring B size:  %d bytes (%.1f KB)\n", *ringBSize, float64(*ringBSize)/1024)
 	fmt.Println()
 
-	// Create gRPC server
-	fmt.Println("Creating gRPC server...")
-	_ = grpc.NewServer()
+	// Create gRPC server (exactly like TCP)
+	s := grpc.NewServer()
+	pb.RegisterGreeterServer(s, &server{})
 
-	// In a real application, you would register your service here:
-	// pb.RegisterGreeterServer(s, &greeterServer{})
-
-	fmt.Println("✓ gRPC server created")
+	fmt.Println("✓ Registered Greeter service")
+	fmt.Printf("✓ Listening on shm://%s\n", *shmName)
+	fmt.Println()
+	fmt.Println("To connect, run the client:")
+	fmt.Printf("  go run ../shm_client_usage -shm_name=%s\n", *shmName)
+	fmt.Println()
+	fmt.Println("Key takeaways:")
+	fmt.Println("  1. Create listener with transport.NewShmListener()")
+	fmt.Println("  2. Pass listener to grpc.Server.Serve() - same as TCP")
+	fmt.Println("  3. Everything else works exactly like TCP gRPC")
 	fmt.Println()
 
-	fmt.Println("Server is now ready to accept connections")
-	fmt.Println("Waiting for client to connect...")
-	fmt.Println()
-	fmt.Println("To connect, run a client with:")
-	fmt.Printf("  grpc.NewClient(\"shm://%s\", grpc.WithShmTransport(), ...)\n", segmentName)
-	fmt.Println()
-
-	// In a real application, this would block serving:
-	// if err := s.Serve(listener); err != nil {
-	//     log.Fatalf("Failed to serve: %v", err)
-	// }
-
-	// For this example, we'll demonstrate the Accept flow
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	fmt.Println("Calling Accept() (will timeout after 10 seconds if no client connects)...")
-
-	// This will block until a client connects or context times out
-	done := make(chan struct{})
-	var conn any
-	var acceptErr error
-
-	go func() {
-		conn, acceptErr = listener.Accept()
-		close(done)
-	}()
-
-	select {
-	case <-done:
-		if acceptErr != nil {
-			fmt.Printf("✗ Accept failed: %v\n", acceptErr)
-			fmt.Println()
-			fmt.Println("This is expected if no client connected.")
-		} else {
-			fmt.Printf("✓ Client connected!\n")
-			fmt.Printf("  Connection: %v\n", conn)
-			fmt.Println()
-			fmt.Println("ServerTransport is now ready to handle RPCs")
-		}
-	case <-ctx.Done():
-		fmt.Println("✗ Timeout waiting for client connection")
-		fmt.Println()
-		fmt.Println("This is expected - no client connected within 10 seconds.")
+	// Serve blocks forever, handling incoming connections
+	if err := s.Serve(lis); err != nil {
+		log.Fatalf("failed to serve: %v", err)
 	}
-
-	fmt.Println()
-	fmt.Println("Server Example Complete")
-	fmt.Println()
-	fmt.Println("In a production server:")
-	fmt.Println("1. Create listener with NewShmListener()")
-	fmt.Println("2. Create gRPC server with grpc.NewServer()")
-	fmt.Println("3. Register your service implementations")
-	fmt.Println("4. Call server.Serve(listener) - blocks handling RPCs")
-	fmt.Println("5. Accept() will be called internally for each client")
 }

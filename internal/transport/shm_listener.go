@@ -132,14 +132,14 @@ func NewShmListener(addr *ShmAddr, segmentSize, ringASize, ringBSize uint64) (*S
 	// Create the control-plane segment used to establish connections without any
 	// dial-side polling.
 	ctlName := l.baseName + shmControlSuffix
-	ctlSeg, err := CreateSegment(ctlName, MinRingCapacity, MinRingCapacity)
-	if err != nil {
-		// If a previous run crashed and left the file behind, clean it up once and retry.
-		if SegmentExists(ctlName) {
-			_ = RemoveSegment(ctlName)
-			ctlSeg, err = CreateSegment(ctlName, MinRingCapacity, MinRingCapacity)
-		}
+
+	// Proactively clean up any stale segment from a previous run before creating.
+	// This handles the case where the server crashed without proper cleanup.
+	if SegmentExists(ctlName) {
+		_ = RemoveSegment(ctlName)
 	}
+
+	ctlSeg, err := CreateSegment(ctlName, MinRingCapacity, MinRingCapacity)
 	if err != nil {
 		cancel()
 		return nil, fmt.Errorf("create control segment: %w", err)
@@ -201,13 +201,13 @@ func (l *ShmListener) Accept() (net.Conn, error) {
 
 		connID := l.connID.Add(1)
 		segmentName := fmt.Sprintf("%s_conn_%d", l.baseName, connID)
-		segment, err := CreateSegment(segmentName, l.ringASize, l.ringBSize)
-		if err != nil {
-			if SegmentExists(segmentName) {
-				_ = RemoveSegment(segmentName)
-				segment, err = CreateSegment(segmentName, l.ringASize, l.ringBSize)
-			}
+
+		// Proactively clean up any stale segment from a previous run.
+		if SegmentExists(segmentName) {
+			_ = RemoveSegment(segmentName)
 		}
+
+		segment, err := CreateSegment(segmentName, l.ringASize, l.ringBSize)
 		if err != nil {
 			_ = writeFrame(l.ctx, l.ctlTx, FrameHeader{Type: FrameTypeREJECT}, encodeConnectReject(connectReject{message: err.Error()}))
 			continue
