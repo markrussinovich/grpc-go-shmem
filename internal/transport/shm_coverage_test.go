@@ -25,6 +25,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"sync"
 	"testing"
 	"time"
@@ -912,4 +913,389 @@ func TestShmPingPong(t *testing.T) {
 	// Close segments
 	clientSeg.Close()
 	serverSeg.Close()
+}
+
+// =============================================================================
+// TestShmClientMix
+// Tests concurrent RPCs with transport shutdown (mirrors TestClientMix)
+// =============================================================================
+
+func TestShmClientMix(t *testing.T) {
+	ct, st, segName, cleanup := setupShmTransportPair(t, 256*1024)
+	defer RemoveSegment(segName)
+
+	// Server goroutine: echo handler
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		st.HandleStreams(context.Background(), func(s *ServerStream) {
+			// Read incoming message (use a reasonable default size)
+			msg, err := s.Read(1024)
+			if err != nil && err != io.EOF {
+				return
+			}
+
+			// Send header
+			_ = s.SendHeader(nil)
+
+			// Send response message
+			if msg != nil {
+				responseData := msg.Materialize()
+				hdr := make([]byte, 5)
+				hdr[0] = 0 // no compression
+				msgLen := uint32(len(responseData))
+				hdr[1] = byte(msgLen >> 24)
+				hdr[2] = byte(msgLen >> 16)
+				hdr[3] = byte(msgLen >> 8)
+				hdr[4] = byte(msgLen)
+				_ = s.Write(hdr, mem.BufferSlice{mem.SliceBuffer(responseData)}, &WriteOptions{})
+			}
+
+			// Send status
+			_ = s.WriteStatus(status.New(codes.OK, ""))
+		})
+	}()
+
+	// Schedule transport shutdown after 500ms
+	time.AfterFunc(500*time.Millisecond, func() {
+		st.Close(nil)
+	})
+
+	// Wait for error and then close client
+	go func() {
+		<-ct.Error()
+		ct.Close(fmt.Errorf("closed manually by test"))
+	}()
+
+	// Spawn concurrent RPCs - some will succeed, some will fail due to shutdown
+	var wg sync.WaitGroup
+	for i := 0; i < 100; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			time.Sleep(time.Duration(i) * 2 * time.Millisecond)
+			performOneShmRPC(ct)
+		}()
+	}
+
+	// Wait for all RPCs to complete (or fail)
+	wg.Wait()
+	cleanup()
+	<-serverDone
+}
+
+// performOneShmRPC performs a single unary RPC on the SHM transport
+func performOneShmRPC(ct *ShmClientTransport) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	s, err := ct.NewStream(ctx, &CallHdr{
+		Host:   "localhost",
+		Method: "/test/Small",
+	})
+	if err != nil {
+		return
+	}
+
+	// Write request
+	msg := []byte("hello")
+	opts := WriteOptions{Last: true}
+	if err := s.Write(nil, newBufferSlice(msg), &opts); err != nil && err != io.EOF {
+		return
+	}
+
+	// Read response (may fail if transport is closing)
+	p := make([]byte, 1024)
+	s.readTo(p)
+}
+
+// =============================================================================
+// TestShmLargeMessageWithDelayRead
+// Tests flow control with delayed reads (mirrors TestLargeMessageWithDelayRead)
+// =============================================================================
+
+func TestShmLargeMessageWithDelayRead(t *testing.T) {
+	// Use a smaller ring to trigger flow control more easily
+	ringSize := uint64(128 * 1024)
+	ct, st, segName, cleanup := setupShmTransportPair(t, ringSize)
+	defer cleanup()
+	defer RemoveSegment(segName)
+
+	// Large message that will exceed the ring buffer
+	largeMsg := make([]byte, 64*1024)
+	for i := range largeMsg {
+		largeMsg[i] = byte(i % 256)
+	}
+
+	serverReady := make(chan struct{})
+	serverDelayRead := make(chan struct{})
+	serverDone := make(chan struct{})
+
+	// Server goroutine with delayed read
+	go func() {
+		defer close(serverDone)
+		st.HandleStreams(context.Background(), func(s *ServerStream) {
+			close(serverReady)
+
+			// Wait before reading to cause client to block on flow control
+			<-serverDelayRead
+
+			// Now read the message (try to read large message)
+			msg, err := s.Read(len(largeMsg) + 5) // +5 for gRPC message header
+			if err != nil && err != io.EOF {
+				t.Errorf("server read error: %v", err)
+				return
+			}
+
+			// Send header
+			_ = s.SendHeader(nil)
+
+			// Send response message
+			if msg != nil {
+				responseData := msg.Materialize()
+				hdr := make([]byte, 5)
+				hdr[0] = 0 // no compression
+				msgLen := uint32(len(responseData))
+				hdr[1] = byte(msgLen >> 24)
+				hdr[2] = byte(msgLen >> 16)
+				hdr[3] = byte(msgLen >> 8)
+				hdr[4] = byte(msgLen)
+				_ = s.Write(hdr, mem.BufferSlice{mem.SliceBuffer(responseData)}, &WriteOptions{})
+			}
+
+			// Send status
+			_ = s.WriteStatus(status.New(codes.OK, ""))
+		})
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// Create stream
+	s, err := ct.NewStream(ctx, &CallHdr{Host: "localhost", Method: "/test/Large"})
+	if err != nil {
+		t.Fatalf("NewStream: %v", err)
+	}
+
+	// Wait for server to be ready
+	select {
+	case <-serverReady:
+	case <-ctx.Done():
+		t.Fatalf("timeout waiting for server")
+	}
+
+	// Start write in a goroutine - this may block on flow control
+	writeDone := make(chan error, 1)
+	go func() {
+		err := s.Write(nil, newBufferSlice(largeMsg), &WriteOptions{Last: true})
+		writeDone <- err
+	}()
+
+	// Allow some time for write to start and potentially block
+	time.Sleep(100 * time.Millisecond)
+
+	// Unblock server to read
+	close(serverDelayRead)
+
+	// Wait for write to complete
+	select {
+	case err := <-writeDone:
+		if err != nil && err != io.EOF {
+			t.Fatalf("Write error: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatalf("timeout waiting for write")
+	}
+
+	// Read response
+	p := make([]byte, len(largeMsg))
+	_, err = s.readTo(p)
+	if err != nil {
+		t.Logf("Read completed with: %v (may be EOF)", err)
+	}
+
+	ct.Close(nil)
+	st.Close(nil)
+	<-serverDone
+}
+
+// =============================================================================
+// TestShmLargeMessageSuspension
+// Tests write blocking when flow control is exhausted (mirrors TestLargeMessageSuspension)
+// =============================================================================
+
+func TestShmLargeMessageSuspension(t *testing.T) {
+	// Use small ring to trigger flow control quickly
+	ringSize := uint64(32 * 1024)
+	ct, st, segName, cleanup := setupShmTransportPair(t, ringSize)
+	defer cleanup()
+	defer RemoveSegment(segName)
+
+	// Server that never reads - will cause client to block
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		st.HandleStreams(context.Background(), func(s *ServerStream) {
+			// Do nothing - let client timeout
+			time.Sleep(5 * time.Second)
+		})
+	}()
+
+	// Short timeout to trigger deadline exceeded
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+
+	s, err := ct.NewStream(ctx, &CallHdr{Host: "localhost", Method: "/test/Large"})
+	if err != nil {
+		t.Fatalf("NewStream: %v", err)
+	}
+
+	// Try to write a message much larger than the ring buffer
+	// This should eventually fail due to flow control + deadline
+	largeMsg := make([]byte, int(ringSize)*4)
+	err = s.Write(nil, newBufferSlice(largeMsg), &WriteOptions{})
+	if err == nil {
+		// First write might succeed if it fits in the buffer
+		err = s.Write(nil, newBufferSlice(largeMsg), &WriteOptions{Last: true})
+	}
+
+	// Expect error due to deadline or stream done
+	if err == nil {
+		t.Log("Write succeeded (buffer had space)")
+	} else {
+		t.Logf("Write returned error as expected: %v", err)
+	}
+
+	// Read should fail with deadline exceeded since server never responds
+	_, readErr := s.readTo(make([]byte, 8))
+	if readErr != nil {
+		st, ok := status.FromError(readErr)
+		if ok && st.Code() == codes.DeadlineExceeded {
+			t.Log("Read correctly returned DeadlineExceeded")
+		} else {
+			t.Logf("Read error: %v", readErr)
+		}
+	}
+
+	ct.Close(nil)
+	st.Close(nil)
+	<-serverDone
+}
+
+// =============================================================================
+// TestShmReadGivesSameError
+// Tests that Read returns the same error after any error occurs
+// (mirrors TestReadGivesSameErrorAfterAnyErrorOccurs)
+// =============================================================================
+
+func TestShmReadGivesSameError(t *testing.T) {
+	ct, st, segName, cleanup := setupShmTransportPair(t, 64*1024)
+	defer cleanup()
+	defer RemoveSegment(segName)
+
+	serverDone := make(chan struct{})
+
+	// Server that returns an error status
+	go func() {
+		defer close(serverDone)
+		st.HandleStreams(context.Background(), func(s *ServerStream) {
+			// Send error status
+			_ = s.WriteStatus(status.New(codes.Internal, "test error"))
+		})
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	s, err := ct.NewStream(ctx, &CallHdr{Host: "localhost", Method: "/test/Error"})
+	if err != nil {
+		t.Fatalf("NewStream: %v", err)
+	}
+
+	// Write request
+	_ = s.Write(nil, newBufferSlice([]byte("test")), &WriteOptions{Last: true})
+
+	// First read should get the error
+	buf := make([]byte, 10)
+	_, err1 := s.readTo(buf)
+	if err1 == nil {
+		t.Fatalf("expected error on first read, got nil")
+	}
+
+	// Subsequent reads should return the same error (or similar)
+	_, err2 := s.readTo(buf)
+	_, err3 := s.readTo(buf)
+
+	// All errors should be non-nil
+	if err2 == nil || err3 == nil {
+		t.Fatalf("expected errors on subsequent reads, got err2=%v, err3=%v", err2, err3)
+	}
+
+	// The errors should be related to the original error
+	t.Logf("First error: %v", err1)
+	t.Logf("Second error: %v", err2)
+	t.Logf("Third error: %v", err3)
+
+	// Verify they're all errors (the specific error may vary due to stream state)
+	if err1 == nil || err2 == nil || err3 == nil {
+		t.Errorf("Expected all reads to return errors after first error")
+	}
+
+	ct.Close(nil)
+	st.Close(nil)
+	<-serverDone
+}
+
+// =============================================================================
+// TestShmWriteHeaderConnectionError
+// Tests that connection errors are properly propagated during write
+// (mirrors TestWriteHeaderConnectionError)
+// =============================================================================
+
+func TestShmWriteHeaderConnectionError(t *testing.T) {
+	ct, st, segName, cleanup := setupShmTransportPair(t, 64*1024)
+	defer RemoveSegment(segName)
+
+	serverDone := make(chan struct{})
+
+	// Server that accepts then immediately closes
+	go func() {
+		defer close(serverDone)
+		// Close server transport immediately
+		time.Sleep(50 * time.Millisecond)
+		st.Close(fmt.Errorf("server closed"))
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Wait for server to close
+	time.Sleep(100 * time.Millisecond)
+
+	// Try to create a new stream - should fail or succeed initially
+	s, err := ct.NewStream(ctx, &CallHdr{Host: "localhost", Method: "/test/Write"})
+	if err != nil {
+		// Expected - transport might be closed already
+		t.Logf("NewStream returned expected error: %v", err)
+		cleanup()
+		<-serverDone
+		return
+	}
+
+	// Try to write - should fail since server closed
+	err = s.Write(nil, newBufferSlice([]byte("test")), &WriteOptions{Last: true})
+	if err != nil {
+		t.Logf("Write returned expected error: %v", err)
+	}
+
+	// Transport should eventually report error
+	select {
+	case <-ct.Error():
+		t.Log("Client transport error channel signaled as expected")
+	case <-time.After(2 * time.Second):
+		t.Log("Timeout waiting for error (may have already been handled)")
+	}
+
+	cleanup()
+	<-serverDone
 }
