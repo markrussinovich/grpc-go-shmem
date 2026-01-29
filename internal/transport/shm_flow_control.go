@@ -69,23 +69,29 @@ import (
 // RFC A73 Phase 5: Flow Control Alignment
 // The shmem transport shares flow control settings with HTTP/2 configuration,
 // using the same initial window sizes and dynamic BDP estimation algorithm.
+//
+// Performance optimization: Uses atomic operations for the hot path (add)
+// to avoid mutex contention on every message.
 type shmBDPEstimator struct {
+	// Fast path fields - accessed atomically without lock
+	// settled is 1 when BDP estimation is complete (bdp == bdpLimit)
+	settled atomic.Uint32
+	// sample is updated atomically during measurement
+	sampleAtomic atomic.Uint32
+	// isSentAtomic is 1 when a BDP ping is outstanding
+	isSentAtomic atomic.Uint32
+
+	// Slow path fields - protected by mutex
 	mu sync.Mutex
 
 	// bdp is the current BDP estimate in bytes.
 	bdp uint32
-
-	// sample is the number of bytes received in the current measurement cycle.
-	sample uint32
 
 	// bwMax is the maximum bandwidth observed so far (bytes/sec).
 	bwMax float64
 
 	// sentAt is the time when the BDP ping was sent.
 	sentAt time.Time
-
-	// isSent indicates whether a BDP ping is outstanding.
-	isSent bool
 
 	// sampleCount is the number of samples taken so far.
 	sampleCount uint64
@@ -106,29 +112,48 @@ func newShmBDPEstimator(initialWindow uint32, updateFn func(n uint32)) *shmBDPEs
 }
 
 // add adds bytes to the current sample. Returns true if a BDP ping should be sent.
+// This is the hot path - optimized to avoid mutex in common cases.
 func (b *shmBDPEstimator) add(n uint32) bool {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	if b.bdp == bdpLimit {
+	// Fast path: if already settled at bdpLimit, nothing to do
+	if b.settled.Load() != 0 {
 		return false
 	}
 
-	if !b.isSent {
-		b.isSent = true
-		b.sample = n
-		b.sentAt = time.Time{}
-		b.sampleCount++
-		return true
+	// Fast path: if a ping is already sent, just accumulate sample atomically
+	if b.isSentAtomic.Load() != 0 {
+		b.sampleAtomic.Add(n)
+		return false
 	}
 
-	b.sample += n
-	return false
+	// Slow path: need to initiate a new measurement cycle
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	// Double-check after acquiring lock
+	if b.bdp == bdpLimit {
+		b.settled.Store(1)
+		return false
+	}
+
+	// Check again if another goroutine already set isSent
+	if b.isSentAtomic.Load() != 0 {
+		b.sampleAtomic.Add(n)
+		return false
+	}
+
+	// Start new measurement
+	b.isSentAtomic.Store(1)
+	b.sampleAtomic.Store(n)
+	b.sentAt = time.Time{}
+	b.sampleCount++
+	return true
 }
 
 // timesnap records the time when a BDP ping is sent.
 func (b *shmBDPEstimator) timesnap() {
+	b.mu.Lock()
 	b.sentAt = time.Now()
+	b.mu.Unlock()
 }
 
 // calculate updates the BDP estimate when a BDP ping ack is received.
@@ -150,20 +175,23 @@ func (b *shmBDPEstimator) calculate() {
 		b.rtt += (rttSample - b.rtt) * alpha
 	}
 
-	b.isSent = false
+	// Read and reset atomic sample
+	sample := b.sampleAtomic.Swap(0)
+	b.isSentAtomic.Store(0)
 
 	// The sample is at most 1.5x the real BDP on a saturated connection.
-	bwCurrent := float64(b.sample) / (b.rtt * 1.5)
+	bwCurrent := float64(sample) / (b.rtt * 1.5)
 	if bwCurrent > b.bwMax {
 		b.bwMax = bwCurrent
 	}
 
 	// Update BDP if the sample suggests higher capacity.
-	if float64(b.sample) >= beta*float64(b.bdp) && bwCurrent == b.bwMax && b.bdp != bdpLimit {
-		sampleFloat := float64(b.sample)
+	if float64(sample) >= beta*float64(b.bdp) && bwCurrent == b.bwMax && b.bdp != bdpLimit {
+		sampleFloat := float64(sample)
 		b.bdp = uint32(gamma * sampleFloat)
 		if b.bdp > bdpLimit {
 			b.bdp = bdpLimit
+			b.settled.Store(1)
 		}
 		bdp := b.bdp
 		b.mu.Unlock()
