@@ -1,32 +1,108 @@
-# Shared Memory Transport – Integration Coverage
+# Shared Memory Echo Example
 
-This directory now tracks the end-to-end state of the shared memory transport, including how it plugs into the standard gRPC client/server APIs.
+This example demonstrates all four gRPC RPC types using the shared memory transport:
 
-## What Works
+1. **UnaryEcho** - Single request/response
+2. **ServerStreamingEcho** - Client sends one request, server streams multiple responses
+3. **ClientStreamingEcho** - Client streams multiple requests, server sends one response
+4. **BidirectionalStreamingEcho** - Both client and server stream messages
 
-- Shared memory transports implement `ClientTransportProvider`/`ServerTransportProvider`, so `grpc.NewClient` and `grpc.Server.Serve` can run over shm when you supply `grpc.WithShmTransport` and a shm listener.
-- Resolver for `shm://` is registered; targets like `shm://routeguide_shm` resolve to `Addr: "shm:routeguide_shm"` for the dialer.
-- Dialer wrapper (`WithShmTransport`) constructs a `net.Conn` that hands its shm transport directly to the HTTP/2 stack (which then bypasses HTTP/2 framing for shm).
-- Flow control and frame handling are live; examples mirror their TCP counterparts.
-- E2E examples run green: `helloworld_shm`, `route_guide_shm`, and the helper script `./run_shmem_examples.sh` (runs all shm demos) all pass.
+## Running the Example
 
-## How to Exercise It
+Open two terminals and run:
 
-- Quick check of all shm demos:
+**Terminal 1 - Start the server:**
+```bash
+cd examples/shm_echo/server
+go run .
+```
 
-   ```bash
-   ./run_shmem_examples.sh
-   ```
+**Terminal 2 - Run the client:**
+```bash
+cd examples/shm_echo/client
+go run .
+```
 
-- Individual runs match the TCP examples, with only listener/dialer differences:
-   - Servers: create a shm listener (e.g., `transport.NewShmListener(&transport.ShmAddr{Name: "demo"}, ...)`) and pass it to `grpc.Server.Serve`.
-   - Clients: dial `shm://<name>` with `grpc.WithShmTransport()` plus credentials (e.g., `insecure.NewCredentials()`).
+## Expected Output
 
-## Remaining Gaps
+**Server:**
+```
+╔══════════════════════════════════════════════════════════╗
+║       Shared Memory Echo Server - All RPC Types         ║
+╚══════════════════════════════════════════════════════════╝
+Listening on shm://echo_shm
+...
+UnaryEcho: received "Hello, shared memory!"
+ServerStreamingEcho: received "Stream me!", sending 5 responses
+ClientStreamingEcho: receiving messages...
+ClientStreamingEcho: received "message 1"
+ClientStreamingEcho: received "message 2"
+ClientStreamingEcho: received "message 3"
+ClientStreamingEcho: received 3 messages
+BidirectionalStreamingEcho: started
+BidirectionalStreamingEcho: echoing "ping 1"
+BidirectionalStreamingEcho: echoing "ping 2"
+BidirectionalStreamingEcho: echoing "ping 3"
+BidirectionalStreamingEcho: client closed stream
+```
 
-- Linux and Windows: the shared memory transport implements futex-like synchronization using futex on Linux and WaitOnAddress on Windows. Examples now build on both OSes.
-- Stats hooks: server-side message recv counter is still stubbed; tracing/metrics parity with TCP is incomplete.
-- Legacy TODOs: `processFrameData` placeholder is unused but still present; ring-capacity investigation noted in tests (`shm_integration_test.go`).
-- Ergonomics: users must opt into `grpc.WithShmTransport` and manually create a shm listener (no automatic scheme-to-listener wiring yet).
+**Client:**
+```
+╔══════════════════════════════════════════════════════════╗
+║       Shared Memory Echo Client - All RPC Types         ║
+╚══════════════════════════════════════════════════════════╝
+Connecting to shm://echo_shm
 
-Use this file as the canonical status for shm integration versus TCP and to track the small remaining deltas.
+--- UnaryEcho ---
+Response: "Hello, shared memory!"
+
+--- ServerStreamingEcho ---
+Response: "Stream me! (response 1)"
+Response: "Stream me! (response 2)"
+Response: "Stream me! (response 3)"
+Response: "Stream me! (response 4)"
+Response: "Stream me! (response 5)"
+
+--- ClientStreamingEcho ---
+Sending: "message 1"
+Sending: "message 2"
+Sending: "message 3"
+Response: "received 3 messages"
+
+--- BidirectionalStreamingEcho ---
+Sending: "ping 1"
+Received: "ping 1"
+Sending: "ping 2"
+Received: "ping 2"
+Sending: "ping 3"
+Received: "ping 3"
+
+All RPC types completed successfully!
+```
+
+## Configuration
+
+Both server and client accept command-line flags:
+
+**Server flags:**
+- `-shm_name`: Shared memory segment name (default: "echo_shm")
+- `-seg_size`: Total segment size in bytes (default: 4MB)
+- `-ring_a`: Ring A buffer size (default: 1MB)
+- `-ring_b`: Ring B buffer size (default: 1MB)
+
+**Client flags:**
+- `-shm_name`: Shared memory segment name (default: "echo_shm")
+
+## Proto Definition
+
+This example uses the Echo service from `examples/features/proto/echo/echo.proto`:
+
+```protobuf
+service Echo {
+  rpc UnaryEcho(EchoRequest) returns (EchoResponse) {}
+  rpc ServerStreamingEcho(EchoRequest) returns (stream EchoResponse) {}
+  rpc ClientStreamingEcho(stream EchoRequest) returns (EchoResponse) {}
+  rpc BidirectionalStreamingEcho(stream EchoRequest) returns (stream EchoResponse) {}
+}
+```
+

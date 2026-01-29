@@ -16,41 +16,146 @@
  * limitations under the License.
  */
 
-// Package main demonstrates the current state of shared memory transport
+// Package main implements an echo client using shared memory transport.
+// It demonstrates all four RPC types: unary, server streaming, client streaming,
+// and bidirectional streaming.
 package main
 
 import (
+	"context"
+	"flag"
 	"fmt"
+	"io"
+	"log"
+	"time"
+
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+	pb "google.golang.org/grpc/examples/features/proto/echo"
 )
 
+var (
+	shmName = flag.String("shm_name", "echo_shm", "Shared memory segment name")
+)
+
+func callUnaryEcho(client pb.EchoClient, message string) {
+	fmt.Println("--- UnaryEcho ---")
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	resp, err := client.UnaryEcho(ctx, &pb.EchoRequest{Message: message})
+	if err != nil {
+		log.Fatalf("UnaryEcho failed: %v", err)
+	}
+	fmt.Printf("Response: %q\n\n", resp.Message)
+}
+
+func callServerStreamingEcho(client pb.EchoClient, message string) {
+	fmt.Println("--- ServerStreamingEcho ---")
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	stream, err := client.ServerStreamingEcho(ctx, &pb.EchoRequest{Message: message})
+	if err != nil {
+		log.Fatalf("ServerStreamingEcho failed: %v", err)
+	}
+
+	for {
+		resp, err := stream.Recv()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			log.Fatalf("ServerStreamingEcho recv failed: %v", err)
+		}
+		fmt.Printf("Response: %q\n", resp.Message)
+	}
+	fmt.Println()
+}
+
+func callClientStreamingEcho(client pb.EchoClient, messages []string) {
+	fmt.Println("--- ClientStreamingEcho ---")
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	stream, err := client.ClientStreamingEcho(ctx)
+	if err != nil {
+		log.Fatalf("ClientStreamingEcho failed: %v", err)
+	}
+
+	for _, msg := range messages {
+		fmt.Printf("Sending: %q\n", msg)
+		if err := stream.Send(&pb.EchoRequest{Message: msg}); err != nil {
+			log.Fatalf("ClientStreamingEcho send failed: %v", err)
+		}
+	}
+
+	resp, err := stream.CloseAndRecv()
+	if err != nil {
+		log.Fatalf("ClientStreamingEcho close failed: %v", err)
+	}
+	fmt.Printf("Response: %q\n\n", resp.Message)
+}
+
+func callBidirectionalStreamingEcho(client pb.EchoClient, messages []string) {
+	fmt.Println("--- BidirectionalStreamingEcho ---")
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	stream, err := client.BidirectionalStreamingEcho(ctx)
+	if err != nil {
+		log.Fatalf("BidirectionalStreamingEcho failed: %v", err)
+	}
+
+	// Send and receive in lockstep
+	for _, msg := range messages {
+		fmt.Printf("Sending: %q\n", msg)
+		if err := stream.Send(&pb.EchoRequest{Message: msg}); err != nil {
+			log.Fatalf("BidirectionalStreamingEcho send failed: %v", err)
+		}
+
+		resp, err := stream.Recv()
+		if err != nil {
+			log.Fatalf("BidirectionalStreamingEcho recv failed: %v", err)
+		}
+		fmt.Printf("Received: %q\n", resp.Message)
+	}
+
+	if err := stream.CloseSend(); err != nil {
+		log.Fatalf("BidirectionalStreamingEcho close failed: %v", err)
+	}
+	fmt.Println()
+}
+
 func main() {
+	flag.Parse()
 
 	fmt.Println("╔══════════════════════════════════════════════════════════╗")
-	fmt.Println("║    Shared Memory Echo Client - Direct Transport Demo    ║")
+	fmt.Println("║       Shared Memory Echo Client - All RPC Types         ║")
 	fmt.Println("╚══════════════════════════════════════════════════════════╝")
-	fmt.Println()
-	fmt.Println("NOTE: This example demonstrates the shared memory transport")
-	fmt.Println("working at the transport layer. Standard gRPC examples require")
-	fmt.Println("additional integration work to use grpc.NewClient()/NewServer().")
-	fmt.Println()
-	fmt.Println("The transport layer is fully functional with:")
-	fmt.Println("  ✓ Futex-based synchronization")
-	fmt.Println("  ✓ Zero-copy shared memory ring buffers")
-	fmt.Println("  ✓ Bidirectional streaming without deadlocks")
-	fmt.Println("  ✓ HTTP/2-style frame protocol")
-	fmt.Println()
-	fmt.Println("What's missing for standard gRPC examples:")
-	fmt.Println("  ✗ Integration with grpc.NewClient()")
-	fmt.Println("  ✗ Integration with grpc.NewServer()")
-	fmt.Println("  ✗ Custom resolver for shm:// URLs")
-	fmt.Println("  ✗ Transport interface bridge layer")
-	fmt.Println()
-	fmt.Println("For working demos, see the test files:")
-	fmt.Println("  - internal/transport/shm/client_unary_test.go")
-	fmt.Println("  - internal/transport/shm/cancel_unary_test.go")
-	fmt.Println("  - internal/transport/shm/streaming_test.go")
-	fmt.Println()
-	fmt.Println("Run tests with:")
-	fmt.Println("  go test -v ./internal/transport/shm -run TestUnary")
-	fmt.Println()
+	fmt.Printf("Connecting to shm://%s\n\n", *shmName)
+
+	// Connect to the server using shared memory transport
+	conn, err := grpc.NewClient(
+		"shm://"+*shmName,
+		grpc.WithShmTransport(),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	if err != nil {
+		log.Fatalf("failed to connect: %v", err)
+	}
+	defer conn.Close()
+
+	client := pb.NewEchoClient(conn)
+
+	// Test all four RPC types
+	callUnaryEcho(client, "Hello, shared memory!")
+
+	callServerStreamingEcho(client, "Stream me!")
+
+	callClientStreamingEcho(client, []string{"message 1", "message 2", "message 3"})
+
+	callBidirectionalStreamingEcho(client, []string{"ping 1", "ping 2", "ping 3"})
+
+	fmt.Println("All RPC types completed successfully!")
 }

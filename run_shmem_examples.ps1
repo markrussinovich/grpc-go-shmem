@@ -41,38 +41,45 @@ function Run-Step {
 }
 
 # Clean leftover segments from prior runs
-$segments = @("helloworld_shm", "routeguide_shm", "my_segment", "grpc_echo", "my_service_segment")
+$segments = @("helloworld_shm", "routeguide_shm", "my_segment", "grpc_echo", "my_service_segment", "echo_shm", "usage_demo")
 Remove-SegmentFiles -Names $segments
 
 $passes = 0
 $fails = 0
 
-# Example 1: shm_echo client demo
-if (Run-Step "shm_echo_client" {
-        Push-Location $examplesDir
-        go run ./shm_echo/client
+# Example 1: shm_echo server+client
+$echoJob = Start-Job -ScriptBlock {
+    param($examples)
+    Set-Location $examples
+    go run ./shm_echo/server
+} -ArgumentList $examplesDir
+Start-Sleep -Seconds 3
+if (Run-Step "shm_echo" {
+    Push-Location $examplesDir
+    go run ./shm_echo/client
     $code = $LASTEXITCODE
-        Pop-Location
+    Pop-Location
     $global:LASTEXITCODE = $code
-    }) { $passes++ } else { $fails++ }
+}) { $passes++ } else { $fails++ }
+Stop-Job $echoJob -ErrorAction SilentlyContinue | Out-Null
+Remove-SegmentFiles -Names @("echo_shm")
 
-# Example 2: shm_client_usage demo
-if (Run-Step "shm_client_usage" {
-        Push-Location $examplesDir
-        go run ./shm_client_usage
+# Example 2: shm_server_usage + shm_client_usage
+$usageJob = Start-Job -ScriptBlock {
+    param($examples)
+    Set-Location $examples
+    go run ./shm_server_usage
+} -ArgumentList $examplesDir
+Start-Sleep -Seconds 3
+if (Run-Step "shm_usage" {
+    Push-Location $examplesDir
+    go run ./shm_client_usage
     $code = $LASTEXITCODE
-        Pop-Location
+    Pop-Location
     $global:LASTEXITCODE = $code
-    }) { $passes++ } else { $fails++ }
-
-# Example 3: shm_server_usage demo (10s accept timeout inside)
-if (Run-Step "shm_server_usage" {
-        Push-Location $examplesDir
-        go run ./shm_server_usage
-    $code = $LASTEXITCODE
-        Pop-Location
-    $global:LASTEXITCODE = $code
-    }) { $passes++ } else { $fails++ }
+}) { $passes++ } else { $fails++ }
+Stop-Job $usageJob -ErrorAction SilentlyContinue | Out-Null
+Remove-SegmentFiles -Names @("usage_demo")
 
 # Example 4: helloworld_shm client-server
 $hwJob = Start-Job -ScriptBlock {
