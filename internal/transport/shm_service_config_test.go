@@ -1,4 +1,4 @@
-//go:build linux || windows
+﻿//go:build linux || windows
 
 /*
  *
@@ -358,7 +358,7 @@ func TestShmServiceConfigString(t *testing.T) {
 func TestShmServiceConfigUnknownPolicy(t *testing.T) {
 	// Test ShouldUseShm with unknown policy (should default to auto behavior)
 	cfg := &ShmServiceConfig{Policy: "unknown_policy"}
-	
+
 	// With capability, should use shm (auto behavior)
 	if !cfg.ShouldUseShm(true) {
 		t.Error("Unknown policy should default to auto behavior (use shm when capable)")

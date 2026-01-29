@@ -1,4 +1,4 @@
-/*
+﻿/*
  *
  * Copyright 2025 gRPC authors.
  *
@@ -222,13 +222,13 @@ func TestShmFlowControlMultiStreamAccountCheck(t *testing.T) {
 // replenish send quotas.
 func TestShmFlowControlWindowUpdate(t *testing.T) {
 	scheduler := NewStreamScheduler()
-	
+
 	// Add a test stream
 	scheduler.AddStream(StreamPriority{StreamID: 1, Weight: 16})
-	
+
 	// Mark it active with pending data
 	scheduler.MarkActive(1, 1000)
-	
+
 	// Get next stream
 	streamID, allowed := scheduler.NextStream(500)
 	if streamID != 1 {
@@ -237,20 +237,20 @@ func TestShmFlowControlWindowUpdate(t *testing.T) {
 	if allowed != 500 {
 		t.Errorf("Expected 500 allowed bytes, got %d", allowed)
 	}
-	
+
 	// Mark idle and verify
 	scheduler.MarkIdle(1)
 	count := scheduler.ActiveStreamCount()
 	if count != 0 {
 		t.Errorf("Expected 0 active streams after MarkIdle, got %d", count)
 	}
-	
+
 	// Verify NextStream returns 0 when no active streams
 	streamID, _ = scheduler.NextStream(500)
 	if streamID != 0 {
 		t.Errorf("Expected streamID 0 when no active streams, got %d", streamID)
 	}
-	
+
 	// Remove stream
 	scheduler.RemoveStream(1)
 	_, ok := scheduler.GetStreamPriority(1)
