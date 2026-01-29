@@ -412,41 +412,44 @@ func TestShmStreamIDExhaustion(t *testing.T) {
 		st.writeStatus(s, status.New(codes.OK, ""))
 	})
 
-	// Artificially set streamID near max to test exhaustion
-	ct.mu.Lock()
-	ct.streamID = MaxStreamID - 4 // Leave room for 2 more streams (IDs increment by 2)
-	ct.mu.Unlock()
+	// Match TCP test: temporarily set MaxStreamID = 3
+	originalMaxStreamID := MaxStreamID
+	MaxStreamID = 3
+	defer func() {
+		MaxStreamID = originalMaxStreamID
+	}()
 
-	// First stream should succeed
-	s1, err := ct.NewStream(ctx, &CallHdr{Method: "/test/Stream1"})
-	if err != nil {
-		t.Fatalf("First stream failed: %v", err)
+	callHdr := &CallHdr{
+		Host:   "localhost",
+		Method: "/test/Small",
 	}
-	t.Logf("Stream 1 created with ID: %d", s1.id)
 
-	// Second stream should succeed but trigger draining
-	s2, err := ct.NewStream(ctx, &CallHdr{Method: "/test/Stream2"})
+	// First stream should succeed with ID = 1
+	s1, err := ct.NewStream(ctx, callHdr)
 	if err != nil {
-		t.Fatalf("Second stream failed: %v", err)
+		t.Fatalf("ct.NewStream() = %v", err)
 	}
-	t.Logf("Stream 2 created with ID: %d", s2.id)
+	if s1.id != 1 {
+		t.Fatalf("Stream id: %d, want: 1", s1.id)
+	}
 
-	// Give transport time to enter draining state
-	time.Sleep(100 * time.Millisecond)
-
-	// Check if transport is draining
+	// Transport should NOT be draining yet
 	if ct.draining.Load() {
-		t.Log("Transport correctly entered draining state after stream ID exhaustion")
-	} else {
-		t.Log("Transport not yet draining (may depend on exact stream ID math)")
+		t.Fatalf("Transport draining after first stream, want not draining")
 	}
 
-	// Third stream should fail because transport is draining (or IDs exhausted)
-	_, err = ct.NewStream(ctx, &CallHdr{Method: "/test/Stream3"})
+	// Second stream should succeed with ID = 3
+	s2, err := ct.NewStream(ctx, callHdr)
 	if err != nil {
-		t.Logf("Third stream correctly failed: %v", err)
-	} else {
-		t.Log("Third stream succeeded (transport may not have exhausted IDs yet)")
+		t.Fatalf("ct.NewStream() = %v", err)
+	}
+	if s2.id != 3 {
+		t.Fatalf("Stream id: %d, want: 3", s2.id)
+	}
+
+	// Transport should now be draining (next stream ID > MaxStreamID)
+	if !ct.draining.Load() {
+		t.Fatalf("Transport not draining after stream ID exhaustion, want draining")
 	}
 }
 
@@ -956,8 +959,8 @@ func TestShmClientMix(t *testing.T) {
 		})
 	}()
 
-	// Schedule transport shutdown after 500ms
-	time.AfterFunc(500*time.Millisecond, func() {
+	// Schedule transport shutdown after 1 second (matching TCP test)
+	time.AfterFunc(time.Second, func() {
 		st.Close(nil)
 	})
 
@@ -968,18 +971,14 @@ func TestShmClientMix(t *testing.T) {
 	}()
 
 	// Spawn concurrent RPCs - some will succeed, some will fail due to shutdown
-	var wg sync.WaitGroup
-	for i := 0; i < 100; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			time.Sleep(time.Duration(i) * 2 * time.Millisecond)
-			performOneShmRPC(ct)
-		}()
+	// Match TCP test: 750 iterations with 2ms sleep between spawns
+	for i := 0; i < 750; i++ {
+		time.Sleep(2 * time.Millisecond)
+		go performOneShmRPC(ct)
 	}
 
-	// Wait for all RPCs to complete (or fail)
-	wg.Wait()
+	// Give RPCs time to complete or fail
+	time.Sleep(2 * time.Second)
 	cleanup()
 	<-serverDone
 }
@@ -1159,22 +1158,24 @@ func TestShmLargeMessageSuspension(t *testing.T) {
 		err = s.Write(nil, newBufferSlice(largeMsg), &WriteOptions{Last: true})
 	}
 
-	// Expect error due to deadline or stream done
-	if err == nil {
-		t.Log("Write succeeded (buffer had space)")
-	} else {
-		t.Logf("Write returned error as expected: %v", err)
+	// Write should fail due to flow control blocking + deadline
+	// Either we get errStreamDone or the write completes and read fails
+	if err != nil && err != errStreamDone {
+		t.Logf("Write returned error: %v", err)
 	}
 
-	// Read should fail with deadline exceeded since server never responds
+	// Read should fail with DeadlineExceeded since server never responds
+	// This matches TCP test which expects codes.DeadlineExceeded
 	_, readErr := s.readTo(make([]byte, 8))
-	if readErr != nil {
-		st, ok := status.FromError(readErr)
-		if ok && st.Code() == codes.DeadlineExceeded {
-			t.Log("Read correctly returned DeadlineExceeded")
-		} else {
-			t.Logf("Read error: %v", readErr)
-		}
+	if readErr == nil {
+		t.Fatalf("Read should have failed due to deadline, got nil")
+	}
+	statusFromErr, ok := status.FromError(readErr)
+	if !ok || statusFromErr.Code() != codes.DeadlineExceeded {
+		t.Fatalf("Read got unexpected error: %v, want status with code %v", readErr, codes.DeadlineExceeded)
+	}
+	if got, want := s.Status().Code(), codes.DeadlineExceeded; got != want {
+		t.Fatalf("s.Status().Code() = %v, want %v", got, want)
 	}
 
 	ct.Close(nil)
@@ -1222,23 +1223,22 @@ func TestShmReadGivesSameError(t *testing.T) {
 		t.Fatalf("expected error on first read, got nil")
 	}
 
-	// Subsequent reads should return the same error (or similar)
+	// Subsequent reads should return the same error (TCP standard behavior)
+	// The error message should be identical across all reads
 	_, err2 := s.readTo(buf)
 	_, err3 := s.readTo(buf)
 
-	// All errors should be non-nil
+	// All errors must be non-nil
 	if err2 == nil || err3 == nil {
 		t.Fatalf("expected errors on subsequent reads, got err2=%v, err3=%v", err2, err3)
 	}
 
-	// The errors should be related to the original error
-	t.Logf("First error: %v", err1)
-	t.Logf("Second error: %v", err2)
-	t.Logf("Third error: %v", err3)
-
-	// Verify they're all errors (the specific error may vary due to stream state)
-	if err1 == nil || err2 == nil || err3 == nil {
-		t.Errorf("Expected all reads to return errors after first error")
+	// Verify the same error is returned on each read (TCP test requirement)
+	if err2.Error() != err1.Error() {
+		t.Errorf("err2.Error() = %v, want %v", err2.Error(), err1.Error())
+	}
+	if err3.Error() != err1.Error() {
+		t.Errorf("err3.Error() = %v, want %v", err3.Error(), err1.Error())
 	}
 
 	ct.Close(nil)

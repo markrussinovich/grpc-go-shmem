@@ -727,6 +727,7 @@ func (t *ShmClientTransport) NewStream(ctx context.Context, callHdr *CallHdr) (*
 	var ch chan struct{}
 	var s *ClientStream
 	var streamID uint32
+	var transportDrainRequired bool
 	for {
 		t.mu.Lock()
 		if t.closed.Load() || t.draining.Load() {
@@ -762,6 +763,9 @@ func (t *ShmClientTransport) NewStream(ctx context.Context, callHdr *CallHdr) (*
 			streamID = 1
 		}
 		t.streamID = streamID + 2 // Increment by 2 to maintain odd IDs
+		// Drain client transport if nextID > MaxStreamID which signals gRPC that
+		// the connection is closed and a new one must be created for subsequent RPCs.
+		transportDrainRequired = t.streamID > MaxStreamID
 
 		// Create the client stream
 		s = &ClientStream{
@@ -907,6 +911,12 @@ func (t *ShmClientTransport) NewStream(ctx context.Context, callHdr *CallHdr) (*
 			}
 		}
 		return nil, &NewStreamError{Err: err, AllowTransparentRetry: true}
+	}
+
+	// If stream ID exhaustion requires draining, initiate graceful close.
+	// This mirrors http2Client behavior.
+	if transportDrainRequired {
+		t.GracefulClose()
 	}
 
 	return s, nil

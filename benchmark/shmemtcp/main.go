@@ -18,7 +18,7 @@
  *
  */
 
-// Command shmemtcp runs side-by-side TCP vs shared-memory gRPC benchmarks for
+// Command Shmtcp runs side-by-side TCP vs shared-memory gRPC benchmarks for
 // unary ping-pong and bidirectional streaming. It sweeps payload sizes from 0
 // to 2MiB, records latency and throughput, and writes CSV/JSON plus SVG plots.
 package main
@@ -89,7 +89,7 @@ type benchEnv struct {
 }
 
 func main() {
-	outDir := flag.String("out", filepath.Join("benchmark", "shmemtcp", "out"), "output directory for results and plots")
+	outDir := flag.String("out", filepath.Join("benchmark", "Shmtcp", "out"), "output directory for results and plots")
 	flag.Parse()
 
 	if err := os.MkdirAll(*outDir, 0o755); err != nil {
@@ -402,10 +402,10 @@ func renderPlots(outDir string, res suiteResults) error {
 	streamingLatencyPath := filepath.Join(outDir, "streaming_latency.svg")
 	streamingThroughputPath := filepath.Join(outDir, "streaming_throughput.svg")
 
-	if err := writeSVGPlot(unaryPath, "Unary ping-pong latency", "Payload size", "Avg latency (µs)", groupUnary(res.Unary)); err != nil {
+	if err := writeSVGPlot(unaryPath, "Unary ping-pong latency", "Payload size", "Avg latency (Âµs)", groupUnary(res.Unary)); err != nil {
 		return err
 	}
-	if err := writeSVGPlot(streamingLatencyPath, "Streaming ping-pong latency", "Payload size", "Avg latency (µs)", groupStreamingLatency(res.Streaming)); err != nil {
+	if err := writeSVGPlot(streamingLatencyPath, "Streaming ping-pong latency", "Payload size", "Avg latency (Âµs)", groupStreamingLatency(res.Streaming)); err != nil {
 		return err
 	}
 	if err := writeSVGPlot(streamingThroughputPath, "Streaming throughput", "Payload size", "Throughput (MiB/s)", groupStreamingThroughput(res.Streaming)); err != nil {
@@ -646,10 +646,10 @@ func summarize(res suiteResults, outDir string) {
 	fmt.Println("Benchmark completed")
 	fmt.Printf("Results saved to %s\n", outDir)
 
-	fmt.Println("\nUnary ping-pong latency (µs per call):")
+	fmt.Println("\nUnary ping-pong latency (Âµs per call):")
 	printUnaryTable(res.Unary)
 
-	fmt.Println("\nStreaming ping-pong latency (µs per message) and throughput (MiB/s):")
+	fmt.Println("\nStreaming ping-pong latency (Âµs per message) and throughput (MiB/s):")
 	printStreamingTable(res.Streaming)
 }
 

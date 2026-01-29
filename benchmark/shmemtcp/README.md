@@ -157,22 +157,22 @@ pip install matplotlib numpy
 ## Architecture
 
 ```
-benchmark/shmemtcp/
-├── README.md                     # This file
-├── benchmark_runner.py           # Full benchmark runner (runs Go tests + plots)
-├── generate_benchmark_plots.py   # Static visualization from cached data
-├── main.go                       # Go benchmark harness
-└── out/
-    └── linux/
-        ├── benchmark_results.json          # Cached results from benchmark_runner.py
-        ├── benchmark_results.txt           # Raw Go benchmark output
-        ├── benchmark_comprehensive.png     # 6-panel comprehensive dashboard
-        ├── benchmark_latency_distribution.png  # Latency histograms/CDFs
-        ├── benchmark_use_cases.png         # Use case recommendation matrix
-        ├── benchmark_patterns.png          # Pattern-based comparison plots
-        └── benchmark_summary.png           # Summary dashboard
-    └── windows/
-        └── ... # Windows-generated artifacts
+benchmark/Shmtcp/
+â”œâ”€â”€ README.md                     # This file
+â”œâ”€â”€ benchmark_runner.py           # Full benchmark runner (runs Go tests + plots)
+â”œâ”€â”€ generate_benchmark_plots.py   # Static visualization from cached data
+â”œâ”€â”€ main.go                       # Go benchmark harness
+â””â”€â”€ out/
+    â””â”€â”€ linux/
+        â”œâ”€â”€ benchmark_results.json          # Cached results from benchmark_runner.py
+        â”œâ”€â”€ benchmark_results.txt           # Raw Go benchmark output
+        â”œâ”€â”€ benchmark_comprehensive.png     # 6-panel comprehensive dashboard
+        â”œâ”€â”€ benchmark_latency_distribution.png  # Latency histograms/CDFs
+        â”œâ”€â”€ benchmark_use_cases.png         # Use case recommendation matrix
+        â”œâ”€â”€ benchmark_patterns.png          # Pattern-based comparison plots
+        â””â”€â”€ benchmark_summary.png           # Summary dashboard
+    â””â”€â”€ windows/
+        â””â”€â”€ ... # Windows-generated artifacts
 ```
 
 ## Scripts

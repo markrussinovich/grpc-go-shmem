@@ -192,7 +192,7 @@ func writeFrameBuffersChunked(tx *ShmRing, fh FrameHeader, hdr []byte, data mem.
 
 Run before and after:
 ```bash
-cd /workspaces/grpc-go-shmem/benchmark/shmemtcp && go test -bench=. -benchtime=3s
+cd /workspaces/grpc-go-shmem/benchmark/Shmtcp && go test -bench=. -benchtime=3s
 ```
 
 Expected results:
@@ -219,5 +219,5 @@ Expected results:
 
 - [ ] All 47 existing SHM tests pass
 - [ ] 256KB message works with 64KB ring
-- [ ] Benchmarks show ≤5% regression for small messages
+- [ ] Benchmarks show â‰¤5% regression for small messages
 - [ ] No new allocations on hot path for small messages
