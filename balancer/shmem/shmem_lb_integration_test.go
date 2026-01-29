@@ -29,6 +29,12 @@ import (
 	"google.golang.org/grpc/resolver"
 )
 
+// exitIdler is a local interface for testing ExitIdle functionality.
+// Using a local interface avoids using the deprecated balancer.ExitIdler.
+type exitIdler interface {
+	ExitIdle()
+}
+
 // TestPickerPrefersShmem tests that the picker selects shmem connections before TCP.
 func TestPickerPrefersShmem(t *testing.T) {
 	cc := testutils.NewBalancerClientConn(t)
@@ -283,7 +289,7 @@ func TestExitIdle(t *testing.T) {
 	}
 
 	// Call ExitIdle - this should try to reconnect idle SubConns
-	b.(balancer.ExitIdler).ExitIdle()
+	b.(exitIdler).ExitIdle()
 
 	// This just verifies ExitIdle doesn't panic
 	t.Log("ExitIdle completed without error")

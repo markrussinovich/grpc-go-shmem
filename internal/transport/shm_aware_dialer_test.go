@@ -394,7 +394,7 @@ func TestNewTransportSelector(t *testing.T) {
 	// With nil config
 	s1 := NewTransportSelector(nil)
 	if s1 == nil {
-		t.Error("NewTransportSelector(nil) returned nil")
+		t.Fatal("NewTransportSelector(nil) returned nil")
 	}
 	if s1.ServiceConfig != nil {
 		t.Error("Expected nil ServiceConfig")

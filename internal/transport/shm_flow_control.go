@@ -202,13 +202,6 @@ func (b *shmBDPEstimator) calculate() {
 	b.mu.Unlock()
 }
 
-// getBDP returns the current BDP estimate.
-func (b *shmBDPEstimator) getBDP() uint32 {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.bdp
-}
-
 // StreamPriority represents the priority of a stream for fair scheduling.
 // This aligns with HTTP/2's stream priority model for multi-stream fairness.
 type StreamPriority struct {

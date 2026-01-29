@@ -34,10 +34,10 @@ import (
 
 // Security handshake frame types (range 0x20-0x2F reserved for security)
 const (
-	FrameTypeHANDSHAKE_INIT FrameType = 0x20 // Client -> Server: initiate handshake
-	FrameTypeHANDSHAKE_RESP FrameType = 0x21 // Server -> Client: handshake response
-	FrameTypeHANDSHAKE_ACK  FrameType = 0x22 // Client -> Server: handshake acknowledgement
-	FrameTypeHANDSHAKE_FAIL FrameType = 0x23 // Either direction: handshake failure
+	FrameTypeHandshakeInit FrameType = 0x20 // Client -> Server: initiate handshake
+	FrameTypeHandshakeResp FrameType = 0x21 // Server -> Client: handshake response
+	FrameTypeHandshakeAck  FrameType = 0x22 // Client -> Server: handshake acknowledgement
+	FrameTypeHandshakeFail FrameType = 0x23 // Either direction: handshake failure
 )
 
 // Handshake protocol version
@@ -270,7 +270,7 @@ func (h *ShmSecurityHandshaker) ClientHandshake(ctx context.Context, ring *ShmRi
 		identity: []byte(h.Identity),
 		nonce:    nonce,
 	}
-	if err := writeFrame(ctx, txRing, FrameHeader{Type: FrameTypeHANDSHAKE_INIT}, encodeHandshakeInit(init)); err != nil {
+	if err := writeFrame(ctx, txRing, FrameHeader{Type: FrameTypeHandshakeInit}, encodeHandshakeInit(init)); err != nil {
 		return nil, fmt.Errorf("failed to send handshake init: %w", err)
 	}
 
@@ -281,7 +281,7 @@ func (h *ShmSecurityHandshaker) ClientHandshake(ctx context.Context, ring *ShmRi
 	}
 
 	switch fh.Type {
-	case FrameTypeHANDSHAKE_RESP:
+	case FrameTypeHandshakeResp:
 		resp, err := decodeHandshakeResp(payload)
 		if err != nil {
 			return nil, err
@@ -297,14 +297,14 @@ func (h *ShmSecurityHandshaker) ClientHandshake(ctx context.Context, ring *ShmRi
 					code:    HandshakeErrIdentityInvalid,
 					message: []byte(err.Error()),
 				}
-				_ = writeFrame(ctx, txRing, FrameHeader{Type: FrameTypeHANDSHAKE_FAIL}, encodeHandshakeFail(fail))
+				_ = writeFrame(ctx, txRing, FrameHeader{Type: FrameTypeHandshakeFail}, encodeHandshakeFail(fail))
 				return nil, fmt.Errorf("server identity verification failed: %w", err)
 			}
 		}
 
 		// Send acknowledgement
 		ack := handshakeAck{version: handshakeVersion, status: 0}
-		if err := writeFrame(ctx, txRing, FrameHeader{Type: FrameTypeHANDSHAKE_ACK}, encodeHandshakeAck(ack)); err != nil {
+		if err := writeFrame(ctx, txRing, FrameHeader{Type: FrameTypeHandshakeAck}, encodeHandshakeAck(ack)); err != nil {
 			return nil, fmt.Errorf("failed to send handshake ack: %w", err)
 		}
 
@@ -317,7 +317,7 @@ func (h *ShmSecurityHandshaker) ClientHandshake(ctx context.Context, ring *ShmRi
 			Nonce:          nonce,
 		}, nil
 
-	case FrameTypeHANDSHAKE_FAIL:
+	case FrameTypeHandshakeFail:
 		fail, _ := decodeHandshakeFail(payload)
 		return nil, &HandshakeError{Code: fail.code, Message: string(fail.message)}
 
@@ -334,7 +334,7 @@ func (h *ShmSecurityHandshaker) ServerHandshake(ctx context.Context, ring *ShmRi
 		return nil, fmt.Errorf("failed to read handshake init: %w", err)
 	}
 
-	if fh.Type != FrameTypeHANDSHAKE_INIT {
+	if fh.Type != FrameTypeHandshakeInit {
 		return nil, fmt.Errorf("expected handshake init, got frame type %d", fh.Type)
 	}
 
@@ -345,7 +345,7 @@ func (h *ShmSecurityHandshaker) ServerHandshake(ctx context.Context, ring *ShmRi
 			code:    HandshakeErrInternal,
 			message: []byte(err.Error()),
 		}
-		_ = writeFrame(ctx, txRing, FrameHeader{Type: FrameTypeHANDSHAKE_FAIL}, encodeHandshakeFail(fail))
+		_ = writeFrame(ctx, txRing, FrameHeader{Type: FrameTypeHandshakeFail}, encodeHandshakeFail(fail))
 		return nil, err
 	}
 
@@ -358,7 +358,7 @@ func (h *ShmSecurityHandshaker) ServerHandshake(ctx context.Context, ring *ShmRi
 				code:    HandshakeErrIdentityInvalid,
 				message: []byte(err.Error()),
 			}
-			_ = writeFrame(ctx, txRing, FrameHeader{Type: FrameTypeHANDSHAKE_FAIL}, encodeHandshakeFail(fail))
+			_ = writeFrame(ctx, txRing, FrameHeader{Type: FrameTypeHandshakeFail}, encodeHandshakeFail(fail))
 			return nil, fmt.Errorf("client identity verification failed: %w", err)
 		}
 	}
@@ -374,7 +374,7 @@ func (h *ShmSecurityHandshaker) ServerHandshake(ctx context.Context, ring *ShmRi
 		identity: []byte(h.Identity),
 		nonce:    serverNonce,
 	}
-	if err := writeFrame(ctx, txRing, FrameHeader{Type: FrameTypeHANDSHAKE_RESP}, encodeHandshakeResp(resp)); err != nil {
+	if err := writeFrame(ctx, txRing, FrameHeader{Type: FrameTypeHandshakeResp}, encodeHandshakeResp(resp)); err != nil {
 		return nil, fmt.Errorf("failed to send handshake response: %w", err)
 	}
 
@@ -385,7 +385,7 @@ func (h *ShmSecurityHandshaker) ServerHandshake(ctx context.Context, ring *ShmRi
 	}
 
 	switch fh.Type {
-	case FrameTypeHANDSHAKE_ACK:
+	case FrameTypeHandshakeAck:
 		ack, err := decodeHandshakeAck(payload)
 		if err != nil {
 			return nil, err
@@ -403,7 +403,7 @@ func (h *ShmSecurityHandshaker) ServerHandshake(ctx context.Context, ring *ShmRi
 			Nonce:          init.nonce,
 		}, nil
 
-	case FrameTypeHANDSHAKE_FAIL:
+	case FrameTypeHandshakeFail:
 		fail, _ := decodeHandshakeFail(payload)
 		return nil, &HandshakeError{Code: fail.code, Message: string(fail.message)}
 
