@@ -1,4 +1,4 @@
-﻿//go:build linux || windows
+//go:build linux || windows
 
 /*
  *
@@ -164,70 +164,70 @@ func TestShmServiceConfigValidate(t *testing.T) {
 
 func TestShmServiceConfigShouldUseShm(t *testing.T) {
 	tests := []struct {
-		name                  string
-		cfg                   *ShmServiceConfig
+		name                 string
+		cfg                  *ShmServiceConfig
 		addrHasShmCapability bool
-		want                  bool
+		want                 bool
 	}{
 		{
-			name:                  "nil config auto - addr has capability",
-			cfg:                   nil,
+			name:                 "nil config auto - addr has capability",
+			cfg:                  nil,
 			addrHasShmCapability: true,
-			want:                  true,
+			want:                 true,
 		},
 		{
-			name:                  "nil config auto - addr no capability",
-			cfg:                   nil,
+			name:                 "nil config auto - addr no capability",
+			cfg:                  nil,
 			addrHasShmCapability: false,
-			want:                  false,
+			want:                 false,
 		},
 		{
-			name:                  "disabled - addr has capability",
-			cfg:                   &ShmServiceConfig{Policy: ShmPolicyDisabled},
+			name:                 "disabled - addr has capability",
+			cfg:                  &ShmServiceConfig{Policy: ShmPolicyDisabled},
 			addrHasShmCapability: true,
-			want:                  false,
+			want:                 false,
 		},
 		{
-			name:                  "disabled - addr no capability",
-			cfg:                   &ShmServiceConfig{Policy: ShmPolicyDisabled},
+			name:                 "disabled - addr no capability",
+			cfg:                  &ShmServiceConfig{Policy: ShmPolicyDisabled},
 			addrHasShmCapability: false,
-			want:                  false,
+			want:                 false,
 		},
 		{
-			name:                  "preferred - addr has capability",
-			cfg:                   &ShmServiceConfig{Policy: ShmPolicyPreferred},
+			name:                 "preferred - addr has capability",
+			cfg:                  &ShmServiceConfig{Policy: ShmPolicyPreferred},
 			addrHasShmCapability: true,
-			want:                  true,
+			want:                 true,
 		},
 		{
-			name:                  "preferred - addr no capability",
-			cfg:                   &ShmServiceConfig{Policy: ShmPolicyPreferred},
+			name:                 "preferred - addr no capability",
+			cfg:                  &ShmServiceConfig{Policy: ShmPolicyPreferred},
 			addrHasShmCapability: false,
-			want:                  true, // preferred always attempts
+			want:                 true, // preferred always attempts
 		},
 		{
-			name:                  "required - addr has capability",
-			cfg:                   &ShmServiceConfig{Policy: ShmPolicyRequired},
+			name:                 "required - addr has capability",
+			cfg:                  &ShmServiceConfig{Policy: ShmPolicyRequired},
 			addrHasShmCapability: true,
-			want:                  true,
+			want:                 true,
 		},
 		{
-			name:                  "required - addr no capability",
-			cfg:                   &ShmServiceConfig{Policy: ShmPolicyRequired},
+			name:                 "required - addr no capability",
+			cfg:                  &ShmServiceConfig{Policy: ShmPolicyRequired},
 			addrHasShmCapability: false,
-			want:                  true, // required always attempts (will fail if unavailable)
+			want:                 true, // required always attempts (will fail if unavailable)
 		},
 		{
-			name:                  "auto - addr has capability",
-			cfg:                   &ShmServiceConfig{Policy: ShmPolicyAuto},
+			name:                 "auto - addr has capability",
+			cfg:                  &ShmServiceConfig{Policy: ShmPolicyAuto},
 			addrHasShmCapability: true,
-			want:                  true,
+			want:                 true,
 		},
 		{
-			name:                  "auto - addr no capability",
-			cfg:                   &ShmServiceConfig{Policy: ShmPolicyAuto},
+			name:                 "auto - addr no capability",
+			cfg:                  &ShmServiceConfig{Policy: ShmPolicyAuto},
 			addrHasShmCapability: false,
-			want:                  false,
+			want:                 false,
 		},
 	}
 
@@ -285,10 +285,10 @@ func boolPtr(b bool) *bool {
 
 func TestShmServiceConfigMarshalJSON(t *testing.T) {
 	cfg := &ShmServiceConfig{
-		Policy:              ShmPolicyPreferred,
-		SegmentSizeBytes:    2097152,
-		RingBufferSizeBytes: 524288,
-		FallbackEnabled:     boolPtr(true),
+		Policy:               ShmPolicyPreferred,
+		SegmentSizeBytes:     2097152,
+		RingBufferSizeBytes:  524288,
+		FallbackEnabled:      boolPtr(true),
 		MaxConcurrentStreams: 100,
 	}
 
@@ -336,10 +336,10 @@ func TestShmServiceConfigString(t *testing.T) {
 		{
 			name: "full config",
 			cfg: &ShmServiceConfig{
-				Policy:              ShmPolicyRequired,
-				SegmentSizeBytes:    1048576,
-				RingBufferSizeBytes: 65536,
-				FallbackEnabled:     boolPtr(false),
+				Policy:               ShmPolicyRequired,
+				SegmentSizeBytes:     1048576,
+				RingBufferSizeBytes:  65536,
+				FallbackEnabled:      boolPtr(false),
 				MaxConcurrentStreams: 50,
 			},
 			want: `ShmServiceConfig{Policy:"required", SegmentSize:1048576, RingBufferSize:65536, Fallback:false, MaxStreams:50}`,

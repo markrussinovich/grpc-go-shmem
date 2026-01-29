@@ -95,42 +95,42 @@ func TestShmFallbackErrorTypes(t *testing.T) {
 func TestShmFallbackHandler(t *testing.T) {
 	tests := []struct {
 		name            string
-		ShmErr        error
+		ShmErr          error
 		fallbackAllowed bool
 		expectFallback  bool
 		expectError     bool
 	}{
 		{
 			name:            "shm succeeds - no fallback needed",
-			ShmErr:        nil,
+			ShmErr:          nil,
 			fallbackAllowed: true,
 			expectFallback:  false,
 			expectError:     false,
 		},
 		{
 			name:            "shm fails, fallback allowed - should fallback",
-			ShmErr:        NewShmError(ShmErrSegmentNotFound, "segment missing"),
+			ShmErr:          NewShmError(ShmErrSegmentNotFound, "segment missing"),
 			fallbackAllowed: true,
 			expectFallback:  true,
 			expectError:     false,
 		},
 		{
 			name:            "shm fails, fallback not allowed - should error",
-			ShmErr:        NewShmError(ShmErrSegmentNotFound, "segment missing"),
+			ShmErr:          NewShmError(ShmErrSegmentNotFound, "segment missing"),
 			fallbackAllowed: false,
 			expectFallback:  false,
 			expectError:     true,
 		},
 		{
 			name:            "permanent error, fallback allowed - should fallback",
-			ShmErr:        NewShmError(ShmErrProtocolMismatch, "version mismatch"),
+			ShmErr:          NewShmError(ShmErrProtocolMismatch, "version mismatch"),
 			fallbackAllowed: true,
 			expectFallback:  true,
 			expectError:     false,
 		},
 		{
 			name:            "permanent error, fallback not allowed - should error",
-			ShmErr:        NewShmError(ShmErrProtocolMismatch, "version mismatch"),
+			ShmErr:          NewShmError(ShmErrProtocolMismatch, "version mismatch"),
 			fallbackAllowed: false,
 			expectFallback:  false,
 			expectError:     true,
@@ -158,7 +158,7 @@ func TestShmFallbackWithAddress(t *testing.T) {
 	tests := []struct {
 		name           string
 		addr           resolver.Address
-		ShmErr       error
+		ShmErr         error
 		expectFallback bool
 	}{
 		{
@@ -168,7 +168,7 @@ func TestShmFallbackWithAddress(t *testing.T) {
 				SegmentName: "test_seg",
 				Required:    false, // fallback allowed
 			}),
-			ShmErr:       NewShmError(ShmErrSegmentNotFound, "missing"),
+			ShmErr:         NewShmError(ShmErrSegmentNotFound, "missing"),
 			expectFallback: true,
 		},
 		{
@@ -178,13 +178,13 @@ func TestShmFallbackWithAddress(t *testing.T) {
 				SegmentName: "test_seg",
 				Required:    true, // no fallback
 			}),
-			ShmErr:       NewShmError(ShmErrSegmentNotFound, "missing"),
+			ShmErr:         NewShmError(ShmErrSegmentNotFound, "missing"),
 			expectFallback: false,
 		},
 		{
 			name:           "no shm capability - should use HTTP2 directly (not a fallback)",
 			addr:           resolver.Address{Addr: "remote:50051"},
-			ShmErr:       nil, // no shm attempt
+			ShmErr:         nil, // no shm attempt
 			expectFallback: false,
 		},
 	}
@@ -325,12 +325,12 @@ func TestCreateTransportWithFallback(t *testing.T) {
 	defer cancel()
 
 	tests := []struct {
-		name               string
-		addr               resolver.Address
-		ShmDialSucceeds  bool
-		http2DialSucceeds  bool
-		expectedTransport  string
-		expectError        bool
+		name              string
+		addr              resolver.Address
+		ShmDialSucceeds   bool
+		http2DialSucceeds bool
+		expectedTransport string
+		expectError       bool
 	}{
 		{
 			name: "shm succeeds",
@@ -338,7 +338,7 @@ func TestCreateTransportWithFallback(t *testing.T) {
 				Enabled:     true,
 				SegmentName: "test",
 			}),
-			ShmDialSucceeds: true,
+			ShmDialSucceeds:   true,
 			http2DialSucceeds: true,
 			expectedTransport: "Shm",
 			expectError:       false,
@@ -349,7 +349,7 @@ func TestCreateTransportWithFallback(t *testing.T) {
 				Enabled:     true,
 				SegmentName: "test",
 			}),
-			ShmDialSucceeds: false,
+			ShmDialSucceeds:   false,
 			http2DialSucceeds: true,
 			expectedTransport: "http2",
 			expectError:       false,
@@ -361,18 +361,18 @@ func TestCreateTransportWithFallback(t *testing.T) {
 				SegmentName: "test",
 				Required:    true,
 			}),
-			ShmDialSucceeds: false,
+			ShmDialSucceeds:   false,
 			http2DialSucceeds: true,
 			expectedTransport: "",
 			expectError:       true,
 		},
 		{
-			name:               "no shm capability - http2 directly",
-			addr:               resolver.Address{Addr: "remote:50051"},
-			ShmDialSucceeds:  false,
-			http2DialSucceeds:  true,
-			expectedTransport:  "http2",
-			expectError:        false,
+			name:              "no shm capability - http2 directly",
+			addr:              resolver.Address{Addr: "remote:50051"},
+			ShmDialSucceeds:   false,
+			http2DialSucceeds: true,
+			expectedTransport: "http2",
+			expectError:       false,
 		},
 	}
 

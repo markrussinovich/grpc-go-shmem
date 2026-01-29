@@ -83,9 +83,9 @@ func TestTransportSelectorBasic(t *testing.T) {
 			// When policy is required but address has no capability,
 			// we still try shm (and let it fail) rather than silently fall back to HTTP2.
 			// This is intentional - "required" means we should not use HTTP2.
-			name:   "Shm not enabled, policy required - still attempts shm (will fail)",
-			addr:   resolver.Address{Addr: "localhost:8080"},
-			config: &ShmServiceConfig{Policy: ShmPolicyRequired},
+			name:     "Shm not enabled, policy required - still attempts shm (will fail)",
+			addr:     resolver.Address{Addr: "localhost:8080"},
+			config:   &ShmServiceConfig{Policy: ShmPolicyRequired},
 			expected: TransportTypeShm,
 		},
 		{
@@ -128,12 +128,12 @@ func TestTransportSelectorBasic(t *testing.T) {
 // TestTransportSelectorWithDetails tests detailed transport selection.
 func TestTransportSelectorWithDetails(t *testing.T) {
 	tests := []struct {
-		name            string
-		addr            resolver.Address
-		config          *ShmServiceConfig
-		expectedType    TransportType
+		name             string
+		addr             resolver.Address
+		config           *ShmServiceConfig
+		expectedType     TransportType
 		expectedFallback bool
-		expectedSegment string
+		expectedSegment  string
 	}{
 		{
 			name:             "HTTP2 with fallback allowed",

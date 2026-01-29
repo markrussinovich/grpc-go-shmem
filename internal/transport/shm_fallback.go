@@ -244,16 +244,16 @@ type TransportCreatorResult struct {
 
 // FallbackTransportCreator creates transports with fallback support.
 type FallbackTransportCreator struct {
-	ShmDialer   TransportDialer
-	http2Dialer   TransportDialer
-	selector      *TransportSelector
+	ShmDialer       TransportDialer
+	http2Dialer     TransportDialer
+	selector        *TransportSelector
 	fallbackHandler *ShmFallbackHandler
 }
 
 // NewFallbackTransportCreator creates a new fallback-aware transport creator.
 func NewFallbackTransportCreator(ShmDialer, http2Dialer TransportDialer) *FallbackTransportCreator {
 	return &FallbackTransportCreator{
-		ShmDialer:     ShmDialer,
+		ShmDialer:       ShmDialer,
 		http2Dialer:     http2Dialer,
 		selector:        NewTransportSelector(nil),
 		fallbackHandler: NewShmFallbackHandler(),

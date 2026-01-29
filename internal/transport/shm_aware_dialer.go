@@ -145,7 +145,7 @@ type ShmAwareDialer struct {
 // NewShmAwareDialer creates a new shm-aware dialer with the given options.
 func NewShmAwareDialer(cfg *ShmServiceConfig, ShmOpts *DialOptions) *ShmAwareDialer {
 	return &ShmAwareDialer{
-		Selector:    NewTransportSelector(cfg),
+		Selector:  NewTransportSelector(cfg),
 		ShmDialer: NewShmDialer(ShmOpts),
 	}
 }

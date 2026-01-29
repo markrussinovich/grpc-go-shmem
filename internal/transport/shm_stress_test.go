@@ -291,4 +291,3 @@ func TestShmBDPEstimation(t *testing.T) {
 	t.Logf("Last BDP update: %d (expected > 0 after updates)", lastUpdate)
 	// Note: We don't assert a specific value since timing can vary
 }
-
