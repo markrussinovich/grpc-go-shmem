@@ -842,10 +842,22 @@ func TestShmPingPong(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
+	// Create rings from segment views
 	clientTx := NewShmRingFromSegment(clientSeg.A, clientSeg.Mem)
 	clientRx := NewShmRingFromSegment(clientSeg.B, clientSeg.Mem)
 	serverTx := NewShmRingFromSegment(serverSeg.B, serverSeg.Mem)
 	serverRx := NewShmRingFromSegment(serverSeg.A, serverSeg.Mem)
+
+	// Create and set events for Windows (no-op on Linux)
+	// Ring A is client->server, Ring B is server->client
+	clientTxEvents, _ := CreateRingEvents(segmentName, "A")
+	clientRxEvents, _ := CreateRingEvents(segmentName, "B")
+	serverTxEvents, _ := CreateRingEvents(segmentName, "B")
+	serverRxEvents, _ := CreateRingEvents(segmentName, "A")
+	clientTx.SetEvents(clientTxEvents)
+	clientRx.SetEvents(clientRxEvents)
+	serverTx.SetEvents(serverTxEvents)
+	serverRx.SetEvents(serverRxEvents)
 
 	serverDone := make(chan struct{})
 
