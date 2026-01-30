@@ -9,6 +9,9 @@
 *.test
 *.out
 
+# Accidental dev/null redirects
+dev/null
+
 # Example binaries
 examples/helloworld/greeter_client/greeter_client
 examples/helloworld/greeter_server/greeter_server
