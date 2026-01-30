@@ -105,7 +105,7 @@ func (c *shmTC) Info() credentials.ProtocolInfo {
 // ClientHandshake performs the client-side handshake for shared memory transport.
 // For shared memory, authentication is implicit - both processes can access
 // the same memory segment has already proved locality.
-func (c *shmTC) ClientHandshake(ctx context.Context, authority string, conn net.Conn) (net.Conn, credentials.AuthInfo, error) {
+func (c *shmTC) ClientHandshake(_ context.Context, _ string, conn net.Conn) (net.Conn, credentials.AuthInfo, error) {
 	// Verify this is a shared memory connection
 	if conn.RemoteAddr().Network() != "shm" {
 		return nil, nil, fmt.Errorf("shm credentials require shm network, got %q", conn.RemoteAddr().Network())

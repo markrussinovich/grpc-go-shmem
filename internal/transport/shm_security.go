@@ -63,7 +63,9 @@ type HandshakeError struct {
 // HandshakeErrorCode defines handshake failure reasons
 type HandshakeErrorCode uint8
 
+// Handshake error codes for shared memory security handshake.
 const (
+	// HandshakeErrNone indicates no error occurred.
 	HandshakeErrNone            HandshakeErrorCode = 0
 	HandshakeErrVersionMismatch HandshakeErrorCode = 1
 	HandshakeErrIdentityInvalid HandshakeErrorCode = 2
@@ -94,7 +96,7 @@ func (s ShmAuthInfo) AuthType() string {
 }
 
 // ValidateAuthority allows any authority override for shm connections
-func (s ShmAuthInfo) ValidateAuthority(authority string) error {
+func (s ShmAuthInfo) ValidateAuthority(_ string) error {
 	return nil
 }
 

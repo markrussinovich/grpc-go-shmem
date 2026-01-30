@@ -1142,7 +1142,7 @@ func TestShmLargeMessageSuspension(t *testing.T) {
 	serverDone := make(chan struct{})
 	go func() {
 		defer close(serverDone)
-		st.HandleStreams(serverCtx, func(s *ServerStream) {
+		st.HandleStreams(serverCtx, func(_ *ServerStream) {
 			// Do nothing - let client timeout
 			time.Sleep(5 * time.Second)
 		})

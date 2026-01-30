@@ -155,7 +155,7 @@ func (builder) Name() string {
 	return Name
 }
 
-func (builder) Build(cc balancer.ClientConn, opts balancer.BuildOptions) balancer.Balancer {
+func (builder) Build(cc balancer.ClientConn, _ balancer.BuildOptions) balancer.Balancer {
 	b := &shmemPreferBalancer{
 		cc:       cc,
 		subConns: resolver.NewAddressMapV2[balancer.SubConn](),
@@ -407,7 +407,7 @@ type shmemPreferPicker struct {
 	sNext int
 }
 
-func (p *shmemPreferPicker) Pick(info balancer.PickInfo) (balancer.PickResult, error) {
+func (p *shmemPreferPicker) Pick(_ balancer.PickInfo) (balancer.PickResult, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 

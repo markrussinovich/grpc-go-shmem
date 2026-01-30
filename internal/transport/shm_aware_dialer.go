@@ -31,6 +31,8 @@ import (
 )
 
 // TransportType indicates the type of transport to use for a connection.
+//
+//revive:disable-next-line:exported stuttering is acceptable for this exported type in internal package
 type TransportType int
 
 const (
@@ -55,6 +57,8 @@ func (t TransportType) String() string {
 
 // TransportSelector determines which transport type to use for an address.
 // This implements RFC A73 compliant transport selection at the subchannel level.
+//
+//revive:disable-next-line:exported stuttering is acceptable for this exported type in internal package
 type TransportSelector struct {
 	// ServiceConfig holds the shm service configuration.
 	// If nil, defaults to auto policy.
@@ -172,6 +176,8 @@ func (d *ShmAwareDialer) DialShm(ctx context.Context, addr resolver.Address) (Cl
 }
 
 // TransportSelectionResult contains the result of transport selection.
+//
+//revive:disable-next-line:exported stuttering is acceptable for this exported type in internal package
 type TransportSelectionResult struct {
 	// Type is the selected transport type.
 	Type TransportType
@@ -250,7 +256,7 @@ func MustUseShmForAddress(addr resolver.Address, cfg *ShmServiceConfig) bool {
 //   - onClose: Callback invoked when transport is closed
 //
 // Returns the ClientTransport or an error if connection fails.
-func NewShmClient(connectCtx, ctx context.Context, addr resolver.Address, opts ConnectOptions, onClose func(GoAwayReason)) (ClientTransport, error) {
+func NewShmClient(connectCtx, _ context.Context, addr resolver.Address, opts ConnectOptions, onClose func(GoAwayReason)) (ClientTransport, error) {
 	segmentName := GetSegmentName(addr)
 	if segmentName == "" {
 		return nil, fmt.Errorf("shm: no segment name available for address %q", addr.Addr)

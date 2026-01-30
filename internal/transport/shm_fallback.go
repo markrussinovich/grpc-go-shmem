@@ -231,11 +231,15 @@ func (s *TransportSelector) HandleTransportError(err error, addr resolver.Addres
 }
 
 // TransportDialer is an interface for dialing transports.
+//
+//revive:disable-next-line:exported stuttering is acceptable for this exported type in internal package
 type TransportDialer interface {
 	Dial(ctx context.Context, addr resolver.Address) (any, error)
 }
 
 // TransportCreatorResult contains the result of transport creation.
+//
+//revive:disable-next-line:exported stuttering is acceptable for this exported type in internal package
 type TransportCreatorResult struct {
 	Transport     any
 	TransportName string
