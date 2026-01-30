@@ -799,7 +799,9 @@ func (t *ShmClientTransport) NewStream(ctx context.Context, callHdr *CallHdr) (*
 		// Register the stream
 		t.streams[streamID] = s
 		t.streamTransport[s] = t
+		t.sendQuotaMu.Lock()
 		t.streamSendQuota[streamID] = int64(maxWindowSize)
+		t.sendQuotaMu.Unlock()
 		t.streamInFlow[streamID] = &s.fc
 		if t.streamQuota > 0 && t.waitingStreams > 0 {
 			select {
