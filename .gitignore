@@ -27,6 +27,12 @@ examples/shm_server_usage/shm_server_usage
 benchmark/shmemtcp/shmemtcp_bench
 benchmark/shmemtcp/out/**/*.png
 benchmark/shmemtcp/out/*.png
+benchmark/shmemtcp/benchmark/
+
+# Generated benchmark outputs and documentation
+internal/transport/*.png
+*.svg
+
 internal/transport/transport.test
 transport.test
 shm.test.exe
