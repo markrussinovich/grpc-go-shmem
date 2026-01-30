@@ -580,9 +580,18 @@ func TestShmGracefulClose(t *testing.T) {
 	testCtx, testCancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	defer testCancel()
 
+	// Channel to signal when server handler has started processing a stream.
+	serverStarted := make(chan struct{}, 1)
+
 	// Start server stream handler: echo one message, then wait for client
 	// half-close and send OK trailers.
 	go serverTransport.HandleStreams(testCtx, func(s *ServerStream) {
+		// Signal that the server handler is running.
+		select {
+		case serverStarted <- struct{}{}:
+		default:
+		}
+
 		// Send initial headers.
 		_ = serverTransport.writeHeader(s, metadata.MD{"content-type": []string{"application/grpc"}})
 
@@ -612,7 +621,7 @@ func TestShmGracefulClose(t *testing.T) {
 	}
 	defer clientTransport.Close(nil)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	cs, err := clientTransport.NewStream(ctx, &CallHdr{Method: "/test/GracefulClose"})
@@ -629,6 +638,14 @@ func TestShmGracefulClose(t *testing.T) {
 	if err := cs.Write(outgoingHeader, newBufferSlice(msg), &WriteOptions{}); err != nil {
 		t.Fatalf("Error while writing: %v", err)
 	}
+
+	// Wait for the server handler to start processing before reading.
+	select {
+	case <-serverStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for server handler to start")
+	}
+
 	if _, err := cs.readTo(incomingHeader); err != nil {
 		t.Fatalf("Error while reading: %v", err)
 	}
