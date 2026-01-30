@@ -28,7 +28,9 @@ import (
 	"time"
 )
 
-// TestSimpleCancellation tests cancellation with a simple context.WithCancel
+// TestSimpleCancellation tests cancellation with a simple context.WithCancel.
+// It uses explicit channel-based synchronization (like TCP tests) rather than
+// arbitrary sleeps to ensure deterministic behavior under load.
 func TestSimpleCancellation(t *testing.T) {
 	log.Printf("=== Starting TestSimpleCancellation ===")
 	name := fmt.Sprintf("simple-cancel-%d", time.Now().UnixNano())
@@ -38,17 +40,21 @@ func TestSimpleCancellation(t *testing.T) {
 	}
 	defer seg.Close()
 
+	// Synchronization channels
+	headersReceived := make(chan struct{}) // Signals server got HEADERS frame
+	messageReceived := make(chan struct{}) // Signals server got MESSAGE frame
+	canceledSeen := make(chan struct{})    // Signals server got CANCEL frame
+
 	// Server goroutine: read HEADERS and MESSAGE, then expect a CANCEL frame
-	canceledSeen := make(chan struct{}, 1)
 	go func() {
 		log.Printf("Server: Starting")
 		srvRx := NewShmRingFromSegment(seg.A, seg.Mem)
 
 		// Read request HEADERS with timeout
 		log.Printf("Server: Reading HEADERS...")
-		readCtx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		readCtx, cancelRead := context.WithTimeout(context.Background(), 2*time.Second)
 		fh, _, err := readFrame(readCtx, srvRx)
-		cancel()
+		cancelRead()
 
 		if err != nil {
 			log.Printf("Server: Failed to read HEADERS: %v", err)
@@ -58,28 +64,38 @@ func TestSimpleCancellation(t *testing.T) {
 			log.Printf("Server: Expected HEADERS, got type %d", fh.Type)
 			return
 		}
+		log.Printf("Server: Got HEADERS (streamID=%d)", fh.StreamID)
+		close(headersReceived) // Signal: HEADERS received
 
-		log.Printf("Server: Got HEADERS (streamID=%d), reading more frames...", fh.StreamID)
-		// Read next frame(s) until CANCEL arrives
-		for i := 0; i < 3; i++ {
-			log.Printf("Server: Reading frame %d...", i+1)
-			readCtx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
-			fh2, payload, err := readFrame(readCtx, srvRx)
-			cancel()
+		// Read MESSAGE frame
+		log.Printf("Server: Reading MESSAGE...")
+		readCtx, cancelRead = context.WithTimeout(context.Background(), 2*time.Second)
+		fh2, payload, err := readFrame(readCtx, srvRx)
+		cancelRead()
 
-			if err != nil {
-				log.Printf("Server: ReadFrame error: %v", err)
-				break
-			}
-			log.Printf("Server: Got frame type %d (streamID=%d, payloadLen=%d)", fh2.Type, fh2.StreamID, len(payload))
-			if fh2.Type == FrameTypeCANCEL {
-				log.Printf("Server: Saw CANCEL frame!")
-				canceledSeen <- struct{}{}
-				return
-			}
+		if err != nil {
+			log.Printf("Server: Failed to read MESSAGE: %v", err)
+			return
 		}
+		log.Printf("Server: Got frame type %d (streamID=%d, payloadLen=%d)", fh2.Type, fh2.StreamID, len(payload))
+		close(messageReceived) // Signal: MESSAGE received
 
-		log.Printf("Server: Exiting without seeing CANCEL")
+		// Now wait for CANCEL frame
+		log.Printf("Server: Waiting for CANCEL frame...")
+		readCtx, cancelRead = context.WithTimeout(context.Background(), 2*time.Second)
+		fh3, _, err := readFrame(readCtx, srvRx)
+		cancelRead()
+
+		if err != nil {
+			log.Printf("Server: ReadFrame error waiting for CANCEL: %v", err)
+			return
+		}
+		if fh3.Type == FrameTypeCANCEL {
+			log.Printf("Server: Saw CANCEL frame!")
+			close(canceledSeen)
+		} else {
+			log.Printf("Server: Expected CANCEL, got type %d", fh3.Type)
+		}
 	}()
 
 	client := NewShmUnaryClient(seg)
@@ -103,10 +119,24 @@ func TestSimpleCancellation(t *testing.T) {
 		errCh <- err
 	}()
 
-	// Let the client send HEADERS and MESSAGE frames, then cancel
-	log.Printf("Client: Sleeping briefly to let frames be sent...")
-	time.Sleep(2 * time.Millisecond)
-	log.Printf("Client: About to call cancel()...")
+	// Wait for server to confirm it received frames (explicit synchronization)
+	log.Printf("Client: Waiting for server to receive HEADERS...")
+	select {
+	case <-headersReceived:
+		log.Printf("Client: Server confirmed HEADERS received")
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for server to receive HEADERS")
+	}
+
+	select {
+	case <-messageReceived:
+		log.Printf("Client: Server confirmed MESSAGE received")
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for server to receive MESSAGE")
+	}
+
+	// NOW cancel - we know for certain the frames were transmitted
+	log.Printf("Client: Calling cancel()...")
 	cancel()
 	log.Printf("Client: cancel() returned")
 
@@ -119,7 +149,6 @@ func TestSimpleCancellation(t *testing.T) {
 			t.Fatal("expected cancellation error, got nil")
 		}
 	case <-time.After(2 * time.Second):
-		log.Printf("Client: TIMEOUT waiting for UnaryCall result!")
 		t.Fatal("client did not return after cancel")
 	}
 
@@ -129,7 +158,6 @@ func TestSimpleCancellation(t *testing.T) {
 	case <-canceledSeen:
 		log.Printf("Server observed CANCEL frame")
 	case <-time.After(2 * time.Second):
-		log.Printf("Server: TIMEOUT waiting for CANCEL frame!")
 		t.Fatal("server did not observe CANCEL frame")
 	}
 
