@@ -72,10 +72,10 @@ import (
 )
 
 func main() {
-	fmt.Println("â•”â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•—")
-	fmt.Println("â•‘    RFC A73 Compliant Transport Selection Demo             â•‘")
-	fmt.Println("â•‘    Phases 1-3: Attributes, Selection, Fallback            â•‘")
-	fmt.Println("â•šâ•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•")
+	fmt.Println("+-------------------------------------------------------------+")
+	fmt.Println("|    RFC A73 Compliant Transport Selection Demo             |")
+	fmt.Println("|    Phases 1-3: Attributes, Selection, Fallback            |")
+	fmt.Println("+-------------------------------------------------------------+")
 	fmt.Println()
 
 	// Demonstrate ShmCapability attribute usage
