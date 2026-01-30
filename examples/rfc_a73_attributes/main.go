@@ -29,38 +29,38 @@ This example shows how:
 
 Key Concepts:
 
-1. ShmCapability Attribute:
-   When a resolver returns addresses, it can annotate them with ShmCapability:
+ 1. ShmCapability Attribute:
+    When a resolver returns addresses, it can annotate them with ShmCapability:
 
-       cap := transport.ShmCapability{
-           Enabled:     true,
-           SegmentName: "my_segment",
-           Preferred:   true,
-           Required:    false,
-       }
-       addr = transport.SetShmCapability(addr, cap)
+    cap := transport.ShmCapability{
+    Enabled:     true,
+    SegmentName: "my_segment",
+    Preferred:   true,
+    Required:    false,
+    }
+    addr = transport.SetShmCapability(addr, cap)
 
-2. TransportSelector (Phase 2):
-   The TransportSelector determines transport type based on attributes:
+ 2. TransportSelector (Phase 2):
+    The TransportSelector determines transport type based on attributes:
 
-       selector := transport.NewTransportSelector(cfg)
-       transportType := selector.SelectTransport(addr)
-       // Returns TransportTypeHTTP2 or TransportTypeShm
+    selector := transport.NewTransportSelector(cfg)
+    transportType := selector.SelectTransport(addr)
+    // Returns TransportTypeHTTP2 or TransportTypeShm
 
-3. Fallback Logic:
-   IsFallbackAllowed() determines if HTTP/2 fallback is allowed:
+ 3. Fallback Logic:
+    IsFallbackAllowed() determines if HTTP/2 fallback is allowed:
 
-       if transport.IsFallbackAllowed(addr) {
-           // Can fall back to HTTP/2 if shm fails
-       }
+    if transport.IsFallbackAllowed(addr) {
+    // Can fall back to HTTP/2 if shm fails
+    }
 
-4. NewShmClient():
-   Creates shm transport with same signature as NewHTTP2Client for
-   seamless integration in clientconn.go.
+ 4. NewShmClient():
+    Creates shm transport with same signature as NewHTTP2Client for
+    seamless integration in clientconn.go.
 
 Running This Example:
 
-    go run examples/rfc_a73_attributes/main.go
+	go run examples/rfc_a73_attributes/main.go
 */
 package main
 
