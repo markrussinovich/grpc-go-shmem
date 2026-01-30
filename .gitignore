@@ -14,6 +14,8 @@ examples/helloworld/greeter_client/greeter_client
 examples/helloworld/greeter_server/greeter_server
 examples/helloworld_shm/greeter_client/greeter_client
 examples/helloworld_shm/greeter_server/greeter_server
+examples/helloworld_shm/greeter_client_shm
+examples/helloworld_shm/greeter_server_shm
 examples/route_guide_shm/client/client
 examples/route_guide_shm/server/server
 examples/shm_server_usage/shm_server_usage

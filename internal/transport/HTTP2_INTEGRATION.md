@@ -22,8 +22,8 @@ This futex-based design provides:
 ### Ring Buffer Design
 
 Two ring buffers provide full-duplex communication:
-- **Ring A**: Client → Server
-- **Ring B**: Server → Client
+- **Ring A**: Client Ã¢â€ â€™ Server
+- **Ring B**: Server Ã¢â€ â€™ Client
 
 Each ring is a power-of-2 circular buffer with:
 - Atomic write/read indices (monotonically increasing)
@@ -60,8 +60,8 @@ In bidirectional streaming, a naive implementation can deadlock:
 
 ```
 Scenario:
-1. Client fills Server→Client buffer while trying to send more
-2. Server fills Client→Server buffer while trying to send more
+1. Client fills ServerÃ¢â€ â€™Client buffer while trying to send more
+2. Server fills ClientÃ¢â€ â€™Server buffer while trying to send more
 3. Both sides block on write()
 4. Neither can read to drain buffers
 5. DEADLOCK!
@@ -74,15 +74,15 @@ The key principle: **Never block both read and write simultaneously.**
 Each side has independent goroutines:
 
 ```
-┌─────────────┐                      ┌─────────────┐
-│   Client    │                      │   Server    │
-├─────────────┤                      ├─────────────┤
-│ Reader      │◄──── Ring B ────────┤ Sender      │
-│ Goroutine   │      (S→C)          │ Goroutine   │
-│             │                      │             │
-│ Sender      │────── Ring A ───────►│ Reader      │
-│ Goroutine   │      (C→S)          │ Goroutine   │
-└─────────────┘                      └─────────────┘
+Ã¢â€Å’Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€Â                      Ã¢â€Å’Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€Â
+Ã¢â€â€š   Client    Ã¢â€â€š                      Ã¢â€â€š   Server    Ã¢â€â€š
+Ã¢â€Å“Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€Â¤                      Ã¢â€Å“Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€Â¤
+Ã¢â€â€š Reader      Ã¢â€â€šÃ¢â€”â€žÃ¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Ring B Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€Â¤ Sender      Ã¢â€â€š
+Ã¢â€â€š Goroutine   Ã¢â€â€š      (SÃ¢â€ â€™C)          Ã¢â€â€š Goroutine   Ã¢â€â€š
+Ã¢â€â€š             Ã¢â€â€š                      Ã¢â€â€š             Ã¢â€â€š
+Ã¢â€â€š Sender      Ã¢â€â€šÃ¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Ring A Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€“ÂºÃ¢â€â€š Reader      Ã¢â€â€š
+Ã¢â€â€š Goroutine   Ã¢â€â€š      (CÃ¢â€ â€™S)          Ã¢â€â€š Goroutine   Ã¢â€â€š
+Ã¢â€â€Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€Ëœ                      Ã¢â€â€Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€Ëœ
 ```
 
 **Why this prevents deadlock:**
@@ -96,8 +96,8 @@ Each side has independent goroutines:
 
 ```go
 type ShmStreamingClient struct {
-    tx *ShmRing  // client → server
-    rx *ShmRing  // server → client
+    tx *ShmRing  // client Ã¢â€ â€™ server
+    rx *ShmRing  // server Ã¢â€ â€™ client
 
     // Single reader goroutine
     // Dispatches frames to per-stream channels
@@ -121,8 +121,8 @@ type ShmStreamingClient struct {
 
 ```go
 type ShmStreamingServer struct {
-    tx *ShmRing  // server → client
-    rx *ShmRing  // client → server
+    tx *ShmRing  // server Ã¢â€ â€™ client
+    rx *ShmRing  // client Ã¢â€ â€™ server
 
     // Single reader goroutine
     // Dispatches to stream handlers
@@ -141,16 +141,16 @@ type ShmStreamingServer struct {
 
 ```
 Client Stream:
-    CREATE → HEADERS → [MESSAGE]* → CLOSE_SEND → [RECV]* → TRAILERS → DONE
-              ↓                                      ↑
-              └──────── concurrent ─────────────────┘
+    CREATE Ã¢â€ â€™ HEADERS Ã¢â€ â€™ [MESSAGE]* Ã¢â€ â€™ CLOSE_SEND Ã¢â€ â€™ [RECV]* Ã¢â€ â€™ TRAILERS Ã¢â€ â€™ DONE
+              Ã¢â€ â€œ                                      Ã¢â€ â€˜
+              Ã¢â€â€Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ concurrent Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€Ëœ
 
 Server Stream:
-    NEW → HEADERS → RECV_LOOP ──┐
-                       ↓         ↓
-                    SEND_LOOP    │
-                       ↓         ↓
-                    TRAILERS → DONE
+    NEW Ã¢â€ â€™ HEADERS Ã¢â€ â€™ RECV_LOOP Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€Â
+                       Ã¢â€ â€œ         Ã¢â€ â€œ
+                    SEND_LOOP    Ã¢â€â€š
+                       Ã¢â€ â€œ         Ã¢â€ â€œ
+                    TRAILERS Ã¢â€ â€™ DONE
 ```
 
 Both send and receive can happen concurrently within a stream.
@@ -176,10 +176,10 @@ Both send and receive can happen concurrently within a stream.
 ### Expected Behavior
 
 With proper concurrent read/write:
-- ✅ No deadlocks even when both buffers are full
-- ✅ Backpressure handled gracefully via buffered queues
-- ✅ Stream isolation (one blocked stream doesn't affect others)
-- ✅ Clean cancellation and shutdown
+- Ã¢Å“â€¦ No deadlocks even when both buffers are full
+- Ã¢Å“â€¦ Backpressure handled gracefully via buffered queues
+- Ã¢Å“â€¦ Stream isolation (one blocked stream doesn't affect others)
+- Ã¢Å“â€¦ Clean cancellation and shutdown
 
 ## Performance Characteristics
 
@@ -222,10 +222,10 @@ Currently, the streaming implementations are standalone. Full integration would 
 ## Conclusion
 
 The shared memory transport provides:
-- ✅ **Futex-based cross-process synchronization**
-- ✅ **HTTP/2-style frame protocol**
-- ✅ **Bidirectional streaming without deadlocks**
-- ✅ **Concurrent read/write architecture**
-- ✅ **High performance and low latency**
+- Ã¢Å“â€¦ **Futex-based cross-process synchronization**
+- Ã¢Å“â€¦ **HTTP/2-style frame protocol**
+- Ã¢Å“â€¦ **Bidirectional streaming without deadlocks**
+- Ã¢Å“â€¦ **Concurrent read/write architecture**
+- Ã¢Å“â€¦ **High performance and low latency**
 
 The key innovation is the **separation of read and write paths** via independent goroutines and buffered queues, ensuring that even when one ring buffer fills, the other direction can still make progress, preventing circular dependencies and deadlocks.

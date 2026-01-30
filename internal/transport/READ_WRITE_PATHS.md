@@ -23,22 +23,22 @@ This document traces the complete read and write paths for both HTTP2 (Unix sock
 
 ```
 Application                    gRPC Core                      Transport Layer
-    │                              │                              │
-    ▼                              │                              │
-clientStream.SendMsg(m)            │                              │
-    │                              │                              │
-    └──► prepareMsg()              │                              │
-         (marshal + compress)      │                              │
-              │                    │                              │
-              ▼                    │                              │
-         csAttempt.sendMsg()       │                              │
-              │                    │                              │
-              ▼                    │                              │
-         a.transportStream.Write(hdr, payload, opts)              │
-              │                    │                              │
-              ├──────────────────────► HTTP2: http2Client.write() │
-              │                    │  or                          │
-              └──────────────────────► Shmem: ShmClientTransport.write()
+    Ã¢â€â€š                              Ã¢â€â€š                              Ã¢â€â€š
+    Ã¢â€“Â¼                              Ã¢â€â€š                              Ã¢â€â€š
+clientStream.SendMsg(m)            Ã¢â€â€š                              Ã¢â€â€š
+    Ã¢â€â€š                              Ã¢â€â€š                              Ã¢â€â€š
+    Ã¢â€â€Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€“Âº prepareMsg()              Ã¢â€â€š                              Ã¢â€â€š
+         (marshal + compress)      Ã¢â€â€š                              Ã¢â€â€š
+              Ã¢â€â€š                    Ã¢â€â€š                              Ã¢â€â€š
+              Ã¢â€“Â¼                    Ã¢â€â€š                              Ã¢â€â€š
+         csAttempt.sendMsg()       Ã¢â€â€š                              Ã¢â€â€š
+              Ã¢â€â€š                    Ã¢â€â€š                              Ã¢â€â€š
+              Ã¢â€“Â¼                    Ã¢â€â€š                              Ã¢â€â€š
+         a.transportStream.Write(hdr, payload, opts)              Ã¢â€â€š
+              Ã¢â€â€š                    Ã¢â€â€š                              Ã¢â€â€š
+              Ã¢â€Å“Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€“Âº HTTP2: http2Client.write() Ã¢â€â€š
+              Ã¢â€â€š                    Ã¢â€â€š  or                          Ã¢â€â€š
+              Ã¢â€â€Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€“Âº Shmem: ShmClientTransport.write()
 ```
 
 ---
@@ -51,14 +51,14 @@ clientStream.SendMsg(m)            │                              │
 // stream.go:938
 func (cs *clientStream) SendMsg(m any) (err error) {
     // 1. Prepare message: marshal + compress
-    hdr, data, payload, pf, err := prepareMsg(m, cs.codec, cs.compressorV0, 
+    hdr, data, payload, pf, err := prepareMsg(m, cs.codec, cs.compressorV0,
         cs.compressorV1, cs.cc.dopts.copts.BufferPool)
-    
+
     // 2. Size check
     if payloadLen > *cs.callInfo.maxSendMessageSize {
         return status.Errorf(codes.ResourceExhausted, ...)
     }
-    
+
     // 3. Call transport write via csAttempt
     op := func(a *csAttempt) error {
         return a.sendMsg(m, hdr, payload, dataLen, payloadLen)
@@ -71,10 +71,10 @@ func (cs *clientStream) SendMsg(m any) (err error) {
 
 ```go
 // stream.go:1122
-func (a *csAttempt) sendMsg(m any, hdr []byte, payld mem.BufferSlice, 
+func (a *csAttempt) sendMsg(m any, hdr []byte, payld mem.BufferSlice,
                             dataLength, payloadLength int) error {
     // Direct call to transport
-    if err := a.transportStream.Write(hdr, payld, 
+    if err := a.transportStream.Write(hdr, payld,
         &transport.WriteOptions{Last: !cs.desc.ClientStreams}); err != nil {
         return io.EOF
     }
@@ -86,7 +86,7 @@ func (a *csAttempt) sendMsg(m any, hdr []byte, payld mem.BufferSlice,
 
 ```go
 // http2_client.go:1109
-func (t *http2Client) write(s *ClientStream, hdr []byte, data mem.BufferSlice, 
+func (t *http2Client) write(s *ClientStream, hdr []byte, data mem.BufferSlice,
                             opts *WriteOptions) error {
     // 1. Check/update stream state
     if opts.Last {
@@ -94,7 +94,7 @@ func (t *http2Client) write(s *ClientStream, hdr []byte, data mem.BufferSlice,
             return errStreamDone
         }
     }
-    
+
     // 2. Create dataFrame control buffer item
     df := &dataFrame{
         streamID:  s.id,
@@ -102,12 +102,12 @@ func (t *http2Client) write(s *ClientStream, hdr []byte, data mem.BufferSlice,
         h:         hdr,
         data:      data,
     }
-    
+
     // 3. Wait for flow control quota (BLOCKING)
     if err := s.wq.get(int32(len(hdr) + dataLen)); err != nil {
         return err
     }
-    
+
     // 4. Enqueue to controlBuf (wakes loopyWriter)
     if err := t.controlBuf.put(df); err != nil {
         return err
@@ -129,17 +129,17 @@ func (c *controlBuffer) put(it cbItem) error {
 func (c *controlBuffer) executeAndPut(f func() bool, it cbItem) (bool, error) {
     c.mu.Lock()
     defer c.mu.Unlock()
-    
+
     // Wake up loopyWriter if waiting
     var wakeUp bool
     if c.consumerWaiting {
         wakeUp = true
         c.consumerWaiting = false
     }
-    
+
     // Enqueue item
     c.list.enqueue(it)
-    
+
     if wakeUp {
         // Signal wakeupCh to unblock loopyWriter.get()
         close(c.wakeupCh)  // effectively signals waiting goroutine
@@ -158,17 +158,17 @@ func (l *loopyWriter) run() (err error) {
         if err != nil {
             return err
         }
-        
+
         // 2. Handle control frame (headers, settings, etc.)
         if err = l.handle(it); err != nil {
             return err
         }
-        
+
         // 3. Process any pending data frames
         if _, err = l.processData(); err != nil {
             return err
         }
-        
+
         // 4. Batch processing loop for efficiency
         for {
             it, err := l.cbuf.get(false)  // non-blocking
@@ -193,9 +193,9 @@ func (l *loopyWriter) processData() (bool, error) {
     if str == nil {
         return true, nil  // no active streams
     }
-    
+
     dataItem := str.itl.peek().(*dataFrame)
-    
+
     // 1. Calculate how much we can send (flow control)
     maxSize := http2MaxFrameLen  // 16KB
     if strQuota := int(l.oiws) - str.bytesOutStanding; strQuota <= 0 {
@@ -207,16 +207,16 @@ func (l *loopyWriter) processData() (bool, error) {
     if maxSize > int(l.sendQuota) {  // connection-level
         maxSize = int(l.sendQuota)
     }
-    
+
     // 2. Copy data to writeBuf
     hSize := min(maxSize, len(dataItem.h))
     dSize := min(maxSize-hSize, reader.Remaining())
     l.writeBuf = append(l.writeBuf, dataItem.h[:hSize])
     l.writeBuf, _ = reader.Peek(dSize, l.writeBuf)
-    
+
     // 3. Write HTTP/2 DATA frame
     err := l.framer.writeData(dataItem.streamID, endStream, l.writeBuf)
-    
+
     // 4. Update quotas
     str.bytesOutStanding += size
     l.sendQuota -= uint32(size)
@@ -232,13 +232,13 @@ func (f *framer) writeData(streamID uint32, endStream bool, data [][]byte) error
     if endStream {
         flags = http2.FlagDataEndStream
     }
-    
+
     // Calculate total length
     length := uint32(0)
     for _, d := range data {
         length += uint32(len(d))
     }
-    
+
     // 1. Write 9-byte HTTP/2 frame header manually
     f.headerBuf = append(f.headerBuf[:0],
         byte(length>>16), byte(length>>8), byte(length),  // 3 bytes: length
@@ -246,10 +246,10 @@ func (f *framer) writeData(streamID uint32, endStream bool, data [][]byte) error
         byte(flags),                                       // 1 byte: flags
         byte(streamID>>24), byte(streamID>>16),           // 4 bytes: stream ID
         byte(streamID>>8), byte(streamID))
-    
+
     // 2. Write header to bufWriter
     f.writer.Write(f.headerBuf)
-    
+
     // 3. Write payload chunks to bufWriter
     for _, d := range data {
         f.writer.Write(d)
@@ -258,7 +258,7 @@ func (f *framer) writeData(streamID uint32, endStream bool, data [][]byte) error
 }
 ```
 
-### bufWriter.Write() → net.Conn: `http_util.go` lines 298-355
+### bufWriter.Write() Ã¢â€ â€™ net.Conn: `http_util.go` lines 298-355
 
 ```go
 // http_util.go:298
@@ -274,10 +274,10 @@ func (w *bufWriter) Write(b []byte) (int, error) {
     for len(b) > 0 {
         copied := copy(w.buf[w.offset:], b)
         w.offset += copied
-        
+
         if w.offset >= w.batchSize {
-            // Buffer full → flush to kernel
-            w.conn.Write(w.buf[:w.offset])  // ← SYSCALL: sendto()
+            // Buffer full Ã¢â€ â€™ flush to kernel
+            w.conn.Write(w.buf[:w.offset])  // Ã¢â€ Â SYSCALL: sendto()
             w.offset = 0
         }
     }
@@ -311,7 +311,7 @@ func (w *bufWriter) Write(b []byte) (int, error) {
 
 ```go
 // shm_client_transport.go:946
-func (t *ShmClientTransport) write(s *ClientStream, hdr []byte, data mem.BufferSlice, 
+func (t *ShmClientTransport) write(s *ClientStream, hdr []byte, data mem.BufferSlice,
                                    opts *WriteOptions) error {
     // 1. Check transport/stream state
     if t.closed.Load() {
@@ -322,14 +322,14 @@ func (t *ShmClientTransport) write(s *ClientStream, hdr []byte, data mem.BufferS
             return errStreamDone
         }
     }
-    
+
     payloadLen := len(hdr) + data.Len()
-    
+
     // 2. Wait for flow control quota (custom implementation)
     if err := t.acquireSendQuota(s.ctx, s.id, payloadLen); err != nil {
         return err
     }
-    
+
     // 3. Build frame header
     fh := FrameHeader{
         StreamID: s.id,
@@ -339,7 +339,7 @@ func (t *ShmClientTransport) write(s *ClientStream, hdr []byte, data mem.BufferS
     if opts != nil && !opts.Last {
         fh.Flags = MessageFlagMORE
     }
-    
+
     // 4. Write directly to ring buffer (no intermediate buffers!)
     if err := writeFrameBuffersChunked(s.ctx, t.clientToServer, fh, hdr, data, 0); err != nil {
         return err
@@ -352,26 +352,26 @@ func (t *ShmClientTransport) write(s *ClientStream, hdr []byte, data mem.BufferS
 
 ```go
 // frame.go:500
-func writeFrameBuffersChunked(ctx context.Context, tx *ShmRing, fh FrameHeader, 
+func writeFrameBuffersChunked(ctx context.Context, tx *ShmRing, fh FrameHeader,
                                hdr []byte, data mem.BufferSlice, maxFramePayload int) error {
     payloadLen := len(hdr) + data.Len()
-    
+
     // Calculate chunk size (half ring capacity by default)
     if maxFramePayload <= 0 {
         cap := int(tx.Capacity())
         maxFramePayload = cap/2 - frameHeaderSize
     }
-    
+
     // FAST PATH: payload fits in single frame
     if payloadLen <= maxFramePayload {
         return writeFrameBuffers(ctx, tx, fh, hdr, data)
     }
-    
+
     // SLOW PATH: chunk large payloads
     combined := make([]byte, payloadLen)
     copy(combined, hdr)
     // ... copy data buffers
-    
+
     for len(remaining) > 0 {
         chunkFH := fh
         if len(remaining) > chunkSize {
@@ -386,24 +386,24 @@ func writeFrameBuffersChunked(ctx context.Context, tx *ShmRing, fh FrameHeader,
 
 ```go
 // frame.go:432
-func writeFrameBuffers(ctx context.Context, tx *ShmRing, fh FrameHeader, 
+func writeFrameBuffers(ctx context.Context, tx *ShmRing, fh FrameHeader,
                        hdr []byte, payload mem.BufferSlice) error {
     dataLen := payload.Len()
     payloadLen := len(hdr) + dataLen
     fh.Length = uint32(payloadLen)
-    
+
     total := frameHeaderSize + payloadLen
-    
+
     // 1. Reserve space in ring buffer (may block via futex)
     res, err := tx.ReserveWrite(ctx, total)
     if err != nil {
         return err
     }
-    
+
     // 2. Encode frame header directly into ring memory
     var fhBytes [frameHeaderSize]byte
     encodeFrameHeaderTo(&fhBytes, fh)
-    
+
     // 3. Write header + payload sequentially into reservation
     written := 0
     writeSeq := func(src []byte) error {
@@ -419,13 +419,13 @@ func writeFrameBuffers(ctx context.Context, tx *ShmRing, fh FrameHeader,
         }
         return nil
     }
-    
+
     writeSeq(fhBytes[:])           // Frame header
     writeSeq(hdr)                   // gRPC header (5 bytes)
     for _, buf := range payload {
         writeSeq(buf.ReadOnlyData()) // Message payload
     }
-    
+
     // 4. Commit and signal reader (futex_wake if needed)
     return res.Commit(total)
 }
@@ -437,7 +437,7 @@ func writeFrameBuffers(ctx context.Context, tx *ShmRing, fh FrameHeader,
 // ring.go:1117
 func (r *ShmRing) ReserveWrite(ctx context.Context, n int) (WriteReservation, error) {
     hdr := r.header()
-    
+
     for {
         // Check context cancellation
         select {
@@ -445,19 +445,19 @@ func (r *ShmRing) ReserveWrite(ctx context.Context, n int) (WriteReservation, er
             return WriteReservation{}, ctx.Err()
         default:
         }
-        
+
         // Load current indices atomically
         writeIdx := hdr.WriteIndex()
         readIdx := hdr.ReadIndex()
-        
+
         // Calculate available space
         usedBefore := writeIdx - readIdx
         available := r.capacity - usedBefore
-        
+
         if uint64(n) <= available {
             // FAST PATH: Space available
             writePos := writeIdx & r.capMask
-            
+
             // Return slices pointing directly into mmap'd memory
             if writePos+uint64(n) <= r.capacity {
                 // No wrap: single contiguous slice
@@ -471,11 +471,11 @@ func (r *ShmRing) ReserveWrite(ctx context.Context, n int) (WriteReservation, er
                 return WriteReservation{First: first, Second: second, ...}, nil
             }
         }
-        
+
         // SLOW PATH: Need to wait for space
         hdr.IncSpaceWaiters()
         spaceSeq := hdr.SpaceSequence()
-        
+
         // Futex wait on spaceSeq (blocks until reader frees space)
         r.waitSpace(ctx, &hdr.spaceSeq, spaceSeq, timeout)
         hdr.DecSpaceWaiters()
@@ -489,10 +489,10 @@ func (r *ShmRing) ReserveWrite(ctx context.Context, n int) (WriteReservation, er
 // ring.go:1092
 func (wr *WriteReservation) Commit(written int) error {
     hdr := wr.ring.header()
-    
+
     // 1. Publish new write index (atomic store with release semantics)
     hdr.SetWriteIndex(wr.writeIdx + uint64(written))
-    
+
     // 2. Increment data sequence and wake reader if waiting
     if written > 0 {
         hdr.IncrementDataSequence()
@@ -528,35 +528,35 @@ func (wr *WriteReservation) Commit(written int) error {
 
 ```
 Wire/Ring                      Transport Layer                    gRPC Core
-    │                              │                                   │
-    ▼                              │                                   │
- [bytes arrive]                    │                                   │
-    │                              │                                   │
-    └──► reader goroutine          │                                   │
-         (http2Client.reader       │                                   │
-          or processIncomingData)  │                                   │
-              │                    │                                   │
-              ▼                    │                                   │
-         frame parsing             │                                   │
-              │                    │                                   │
-              ▼                    │                                   │
-         handleData/MESSAGE        │                                   │
-              │                    │                                   │
-              ▼                    │                                   │
-         s.write(recvMsg{buffer})  │                                   │
-              │                    │                                   │
-              └──────────────────────► recvBuffer.put()                │
-                                   │        │                          │
-                                   │        ▼                          │
-                                   │   recvBufferReader.Read()         │
-                                   │        │                          │
-                                   │        ▼                          │
-                                   │   parser.recvMsg()                │
-                                   │        │                          │
-                                   │        ▼                          │
-                                   │   recv() → Unmarshal              │
-                                   │        │                          │
-                                   │        └──► Application receives m
+    Ã¢â€â€š                              Ã¢â€â€š                                   Ã¢â€â€š
+    Ã¢â€“Â¼                              Ã¢â€â€š                                   Ã¢â€â€š
+ [bytes arrive]                    Ã¢â€â€š                                   Ã¢â€â€š
+    Ã¢â€â€š                              Ã¢â€â€š                                   Ã¢â€â€š
+    Ã¢â€â€Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€“Âº reader goroutine          Ã¢â€â€š                                   Ã¢â€â€š
+         (http2Client.reader       Ã¢â€â€š                                   Ã¢â€â€š
+          or processIncomingData)  Ã¢â€â€š                                   Ã¢â€â€š
+              Ã¢â€â€š                    Ã¢â€â€š                                   Ã¢â€â€š
+              Ã¢â€“Â¼                    Ã¢â€â€š                                   Ã¢â€â€š
+         frame parsing             Ã¢â€â€š                                   Ã¢â€â€š
+              Ã¢â€â€š                    Ã¢â€â€š                                   Ã¢â€â€š
+              Ã¢â€“Â¼                    Ã¢â€â€š                                   Ã¢â€â€š
+         handleData/MESSAGE        Ã¢â€â€š                                   Ã¢â€â€š
+              Ã¢â€â€š                    Ã¢â€â€š                                   Ã¢â€â€š
+              Ã¢â€“Â¼                    Ã¢â€â€š                                   Ã¢â€â€š
+         s.write(recvMsg{buffer})  Ã¢â€â€š                                   Ã¢â€â€š
+              Ã¢â€â€š                    Ã¢â€â€š                                   Ã¢â€â€š
+              Ã¢â€â€Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€“Âº recvBuffer.put()                Ã¢â€â€š
+                                   Ã¢â€â€š        Ã¢â€â€š                          Ã¢â€â€š
+                                   Ã¢â€â€š        Ã¢â€“Â¼                          Ã¢â€â€š
+                                   Ã¢â€â€š   recvBufferReader.Read()         Ã¢â€â€š
+                                   Ã¢â€â€š        Ã¢â€â€š                          Ã¢â€â€š
+                                   Ã¢â€â€š        Ã¢â€“Â¼                          Ã¢â€â€š
+                                   Ã¢â€â€š   parser.recvMsg()                Ã¢â€â€š
+                                   Ã¢â€â€š        Ã¢â€â€š                          Ã¢â€â€š
+                                   Ã¢â€â€š        Ã¢â€“Â¼                          Ã¢â€â€š
+                                   Ã¢â€â€š   recv() Ã¢â€ â€™ Unmarshal              Ã¢â€â€š
+                                   Ã¢â€â€š        Ã¢â€â€š                          Ã¢â€â€š
+                                   Ã¢â€â€š        Ã¢â€â€Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€“Âº Application receives m
 ```
 
 ---
@@ -574,22 +574,22 @@ func (t *http2Client) reader(errCh chan<- error) {
             t.Close(errClose)
         }
     }()
-    
+
     // Read server preface first
     t.readServerPreface()
-    
+
     // Main read loop
     for {
         // 1. Throttle if control buffer is backed up
         t.controlBuf.throttle()
-        
+
         // 2. Read next HTTP/2 frame (SYSCALL: recv())
         frame, err := t.framer.readFrame()
-        
+
         if t.keepaliveEnabled {
             atomic.StoreInt64(&t.lastRead, time.Now().UnixNano())
         }
-        
+
         // 3. Dispatch frame by type
         switch frame := frame.(type) {
         case *http2.MetaHeadersFrame:
@@ -618,12 +618,12 @@ func (t *http2Client) reader(errCh chan<- error) {
 // http2_client.go:1188
 func (t *http2Client) handleData(f *parsedDataFrame) {
     size := f.Header().Length
-    
+
     // 1. Update bandwidth estimator
     if t.bdpEst != nil {
         sendBDPPing = t.bdpEst.add(size)
     }
-    
+
     // 2. Connection-level flow control
     if w := t.fc.onData(size); w > 0 {
         t.controlBuf.put(&outgoingWindowUpdate{
@@ -631,29 +631,29 @@ func (t *http2Client) handleData(f *parsedDataFrame) {
             increment: w,
         })
     }
-    
+
     // 3. Find target stream
     s := t.getStream(f)
     if s == nil {
         return
     }
-    
+
     // 4. Stream-level flow control
     if size > 0 {
         if err := s.fc.onData(size); err != nil {
             t.closeStream(s, io.EOF, ...)
             return
         }
-        
+
         dataLen := f.data.Len()
         if dataLen > 0 {
             f.data.Ref()  // Take reference to buffer
-            
+
             // 5. Deliver to stream's receive buffer
             s.write(recvMsg{buffer: f.data})
         }
     }
-    
+
     // 6. Handle end of stream
     if f.StreamEnded() {
         t.closeStream(s, io.EOF, ...)
@@ -661,7 +661,7 @@ func (t *http2Client) handleData(f *parsedDataFrame) {
 }
 ```
 
-### Stream.write() → recvBuffer: `transport.go` lines 376-378, 78-100
+### Stream.write() Ã¢â€ â€™ recvBuffer: `transport.go` lines 376-378, 78-100
 
 ```go
 // transport.go:376
@@ -672,7 +672,7 @@ func (s *Stream) write(m recvMsg) {
 // transport.go:78
 func (b *recvBuffer) put(r recvMsg) {
     b.mu.Lock()
-    
+
     // Fast path: channel is empty, try direct send
     if len(b.backlog) == 0 {
         select {
@@ -682,7 +682,7 @@ func (b *recvBuffer) put(r recvMsg) {
         default:
         }
     }
-    
+
     // Slow path: buffer in backlog
     b.backlog = append(b.backlog, r)
     b.mu.Unlock()
@@ -703,8 +703,8 @@ func (cs *clientStream) RecvMsg(m any) error {
 // stream.go:1146
 func (a *csAttempt) recvMsg(m any, payInfo *payloadInfo) (err error) {
     // Call recv() which reads from transport and unmarshals
-    if err := recv(&a.parser, cs.codec, a.transportStream, 
-                   a.decompressorV0, m, *cs.callInfo.maxReceiveMessageSize, 
+    if err := recv(&a.parser, cs.codec, a.transportStream,
+                   a.decompressorV0, m, *cs.callInfo.maxReceiveMessageSize,
                    payInfo, a.decompressorV1, false); err != nil {
         return err
     }
@@ -722,28 +722,28 @@ func (p *parser) recvMsg(maxReceiveMessageSize int) (payloadFormat, mem.BufferSl
     if err != nil {
         return 0, nil, err
     }
-    
+
     pf := payloadFormat(p.header[0])
     length := binary.BigEndian.Uint32(p.header[1:])
-    
+
     // 2. Size check
     if int(length) > maxReceiveMessageSize {
         return 0, nil, status.Errorf(codes.ResourceExhausted, ...)
     }
-    
+
     // 3. Read payload bytes
     data, err := p.r.Read(int(length))
     return pf, data, nil
 }
 
 // rpc_util.go:1013
-func recv(p *parser, c baseCodec, s recvCompressor, dc Decompressor, 
-          m any, maxReceiveMessageSize int, payInfo *payloadInfo, 
+func recv(p *parser, c baseCodec, s recvCompressor, dc Decompressor,
+          m any, maxReceiveMessageSize int, payInfo *payloadInfo,
           compressor encoding.Compressor, isServer bool) error {
     // 1. Receive and decompress
-    data, err := recvAndDecompress(p, s, dc, maxReceiveMessageSize, 
+    data, err := recvAndDecompress(p, s, dc, maxReceiveMessageSize,
                                     payInfo, compressor, isServer)
-    
+
     // 2. Unmarshal into message
     defer data.Free()
     if err := c.Unmarshal(data, m); err != nil {
@@ -779,7 +779,7 @@ func (r *recvBufferReader) readAdditional(m recvMsg, n int) (b mem.Buffer, err e
         }
         return nil, m.err
     }
-    
+
     // Return the buffer (possibly split if larger than n)
     if m.buffer.Len() > n {
         m.buffer, r.last = mem.SplitUnsafe(m.buffer, n)
@@ -817,38 +817,38 @@ func (t *ShmClientTransport) processIncomingData(ctx context.Context) {
             go t.Close(errors.New("incoming data processing ended"))
         }
     }()
-    
+
     for {
         if t.closed.Load() {
             return
         }
-        
+
         // 1. Read frame from ring (blocks via futex if empty)
         fh, payloadBuf, err := readFrameView(ctx, t.serverToClient)
         if err != nil {
             // Handle EOF, context cancel, ring closed
             return
         }
-        
+
         // 2. Update keepalive timestamp
         atomic.StoreInt64(&t.lastRead, time.Now().UnixNano())
-        
+
         // 3. Dispatch by frame type
         switch fh.Type {
         case FrameTypeGOAWAY:
             // Handle graceful shutdown
             t.draining.Store(true)
-            
+
         case FrameTypeWindowUpdate:
             delta := binary.LittleEndian.Uint32(payload[:4])
             t.addSendQuota(fh.StreamID, delta)
-            
+
         case FrameTypeMESSAGE:
             // Find stream and deliver
             t.mu.RLock()
             stream, ok := t.streams[fh.StreamID]
             t.mu.RUnlock()
-            
+
             if ok {
                 // Apply flow control
                 sz := uint32(len(payload))
@@ -860,7 +860,7 @@ func (t *ShmClientTransport) processIncomingData(ctx context.Context) {
                     t.closeStream(stream, err, ...)
                     continue
                 }
-                
+
                 // Zero-copy delivery: transfer buffer ownership
                 if payloadBuf != nil {
                     payloadTransferred = true
@@ -868,12 +868,12 @@ func (t *ShmClientTransport) processIncomingData(ctx context.Context) {
                     payloadBuf = nil
                 }
             }
-            
+
         case FrameTypeTRAILERS:
             // Handle trailers and close stream
             tr, _ := decodeTrailers(payload)
             t.closeStream(stream, err, false, 0, st, trailerMap, true)
-            
+
         case FrameTypeCANCEL:
             stream.write(recvMsg{err: context.Canceled})
         }
@@ -892,7 +892,7 @@ func readFrameView(ctx context.Context, rx *ShmRing) (FrameHeader, mem.Buffer, e
         if err != nil {
             return FrameHeader{}, nil, err
         }
-        
+
         // Copy header bytes (may be split across wrap)
         var hb [frameHeaderSize]byte
         copy(hb[:], first)
@@ -900,13 +900,13 @@ func readFrameView(ctx context.Context, rx *ShmRing) (FrameHeader, mem.Buffer, e
             copy(hb[len(first):], second)
         }
         commitHeader.Commit(frameHeaderSize)
-        
+
         // 2. Decode frame header
         fh, err := decodeFrameHeader(hb[:])
         if err != nil {
             return FrameHeader{}, nil, err
         }
-        
+
         // Skip padding frames
         if fh.Type == FrameTypePAD {
             if fh.Length > 0 {
@@ -914,21 +914,21 @@ func readFrameView(ctx context.Context, rx *ShmRing) (FrameHeader, mem.Buffer, e
             }
             continue
         }
-        
+
         if fh.Length == 0 {
             return fh, nil, nil
         }
-        
+
         // 3. Read payload (zero-copy when contiguous)
         pFirst, pSecond, commitPayload, err := rx.ReadSlices(ctx, int(fh.Length))
         if err != nil {
             return FrameHeader{}, nil, err
         }
-        
+
         // FAST PATH: contiguous payload (no wrap)
         if len(pSecond) == 0 {
             contig := pFirst[:fh.Length]
-            
+
             // Small payloads: copy and commit immediately
             if mem.IsBelowBufferPoolingThreshold(int(fh.Length)) {
                 commitPayload.Commit(int(fh.Length))
@@ -936,13 +936,13 @@ func readFrameView(ctx context.Context, rx *ShmRing) (FrameHeader, mem.Buffer, e
                 copy(result, contig)
                 return fh, mem.SliceBuffer(result), nil
             }
-            
+
             // Large payloads: wrap in buffer with deferred commit
             pool := &ringCommitPool{commit: *commitPayload}
             buf := mem.NewBuffer(&contig, pool)
             return fh, buf, nil
         }
-        
+
         // SLOW PATH: wrapped payload (copy to contiguous)
         contig := make([]byte, fh.Length)
         copy(contig, pFirst)
@@ -957,10 +957,10 @@ func readFrameView(ctx context.Context, rx *ShmRing) (FrameHeader, mem.Buffer, e
 
 ```go
 // Returns slices directly into mmap'd ring memory
-func (r *ShmRing) ReadSlices(ctx context.Context, n int) (first, second []byte, 
+func (r *ShmRing) ReadSlices(ctx context.Context, n int) (first, second []byte,
                                                           commit *ReadCommit, error) {
     hdr := r.header()
-    
+
     for {
         // Check context
         select {
@@ -968,15 +968,15 @@ func (r *ShmRing) ReadSlices(ctx context.Context, n int) (first, second []byte,
             return nil, nil, nil, ctx.Err()
         default:
         }
-        
+
         writeIdx := hdr.WriteIndex()
         readIdx := hdr.ReadIndex()
         used := writeIdx - readIdx
-        
+
         if used >= uint64(n) {
             // Data available - return slices into ring memory
             readPos := readIdx & r.capMask
-            
+
             if readPos+uint64(n) <= r.capacity {
                 // No wrap
                 ptr := unsafe.Pointer(uintptr(r.dataPtr()) + uintptr(readPos))
@@ -989,7 +989,7 @@ func (r *ShmRing) ReadSlices(ctx context.Context, n int) (first, second []byte,
                 return first, second, &ReadCommit{...}, nil
             }
         }
-        
+
         // Wait for data via futex
         hdr.IncDataWaiters()
         dataSeq := hdr.DataSequence()
@@ -1091,7 +1091,7 @@ type ShmClientTransport struct {
 ### HTTP2 Flow Control (Write Path)
 
 1. **Stream quota**: `s.wq.get(size)` blocks in `write()` before creating dataFrame
-2. **Connection quota**: Checked in `loopyWriter.processData()` 
+2. **Connection quota**: Checked in `loopyWriter.processData()`
 3. **Window updates**: Received via WINDOW_UPDATE frames, delivered to controlBuf
 
 ```go
@@ -1121,7 +1121,7 @@ if err := t.acquireSendQuota(s.ctx, s.id, payloadLen); err != nil {
 | Backpressure mechanism | Channel + loopyWriter | Ring buffer full + futex |
 | Batching | loopyWriter batches frames | Direct write, no batching |
 | Syscalls per write | 1-2 (sendto) | 0-1 (futex_wake if reader waiting) |
-| Memory copies | 4+ (app→heap→bufWriter→kernel→peer) | 1 (app→ring mmap) |
+| Memory copies | 4+ (appÃ¢â€ â€™heapÃ¢â€ â€™bufWriterÃ¢â€ â€™kernelÃ¢â€ â€™peer) | 1 (appÃ¢â€ â€™ring mmap) |
 
 ---
 
@@ -1130,7 +1130,7 @@ if err := t.acquireSendQuota(s.ctx, s.id, payloadLen); err != nil {
 ### HTTP2 Server: `http2_server.go`
 
 Server write path is nearly identical to client:
-1. `ServerStream.SendMsg()` → `prepareMsg()` → `ss.t.write()`
+1. `ServerStream.SendMsg()` Ã¢â€ â€™ `prepareMsg()` Ã¢â€ â€™ `ss.t.write()`
 2. `http2Server.write()` creates `dataFrame`, puts in `controlBuf`
 3. `loopyWriter.run()` dequeues and writes to `framer`
 
@@ -1138,18 +1138,18 @@ Server write path is nearly identical to client:
 
 ```go
 // shm_server_transport.go:956
-func (t *ShmServerTransport) write(s *ServerStream, hdr []byte, data mem.BufferSlice, 
+func (t *ShmServerTransport) write(s *ServerStream, hdr []byte, data mem.BufferSlice,
                                    _ *WriteOptions) error {
     // 1. Maybe write headers first
     if err := t.maybeWriteHeader(s); err != nil {
         return err
     }
-    
+
     // 2. Flow control
     if err := t.acquireSendQuota(s.ctx, s.id, payloadLen); err != nil {
         return err
     }
-    
+
     // 3. Direct ring write (holding writeMu for serialization)
     t.writeMu.Lock()
     defer t.writeMu.Unlock()
@@ -1168,5 +1168,5 @@ func (t *ShmServerTransport) write(s *ServerStream, hdr []byte, data mem.BufferS
 | **Memory copies** | 4+ per message | 1 per message (direct to ring) |
 | **Batching** | loopyWriter batches in bufWriter | No batching (direct commit) |
 | **Backpressure** | TCP flow control + gRPC flow control | Ring full + futex wait |
-| **Zero-copy read** | No (kernel → userspace copy) | Yes when contiguous in ring |
+| **Zero-copy read** | No (kernel Ã¢â€ â€™ userspace copy) | Yes when contiguous in ring |
 | **Frame format** | HTTP/2 (9-byte header) | Custom (16-byte header) |
