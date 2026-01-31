@@ -656,18 +656,23 @@ func readFrameView(ctx context.Context, rx *ShmRing) (FrameHeader, mem.Buffer, e
 		// The issue: commitReadIdx was set to sharedReadIdx at ReadSlices time,
 		// but if another read's header commit happened before the payload commit,
 		// it would advance sharedReadIdx to the wrong position.
-		var result []byte
+		//
+		// Optimization: Use mem.Copy with the default buffer pool to reduce
+		// allocations for large payloads. The pool reuses buffers of common sizes.
+		var buf mem.Buffer
 		if len(pSecond) == 0 {
-			// Contiguous case
-			result = make([]byte, payloadLen)
-			copy(result, pFirst[:payloadLen])
+			// Contiguous case: use mem.Copy which leverages the buffer pool
+			buf = mem.Copy(pFirst[:payloadLen], mem.DefaultBufferPool())
 		} else {
-			// Wrap-around case
-			result = make([]byte, payloadLen)
-			copied := copy(result, pFirst)
-			copy(result[copied:], pSecond)
+			// Wrap-around case: need to copy both parts
+			// Get a pooled buffer, copy both parts, then wrap it
+			pool := mem.DefaultBufferPool()
+			poolBuf := pool.Get(payloadLen)
+			copied := copy(*poolBuf, pFirst)
+			copy((*poolBuf)[copied:], pSecond)
+			buf = mem.NewBuffer(poolBuf, pool)
 		}
 		commitPayload.Commit(payloadLen)
-		return fh, mem.SliceBuffer(result), nil
+		return fh, buf, nil
 	}
 }
