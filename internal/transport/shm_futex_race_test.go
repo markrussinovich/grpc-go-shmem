@@ -22,6 +22,7 @@ package transport
 
 import (
 	"errors"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -41,14 +42,18 @@ func TestFutexBasicWakeLogic(t *testing.T) {
 
 	// Start a waiter
 	done := make(chan struct{})
+	ready := make(chan struct{})
 	go func() {
 		defer close(done)
+		// Signal ready just before waiting
+		close(ready)
 		// Wait for counter to change from 100
 		futexWait(&counter, 100)
 	}()
 
-	// Give the waiter time to start
-	time.Sleep(10 * time.Millisecond)
+	// Wait for waiter to be ready
+	<-ready
+	runtime.Gosched()
 
 	// Change the value and wake
 	atomic.StoreUint32(&counter, 101)
@@ -91,14 +96,18 @@ func TestFutexAtomicRecheck(t *testing.T) {
 	atomic.StoreUint32(&addr, 100)
 
 	done := make(chan struct{})
+	ready := make(chan struct{})
 	go func() {
+		// Signal ready just before waiting
+		close(ready)
 		// This should proceed to actual futex wait
 		futexWait(&addr, 100)
 		close(done)
 	}()
 
-	// Give the futex wait time to start
-	time.Sleep(10 * time.Millisecond)
+	// Wait for waiter to be ready
+	<-ready
+	runtime.Gosched()
 
 	// Now change value and wake
 	atomic.StoreUint32(&addr, 101)

@@ -23,6 +23,7 @@ package transport
 import (
 	"context"
 	"fmt"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -105,7 +106,7 @@ func TestSelection_ChoosesSHM_and_ExecutesUnary(t *testing.T) {
 	}
 
 	// Unary call over the shared memory segment
-	time.Sleep(10 * time.Millisecond)
+	runtime.Gosched()
 	seg := ct.(*ShmClientTransport).segment
 	cli := NewShmUnaryClient(seg)
 	payload := make([]byte, 5+3)

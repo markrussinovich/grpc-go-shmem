@@ -381,14 +381,18 @@ func TestShmRingNoPolling(t *testing.T) {
 
 	// Start a writer that should block (no polling)
 	writerDone := make(chan error, 1)
+	writerReady := make(chan struct{})
 	go func() {
+		// Signal ready just before blocking
+		close(writerReady)
 		// This should block until reader frees space
 		err := ring.WriteBlocking([]byte("test"))
 		writerDone <- err
 	}()
 
-	// Let writer block for a short time
-	time.Sleep(50 * time.Millisecond)
+	// Wait for writer to be ready to block
+	<-writerReady
+	runtime.Gosched()
 
 	// Check that goroutine count is stable (no polling creating new goroutines)
 	currentGoroutines := runtime.NumGoroutine()
