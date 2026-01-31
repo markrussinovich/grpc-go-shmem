@@ -16,21 +16,21 @@
  *
  */
 
-// Package shmem implements a load balancing policy that prefers shared memory
+// Package shm implements a load balancing policy that prefers shared memory
 // transport for local endpoints. This is part of RFC A73 Phase 6.
 //
-// The policy inspects endpoint attributes to identify shmem-capable endpoints
+// The policy inspects endpoint attributes to identify shm-capable endpoints
 // and prioritizes them over TCP endpoints when both the client and server are
 // on the same machine.
 //
 // Usage:
 //
-//	import _ "google.golang.org/grpc/balancer/shmem"
+//	import _ "google.golang.org/grpc/balancer/shm"
 //
 //	// Set service config to use shmem_prefer policy
 //	conn, err := grpc.Dial(target,
 //	    grpc.WithDefaultServiceConfig(`{"loadBalancingConfig": [{"shmem_prefer":{}}]}`))
-package shmem
+package shm
 
 import (
 	"encoding/json"

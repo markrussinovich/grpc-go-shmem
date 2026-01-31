@@ -16,7 +16,7 @@
  *
  */
 
-package shmem
+package shm
 
 import (
 	"testing"
