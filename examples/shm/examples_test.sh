@@ -60,7 +60,6 @@ pass () {
 # Note: compression is excluded due to gzip encoding issues with shm transport
 # Note: retry is excluded as service config retry may not work with shm transport
 # Note: gracefulstop is excluded due to transport-level stream closing differences
-# Note: flow_control is excluded because SHM is too fast for the test (timeout issues)
 EXAMPLES=(
     "helloworld"
     "route_guide"
@@ -68,6 +67,7 @@ EXAMPLES=(
     "features/deadline"
     "features/error_details"
     "features/error_handling"
+    "features/flow_control"
     "features/interceptor"
     "features/metadata"
     "features/multiplex"

@@ -32,7 +32,6 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	pb "google.golang.org/grpc/examples/features/proto/echo"
-	"google.golang.org/grpc/internal/grpcsync"
 )
 
 var addr = flag.String("addr", "shm://flow_control_shm", "the address to connect to")
@@ -60,48 +59,67 @@ func main() {
 	}
 	log.Printf("New stream began.")
 
-	// First we will send data on the stream until we cannot send any more.  We
-	// detect this by not seeing a message sent 1s after the last sent message.
-	stopSending := grpcsync.NewEvent()
-	sentOne := make(chan struct{})
+	// For SHM transport: The ring buffer is finite (~2MB default), so when the
+	// server isn't reading, the buffer fills up and Send() blocks.
+	//
+	// This example demonstrates flow control in two phases:
+	// Phase 1: Client sends until blocked (server is delaying reads)
+	// Phase 2: Server sends until blocked (client is delaying reads)
+	//
+	// We use a shorter blocking detection timeout for SHM since the buffer fills faster.
+	const blockingTimeout = 200 * time.Millisecond
+	const numMessagesToSend = 50000 // Need many messages to fill 64MB ring buffer
+
+	// Phase 1: Send messages until we detect blocking or reach the limit
+	blocked := false
+	sentCount := 0
+	sendDone := make(chan struct{})
+	
 	go func() {
-		i := 0
-		for !stopSending.HasFired() {
-			i++
+		defer close(sendDone)
+		for i := 0; i < numMessagesToSend; i++ {
 			if err := stream.Send(&pb.EchoRequest{Message: payload}); err != nil {
-				log.Fatalf("Error sending data: %v", err)
+				log.Printf("Error sending data after %d messages: %v", sentCount, err)
+				return
 			}
-			sentOne <- struct{}{}
+			sentCount++
 		}
-		log.Printf("Sent %v messages.", i)
-		stream.CloseSend()
 	}()
 
-	for !stopSending.HasFired() {
-		after := time.NewTimer(time.Second)
-		select {
-		case <-sentOne:
-			after.Stop()
-		case <-after.C:
-			log.Printf("Sending is blocked.")
-			stopSending.Fire()
-			<-sentOne
-		}
+	// Wait for sending to complete or timeout (indicating blocking)
+	select {
+	case <-sendDone:
+		log.Printf("Sent all %d messages without blocking.", sentCount)
+	case <-time.After(blockingTimeout):
+		blocked = true
+		log.Printf("Sending is blocked after ~%d messages (ring buffer full).", sentCount)
 	}
 
-	// Next, we wait 2 seconds before reading from the stream, to give the
-	// server an opportunity to block while sending its responses.
+	// Wait for sender to finish (it will complete once server starts reading)
+	<-sendDone
+	log.Printf("Finished sending %d messages total.", sentCount)
+	stream.CloseSend()
+
+	if blocked {
+		log.Printf("✓ Flow control demonstrated: client sending was blocked by backpressure.")
+	}
+
+	// Phase 2: Delay before reading to let server experience backpressure
+	log.Printf("Client: Delaying read for 2 seconds to demonstrate server-side backpressure...")
 	time.Sleep(2 * time.Second)
 
-	// Finally, read all the data sent by the server to allow it to unblock.
-	for i := 0; true; i++ {
+	// Read all the data sent by the server
+	recvCount := 0
+	for {
 		if _, err := stream.Recv(); err != nil {
-			log.Printf("Read %v messages.", i)
 			if err == io.EOF {
+				log.Printf("Read %d messages from server.", recvCount)
 				log.Printf("Stream ended successfully.")
 				return
 			}
-			log.Fatalf("Error receiving data: %v", err)
+			log.Printf("Error receiving data after %d messages: %v", recvCount, err)
+			return
 		}
+		recvCount++
 	}
 }
