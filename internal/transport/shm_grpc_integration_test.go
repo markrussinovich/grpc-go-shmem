@@ -275,11 +275,25 @@ func TestFullRPC_Integration(t *testing.T) {
 
 	t.Log("Client: Request sent")
 
-	// Wait for response (with timeout)
-	time.Sleep(200 * time.Millisecond)
+	// Read response - wait for headers, message, and trailers
+	respData, err := stream.Read(1024)
+	if err != nil {
+		t.Logf("Client: Read returned: %v (may include EOF)", err)
+	}
+	if respData != nil {
+		t.Logf("Client: Received %d bytes of response data", respData.Len())
+		respData.Free()
+	}
+
+	// Wait for stream to complete
+	select {
+	case <-stream.Done():
+		t.Log("Client: Stream completed")
+	case <-ctx.Done():
+		t.Fatalf("Client: Timeout waiting for stream completion")
+	}
 
 	t.Log("=== Full RPC Integration Test COMPLETED ===")
-	t.Log("Note: Full end-to-end verification requires complete ServerStream implementation")
 }
 
 func TestShmDeadlinePropagation(t *testing.T) {
