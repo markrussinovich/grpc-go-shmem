@@ -57,13 +57,13 @@ pass () {
 
 # Shared memory examples to test
 # Note: keepalive example blocks forever, so we don't include it here
-# Note: compression is excluded due to gzip encoding issues with shm transport
 # Note: retry is excluded as service config retry may not work with shm transport
 # Note: gracefulstop is excluded due to transport-level stream closing differences
 EXAMPLES=(
     "helloworld"
     "route_guide"
     "features/cancellation"
+    "features/compression"
     "features/deadline"
     "features/error_details"
     "features/error_handling"

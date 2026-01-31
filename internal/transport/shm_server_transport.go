@@ -1002,6 +1002,11 @@ func (t *ShmServerTransport) writeHeader(s *ServerStream, md metadata.MD) error 
 		kvs = append(kvs, KV{Key: k, Values: byteVals})
 	}
 
+	// Add grpc-encoding if sendCompress is set (like HTTP/2 does)
+	if s.sendCompress != "" {
+		kvs = append(kvs, KV{Key: "grpc-encoding", Values: [][]byte{[]byte(s.sendCompress)}})
+	}
+
 	// Create HEADERS frame with server-initial type
 	hdr := HeadersV1{
 		Version:          1,
