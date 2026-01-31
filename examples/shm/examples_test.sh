@@ -60,7 +60,7 @@ pass () {
 # Note: compression is excluded due to gzip encoding issues with shm transport
 # Note: retry is excluded as service config retry may not work with shm transport
 # Note: gracefulstop is excluded due to transport-level stream closing differences
-# Note: flow_control is excluded due to data corruption under high throughput (ring buffer issue)
+# Note: flow_control is excluded because SHM is too fast for the test (timeout issues)
 EXAMPLES=(
     "helloworld"
     "route_guide"

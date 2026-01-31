@@ -41,7 +41,9 @@ var payload = string(make([]byte, 8*1024)) // 8KB
 
 func main() {
 	flag.Parse()
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	// SHM transport is much faster than TCP, so we need a longer timeout
+	// to allow the flow control test to complete.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	conn, err := grpc.NewClient(*addr, grpc.WithTransportCredentials(insecure.NewCredentials()))

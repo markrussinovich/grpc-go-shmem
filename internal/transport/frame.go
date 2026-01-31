@@ -23,7 +23,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"sync"
 
 	"google.golang.org/grpc/mem"
 )
@@ -110,22 +109,10 @@ func decodeFrameHeader(b []byte) (FrameHeader, error) {
 	return fh, nil
 }
 
-// ringCommitPool defers advancing the ring read index until the payload buffer
-// is fully released by the consumer. It holds a COPY of the ReadCommit state
-// to avoid races when the ring's embedded ReadCommit is reused by later reads.
-type ringCommitPool struct {
-	once   sync.Once
-	commit ReadCommit // Value copy, not pointer - captures state at creation time
-}
-
-func (p *ringCommitPool) Get(_ int) *[]byte { return nil }
-
-func (p *ringCommitPool) Put(b *[]byte) {
-	p.once.Do(func() {
-		shmDebugf("[DEBUG] ringCommitPool.Put: committing %d bytes", len(*b))
-		p.commit.Commit(len(*b))
-	})
-}
+// NOTE: ringCommitPool was removed because the deferred commit pattern it
+// implemented was unsafe. When multiple reads occur before commits complete,
+// the sharedReadIdx can be set incorrectly, leading to data corruption.
+// See the fix in readFrameView which now always copies and commits immediately.
 
 // Simple binary v1 payloads.
 
@@ -659,29 +646,28 @@ func readFrameView(ctx context.Context, rx *ShmRing) (FrameHeader, mem.Buffer, e
 			return FrameHeader{}, nil, err
 		}
 
-		// Fast-path: contiguous payload; wrap-around is rare with large rings.
+		// Always copy and commit immediately to ensure correct ring buffer
+		// index tracking. The deferred commit pattern via ringCommitPool is unsafe
+		// because it can cause sharedReadIdx to be set incorrectly when multiple
+		// reads occur before commits complete, leading to data corruption.
+		//
+		// Previously, large payloads used a zero-copy path with deferred commits,
+		// but this caused corruption under high throughput (see flow_control example).
+		// The issue: commitReadIdx was set to sharedReadIdx at ReadSlices time,
+		// but if another read's header commit happened before the payload commit,
+		// it would advance sharedReadIdx to the wrong position.
+		var result []byte
 		if len(pSecond) == 0 {
-			contig := pFirst[:payloadLen]
-			// mem.NewBuffer ignores the pool for small buffers (<=1024 bytes),
-			// so we must commit immediately for small payloads to avoid blocking
-			// the ring buffer reader.
-			if mem.IsBelowBufferPoolingThreshold(payloadLen) {
-				commitPayload.Commit(payloadLen)
-				// Return a copy so caller doesn't hold ring memory
-				result := make([]byte, payloadLen)
-				copy(result, contig)
-				return fh, mem.SliceBuffer(result), nil
-			}
-			pool := &ringCommitPool{commit: *commitPayload} // Value copy to capture state
-			buf := mem.NewBuffer(&contig, pool)
-			return fh, buf, nil
+			// Contiguous case
+			result = make([]byte, payloadLen)
+			copy(result, pFirst[:payloadLen])
+		} else {
+			// Wrap-around case
+			result = make([]byte, payloadLen)
+			copied := copy(result, pFirst)
+			copy(result[copied:], pSecond)
 		}
-
-		// Wrap-around fallback: copy once into a contiguous buffer, then commit immediately.
-		contig := make([]byte, payloadLen)
-		copied := copy(contig, pFirst)
-		copy(contig[copied:], pSecond)
 		commitPayload.Commit(payloadLen)
-		return fh, mem.SliceBuffer(contig), nil
+		return fh, mem.SliceBuffer(result), nil
 	}
 }
