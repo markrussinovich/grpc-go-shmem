@@ -381,19 +381,23 @@ func TestCrossProcessEcho(t *testing.T) {
 
 		// Test that read blocks until data is available
 		readDone := make(chan struct{})
+		readReady := make(chan struct{})
 		var readErr error
 		var readData []byte
 
 		go func() {
 			defer close(readDone)
+			// Signal ready just before blocking read
+			close(readReady)
 			buf := make([]byte, 10)
 			n, err := testConn.ReadContext(ctx, buf)
 			readErr = err
 			readData = buf[:n]
 		}()
 
-		// Give the read goroutine time to start and block
-		time.Sleep(100 * time.Millisecond)
+		// Wait for read goroutine to be ready to block
+		<-readReady
+		runtime.Gosched()
 
 		// Verify read hasn't completed yet (should be blocking)
 		select {
@@ -503,8 +507,10 @@ func TestCrossProcessBackpressure(t *testing.T) {
 	// Wait for write to start
 	<-writeStarted
 
-	// Give write time to fill the small buffer and block
-	time.Sleep(200 * time.Millisecond)
+	// Yield multiple times to give write a chance to fill buffer and block
+	for i := 0; i < 20; i++ {
+		runtime.Gosched()
+	}
 
 	// Verify write is still in progress (blocked due to backpressure)
 	select {

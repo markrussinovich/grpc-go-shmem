@@ -34,6 +34,7 @@
 package transport
 
 import (
+	"runtime"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -655,9 +656,11 @@ func TestFutexWaitWake(t *testing.T) {
 	var addr uint32
 	waitDone := make(chan bool, 1)
 	wakeCount := make(chan int, 1)
+	ready := make(chan struct{})
 
 	// Start a goroutine that waits
 	go func() {
+		close(ready) // Signal we're about to wait
 		err := futexWait(&addr, 0) // wait while addr == 0
 		if err != nil {
 			t.Errorf("futexWait failed: %v", err)
@@ -665,8 +668,9 @@ func TestFutexWaitWake(t *testing.T) {
 		waitDone <- true
 	}()
 
-	// Give the waiter a chance to start waiting
-	time.Sleep(10 * time.Millisecond)
+	// Wait for goroutine to signal it's ready, then yield to let it enter futexWait
+	<-ready
+	runtime.Gosched()
 
 	// Wake the waiter
 	go func() {
@@ -703,10 +707,15 @@ func TestFutexMultipleWaiters(t *testing.T) {
 	var addr uint32 = 42
 	const numWaiters = 3
 	waitDone := make(chan bool, numWaiters)
+	allReady := make(chan struct{})
 
 	// Start multiple waiters
+	var readyCount int32
 	for i := 0; i < numWaiters; i++ {
 		go func() {
+			if atomic.AddInt32(&readyCount, 1) == numWaiters {
+				close(allReady) // Signal all waiters are ready
+			}
 			err := futexWait(&addr, 42) // wait while addr == 42
 			if err != nil {
 				t.Errorf("futexWait failed: %v", err)
@@ -715,8 +724,9 @@ func TestFutexMultipleWaiters(t *testing.T) {
 		}()
 	}
 
-	// Give waiters a chance to start waiting
-	time.Sleep(10 * time.Millisecond)
+	// Wait for all waiters to signal ready, then yield to let them enter futexWait
+	<-allReady
+	runtime.Gosched()
 
 	// Change the value before waking. This avoids a lost-wake race where a waiter
 	// starts waiting after the wake and would otherwise block forever because the
@@ -752,9 +762,11 @@ func TestFutexValueChange(t *testing.T) {
 
 	var addr uint32
 	waitDone := make(chan bool, 1)
+	ready := make(chan struct{})
 
 	// Start a waiter
 	go func() {
+		close(ready) // Signal we're about to wait
 		err := futexWait(&addr, 0) // wait while addr == 0
 		if err != nil {
 			t.Errorf("futexWait failed: %v", err)
@@ -762,8 +774,9 @@ func TestFutexValueChange(t *testing.T) {
 		waitDone <- true
 	}()
 
-	// Give the waiter a chance to start waiting
-	time.Sleep(10 * time.Millisecond)
+	// Wait for goroutine to signal ready, then yield to let it enter futexWait
+	<-ready
+	runtime.Gosched()
 
 	// Change the value (this alone won't wake the waiter in our implementation)
 	atomic.StoreUint32(&addr, 1)
@@ -792,12 +805,14 @@ func TestFutexSpuriousWake(t *testing.T) {
 
 	var addr uint32 = 100
 	done := make(chan bool, 1)
+	ready := make(chan struct{})
 
 	// Test the typical usage pattern in a separate goroutine
 	go func() {
 		waitCount := 0
 		maxWaits := 5
 
+		close(ready) // Signal we're starting the loop
 		for waitCount < maxWaits {
 			// Typical usage pattern: check condition, then wait only if condition unmet
 			currentVal := atomic.LoadUint32(&addr)
@@ -829,8 +844,9 @@ func TestFutexSpuriousWake(t *testing.T) {
 		done <- true
 	}()
 
-	// Give the waiter a chance to start
-	time.Sleep(10 * time.Millisecond)
+	// Wait for goroutine to signal ready, then yield to let it enter the wait loop
+	<-ready
+	runtime.Gosched()
 
 	// Change the value and wake the waiter
 	atomic.StoreUint32(&addr, 200)
@@ -893,9 +909,11 @@ func TestFutexWithSharedMemory(t *testing.T) {
 
 	// Test async wait/wake pattern
 	waitDone := make(chan bool, 1)
+	ready := make(chan struct{})
 	currentSeq := ring.DataSequence()
 
 	go func() {
+		close(ready) // Signal we're about to wait
 		// Wait for sequence to change
 		err := futexWait(seqPtr, currentSeq)
 		if err != nil {
@@ -904,8 +922,9 @@ func TestFutexWithSharedMemory(t *testing.T) {
 		waitDone <- true
 	}()
 
-	// Give waiter time to start
-	time.Sleep(10 * time.Millisecond)
+	// Wait for goroutine to signal ready, then yield to let it enter futexWait
+	<-ready
+	runtime.Gosched()
 
 	// Increment sequence and wake
 	ring.IncrementDataSequence()

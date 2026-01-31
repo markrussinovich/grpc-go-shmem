@@ -24,6 +24,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"runtime"
 	"testing"
 	"time"
 
@@ -141,8 +142,8 @@ func TestUnary_CancellationWithSlowServer(t *testing.T) {
 	<-serverReady
 	log.Printf("Test: Server is ready")
 
-	// Small delay to ensure server is in read state
-	time.Sleep(50 * time.Millisecond)
+	// Yield to let server goroutine enter read state
+	runtime.Gosched()
 
 	// Create client
 	client := NewShmUnaryClient(seg)

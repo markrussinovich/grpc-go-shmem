@@ -25,6 +25,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -124,7 +125,7 @@ func TestShmPingPongSizes(t *testing.T) {
 			}
 
 			// Unary call
-			time.Sleep(10 * time.Millisecond)
+			runtime.Gosched()
 			seg := ct.(*ShmClientTransport).segment
 			cli := NewShmUnaryClient(seg)
 
@@ -358,7 +359,7 @@ func TestShmStreamError(t *testing.T) {
 		t.Fatalf("client factory: %v", err)
 	}
 
-	time.Sleep(10 * time.Millisecond)
+	runtime.Gosched()
 	seg := ct.(*ShmClientTransport).segment
 	cli := NewShmUnaryClient(seg)
 	defer cli.Close()
@@ -443,9 +444,12 @@ func TestShmInflightStreamClosing(t *testing.T) {
 	}
 
 	donec := make(chan struct{})
+	ready := make(chan struct{})
 	serr := status.Error(codes.Internal, "client connection is closing")
 	go func() {
 		defer close(donec)
+		// Signal ready just before blocking on read
+		close(ready)
 		// Try to read from the stream - this should block until stream is closed
 		_, err := stream.Read(1024)
 		if err == nil {
@@ -456,8 +460,9 @@ func TestShmInflightStreamClosing(t *testing.T) {
 		t.Logf("Read returned error as expected: %v", err)
 	}()
 
-	// Give the reader goroutine time to start blocking
-	time.Sleep(50 * time.Millisecond)
+	// Wait for reader goroutine to be ready to block
+	<-ready
+	runtime.Gosched()
 
 	// Close the stream with an error - this should unblock the reader
 	stream.Close(serr)
@@ -504,6 +509,7 @@ func TestShmContextCanceledOnClose(t *testing.T) {
 	defer serverTransport.Close(nil)
 
 	var ctxCanceled atomic.Bool
+	ctxCanceledCh := make(chan struct{})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -512,6 +518,7 @@ func TestShmContextCanceledOnClose(t *testing.T) {
 		started <- struct{}{}
 		<-s.Context().Done()
 		ctxCanceled.Store(true)
+		close(ctxCanceledCh)
 	})
 
 	// Client creates stream
@@ -541,15 +548,13 @@ func TestShmContextCanceledOnClose(t *testing.T) {
 	// Close connection from the client side.
 	clientTransport.Close(fmt.Errorf("connection closed"))
 
-	// Verify context was canceled.
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if ctxCanceled.Load() {
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
+	// Wait for context to be canceled via explicit channel signal
+	select {
+	case <-ctxCanceledCh:
+		// Success - context was canceled
+	case <-time.After(2 * time.Second):
+		t.Fatal("stream context was not canceled on connection close")
 	}
-	t.Fatal("stream context was not canceled on connection close")
 }
 
 // TestShmGracefulClose ensures that GracefulClose allows in-flight streams to

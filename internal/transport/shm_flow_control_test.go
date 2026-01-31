@@ -21,6 +21,7 @@ package transport
 import (
 	"context"
 	"fmt"
+	"runtime"
 	"testing"
 	"time"
 
@@ -205,8 +206,10 @@ func TestShmFlowControlMultiStreamAccountCheck(t *testing.T) {
 		}
 	}
 
-	// Allow time for messages to be processed
-	time.Sleep(100 * time.Millisecond)
+	// Yield to allow writes to be processed
+	for i := 0; i < 10; i++ {
+		runtime.Gosched()
+	}
 
 	// Verify connection quota was consumed
 	cliTransport.sendQuotaMu.Lock()

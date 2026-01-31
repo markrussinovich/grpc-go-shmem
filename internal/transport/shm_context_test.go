@@ -35,14 +35,16 @@ func TestContextCancellation(t *testing.T) {
 
 	// Test that context works
 	done := make(chan struct{})
+	ready := make(chan struct{})
 	go func() {
 		log.Printf("Goroutine: Waiting for ctx.Done()...")
+		close(ready) // Signal we're ready to wait
 		<-ctx.Done()
 		log.Printf("Goroutine: ctx.Done() fired! err=%v", ctx.Err())
 		close(done)
 	}()
 
-	time.Sleep(10 * time.Millisecond)
+	<-ready // Wait for goroutine to be ready
 	log.Printf("Main: About to call cancel()")
 	cancel()
 	log.Printf("Main: cancel() returned")

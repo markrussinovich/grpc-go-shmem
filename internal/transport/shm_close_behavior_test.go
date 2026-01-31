@@ -51,11 +51,15 @@ func TestRingCloseUnblocksWaiters(t *testing.T) {
 	var wg sync.WaitGroup
 	var readerUnblocked bool
 	var readerMutex sync.Mutex
+	ready := make(chan struct{})
 
 	// Test 1: ReadBlockingContext on empty ring should block, then unblock on Close()
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
+
+		// Signal ready just before blocking
+		close(ready)
 
 		// This should block waiting for data (ring is empty)
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -74,8 +78,9 @@ func TestRingCloseUnblocksWaiters(t *testing.T) {
 		}
 	}()
 
-	// Give goroutine time to start and block
-	time.Sleep(200 * time.Millisecond)
+	// Wait for goroutine to be ready to block
+	<-ready
+	runtime.Gosched()
 
 	// Verify reader is still blocked
 	readerMutex.Lock()
