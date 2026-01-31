@@ -27,18 +27,55 @@ import (
 	"strings"
 	"time"
 
+	"google.golang.org/grpc/grpclog"
 	"google.golang.org/grpc/internal/transport"
 )
+
+var shmLogger = grpclog.Component("shm")
 
 // WithShmTransport returns a DialOption that configures the client to use
 // shared memory transport. This should be used with addresses of the form
 // "shm://segment_name".
+//
+// When used, the dialer will:
+//   - Use shared memory transport for shm:// addresses
+//   - Fall back to standard TCP for non-shm addresses (enabling mixed transport)
+//   - Optionally fall back to TCP if shm connection fails (configurable)
 //
 // Example:
 //
 //	conn, err := grpc.NewClient("shm://my_segment", grpc.WithShmTransport(), grpc.WithTransportCredentials(insecure.NewCredentials()))
 func WithShmTransport() DialOption {
 	return WithShmTransportAndOptions(nil)
+}
+
+// ShmTransportConfig contains configuration options for shared memory transport.
+type ShmTransportConfig struct {
+	// DialOptions contains shm-specific dial options (segment size, ring sizes, etc.)
+	DialOptions *transport.DialOptions
+
+	// FallbackEnabled allows falling back to TCP if shm connection fails.
+	// Default is true.
+	FallbackEnabled bool
+
+	// TCPFallbackAddr is the TCP address to fall back to if shm fails.
+	// If empty, fallback is disabled even if FallbackEnabled is true.
+	// Format: "host:port"
+	TCPFallbackAddr string
+
+	// AllowMixedTransport allows the dialer to handle both shm and TCP addresses.
+	// When true, non-shm addresses will use standard TCP dial.
+	// Default is true for RFC A73 compliance.
+	AllowMixedTransport bool
+}
+
+// DefaultShmTransportConfig returns the default configuration.
+func DefaultShmTransportConfig() *ShmTransportConfig {
+	return &ShmTransportConfig{
+		DialOptions:         transport.DefaultDialOptions(),
+		FallbackEnabled:     true,
+		AllowMixedTransport: true,
+	}
 }
 
 // WithShmTransportAndOptions returns a DialOption that configures the client to use
@@ -53,38 +90,96 @@ func WithShmTransport() DialOption {
 //	}
 //	conn, err := grpc.NewClient("shm://my_segment", grpc.WithShmTransportAndOptions(opts), grpc.WithTransportCredentials(insecure.NewCredentials()))
 func WithShmTransportAndOptions(opts *transport.DialOptions) DialOption {
-	if opts == nil {
-		opts = transport.DefaultDialOptions()
+	cfg := DefaultShmTransportConfig()
+	if opts != nil {
+		cfg.DialOptions = opts
+	}
+	return WithShmTransportConfig(cfg)
+}
+
+// WithShmTransportConfig returns a DialOption with full configuration control.
+// This is the most flexible option for configuring shared memory transport.
+//
+// Example:
+//
+//	cfg := &grpc.ShmTransportConfig{
+//	    DialOptions:         transport.DefaultDialOptions(),
+//	    FallbackEnabled:     true,
+//	    TCPFallbackAddr:     "localhost:50051",
+//	    AllowMixedTransport: true,
+//	}
+//	conn, err := grpc.NewClient("shm://my_segment", grpc.WithShmTransportConfig(cfg))
+func WithShmTransportConfig(cfg *ShmTransportConfig) DialOption {
+	if cfg == nil {
+		cfg = DefaultShmTransportConfig()
+	}
+	if cfg.DialOptions == nil {
+		cfg.DialOptions = transport.DefaultDialOptions()
 	}
 
-	// Create a context dialer that understands shm:// addresses
+	fallbackHandler := transport.NewShmFallbackHandler()
+
+	// Create a context dialer that understands shm:// addresses and supports fallback
 	dialer := func(ctx context.Context, addr string) (net.Conn, error) {
 		// Check if this is a shm:// address
 		if strings.HasPrefix(addr, "shm:") {
-			// Extract segment name from "shm:segment_name"
-			segmentName := strings.TrimPrefix(addr, "shm:")
-
-			// Use the shared memory dialer
-			clientTransport, err := transport.DialShm(ctx, segmentName, opts)
-			if err != nil {
-				return nil, fmt.Errorf("failed to dial shared memory segment %q: %v", segmentName, err)
-			}
-
-			// Wrap the transport in a net.Conn-compatible interface
-			shmTransport := clientTransport.(*transport.ShmClientTransport)
-			localAddr := &transport.ShmAddr{Name: segmentName + "_client"}
-			return &shmClientConn{
-				transport:  shmTransport,
-				localAddr:  localAddr,
-				remoteAddr: shmTransport.RemoteAddr(),
-			}, nil
+			return dialShmWithFallback(ctx, addr, cfg, fallbackHandler)
 		}
 
-		// Not a shm:// address, return error
-		return nil, fmt.Errorf("WithShmTransport can only dial shm:// addresses, got: %s", addr)
+		// Not a shm:// address - handle based on configuration
+		if cfg.AllowMixedTransport {
+			// RFC A73: Allow mixed transport - dial TCP for non-shm addresses
+			return (&net.Dialer{}).DialContext(ctx, "tcp", addr)
+		}
+
+		// Strict shm-only mode
+		return nil, fmt.Errorf("WithShmTransport in strict mode can only dial shm:// addresses, got: %s", addr)
 	}
 
 	return WithContextDialer(dialer)
+}
+
+// dialShmWithFallback attempts to dial via shared memory, falling back to TCP if configured.
+func dialShmWithFallback(ctx context.Context, addr string, cfg *ShmTransportConfig, fallbackHandler *transport.ShmFallbackHandler) (net.Conn, error) {
+	// Extract segment name from "shm:segment_name"
+	segmentName := strings.TrimPrefix(addr, "shm:")
+
+	// Try shared memory first
+	clientTransport, err := transport.DialShm(ctx, segmentName, cfg.DialOptions)
+	if err == nil {
+		// Success - wrap the transport
+		shmTransport := clientTransport.(*transport.ShmClientTransport)
+		localAddr := &transport.ShmAddr{Name: segmentName + "_client"}
+		return &shmClientConn{
+			transport:  shmTransport,
+			localAddr:  localAddr,
+			remoteAddr: shmTransport.RemoteAddr(),
+		}, nil
+	}
+
+	// Shm dial failed - check if we should fall back
+	if !cfg.FallbackEnabled || cfg.TCPFallbackAddr == "" {
+		return nil, fmt.Errorf("failed to dial shared memory segment %q: %v", segmentName, err)
+	}
+
+	// Use the fallback handler to decide
+	result := fallbackHandler.HandleShmError(err, true)
+	if !result.ShouldFallback {
+		return nil, fmt.Errorf("shm transport failed and fallback not triggered: %w", err)
+	}
+
+	// Log the fallback
+	shmLogger.Infof("shm dial to %q failed, falling back to TCP %q: %v",
+		segmentName, cfg.TCPFallbackAddr, err)
+
+	// Fall back to TCP
+	tcpConn, tcpErr := (&net.Dialer{}).DialContext(ctx, "tcp", cfg.TCPFallbackAddr)
+	if tcpErr != nil {
+		return nil, fmt.Errorf("shm failed (%v) and TCP fallback to %q also failed: %w",
+			err, cfg.TCPFallbackAddr, tcpErr)
+	}
+
+	return tcpConn, nil
 }
 
 // shmClientConn wraps a shared memory client transport to implement net.Conn.

@@ -307,6 +307,10 @@ func (t *ShmServerTransport) HandleStreams(ctx context.Context, handle func(*Ser
 		return
 	}
 	t.handleFunc = handle
+	// Add to WaitGroup while holding lock to prevent race with Close().
+	// Close() checks closed flag and then calls readerWG.Wait(), so we must
+	// ensure Add(1) happens before closed is set to true.
+	t.readerWG.Add(1)
 	t.mu.Unlock()
 
 	// The reader and all stream contexts should be canceled when either the
@@ -322,7 +326,6 @@ func (t *ShmServerTransport) HandleStreams(ctx context.Context, handle func(*Ser
 	}()
 
 	// Start processing incoming data from the client
-	t.readerWG.Add(1)
 	go func() {
 		defer t.readerWG.Done()
 		t.processIncomingData(procCtx)
@@ -867,7 +870,11 @@ func (t *ShmServerTransport) handleCancel(streamID uint32) {
 // handlers will be terminated asynchronously.
 func (t *ShmServerTransport) Close(err error) {
 	t.closeOnce.Do(func() {
+		// Hold mu while setting closed to prevent race with HandleStreams
+		// which checks closed and calls readerWG.Add(1) under the same lock.
+		t.mu.Lock()
 		t.closed.Store(true)
+		t.mu.Unlock()
 		if err == nil {
 			err = ErrConnClosing
 		}

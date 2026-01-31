@@ -660,7 +660,7 @@ func TestFutexWaitWake(t *testing.T) {
 
 	// Start a goroutine that waits
 	go func() {
-		close(ready) // Signal we're about to wait
+		close(ready)               // Signal we're about to wait
 		err := futexWait(&addr, 0) // wait while addr == 0
 		if err != nil {
 			t.Errorf("futexWait failed: %v", err)
@@ -766,7 +766,7 @@ func TestFutexValueChange(t *testing.T) {
 
 	// Start a waiter
 	go func() {
-		close(ready) // Signal we're about to wait
+		close(ready)               // Signal we're about to wait
 		err := futexWait(&addr, 0) // wait while addr == 0
 		if err != nil {
 			t.Errorf("futexWait failed: %v", err)
