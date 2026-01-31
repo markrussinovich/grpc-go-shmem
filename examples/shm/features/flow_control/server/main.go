@@ -88,10 +88,12 @@ func (s *server) BidirectionalStreamingEcho(stream pb.Echo_BidirectionalStreamin
 	}()
 
 	// Wait for sending to complete or timeout (indicating blocking)
+	timer := time.NewTimer(blockingTimeout)
 	select {
 	case <-sendDone:
+		timer.Stop()
 		log.Printf("Server: Sent all %d messages without blocking.", sentCount)
-	case <-time.After(blockingTimeout):
+	case <-timer.C:
 		blocked = true
 		log.Printf("Server: Sending is blocked after ~%d messages (ring buffer full).", sentCount)
 	}

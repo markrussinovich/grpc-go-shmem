@@ -74,7 +74,7 @@ func main() {
 	blocked := false
 	sentCount := 0
 	sendDone := make(chan struct{})
-	
+
 	go func() {
 		defer close(sendDone)
 		for i := 0; i < numMessagesToSend; i++ {
@@ -87,10 +87,12 @@ func main() {
 	}()
 
 	// Wait for sending to complete or timeout (indicating blocking)
+	timer := time.NewTimer(blockingTimeout)
 	select {
 	case <-sendDone:
+		timer.Stop()
 		log.Printf("Sent all %d messages without blocking.", sentCount)
-	case <-time.After(blockingTimeout):
+	case <-timer.C:
 		blocked = true
 		log.Printf("Sending is blocked after ~%d messages (ring buffer full).", sentCount)
 	}
