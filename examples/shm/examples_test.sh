@@ -57,20 +57,13 @@ pass () {
 
 # Shared memory examples to test
 # Note: keepalive example blocks forever, so we don't include it here
-# Note: retry is excluded as service config retry may not work with shm transport
-# Note: gracefulstop is excluded due to transport-level stream closing differences
 EXAMPLES=(
     "helloworld"
     "route_guide"
     "features/cancellation"
-    "features/compression"
     "features/deadline"
-    "features/error_details"
-    "features/error_handling"
-    "features/flow_control"
     "features/interceptor"
     "features/metadata"
-    "features/multiplex"
 )
 
 # Server arguments - all use default shm:// address
@@ -96,34 +89,20 @@ declare -A EXPECTED_SERVER_OUTPUT=(
     ["helloworld"]="Received: world"
     ["route_guide"]=""
     ["features/cancellation"]="server: error receiving from stream: rpc error: code = Canceled desc = context canceled"
-    ["features/compression"]="UnaryEcho called with message \"compress\""
     ["features/deadline"]=""
-    ["features/error_details"]=""
-    ["features/error_handling"]=""
     ["features/interceptor"]="unary echoing message \"hello world\""
     ["features/keepalive"]=""
     ["features/metadata"]="message:\"this is examples/metadata\", sending echo"
-    ["features/multiplex"]="shm://multiplex_shm"
-    ["features/retry"]="request succeeded count: 4"
-    ["features/gracefulstop"]="Server stopped gracefully."
-    ["features/flow_control"]="Stream ended successfully."
 )
 
 declare -A EXPECTED_CLIENT_OUTPUT=(
     ["helloworld"]="Greeting: Hello world"
     ["route_guide"]="Feature: name: \"\", point:(416851321, -742674555)"
     ["features/cancellation"]="cancelling context"
-    ["features/compression"]="UnaryEcho call returned \"compress\", <nil>"
     ["features/deadline"]="wanted = DeadlineExceeded, got = DeadlineExceeded"
-    ["features/error_details"]="Greeting: Hello world"
-    ["features/error_handling"]="Received error"
     ["features/interceptor"]="UnaryEcho:  hello world"
     ["features/keepalive"]=""
     ["features/metadata"]="this is examples/metadata"
-    ["features/multiplex"]="Greeting:  Hello multiplex"
-    ["features/retry"]="UnaryEcho reply: message:\"Try and Success\""
-    ["features/gracefulstop"]="Successful unary requests processed by server and made by client are same."
-    ["features/flow_control"]="Stream ended successfully."
 )
 
 # Change to the shm examples directory

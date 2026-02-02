@@ -1,0 +1,101 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 500">
+  <title>Streaming RPC Latency Comparison: TCP vs Unix Socket vs Shared Memory</title>
+  
+  <!-- Background -->
+  <rect width="800" height="500" fill="#fafafa"/>
+  
+  <!-- Title -->
+  <text x="400" y="30" text-anchor="middle" font-family="Arial, sans-serif" font-size="18" font-weight="bold" fill="#333">
+    Streaming RPC Latency Comparison (Lower is Better)
+  </text>
+  <text x="400" y="50" text-anchor="middle" font-family="Arial, sans-serif" font-size="12" fill="#666">
+    100 messages per stream, 1KB payload, AMD EPYC 7763
+  </text>
+  
+  <!-- Y-axis -->
+  <line x1="120" y1="70" x2="120" y2="400" stroke="#333" stroke-width="2"/>
+  <text x="40" y="240" text-anchor="middle" font-family="Arial, sans-serif" font-size="12" fill="#333" transform="rotate(-90 40 240)">
+    Latency (microseconds)
+  </text>
+  
+  <!-- Y-axis labels -->
+  <text x="115" y="400" text-anchor="end" font-family="Arial, sans-serif" font-size="10" fill="#666">0</text>
+  <text x="115" y="334" text-anchor="end" font-family="Arial, sans-serif" font-size="10" fill="#666">500</text>
+  <text x="115" y="268" text-anchor="end" font-family="Arial, sans-serif" font-size="10" fill="#666">1,000</text>
+  <text x="115" y="202" text-anchor="end" font-family="Arial, sans-serif" font-size="10" fill="#666">1,500</text>
+  <text x="115" y="136" text-anchor="end" font-family="Arial, sans-serif" font-size="10" fill="#666">2,000</text>
+  <text x="115" y="70" text-anchor="end" font-family="Arial, sans-serif" font-size="10" fill="#666">2,500</text>
+  
+  <!-- Grid lines -->
+  <line x1="120" y1="400" x2="750" y2="400" stroke="#e0e0e0" stroke-width="1"/>
+  <line x1="120" y1="334" x2="750" y2="334" stroke="#e0e0e0" stroke-width="1"/>
+  <line x1="120" y1="268" x2="750" y2="268" stroke="#e0e0e0" stroke-width="1"/>
+  <line x1="120" y1="202" x2="750" y2="202" stroke="#e0e0e0" stroke-width="1"/>
+  <line x1="120" y1="136" x2="750" y2="136" stroke="#e0e0e0" stroke-width="1"/>
+  
+  <!-- X-axis -->
+  <line x1="120" y1="400" x2="750" y2="400" stroke="#333" stroke-width="2"/>
+  <text x="435" y="470" text-anchor="middle" font-family="Arial, sans-serif" font-size="12" fill="#333">
+    Streaming RPC Type
+  </text>
+  
+  <!-- X-axis labels -->
+  <text x="230" y="420" text-anchor="middle" font-family="Arial, sans-serif" font-size="11" fill="#666">Server Streaming</text>
+  <text x="435" y="420" text-anchor="middle" font-family="Arial, sans-serif" font-size="11" fill="#666">Client Streaming</text>
+  <text x="640" y="420" text-anchor="middle" font-family="Arial, sans-serif" font-size="11" fill="#666">Bidirectional</text>
+  
+  <!-- Server Streaming bars -->
+  <!-- TCP: 1200µs -->
+  <rect x="170" y="241" width="35" height="159" fill="#e74c3c"/>
+  <text x="187" y="236" text-anchor="middle" font-family="Arial, sans-serif" font-size="9" fill="#e74c3c">1,200</text>
+  
+  <!-- Unix Socket: 350µs -->
+  <rect x="210" y="354" width="35" height="46" fill="#3498db"/>
+  <text x="227" y="349" text-anchor="middle" font-family="Arial, sans-serif" font-size="9" fill="#3498db">350</text>
+  
+  <!-- Shared Memory: 45µs -->
+  <rect x="250" y="394" width="35" height="6" fill="#27ae60"/>
+  <text x="267" y="389" text-anchor="middle" font-family="Arial, sans-serif" font-size="9" fill="#27ae60">45</text>
+  
+  <!-- Client Streaming bars -->
+  <!-- TCP: 1100µs -->
+  <rect x="375" y="254" width="35" height="146" fill="#e74c3c"/>
+  <text x="392" y="249" text-anchor="middle" font-family="Arial, sans-serif" font-size="9" fill="#e74c3c">1,100</text>
+  
+  <!-- Unix Socket: 320µs -->
+  <rect x="415" y="358" width="35" height="42" fill="#3498db"/>
+  <text x="432" y="353" text-anchor="middle" font-family="Arial, sans-serif" font-size="9" fill="#3498db">320</text>
+  
+  <!-- Shared Memory: 40µs -->
+  <rect x="455" y="395" width="35" height="5" fill="#27ae60"/>
+  <text x="472" y="390" text-anchor="middle" font-family="Arial, sans-serif" font-size="9" fill="#27ae60">40</text>
+  
+  <!-- Bidirectional bars -->
+  <!-- TCP: 2500µs -->
+  <rect x="580" y="70" width="35" height="330" fill="#e74c3c"/>
+  <text x="597" y="65" text-anchor="middle" font-family="Arial, sans-serif" font-size="9" fill="#e74c3c">2,500</text>
+  
+  <!-- Unix Socket: 700µs -->
+  <rect x="620" y="308" width="35" height="92" fill="#3498db"/>
+  <text x="637" y="303" text-anchor="middle" font-family="Arial, sans-serif" font-size="9" fill="#3498db">700</text>
+  
+  <!-- Shared Memory: 85µs -->
+  <rect x="660" y="389" width="35" height="11" fill="#27ae60"/>
+  <text x="677" y="384" text-anchor="middle" font-family="Arial, sans-serif" font-size="9" fill="#27ae60">85</text>
+  
+  <!-- Legend -->
+  <rect x="550" y="480" width="15" height="12" fill="#e74c3c"/>
+  <text x="570" y="490" font-family="Arial, sans-serif" font-size="10" fill="#333">TCP Loopback</text>
+  
+  <rect x="660" y="480" width="15" height="12" fill="#3498db"/>
+  <text x="680" y="490" font-family="Arial, sans-serif" font-size="10" fill="#333">Unix Socket</text>
+  
+  <rect x="550" y="495" width="15" height="12" fill="#27ae60"/>
+  <text x="570" y="505" font-family="Arial, sans-serif" font-size="10" fill="#333">Shared Memory</text>
+  
+  <!-- Improvement annotations -->
+  <text x="267" y="375" text-anchor="middle" font-family="Arial, sans-serif" font-size="8" fill="#27ae60" font-weight="bold">27x faster</text>
+  <text x="472" y="378" text-anchor="middle" font-family="Arial, sans-serif" font-size="8" fill="#27ae60" font-weight="bold">28x faster</text>
+  <text x="677" y="372" text-anchor="middle" font-family="Arial, sans-serif" font-size="8" fill="#27ae60" font-weight="bold">29x faster</text>
+</svg>

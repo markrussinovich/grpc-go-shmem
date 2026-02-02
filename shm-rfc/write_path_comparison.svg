@@ -1,0 +1,134 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 650">
+  <title>Write Path: HTTP/2 vs Shared Memory</title>
+  
+  <!-- Background -->
+  <rect width="900" height="650" fill="#fafafa"/>
+  
+  <!-- Title -->
+  <text x="450" y="30" text-anchor="middle" font-family="Arial, sans-serif" font-size="18" font-weight="bold" fill="#333">
+    Write Path Comparison: HTTP/2 vs Shared Memory
+  </text>
+  
+  <!-- Divider -->
+  <line x1="450" y1="50" x2="450" y2="630" stroke="#ccc" stroke-width="2" stroke-dasharray="5,5"/>
+  
+  <!-- HTTP/2 Title -->
+  <text x="225" y="70" text-anchor="middle" font-family="Arial, sans-serif" font-size="16" font-weight="bold" fill="#e74c3c">
+    HTTP/2 Write Path
+  </text>
+  
+  <!-- SHM Title -->
+  <text x="675" y="70" text-anchor="middle" font-family="Arial, sans-serif" font-size="16" font-weight="bold" fill="#27ae60">
+    Shared Memory Write Path
+  </text>
+  
+  <!-- HTTP/2 Flow Boxes -->
+  <!-- SendMsg -->
+  <rect x="75" y="90" width="150" height="35" fill="#3498db" rx="5"/>
+  <text x="150" y="113" text-anchor="middle" font-family="Arial, sans-serif" font-size="11" fill="white">SendMsg(m)</text>
+  <line x1="150" y1="125" x2="150" y2="140" stroke="#333" stroke-width="2" marker-end="url(#arrowDown)"/>
+  
+  <!-- prepareMsg -->
+  <rect x="75" y="145" width="150" height="35" fill="#9b59b6" rx="5"/>
+  <text x="150" y="168" text-anchor="middle" font-family="Arial, sans-serif" font-size="11" fill="white">prepareMsg()</text>
+  <text x="240" y="165" font-family="Arial, sans-serif" font-size="9" fill="#666">(marshal + compress)</text>
+  <line x1="150" y1="180" x2="150" y2="195" stroke="#333" stroke-width="2" marker-end="url(#arrowDown)"/>
+  
+  <!-- http2Client.write -->
+  <rect x="75" y="200" width="150" height="35" fill="#e74c3c" rx="5"/>
+  <text x="150" y="223" text-anchor="middle" font-family="Arial, sans-serif" font-size="11" fill="white">http2Client.write()</text>
+  <line x1="150" y1="235" x2="150" y2="250" stroke="#333" stroke-width="2" marker-end="url(#arrowDown)"/>
+  
+  <!-- Wait for quota -->
+  <rect x="75" y="255" width="150" height="35" fill="#f39c12" rx="5"/>
+  <text x="150" y="278" text-anchor="middle" font-family="Arial, sans-serif" font-size="11" fill="white">s.wq.get(sz)</text>
+  <text x="240" y="275" font-family="Arial, sans-serif" font-size="9" fill="#666">(wait for quota)</text>
+  <line x1="150" y1="290" x2="150" y2="305" stroke="#333" stroke-width="2" marker-end="url(#arrowDown)"/>
+  
+  <!-- controlBuf.put -->
+  <rect x="75" y="310" width="150" height="35" fill="#e67e22" rx="5"/>
+  <text x="150" y="333" text-anchor="middle" font-family="Arial, sans-serif" font-size="11" fill="white">controlBuf.put(df)</text>
+  <text x="240" y="330" font-family="Arial, sans-serif" font-size="9" fill="#666">(async queue)</text>
+  <line x1="150" y1="345" x2="150" y2="360" stroke="#333" stroke-width="2" marker-end="url(#arrowDown)"/>
+  
+  <!-- loopyWriter -->
+  <rect x="60" y="365" width="180" height="50" fill="#34495e" stroke="#e74c3c" stroke-width="2" rx="5"/>
+  <text x="150" y="385" text-anchor="middle" font-family="Arial, sans-serif" font-size="10" fill="white" font-weight="bold">[loopyWriter goroutine]</text>
+  <text x="150" y="400" text-anchor="middle" font-family="Arial, sans-serif" font-size="9" fill="#bdc3c7">separate goroutine</text>
+  <line x1="150" y1="415" x2="150" y2="430" stroke="#333" stroke-width="2" marker-end="url(#arrowDown)"/>
+  
+  <!-- framer.writeData -->
+  <rect x="75" y="435" width="150" height="35" fill="#1abc9c" rx="5"/>
+  <text x="150" y="458" text-anchor="middle" font-family="Arial, sans-serif" font-size="11" fill="white">framer.writeData()</text>
+  <line x1="150" y1="470" x2="150" y2="485" stroke="#333" stroke-width="2" marker-end="url(#arrowDown)"/>
+  
+  <!-- net.Conn.Write -->
+  <rect x="60" y="490" width="180" height="50" fill="#c0392b" stroke="#c0392b" stroke-width="2" rx="5"/>
+  <text x="150" y="510" text-anchor="middle" font-family="Arial, sans-serif" font-size="10" fill="white" font-weight="bold">net.Conn.Write()</text>
+  <text x="150" y="525" text-anchor="middle" font-family="Arial, sans-serif" font-size="9" fill="#f1c40f">SYSCALL: write()</text>
+  
+  <!-- HTTP/2 Summary -->
+  <rect x="60" y="560" width="180" height="60" fill="#ffebee" stroke="#e74c3c" stroke-width="2" rx="5"/>
+  <text x="150" y="580" text-anchor="middle" font-family="Arial, sans-serif" font-size="10" fill="#c0392b" font-weight="bold">HTTP/2 Overhead:</text>
+  <text x="150" y="595" text-anchor="middle" font-family="Arial, sans-serif" font-size="9" fill="#666">• Async queue + goroutine</text>
+  <text x="150" y="610" text-anchor="middle" font-family="Arial, sans-serif" font-size="9" fill="#666">• Multiple synchronizations</text>
+  
+  <!-- SHM Flow Boxes -->
+  <!-- SendMsg -->
+  <rect x="525" y="90" width="150" height="35" fill="#3498db" rx="5"/>
+  <text x="600" y="113" text-anchor="middle" font-family="Arial, sans-serif" font-size="11" fill="white">SendMsg(m)</text>
+  <line x1="600" y1="125" x2="600" y2="140" stroke="#333" stroke-width="2" marker-end="url(#arrowDown)"/>
+  
+  <!-- prepareMsg -->
+  <rect x="525" y="145" width="150" height="35" fill="#9b59b6" rx="5"/>
+  <text x="600" y="168" text-anchor="middle" font-family="Arial, sans-serif" font-size="11" fill="white">prepareMsg()</text>
+  <text x="690" y="165" font-family="Arial, sans-serif" font-size="9" fill="#666">(marshal + compress)</text>
+  <line x1="600" y1="180" x2="600" y2="195" stroke="#333" stroke-width="2" marker-end="url(#arrowDown)"/>
+  
+  <!-- ShmClientTransport.write -->
+  <rect x="525" y="200" width="150" height="35" fill="#27ae60" rx="5"/>
+  <text x="600" y="223" text-anchor="middle" font-family="Arial, sans-serif" font-size="11" fill="white">ShmTransport.write()</text>
+  <line x1="600" y1="235" x2="600" y2="250" stroke="#333" stroke-width="2" marker-end="url(#arrowDown)"/>
+  
+  <!-- acquireSendQuota -->
+  <rect x="525" y="255" width="150" height="35" fill="#2ecc71" rx="5"/>
+  <text x="600" y="278" text-anchor="middle" font-family="Arial, sans-serif" font-size="11" fill="white">acquireSendQuota()</text>
+  <line x1="600" y1="290" x2="600" y2="305" stroke="#333" stroke-width="2" marker-end="url(#arrowDown)"/>
+  
+  <!-- ReserveWrite -->
+  <rect x="510" y="310" width="180" height="65" fill="#27ae60" stroke="#1e8449" stroke-width="2" rx="5"/>
+  <text x="600" y="330" text-anchor="middle" font-family="Arial, sans-serif" font-size="10" fill="white" font-weight="bold">ShmRing.ReserveWrite(n)</text>
+  <text x="600" y="348" text-anchor="middle" font-family="Arial, sans-serif" font-size="9" fill="#d5f5e3">atomic check space</text>
+  <text x="600" y="363" text-anchor="middle" font-family="Arial, sans-serif" font-size="9" fill="#d5f5e3">if full: futex_wait</text>
+  <line x1="600" y1="375" x2="600" y2="390" stroke="#333" stroke-width="2" marker-end="url(#arrowDown)"/>
+  
+  <!-- Copy to ring -->
+  <rect x="525" y="395" width="150" height="50" fill="#16a085" rx="5"/>
+  <text x="600" y="415" text-anchor="middle" font-family="Arial, sans-serif" font-size="10" fill="white" font-weight="bold">Direct Memory Copy</text>
+  <text x="600" y="433" text-anchor="middle" font-family="Arial, sans-serif" font-size="9" fill="#d5f5e3">copy(ring, hdr+data)</text>
+  <line x1="600" y1="445" x2="600" y2="460" stroke="#333" stroke-width="2" marker-end="url(#arrowDown)"/>
+  
+  <!-- Commit -->
+  <rect x="510" y="465" width="180" height="65" fill="#27ae60" stroke="#1e8449" stroke-width="2" rx="5"/>
+  <text x="600" y="485" text-anchor="middle" font-family="Arial, sans-serif" font-size="10" fill="white" font-weight="bold">res.Commit()</text>
+  <text x="600" y="503" text-anchor="middle" font-family="Arial, sans-serif" font-size="9" fill="#d5f5e3">atomic widx update</text>
+  <text x="600" y="518" text-anchor="middle" font-family="Arial, sans-serif" font-size="9" fill="#f1c40f">futex_wake if waiters</text>
+  
+  <!-- SHM Summary -->
+  <rect x="510" y="560" width="180" height="60" fill="#e8f8f5" stroke="#27ae60" stroke-width="2" rx="5"/>
+  <text x="600" y="580" text-anchor="middle" font-family="Arial, sans-serif" font-size="10" fill="#1e8449" font-weight="bold">SHM Advantages:</text>
+  <text x="600" y="595" text-anchor="middle" font-family="Arial, sans-serif" font-size="9" fill="#666">• Sync write (no queue)</text>
+  <text x="600" y="610" text-anchor="middle" font-family="Arial, sans-serif" font-size="9" fill="#666">• Zero syscalls fast path</text>
+  
+  <!-- Arrow marker definition -->
+  <defs>
+    <marker id="arrowDown" markerWidth="10" markerHeight="10" refX="5" refY="0" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L10,0 L5,10 z" fill="#333"/>
+    </marker>
+  </defs>
+  
+  <!-- Comparison arrows -->
+  <text x="310" y="400" text-anchor="middle" font-family="Arial, sans-serif" font-size="36" fill="#27ae60">→</text>
+  <text x="310" y="430" text-anchor="middle" font-family="Arial, sans-serif" font-size="12" fill="#27ae60" font-weight="bold">~50x faster</text>
+</svg>
