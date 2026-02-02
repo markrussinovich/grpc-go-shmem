@@ -32,8 +32,8 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
-	"google.golang.org/grpc/metadata"
 	ecpb "google.golang.org/grpc/examples/features/proto/echo"
+	"google.golang.org/grpc/metadata"
 )
 
 var addr = flag.String("addr", "shm://interceptor_shm", "the address to connect to")
