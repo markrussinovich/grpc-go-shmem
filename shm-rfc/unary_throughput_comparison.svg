@@ -1,10 +1,10 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 500">
   <title>Throughput Comparison: TCP vs Unix Socket vs Shared Memory</title>
-  
+
   <!-- Background -->
   <rect width="800" height="500" fill="#fafafa"/>
-  
+
   <!-- Title -->
   <text x="400" y="30" text-anchor="middle" font-family="Arial, sans-serif" font-size="18" font-weight="bold" fill="#333">
     Throughput Comparison (Higher is Better)
@@ -12,13 +12,13 @@
   <text x="400" y="50" text-anchor="middle" font-family="Arial, sans-serif" font-size="12" fill="#666">
     AMD EPYC 7763, Linux, gRPC-Go v1.68.x
   </text>
-  
+
   <!-- Y-axis -->
   <line x1="100" y1="70" x2="100" y2="420" stroke="#333" stroke-width="2"/>
   <text x="40" y="250" text-anchor="middle" font-family="Arial, sans-serif" font-size="12" fill="#333" transform="rotate(-90 40 250)">
     Throughput (MB/s)
   </text>
-  
+
   <!-- Y-axis labels -->
   <text x="95" y="420" text-anchor="end" font-family="Arial, sans-serif" font-size="10" fill="#666">0</text>
   <text x="95" y="350" text-anchor="end" font-family="Arial, sans-serif" font-size="10" fill="#666">5,000</text>
@@ -26,20 +26,20 @@
   <text x="95" y="210" text-anchor="end" font-family="Arial, sans-serif" font-size="10" fill="#666">15,000</text>
   <text x="95" y="140" text-anchor="end" font-family="Arial, sans-serif" font-size="10" fill="#666">20,000</text>
   <text x="95" y="80" text-anchor="end" font-family="Arial, sans-serif" font-size="10" fill="#666">30,000</text>
-  
+
   <!-- Grid lines -->
   <line x1="100" y1="420" x2="750" y2="420" stroke="#e0e0e0" stroke-width="1"/>
   <line x1="100" y1="350" x2="750" y2="350" stroke="#e0e0e0" stroke-width="1"/>
   <line x1="100" y1="280" x2="750" y2="280" stroke="#e0e0e0" stroke-width="1"/>
   <line x1="100" y1="210" x2="750" y2="210" stroke="#e0e0e0" stroke-width="1"/>
   <line x1="100" y1="140" x2="750" y2="140" stroke="#e0e0e0" stroke-width="1"/>
-  
+
   <!-- X-axis -->
   <line x1="100" y1="420" x2="750" y2="420" stroke="#333" stroke-width="2"/>
   <text x="425" y="470" text-anchor="middle" font-family="Arial, sans-serif" font-size="12" fill="#333">
     Payload Size
   </text>
-  
+
   <!-- X-axis labels -->
   <text x="140" y="440" text-anchor="middle" font-family="Arial, sans-serif" font-size="10" fill="#666">64B</text>
   <text x="220" y="440" text-anchor="middle" font-family="Arial, sans-serif" font-size="10" fill="#666">256B</text>
@@ -49,10 +49,10 @@
   <text x="540" y="440" text-anchor="middle" font-family="Arial, sans-serif" font-size="10" fill="#666">64KB</text>
   <text x="620" y="440" text-anchor="middle" font-family="Arial, sans-serif" font-size="10" fill="#666">256KB</text>
   <text x="700" y="440" text-anchor="middle" font-family="Arial, sans-serif" font-size="10" fill="#666">1MB</text>
-  
+
   <!-- Scale: 30000 MB/s = 340 pixels, so 1 MB/s = 0.0113 pixels -->
   <!-- TCP Line (red) -->
-  <polyline 
+  <polyline
     points="140,419 220,417 300,415 380,411 460,399 540,389 620,374 700,371"
     fill="none" stroke="#e74c3c" stroke-width="3"/>
   <circle cx="140" cy="419" r="4" fill="#e74c3c"/>
@@ -63,9 +63,9 @@
   <circle cx="540" cy="389" r="4" fill="#e74c3c"/>
   <circle cx="620" cy="374" r="4" fill="#e74c3c"/>
   <circle cx="700" cy="371" r="4" fill="#e74c3c"/>
-  
+
   <!-- Unix Socket Line (orange) -->
-  <polyline 
+  <polyline
     points="140,417 220,409 300,406 380,393 460,381 540,364 620,354 700,353"
     fill="none" stroke="#f39c12" stroke-width="3"/>
   <circle cx="140" cy="417" r="4" fill="#f39c12"/>
@@ -76,9 +76,9 @@
   <circle cx="540" cy="364" r="4" fill="#f39c12"/>
   <circle cx="620" cy="354" r="4" fill="#f39c12"/>
   <circle cx="700" cy="353" r="4" fill="#f39c12"/>
-  
+
   <!-- Shared Memory Line (green) - dominant -->
-  <polyline 
+  <polyline
     points="140,409 220,385 300,317 380,274 460,261 540,262 620,249 700,76"
     fill="none" stroke="#27ae60" stroke-width="3"/>
   <circle cx="140" cy="409" r="5" fill="#27ae60"/>
@@ -89,7 +89,7 @@
   <circle cx="540" cy="262" r="5" fill="#27ae60"/>
   <circle cx="620" cy="249" r="5" fill="#27ae60"/>
   <circle cx="700" cy="76" r="5" fill="#27ae60"/>
-  
+
   <!-- Data labels for SHM -->
   <text x="140" y="400" text-anchor="middle" font-family="Arial, sans-serif" font-size="9" fill="#27ae60" font-weight="bold">988</text>
   <text x="220" y="376" text-anchor="middle" font-family="Arial, sans-serif" font-size="9" fill="#27ae60" font-weight="bold">3,045</text>
@@ -99,7 +99,7 @@
   <text x="540" y="253" text-anchor="middle" font-family="Arial, sans-serif" font-size="9" fill="#27ae60" font-weight="bold">13,793</text>
   <text x="620" y="240" text-anchor="middle" font-family="Arial, sans-serif" font-size="9" fill="#27ae60" font-weight="bold">14,611</text>
   <text x="700" y="67" text-anchor="middle" font-family="Arial, sans-serif" font-size="9" fill="#27ae60" font-weight="bold">29,518</text>
-  
+
   <!-- Legend -->
   <rect x="120" y="55" width="180" height="80" fill="white" stroke="#ccc" stroke-width="1" rx="4"/>
   <line x1="130" y1="77" x2="160" y2="77" stroke="#e74c3c" stroke-width="3"/>
@@ -111,7 +111,7 @@
   <line x1="130" y1="121" x2="160" y2="121" stroke="#27ae60" stroke-width="3"/>
   <circle cx="145" cy="121" r="5" fill="#27ae60"/>
   <text x="165" y="126" font-family="Arial, sans-serif" font-size="11" fill="#333">Shared Memory</text>
-  
+
   <!-- Annotation for 1MB -->
   <text x="720" y="130" font-family="Arial, sans-serif" font-size="11" fill="#27ae60" font-weight="bold">
     7x faster

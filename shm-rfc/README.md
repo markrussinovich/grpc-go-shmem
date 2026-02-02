@@ -74,7 +74,7 @@ BenchmarkShmRingWriteRead/size=1048576-2         58099      35524 ns/op   29517.
 
 BenchmarkShmLatencyPercentiles-2 (1KB payload):
   avg: 405 ns
-  min: 240 ns  
+  min: 240 ns
   p50: 301 ns
   p90: 331 ns
   p99: 3256 ns

@@ -108,8 +108,8 @@ The shared memory transport integrates with gRPC-Go with **minimal modifications
 A single interface addition allows custom transports to bypass HTTP/2 wrapping:
 
 ```go
-// ClientTransportProvider is an interface for connections that provide 
-// their own ClientTransport. This allows custom transports (like shared 
+// ClientTransportProvider is an interface for connections that provide
+// their own ClientTransport. This allows custom transports (like shared
 // memory) to be used with gRPC's standard APIs.
 type ClientTransportProvider interface {
     GetClientTransport() ClientTransport
@@ -119,15 +119,15 @@ type ClientTransportProvider interface {
 The `NewHTTP2Client` function checks for this interface after dialing:
 
 ```go
-func NewHTTP2Client(connectCtx, ctx context.Context, addr resolver.Address, 
+func NewHTTP2Client(connectCtx, ctx context.Context, addr resolver.Address,
     opts ConnectOptions, onClose func(GoAwayReason)) (ClientTransport, error) {
     // ... dial connection ...
-    
+
     // Check if the connection provides its own transport
     if provider, ok := conn.(ClientTransportProvider); ok {
         return provider.GetClientTransport(), nil
     }
-    
+
     // Continue with HTTP2 client creation...
 }
 ```
@@ -617,7 +617,7 @@ The ring buffer must implement:
 // C implementation sketch
 typedef struct {
     uint64_t capacity;      // Power of 2
-    uint64_t widx;          // Monotonic write index  
+    uint64_t widx;          // Monotonic write index
     uint64_t ridx;          // Monotonic read index
     uint32_t dataSeq;       // Futex for readers
     uint32_t spaceSeq;      // Futex for writers

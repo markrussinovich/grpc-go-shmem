@@ -1,10 +1,10 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 500">
   <title>Streaming RPC Throughput Comparison: TCP vs Unix Socket vs Shared Memory</title>
-  
+
   <!-- Background -->
   <rect width="800" height="500" fill="#fafafa"/>
-  
+
   <!-- Title -->
   <text x="400" y="30" text-anchor="middle" font-family="Arial, sans-serif" font-size="18" font-weight="bold" fill="#333">
     Streaming RPC Throughput Comparison (Higher is Better)
@@ -12,13 +12,13 @@
   <text x="400" y="50" text-anchor="middle" font-family="Arial, sans-serif" font-size="12" fill="#666">
     Large payload streaming, AMD EPYC 7763, Linux
   </text>
-  
+
   <!-- Y-axis -->
   <line x1="100" y1="70" x2="100" y2="400" stroke="#333" stroke-width="2"/>
   <text x="40" y="240" text-anchor="middle" font-family="Arial, sans-serif" font-size="12" fill="#333" transform="rotate(-90 40 240)">
     Throughput (MB/s)
   </text>
-  
+
   <!-- Y-axis labels -->
   <text x="95" y="400" text-anchor="end" font-family="Arial, sans-serif" font-size="10" fill="#666">0</text>
   <text x="95" y="345" text-anchor="end" font-family="Arial, sans-serif" font-size="10" fill="#666">5,000</text>
@@ -27,7 +27,7 @@
   <text x="95" y="180" text-anchor="end" font-family="Arial, sans-serif" font-size="10" fill="#666">20,000</text>
   <text x="95" y="125" text-anchor="end" font-family="Arial, sans-serif" font-size="10" fill="#666">25,000</text>
   <text x="95" y="70" text-anchor="end" font-family="Arial, sans-serif" font-size="10" fill="#666">30,000</text>
-  
+
   <!-- Grid lines -->
   <line x1="100" y1="400" x2="750" y2="400" stroke="#e0e0e0" stroke-width="1"/>
   <line x1="100" y1="345" x2="750" y2="345" stroke="#e0e0e0" stroke-width="1"/>
@@ -35,73 +35,73 @@
   <line x1="100" y1="235" x2="750" y2="235" stroke="#e0e0e0" stroke-width="1"/>
   <line x1="100" y1="180" x2="750" y2="180" stroke="#e0e0e0" stroke-width="1"/>
   <line x1="100" y1="125" x2="750" y2="125" stroke="#e0e0e0" stroke-width="1"/>
-  
+
   <!-- X-axis -->
   <line x1="100" y1="400" x2="750" y2="400" stroke="#333" stroke-width="2"/>
   <text x="425" y="470" text-anchor="middle" font-family="Arial, sans-serif" font-size="12" fill="#333">
     Payload Size
   </text>
-  
+
   <!-- X-axis labels -->
   <text x="180" y="420" text-anchor="middle" font-family="Arial, sans-serif" font-size="11" fill="#666">16 KB</text>
   <text x="340" y="420" text-anchor="middle" font-family="Arial, sans-serif" font-size="11" fill="#666">64 KB</text>
   <text x="500" y="420" text-anchor="middle" font-family="Arial, sans-serif" font-size="11" fill="#666">256 KB</text>
   <text x="660" y="420" text-anchor="middle" font-family="Arial, sans-serif" font-size="11" fill="#666">1 MB</text>
-  
+
   <!-- 16KB bars -->
   <!-- TCP: 1745 MB/s -->
   <rect x="130" y="381" width="30" height="19" fill="#e74c3c"/>
-  
+
   <!-- Unix Socket: 3348 MB/s -->
   <rect x="165" y="363" width="30" height="37" fill="#3498db"/>
-  
+
   <!-- Shared Memory: 13873 MB/s -->
   <rect x="200" y="247" width="30" height="153" fill="#27ae60"/>
   <text x="215" y="242" text-anchor="middle" font-family="Arial, sans-serif" font-size="8" fill="#27ae60">13.9K</text>
-  
+
   <!-- 64KB bars -->
   <!-- TCP: 2640 MB/s -->
   <rect x="290" y="371" width="30" height="29" fill="#e74c3c"/>
-  
+
   <!-- Unix Socket: 4836 MB/s -->
   <rect x="325" y="347" width="30" height="53" fill="#3498db"/>
-  
+
   <!-- Shared Memory: 13793 MB/s -->
   <rect x="360" y="248" width="30" height="152" fill="#27ae60"/>
   <text x="375" y="243" text-anchor="middle" font-family="Arial, sans-serif" font-size="8" fill="#27ae60">13.8K</text>
-  
+
   <!-- 256KB bars -->
   <!-- TCP: 3945 MB/s -->
   <rect x="450" y="357" width="30" height="43" fill="#e74c3c"/>
-  
+
   <!-- Unix Socket: 5635 MB/s -->
   <rect x="485" y="338" width="30" height="62" fill="#3498db"/>
-  
+
   <!-- Shared Memory: 14611 MB/s -->
   <rect x="520" y="239" width="30" height="161" fill="#27ae60"/>
   <text x="535" y="234" text-anchor="middle" font-family="Arial, sans-serif" font-size="8" fill="#27ae60">14.6K</text>
-  
+
   <!-- 1MB bars -->
   <!-- TCP: 4191 MB/s -->
   <rect x="610" y="354" width="30" height="46" fill="#e74c3c"/>
-  
+
   <!-- Unix Socket: 5706 MB/s -->
   <rect x="645" y="337" width="30" height="63" fill="#3498db"/>
-  
+
   <!-- Shared Memory: 29518 MB/s -->
   <rect x="680" y="75" width="30" height="325" fill="#27ae60"/>
   <text x="695" y="70" text-anchor="middle" font-family="Arial, sans-serif" font-size="8" fill="#27ae60">29.5K</text>
-  
+
   <!-- Legend -->
   <rect x="550" y="480" width="15" height="12" fill="#e74c3c"/>
   <text x="570" y="490" font-family="Arial, sans-serif" font-size="10" fill="#333">TCP Loopback</text>
-  
+
   <rect x="660" y="480" width="15" height="12" fill="#3498db"/>
   <text x="680" y="490" font-family="Arial, sans-serif" font-size="10" fill="#333">Unix Socket</text>
-  
+
   <rect x="550" y="495" width="15" height="12" fill="#27ae60"/>
   <text x="570" y="505" font-family="Arial, sans-serif" font-size="10" fill="#333">Shared Memory</text>
-  
+
   <!-- Improvement annotations -->
   <text x="215" y="260" text-anchor="middle" font-family="Arial, sans-serif" font-size="7" fill="white" font-weight="bold">8x</text>
   <text x="375" y="260" text-anchor="middle" font-family="Arial, sans-serif" font-size="7" fill="white" font-weight="bold">5x</text>
