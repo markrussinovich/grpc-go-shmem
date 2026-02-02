@@ -749,35 +749,6 @@ Latency per message within an active stream (1KB messages):
 
 ---
 
-## Rationale
-
-### Why Not Use Existing Solutions?
-
-1. **Unix Domain Sockets (UDS)**: Still go through kernel socket layer, 5-10x slower than shared memory
-2. **Named Pipes**: Platform-specific, limited to streaming, no random access
-3. **Memory-Mapped Files Without Futex**: Would require polling, wasting CPU
-4. **TCP Loopback**: Full network stack overhead, 30-50x slower
-
-### Design Trade-offs
-
-| Decision | Trade-off | Rationale |
-|----------|-----------|-----------|
-| **Futex for sync** | Linux-specific | Provides lowest latency; fallback for other platforms |
-| **Fixed ring sizes** | Memory reservation | Predictable performance; can be configured |
-| **Single connection per segment** | Simpler design | Avoids complex multiplexing; use multiple segments if needed |
-| **16-byte frame header** | Slight overhead | Memory alignment benefits; room for future extensions |
-
-### Why Minimal Core Changes?
-
-The design prioritizes minimal modifications to gRPC core code:
-
-1. **Reduced merge conflicts**: Easier to maintain across gRPC versions
-2. **Lower risk**: Existing HTTP/2 behavior unchanged
-3. **Extensibility**: Same pattern can support future custom transports
-4. **Review efficiency**: Focused review on new code rather than refactoring
-
----
-
 ## Implementation
 
 ### File Location Guide
