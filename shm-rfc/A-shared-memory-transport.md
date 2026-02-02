@@ -9,7 +9,9 @@ Shared Memory Transport for gRPC
 
 ## Abstract
 
-This proposal introduces a shared memory transport for gRPC, enabling high-performance inter-process communication (IPC) for gRPC services running on the same machine. The shared memory transport achieves 10-50x lower latency and 15-40x higher throughput compared to TCP loopback by eliminating kernel network stack overhead through memory-mapped regions and futex-based synchronization.
+This proposal introduces a shared memory transport for gRPC, enabling high-performance inter-process communication (IPC) for gRPC services running on the same machine. The shared memory transport achieves 10-50x lower latency and 15-40x higher throughput compared to TCP loopback by eliminating kernel network stack overhead through memory-mapped regions and efficient synchronization primitives.
+
+**Supported Platforms**: This implementation supports **Linux** (using futex for synchronization) and **Windows** (using `WaitOnAddress()` for synchronization). Both platforms provide equivalent functionality with platform-native primitives for optimal performance.
 
 ## Background
 
@@ -29,7 +31,7 @@ For latency-sensitive workloads (ML inference, real-time analytics, high-frequen
 A shared memory transport provides:
 
 1. **Zero kernel involvement in data path**: After initial setup, data transfer is pure user-space memory copy
-2. **Futex-based synchronization**: Efficient cross-process blocking with minimal syscalls
+2. **Platform-native synchronization**: Efficient cross-process blocking with minimal syscalls using futex (Linux) or `WaitOnAddress()` (Windows)
 3. **Zero-copy potential**: With careful design, data can remain in shared memory without copies
 4. **Lower latency**: Sub-microsecond roundtrip times are achievable
 5. **Higher throughput**: Memory bandwidth limited rather than socket-limited
@@ -824,7 +826,7 @@ export GRPC_SHM_FUTEX_DEBUG=1              # Enable futex debug logging
 
 ## Open Issues
 
-1. **Windows Support**: The current implementation uses Linux futex. Windows support requires `WaitOnAddress()` which has different semantics.
+1. **macOS Support**: macOS lacks futex. Support would require `pthread_cond` with additional synchronization overhead, or a polling fallback.
 
 2. **Security Model**: Shared memory segments are accessible to any process with the name. Should we support access control?
 
