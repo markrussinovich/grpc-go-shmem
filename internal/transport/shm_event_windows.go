@@ -22,7 +22,9 @@ package transport
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"log"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -200,7 +202,9 @@ func (e *RingEvents) Close() error {
 // SignalData signals that new data is available in the ring.
 func (e *RingEvents) SignalData() {
 	if e.dataEvent != 0 {
-		shmDebugf("[DEBUG] SignalData: setting event=%v", e.dataEvent)
+		if shmDebugEnabled {
+			log.Printf("[DEBUG] SignalData: setting event=%v", e.dataEvent)
+		}
 		windows.SetEvent(e.dataEvent)
 	}
 }
@@ -235,12 +239,31 @@ func (e *RingEvents) WaitContig(addr *uint32, val uint32, timeout time.Duration)
 	return waitOnEventWithValue(e.contigEvent, addr, val, timeout)
 }
 
+// Pre-allocated sentinel errors for waitOnEventWithValue to avoid heap allocations
+// in the hot path. The Accept goroutine's control ring wait can loop millions of
+// times; using fmt.Errorf on each iteration causes massive GC pressure.
+var (
+	errWaitFailed     = errors.New("WaitForSingleObject failed")
+	errWaitAbandoned  = errors.New("event abandoned")
+	errWaitUnexpected = errors.New("unexpected wait result")
+
+	// logWaitErrorOnce ensures the first WaitForSingleObject failure is
+	// logged with full detail for diagnosis, then all subsequent failures
+	// use the zero-alloc sentinel.
+	logWaitErrorOnce sync.Once
+)
+
 // waitOnEventWithValue waits on an event handle while checking if the atomic value changed.
 // This combines the Windows event wait with the futex-like value check semantics.
 func waitOnEventWithValue(event windows.Handle, addr *uint32, expectedVal uint32, timeout time.Duration) error {
 	// Fast-path: check if value already changed
 	if atomic.LoadUint32(addr) != expectedVal {
 		return nil
+	}
+
+	// Guard against closed/invalid handle (handle 0 is NULL on Windows).
+	if event == 0 {
+		return errWaitFailed
 	}
 
 	// Calculate timeout in milliseconds
@@ -259,7 +282,10 @@ func waitOnEventWithValue(event windows.Handle, addr *uint32, expectedVal uint32
 	// Wait on the event
 	ret, err := windows.WaitForSingleObject(event, timeoutMs)
 	if err != nil {
-		return fmt.Errorf("WaitForSingleObject: %w", err)
+		logWaitErrorOnce.Do(func() {
+			shmDebugf("waitOnEventWithValue: WaitForSingleObject failed: handle=%v err=%v timeout=%v", event, err, timeout)
+		})
+		return errWaitFailed
 	}
 
 	// WAIT_TIMEOUT = 0x00000102 = 258
@@ -280,9 +306,9 @@ func waitOnEventWithValue(event windows.Handle, addr *uint32, expectedVal uint32
 		}
 		return ErrFutexTimeout
 	case windows.WAIT_ABANDONED:
-		return fmt.Errorf("event abandoned")
+		return errWaitAbandoned
 	default:
-		return fmt.Errorf("unexpected wait result: %d", ret)
+		return errWaitUnexpected
 	}
 }
 

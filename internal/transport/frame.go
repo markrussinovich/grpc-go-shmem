@@ -23,6 +23,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"log"
 	"sync"
 
 	"google.golang.org/grpc/mem"
@@ -118,7 +119,9 @@ func (p *ringCommitPool) Get(_ int) *[]byte { return nil }
 
 func (p *ringCommitPool) Put(b *[]byte) {
 	p.once.Do(func() {
-		shmDebugf("[DEBUG] ringCommitPool.Put: committing %d bytes", len(*b))
+		if shmDebugEnabled {
+			log.Printf("[DEBUG] ringCommitPool.Put: committing %d bytes", len(*b))
+		}
 		p.commit.Commit(len(*b))
 	})
 }

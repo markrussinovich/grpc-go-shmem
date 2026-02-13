@@ -295,9 +295,13 @@ func (l *ShmListener) Close() error {
 			// the read to fail, which is the desired behavior.
 			if l.ctlRx != nil {
 				_ = l.ctlRx.Close()
+				// Mark memory invalid BEFORE unmapping to prevent segfaults
+				// in concurrent readers that may still be accessing header fields.
+				l.ctlRx.MarkMemoryInvalid()
 			}
 			if l.ctlTx != nil {
 				_ = l.ctlTx.Close()
+				l.ctlTx.MarkMemoryInvalid()
 			}
 
 			l.ctlSegment.Close()

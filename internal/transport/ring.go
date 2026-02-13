@@ -59,6 +59,11 @@ const (
 
 var shmDebugEnabled = os.Getenv("GRPC_SHM_DEBUG") != ""
 
+// shmDebugf logs debug messages for SHM transport when GRPC_SHM_DEBUG is set.
+// IMPORTANT: Callers in hot paths (Commit, ReadSlices, ReserveWrite) MUST guard
+// calls with `if shmDebugEnabled { ... }` to avoid heap-escaping variadic args.
+// The variadic `args ...any` parameter causes allocations even when the function
+// returns early, because the []any slice is constructed at the call site.
 func shmDebugf(format string, args ...any) {
 	if !shmDebugEnabled {
 		return
@@ -96,6 +101,13 @@ type ShmRing struct {
 	dataOff  uintptr // base address of data area
 	mem      []byte  // the mmapped region (no copying)
 	closed   uint32  // atomic flag: 1 if this ring has been closed locally
+
+	// memInvalid is set before the shared memory backing this ring is unmapped.
+	// When set, NO header fields (hdr.*) may be accessed — the memory is or will
+	// be unmapped. This distinguishes "logically closed" (producer done writing,
+	// but memory is still valid, so consumers can drain remaining data) from
+	// "memory being released" (ShmListener.Close → segment.Close path).
+	memInvalid uint32
 
 	// pendingReadIdx tracks how far we've read (but not committed) in the ring.
 	// This is process-local (not in shared memory) and allows the reader to
@@ -521,7 +533,13 @@ func (r *ShmRing) ReadBlocking(buf []byte) (int, error) {
 
 	// Consumer side: read data and signal producer
 	for {
-		// Check for closure first
+		// Bail immediately if memory is being unmapped.
+		if atomic.LoadUint32(&r.memInvalid) != 0 {
+			return 0, io.EOF
+		}
+
+		// Check for closure in shared memory header (covers both local
+		// and remote close since Close() sets hdr.Closed too).
 		if hdr.Closed() {
 			// Check if data is still available even when closed
 			writeIdx := hdr.WriteIndex()
@@ -599,13 +617,21 @@ func (r *ShmRing) ReadBlocking(buf []byte) (int, error) {
 			return bytesRead, nil
 		}
 
-		// No data available - check closure and wait for producer
+		// No data available - check closure and wait for producer.
+		// Bail if memory is being unmapped.
+		if atomic.LoadUint32(&r.memInvalid) != 0 {
+			return 0, io.EOF
+		}
 		if !hdr.Closed() {
 			// Phase 1: Spin-wait for a short duration before falling back to futex.
 			// This dramatically reduces latency in ping-pong patterns where data
 			// arrives quickly, avoiding the ~10µs futex wake overhead.
 			spinLimit := atomic.LoadUint32(&r.dataSpinCutoff)
 			for spin := uint32(0); spin < spinLimit; spin++ {
+				// Bail if memory is being unmapped.
+				if atomic.LoadUint32(&r.memInvalid) != 0 {
+					return 0, io.EOF
+				}
 				// Check if data arrived during spin
 				if hdr.WriteIndex()-hdr.ReadIndex() > 0 {
 					// Data arrived! Update adaptive cutoff (success = spin faster next time)
@@ -617,7 +643,10 @@ func (r *ShmRing) ReadBlocking(buf []byte) (int, error) {
 					}
 					continue // Re-enter main loop to read data
 				}
-				// Check closure during spin
+				// Check closure during spin — local first, then remote.
+				if atomic.LoadUint32(&r.memInvalid) != 0 {
+					return 0, io.EOF
+				}
 				if hdr.Closed() {
 					return 0, io.EOF
 				}
@@ -630,6 +659,10 @@ func (r *ShmRing) ReadBlocking(buf []byte) (int, error) {
 			newCutoff := (7*spinLimit + spinIterationsMin) / 8
 			atomic.StoreUint32(&r.dataSpinCutoff, max(spinIterationsMin, newCutoff))
 
+			// Bail if memory is being unmapped.
+			if atomic.LoadUint32(&r.memInvalid) != 0 {
+				return 0, io.EOF
+			}
 			hdr.IncDataWaiters()
 			dataSeq := hdr.DataSequence()
 			// Re-check data availability and closed state before sleeping
@@ -640,7 +673,11 @@ func (r *ShmRing) ReadBlocking(buf []byte) (int, error) {
 				continue
 			}
 			// Re-check closed flag to avoid missing a close that happened
-			// after our initial check but before we entered futexWait
+			// after our initial check but before we entered futexWait.
+			if atomic.LoadUint32(&r.memInvalid) != 0 {
+				// Cannot safely call hdr.DecDataWaiters since memory may be gone.
+				return 0, io.EOF
+			}
 			if hdr.Closed() {
 				hdr.DecDataWaiters()
 				return 0, io.EOF
@@ -649,9 +686,9 @@ func (r *ShmRing) ReadBlocking(buf []byte) (int, error) {
 				// Spurious wake or other wake reasons - just continue the loop
 				_ = err // silence staticcheck SA9003
 			}
-			// Check if ring is still valid before decrementing - segment may
+			// Check if memory is still valid before decrementing - segment may
 			// have been unmapped while we were blocked on futexWait
-			if atomic.LoadUint32(&r.closed) == 0 {
+			if atomic.LoadUint32(&r.memInvalid) == 0 {
 				hdr.DecDataWaiters()
 			}
 		} else {
@@ -682,6 +719,15 @@ func (r *ShmRing) Close() error {
 	r.signalContig(&hdr.contigSeq)
 
 	return nil
+}
+
+// MarkMemoryInvalid signals that the shared memory backing this ring is about
+// to be unmapped. After this call, no header fields (hdr.*) or data areas may
+// be accessed. This must be called BEFORE the segment is unmapped/closed to
+// prevent segfaults in concurrent readers. It also sets the closed flag.
+func (r *ShmRing) MarkMemoryInvalid() {
+	atomic.StoreUint32(&r.memInvalid, 1)
+	atomic.StoreUint32(&r.closed, 1)
 }
 
 // Available returns the number of bytes available for writing
@@ -970,9 +1016,11 @@ func (r *ShmRing) ReadBlockingContext(ctx context.Context, buf []byte) (int, err
 			// This is conservative but avoids potential races in the waiter registration.
 			if bytesRead > 0 && hdr.SpaceWaiters() > 0 {
 				hdr.IncrementSpaceSequence()
-				newSeq := hdr.SpaceSequence()
-				shmDebugf("READBLOCKING_SPACE_WAKE: freed %d bytes, new spaceSeq=%d, waking waiters",
-					bytesRead, newSeq)
+				if shmDebugEnabled {
+					newSeq := hdr.SpaceSequence()
+					log.Printf("READBLOCKING_SPACE_WAKE: freed %d bytes, new spaceSeq=%d, waking waiters",
+						bytesRead, newSeq)
+				}
 				r.signalSpace(&hdr.spaceSeq)
 			}
 
@@ -987,8 +1035,10 @@ func (r *ShmRing) ReadBlockingContext(ctx context.Context, buf []byte) (int, err
 		// Need to wait for data
 		hdr.IncDataWaiters()
 		dataSeq := hdr.DataSequence()
-		shmDebugf("READBLOCKING_DATA_WAIT: empty ring, dataWaiters=%d, dataSeq=%d, widx=%d, ridx=%d",
-			hdr.DataWaiters(), dataSeq, hdr.WriteIndex(), hdr.ReadIndex())
+		if shmDebugEnabled {
+			log.Printf("READBLOCKING_DATA_WAIT: empty ring, dataWaiters=%d, dataSeq=%d, widx=%d, ridx=%d",
+				hdr.DataWaiters(), dataSeq, hdr.WriteIndex(), hdr.ReadIndex())
+		}
 
 		// Re-check data availability before sleeping
 		writeIdx = hdr.WriteIndex()
@@ -1103,10 +1153,14 @@ func (wr *WriteReservation) Commit(written int) error {
 		hdr.IncrementDataSequence()
 		newSeq := hdr.DataSequence()
 		waiters := hdr.DataWaiters()
-		shmDebugf("COMMIT_DATA_WAKE: written=%d, newSeq=%d, dataWaiters=%d", written, newSeq, waiters)
+		if shmDebugEnabled {
+			log.Printf("COMMIT_DATA_WAKE: written=%d, newSeq=%d, dataWaiters=%d", written, newSeq, waiters)
+		}
 		// Only wake if there are waiters - avoids unnecessary syscalls
 		if waiters > 0 {
-			shmDebugf("COMMIT_DATA_WAKE: waking 1 waiter")
+			if shmDebugEnabled {
+				log.Printf("COMMIT_DATA_WAKE: waking 1 waiter")
+			}
 			wr.ring.signalData(&hdr.dataSeq)
 		}
 	}
@@ -1221,10 +1275,12 @@ func (r *ShmRing) ReserveWrite(ctx context.Context, n int) (WriteReservation, er
 		}
 		atomic.StoreUint32(&r.spaceSpinCutoff, newCutoff)
 
-		if dl, ok := ctx.Deadline(); ok {
-			shmDebugf("ReserveWrite: waiting with timeout=%s", time.Until(dl))
-		} else {
-			shmDebugf("ReserveWrite: waiting WITHOUT timeout")
+		if shmDebugEnabled {
+			if dl, ok := ctx.Deadline(); ok {
+				log.Printf("ReserveWrite: waiting with timeout=%s", time.Until(dl))
+			} else {
+				log.Printf("ReserveWrite: waiting WITHOUT timeout")
+			}
 		}
 
 		// Spin failed - fall back to futex, choosing wait type based on fullness
@@ -1234,8 +1290,10 @@ func (r *ShmRing) ReserveWrite(ctx context.Context, n int) (WriteReservation, er
 		if free == 0 {
 			hdr.IncSpaceWaiters()
 			exp := hdr.SpaceSequence()
-			shmDebugf("RESERVE_WRITE_SPACE_WAIT: ring FULL, spaceWaiters=%d, exp=%d, widx=%d, ridx=%d",
-				hdr.SpaceWaiters(), exp, writeIdx, readIdx)
+			if shmDebugEnabled {
+				log.Printf("RESERVE_WRITE_SPACE_WAIT: ring FULL, spaceWaiters=%d, exp=%d, widx=%d, ridx=%d",
+					hdr.SpaceWaiters(), exp, writeIdx, readIdx)
+			}
 			// Re-check
 			writeIdx = hdr.WriteIndex()
 			readIdx = hdr.ReadIndex()
@@ -1250,9 +1308,13 @@ func (r *ShmRing) ReserveWrite(ctx context.Context, n int) (WriteReservation, er
 					hdr.DecSpaceWaiters()
 					return WriteReservation{}, context.DeadlineExceeded
 				}
-				shmDebugf("FUTEX_ENTER: exp=%d, rem=%v", exp, rem)
+				if shmDebugEnabled {
+					log.Printf("FUTEX_ENTER: exp=%d, rem=%v", exp, rem)
+				}
 				err = r.waitForSpace(&hdr.spaceSeq, exp, rem)
-				shmDebugf("FUTEX_EXIT: exp=%d, err=%v, newSeq=%d", exp, err, hdr.SpaceSequence())
+				if shmDebugEnabled {
+					log.Printf("FUTEX_EXIT: exp=%d, err=%v, newSeq=%d", exp, err, hdr.SpaceSequence())
+				}
 			} else {
 				err = r.waitForSpace(&hdr.spaceSeq, exp, 0)
 			}
@@ -1337,22 +1399,21 @@ func (r *ShmRing) ReadSlices(ctx context.Context, n int) (first, second []byte, 
 		default:
 		}
 
-		// Check local closed flag - this is safe even if memory is unmapped.
-		// BUT: we must still allow draining data if the ring was closed after writes.
-		// Only return EOF immediately if we detect memory is actually unsafe to access.
-		// In single-process tests, producer and consumer share the same ShmRing instance,
-		// so r.closed gets set when producer closes, but memory is still valid.
-		localClosed := atomic.LoadUint32(&r.closed) != 0
+		// If shared memory is about to be unmapped, bail immediately.
+		if atomic.LoadUint32(&r.memInvalid) != 0 {
+			return nil, nil, nil, io.EOF
+		}
 
-		// Check closed state in shared memory - but always allow reading remaining data first.
+		// Check closed state. Close() sets both r.closed AND hdr.Closed(),
+		// so headerClosed covers both local and remote close. When closed,
+		// the ring should still drain any remaining data before returning EOF.
 		headerClosed := hdr.Closed()
 
 		// Use pendingReadIdx for availability (allows read-ahead while buffers are held)
 		pendingIdx := atomic.LoadUint64(&r.pendingReadIdx)
 
-		// If closed (either locally or in header), check if there's still data to drain
-		if localClosed || headerClosed {
-			// Check if data is still available even when closed
+		// If remote side closed, check if there's still data to drain
+		if headerClosed {
 			writeIdx := hdr.WriteIndex()
 			availableBefore := writeIdx - pendingIdx
 			if availableBefore == 0 {
@@ -1410,6 +1471,10 @@ func (r *ShmRing) ReadSlices(ctx context.Context, n int) (first, second []byte, 
 		spinSuccess := false
 		for i := uint32(0); i < spinCutoff; i++ {
 			runtime_procyield(1) // PAUSE instruction to reduce power/contention
+			// Bail if memory is being unmapped.
+			if atomic.LoadUint32(&r.memInvalid) != 0 {
+				return nil, nil, nil, io.EOF
+			}
 			writeIdx = hdr.WriteIndex()
 			pendingIdx = atomic.LoadUint64(&r.pendingReadIdx)
 			if writeIdx-pendingIdx >= uint64(n) {
@@ -1440,19 +1505,22 @@ func (r *ShmRing) ReadSlices(ctx context.Context, n int) (first, second []byte, 
 		default:
 		}
 
-		if dl, ok := ctx.Deadline(); ok {
-			shmDebugf("ReadSlices: waiting with timeout=%s", time.Until(dl))
-		} else {
-			shmDebugf("ReadSlices: waiting WITHOUT timeout")
+		if shmDebugEnabled {
+			if dl, ok := ctx.Deadline(); ok {
+				log.Printf("ReadSlices: waiting with timeout=%s", time.Until(dl))
+			} else {
+				log.Printf("ReadSlices: waiting WITHOUT timeout")
+			}
 		}
 
-		// Check local closed flag before accessing header
-		// If closed, re-check for data - producer may have written before closing
-		localClosed = atomic.LoadUint32(&r.closed) != 0
+		// Bail if memory is being unmapped.
+		if atomic.LoadUint32(&r.memInvalid) != 0 {
+			return nil, nil, nil, io.EOF
+		}
 		headerClosed = hdr.Closed()
 
-		if localClosed || headerClosed {
-			// Re-check if data appeared (race with producer)
+		if headerClosed {
+			// Remote side closed — re-check if data appeared (race with producer)
 			writeIdx = hdr.WriteIndex()
 			pendingIdx = atomic.LoadUint64(&r.pendingReadIdx)
 			available := writeIdx - pendingIdx
@@ -1471,6 +1539,10 @@ func (r *ShmRing) ReadSlices(ctx context.Context, n int) (first, second []byte, 
 		// Snapshot the producer's wake-up sequence, then re-check indices before
 		// sleeping to avoid a lost-wake race where the producer commits data after
 		// our availability check but before we enter futexWait.
+		// Bail if memory is being unmapped.
+		if atomic.LoadUint32(&r.memInvalid) != 0 {
+			return nil, nil, nil, io.EOF
+		}
 		hdr.IncDataWaiters()
 		dataSeq := hdr.DataSequence()
 		writeIdx = hdr.WriteIndex()
@@ -1482,10 +1554,13 @@ func (r *ShmRing) ReadSlices(ctx context.Context, n int) (first, second []byte, 
 		}
 
 		// Re-check closed flag after incrementing waiters and before futexWait
-		// to avoid missing a close that happened between our initial check and now
-		localClosed = atomic.LoadUint32(&r.closed) != 0
+		// to avoid missing a close that happened between our initial check and now.
+		if atomic.LoadUint32(&r.memInvalid) != 0 {
+			// Cannot safely call hdr.DecDataWaiters since memory may be gone.
+			return nil, nil, nil, io.EOF
+		}
 		headerClosed = hdr.Closed()
-		if localClosed || headerClosed {
+		if headerClosed {
 			hdr.DecDataWaiters()
 			// Re-check if data appeared
 			writeIdx = hdr.WriteIndex()
@@ -1496,31 +1571,39 @@ func (r *ShmRing) ReadSlices(ctx context.Context, n int) (first, second []byte, 
 			return nil, nil, nil, io.EOF
 		}
 
-		shmDebugf("[DEBUG] Ring read: no data available, dataSeq=%d, waiting on futex...", dataSeq)
+		if shmDebugEnabled {
+			log.Printf("[DEBUG] Ring read: no data available, dataSeq=%d, waiting on futex...", dataSeq)
+		}
 
 		// If ctx has a deadline, wait with timeout; otherwise, infinite wait.
 		var err error
 		if deadline, has := ctx.Deadline(); has {
 			rem := time.Until(deadline)
 			if rem <= 0 {
-				// Check if ring is still valid before decrementing
-				if atomic.LoadUint32(&r.closed) == 0 {
+				// Check if memory is still valid before decrementing
+				if atomic.LoadUint32(&r.memInvalid) == 0 {
 					hdr.DecDataWaiters()
 				}
 				return nil, nil, nil, context.DeadlineExceeded
 			}
-			shmDebugf("[DEBUG] Ring read: calling waitForData with timeout=%v", rem)
+			if shmDebugEnabled {
+				log.Printf("[DEBUG] Ring read: calling waitForData with timeout=%v", rem)
+			}
 			err = r.waitForData(&hdr.dataSeq, dataSeq, rem)
 		} else {
-			shmDebugf("[DEBUG] Ring read: calling waitForData (no timeout)")
+			if shmDebugEnabled {
+				log.Printf("[DEBUG] Ring read: calling waitForData (no timeout)")
+			}
 			err = r.waitForData(&hdr.dataSeq, dataSeq, 0)
 		}
-		// Check if ring is still valid before decrementing - the segment may have
+		// Check if memory is still valid before decrementing - the segment may have
 		// been unmapped while we were blocked on futexWait
-		if atomic.LoadUint32(&r.closed) == 0 {
+		if atomic.LoadUint32(&r.memInvalid) == 0 {
 			hdr.DecDataWaiters()
 		}
-		shmDebugf("[DEBUG] Ring read: wait returned, err=%v", err)
+		if shmDebugEnabled {
+			log.Printf("[DEBUG] Ring read: wait returned, err=%v", err)
+		}
 
 		if err != nil {
 			// Translate futex timeout to context timeout; keep going on spurious wake.

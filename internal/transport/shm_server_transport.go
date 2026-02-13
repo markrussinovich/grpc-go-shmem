@@ -25,6 +25,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"log"
 	"math"
 	"net"
 	"strings"
@@ -301,7 +302,9 @@ func (t *ShmServerTransport) HandleStreams(ctx context.Context, handle func(*Ser
 
 // processIncomingData reads data from the client->server ring and processes gRPC frames
 func (t *ShmServerTransport) processIncomingData(ctx context.Context) {
-	shmDebugf("[DEBUG] ShmServerTransport.processIncomingData: STARTED, ring=%p", t.clientToServer)
+	if shmDebugEnabled {
+		log.Printf("[DEBUG] ShmServerTransport.processIncomingData: STARTED, ring=%p", t.clientToServer)
+	}
 	defer func() {
 		shmDebugf("[DEBUG] ShmServerTransport.processIncomingData: EXITING")
 		if !t.closed.Load() {
@@ -314,23 +317,31 @@ func (t *ShmServerTransport) processIncomingData(ctx context.Context) {
 			shmDebugf("[DEBUG] ShmServerTransport.processIncomingData: transport closed, exiting")
 			return
 		}
-		shmDebugf("[DEBUG] ShmServerTransport.processIncomingData: waiting for frame from client... widx=%d, ridx=%d", t.clientToServer.header().WriteIndex(), t.clientToServer.header().ReadIndex())
+		if shmDebugEnabled {
+			log.Printf("[DEBUG] ShmServerTransport.processIncomingData: waiting for frame from client... widx=%d, ridx=%d", t.clientToServer.header().WriteIndex(), t.clientToServer.header().ReadIndex())
+		}
 		fh, payloadBuf, err := readFrameView(ctx, t.clientToServer)
 		if err != nil {
-			shmDebugf("[DEBUG] ShmServerTransport.processIncomingData: readFrameView error: %v", err)
+			if shmDebugEnabled {
+				log.Printf("[DEBUG] ShmServerTransport.processIncomingData: readFrameView error: %v", err)
+			}
 			if errors.Is(err, ErrRingClosed) || errors.Is(err, io.EOF) || errors.Is(err, context.Canceled) || t.closed.Load() {
 				return
 			}
 			continue
 		}
-		shmDebugf("[DEBUG] ShmServerTransport.processIncomingData: received frame type=%d, streamID=%d, length=%d", fh.Type, fh.StreamID, fh.Length)
+		if shmDebugEnabled {
+			log.Printf("[DEBUG] ShmServerTransport.processIncomingData: received frame type=%d, streamID=%d, length=%d", fh.Type, fh.StreamID, fh.Length)
+		}
 
 		// Update last read timestamp for keepalive tracking.
 		atomic.StoreInt64(&t.lastRead, time.Now().UnixNano())
 
 		payloadTransferred := false
 		release := func() {
-			shmDebugf("[DEBUG] ShmServerTransport.processIncomingData: release() called, payloadTransferred=%v, payloadBuf=%v", payloadTransferred, payloadBuf)
+			if shmDebugEnabled {
+				log.Printf("[DEBUG] ShmServerTransport.processIncomingData: release() called, payloadTransferred=%v, payloadBuf=%v", payloadTransferred, payloadBuf)
+			}
 			if !payloadTransferred && payloadBuf != nil {
 				payloadBuf.Free()
 				payloadBuf = nil
@@ -895,7 +906,9 @@ func (t *ShmServerTransport) writeHeader(s *ServerStream, md metadata.MD) error 
 		return nil
 	}
 
-	shmDebugf("[DEBUG] ShmServerTransport.writeHeader: stream=%d, metadata keys=%v", s.id, len(md))
+	if shmDebugEnabled {
+		log.Printf("[DEBUG] ShmServerTransport.writeHeader: stream=%d, metadata keys=%v", s.id, len(md))
+	}
 
 	// Convert metadata.MD to []KV format
 	var kvs []KV
@@ -926,13 +939,17 @@ func (t *ShmServerTransport) writeHeader(s *ServerStream, md metadata.MD) error 
 		Length:   uint32(len(payload)),
 	}
 
-	shmDebugf("[DEBUG] ShmServerTransport.writeHeader: Writing HEADERS frame, streamID=%d, length=%d", s.id, fh.Length)
+	if shmDebugEnabled {
+		log.Printf("[DEBUG] ShmServerTransport.writeHeader: Writing HEADERS frame, streamID=%d, length=%d", s.id, fh.Length)
+	}
 
 	// Write frame to server->client ring
 	t.writeMu.Lock()
 	defer t.writeMu.Unlock()
 	if err := writeFrame(context.Background(), t.serverToClient, fh, payload); err != nil {
-		shmDebugf("[ERROR] ShmServerTransport.writeHeader: Failed to write frame: %v", err)
+		if shmDebugEnabled {
+			log.Printf("[ERROR] ShmServerTransport.writeHeader: Failed to write frame: %v", err)
+		}
 		return err
 	}
 
@@ -962,7 +979,9 @@ func (t *ShmServerTransport) write(s *ServerStream, hdr []byte, data mem.BufferS
 	}
 
 	payloadLen := len(hdr) + data.Len()
-	shmDebugf("[DEBUG] ShmServerTransport.write: stream=%d, hdr_len=%d, data_bytes=%d", s.id, len(hdr), data.Len())
+	if shmDebugEnabled {
+		log.Printf("[DEBUG] ShmServerTransport.write: stream=%d, hdr_len=%d, data_bytes=%d", s.id, len(hdr), data.Len())
+	}
 
 	// Enforce outbound flow control before writing.
 	if err := t.acquireSendQuota(s.ctx, s.id, payloadLen); err != nil {
@@ -979,7 +998,9 @@ func (t *ShmServerTransport) write(s *ServerStream, hdr []byte, data mem.BufferS
 	t.writeMu.Lock()
 	defer t.writeMu.Unlock()
 	if err := writeFrameBuffersChunked(context.Background(), t.serverToClient, fh, hdr, data, 0); err != nil {
-		shmDebugf("[ERROR] ShmServerTransport.write: Failed to write frame: %v", err)
+		if shmDebugEnabled {
+			log.Printf("[ERROR] ShmServerTransport.write: Failed to write frame: %v", err)
+		}
 		return err
 	}
 
@@ -1000,7 +1021,9 @@ func (t *ShmServerTransport) writeStatus(s *ServerStream, st *status.Status) err
 		return err
 	}
 
-	shmDebugf("[DEBUG] ShmServerTransport.writeStatus: stream=%d, code=%v, msg=%s", s.id, st.Code(), st.Message())
+	if shmDebugEnabled {
+		log.Printf("[DEBUG] ShmServerTransport.writeStatus: stream=%d, code=%v, msg=%s", s.id, st.Code(), st.Message())
+	}
 
 	// Snapshot trailer metadata.
 	s.hdrMu.Lock()
@@ -1033,13 +1056,17 @@ func (t *ShmServerTransport) writeStatus(s *ServerStream, st *status.Status) err
 		Length:   uint32(len(payload)),
 	}
 
-	shmDebugf("[DEBUG] ShmServerTransport.writeStatus: Writing TRAILERS frame, streamID=%d, length=%d", s.id, fh.Length)
+	if shmDebugEnabled {
+		log.Printf("[DEBUG] ShmServerTransport.writeStatus: Writing TRAILERS frame, streamID=%d, length=%d", s.id, fh.Length)
+	}
 
 	// Write frame to server->client ring
 	t.writeMu.Lock()
 	defer t.writeMu.Unlock()
 	if err := writeFrame(context.Background(), t.serverToClient, fh, payload); err != nil {
-		shmDebugf("[ERROR] ShmServerTransport.writeStatus: Failed to write frame: %v", err)
+		if shmDebugEnabled {
+			log.Printf("[ERROR] ShmServerTransport.writeStatus: Failed to write frame: %v", err)
+		}
 		return err
 	}
 

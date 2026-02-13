@@ -25,6 +25,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -823,6 +824,17 @@ func TestShmGoAwayDrainingCompletesGracefully(t *testing.T) {
 // =============================================================================
 
 func TestShmPingPong(t *testing.T) {
+	// This test uses two separate mappings of the same shared memory segment
+	// (simulating two processes). On Windows, WaitOnAddress/WakeByAddressSingle
+	// match by virtual address, not physical page. With GOMAXPROCS=1, the spin
+	// loop in ReadSlices cannot succeed (only one goroutine runs at a time) and
+	// the subsequent futex wake targets the wrong virtual address, causing a
+	// deadlock. With GOMAXPROCS >= 2 the server goroutine runs on a separate P
+	// and can commit data while the client is still spinning.
+	if runtime.GOMAXPROCS(0) < 2 {
+		t.Skip("requires GOMAXPROCS >= 2: dual-mapping futex addresses differ")
+	}
+
 	segmentName := fmt.Sprintf("test_ping_%d", time.Now().UnixNano())
 	defer RemoveSegment(segmentName)
 

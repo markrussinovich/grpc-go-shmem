@@ -31,7 +31,7 @@ RESULTS_FILE = OUT_DIR / "benchmark_results.json"
 def run_benchmarks() -> dict:
     """Run Go benchmarks and parse results."""
     print("=" * 70)
-    print("Running gRPC Transport Benchmarks...")
+    print("Running Full gRPC Stack Benchmarks (SHM / TCP / Unix)...")
     print("=" * 70)
 
     results = {
@@ -40,25 +40,25 @@ def run_benchmarks() -> dict:
         "benchmarks": {}
     }
 
-    # Run transport benchmarks - filter to specific benchmarks for plotting
-    # Avoid slow benchmarks like BenchmarkShmBackpressure
-    # Include Large Payload benchmarks (streaming and roundtrip) for all transports
+    # Run full gRPC stack benchmarks (protobuf + framing + transport).
+    # These exercise the same code path as the .NET gRPC benchmarks:
+    #   client.UnaryCall / stream.Send+Recv
+    #     -> protobuf -> gRPC framing -> transport -> server handler -> reverse
     benchmark_pattern = (
-        "BenchmarkShmRingWriteRead|BenchmarkShmRingRoundtrip|"
-        "BenchmarkShmRingLargePayloads$|BenchmarkShmRingLargePayloadsRoundtrip|"
-        "BenchmarkTCPLoopback$|BenchmarkTCPLoopbackRoundtrip|"
-        "BenchmarkTCPLargePayloads$|BenchmarkTCPLargePayloadsRoundtrip|"
-        "BenchmarkUnixSocketLoopback|BenchmarkUnixSocketRoundtrip|"
-        "BenchmarkUnixLargePayloads$|BenchmarkUnixLargePayloadsRoundtrip"
+        "BenchmarkGRPC(Shm|TCP|Unix)(Stream|Unary|LargeStream|LargeUnary)"
     )
     # Use 2s benchtime to allow proper warm-up - shared memory transport has
-    # initial segment creation overhead that distorts results with short benchtime
+    # initial segment creation overhead that distorts results with short benchtime.
+    # Use 4 GOMAXPROCS: the SHM transport needs concurrent goroutines on both
+    # sides (client send, client recv, server recv, server handler) while TCP
+    # offloads data transfer to the kernel. With only 2 procs, SHM goroutines
+    # starve and latency inflates ~20x.
     cmd = [
         "go", "test",
         f"-bench={benchmark_pattern}",
-        "-benchtime=2s", "-cpu=2",
+        "-benchtime=2s", "-cpu=4",
         "-run=^$",  # Don't run tests, only benchmarks
-        "google.golang.org/grpc/internal/transport",
+        "google.golang.org/grpc/benchmark/shmemtcp",
         "-benchmem"
     ]
 
@@ -162,9 +162,11 @@ def extract_data(results: dict) -> dict:
     sizes = [64, 256, 1024, 4096, 16384, 65536, 262144, 1048576]
     size_labels = ['64B', '256B', '1KB', '4KB', '16KB', '64KB', '256KB', '1MB']
 
-    # Large payload sizes (1MB to 256MB)
-    large_sizes = [1048576, 4194304, 16777216, 67108864, 134217728, 268435456]
-    large_size_labels = ['1MB', '4MB', '16MB', '64MB', '128MB', '256MB']
+    # Large payload sizes (1MB to 16MB)
+    # Capped at 16MB: payloads approaching ring buffer size (64MiB) may corrupt
+    # data during gRPC frame reassembly over SHM transport.
+    large_sizes = [1048576, 4194304, 16777216]
+    large_size_labels = ['1MB', '4MB', '16MB']
 
     data = {
         "sizes": sizes,
@@ -188,41 +190,41 @@ def extract_data(results: dict) -> dict:
         bench = benchmarks[bench_name]
         return [bench.get(str(s), {}).get("mb_s") for s in sizes]
 
-    # Streaming (one-way) benchmarks
-    data["shm_stream_latency"] = get_latency("BenchmarkShmRingWriteRead", sizes)
-    data["tcp_stream_latency"] = get_latency("BenchmarkTCPLoopback", sizes)
-    data["unix_stream_latency"] = get_latency("BenchmarkUnixSocketLoopback", sizes)
+    # Streaming (ping-pong) benchmarks — full gRPC stack
+    data["shm_stream_latency"] = get_latency("BenchmarkGRPCShmStream", sizes)
+    data["tcp_stream_latency"] = get_latency("BenchmarkGRPCTCPStream", sizes)
+    data["unix_stream_latency"] = get_latency("BenchmarkGRPCUnixStream", sizes)
 
-    data["shm_stream_throughput"] = get_throughput("BenchmarkShmRingWriteRead", sizes)
-    data["tcp_stream_throughput"] = get_throughput("BenchmarkTCPLoopback", sizes)
-    data["unix_stream_throughput"] = get_throughput("BenchmarkUnixSocketLoopback", sizes)
+    data["shm_stream_throughput"] = get_throughput("BenchmarkGRPCShmStream", sizes)
+    data["tcp_stream_throughput"] = get_throughput("BenchmarkGRPCTCPStream", sizes)
+    data["unix_stream_throughput"] = get_throughput("BenchmarkGRPCUnixStream", sizes)
 
-    # Roundtrip (unary) benchmarks - only 4 sizes
+    # Unary RPC benchmarks — full gRPC stack, only 4 sizes
     rt_sizes = [64, 256, 1024, 4096]
     rt_labels = ['64B', '256B', '1KB', '4KB']
 
     data["rt_sizes"] = rt_sizes
     data["rt_size_labels"] = rt_labels
 
-    data["shm_rt_latency"] = get_latency("BenchmarkShmRingRoundtrip", rt_sizes)
-    data["tcp_rt_latency"] = get_latency("BenchmarkTCPLoopbackRoundtrip", rt_sizes)
-    data["unix_rt_latency"] = get_latency("BenchmarkUnixSocketRoundtrip", rt_sizes)
+    data["shm_rt_latency"] = get_latency("BenchmarkGRPCShmUnary", rt_sizes)
+    data["tcp_rt_latency"] = get_latency("BenchmarkGRPCTCPUnary", rt_sizes)
+    data["unix_rt_latency"] = get_latency("BenchmarkGRPCUnixUnary", rt_sizes)
 
-    # Large payload STREAMING benchmarks (all transports - up to 256MB)
-    data["shm_large_stream_throughput"] = get_throughput("BenchmarkShmRingLargePayloads", large_sizes)
-    data["shm_large_stream_latency"] = get_latency("BenchmarkShmRingLargePayloads", large_sizes)
-    data["tcp_large_stream_throughput"] = get_throughput("BenchmarkTCPLargePayloads", large_sizes)
-    data["tcp_large_stream_latency"] = get_latency("BenchmarkTCPLargePayloads", large_sizes)
-    data["unix_large_stream_throughput"] = get_throughput("BenchmarkUnixLargePayloads", large_sizes)
-    data["unix_large_stream_latency"] = get_latency("BenchmarkUnixLargePayloads", large_sizes)
+    # Large payload STREAMING benchmarks (all transports — up to 256MB)
+    data["shm_large_stream_throughput"] = get_throughput("BenchmarkGRPCShmLargeStream", large_sizes)
+    data["shm_large_stream_latency"] = get_latency("BenchmarkGRPCShmLargeStream", large_sizes)
+    data["tcp_large_stream_throughput"] = get_throughput("BenchmarkGRPCTCPLargeStream", large_sizes)
+    data["tcp_large_stream_latency"] = get_latency("BenchmarkGRPCTCPLargeStream", large_sizes)
+    data["unix_large_stream_throughput"] = get_throughput("BenchmarkGRPCUnixLargeStream", large_sizes)
+    data["unix_large_stream_latency"] = get_latency("BenchmarkGRPCUnixLargeStream", large_sizes)
 
-    # Large payload ROUNDTRIP (UNARY) benchmarks (all transports - up to 256MB)
-    data["shm_large_rt_throughput"] = get_throughput("BenchmarkShmRingLargePayloadsRoundtrip", large_sizes)
-    data["shm_large_rt_latency"] = get_latency("BenchmarkShmRingLargePayloadsRoundtrip", large_sizes)
-    data["tcp_large_rt_throughput"] = get_throughput("BenchmarkTCPLargePayloadsRoundtrip", large_sizes)
-    data["tcp_large_rt_latency"] = get_latency("BenchmarkTCPLargePayloadsRoundtrip", large_sizes)
-    data["unix_large_rt_throughput"] = get_throughput("BenchmarkUnixLargePayloadsRoundtrip", large_sizes)
-    data["unix_large_rt_latency"] = get_latency("BenchmarkUnixLargePayloadsRoundtrip", large_sizes)
+    # Large payload UNARY benchmarks (all transports — up to 256MB)
+    data["shm_large_rt_throughput"] = get_throughput("BenchmarkGRPCShmLargeUnary", large_sizes)
+    data["shm_large_rt_latency"] = get_latency("BenchmarkGRPCShmLargeUnary", large_sizes)
+    data["tcp_large_rt_throughput"] = get_throughput("BenchmarkGRPCTCPLargeUnary", large_sizes)
+    data["tcp_large_rt_latency"] = get_latency("BenchmarkGRPCTCPLargeUnary", large_sizes)
+    data["unix_large_rt_throughput"] = get_throughput("BenchmarkGRPCUnixLargeUnary", large_sizes)
+    data["unix_large_rt_latency"] = get_latency("BenchmarkGRPCUnixLargeUnary", large_sizes)
 
     return data
 
@@ -271,7 +273,7 @@ def generate_plots(data: dict):
     # Plot 1: Communication Pattern Benchmarks (main dashboard)
     # ================================================================
     fig, axes = plt.subplots(3, 2, figsize=(14, 14))
-    fig.suptitle(f'gRPC Shared Memory Transport - Communication Pattern Benchmarks\n64 MiB Ring Buffers • {cpu[:30]}',
+    fig.suptitle(f'gRPC Shared Memory Transport - Full Stack Benchmarks\n64 MiB Ring Buffers • protobuf + gRPC framing + transport • {cpu[:30]}',
                  fontsize=14, fontweight='bold')
 
     width = 0.25
@@ -438,7 +440,7 @@ def generate_plots(data: dict):
     # Plot 2: Summary Comparison
     # ================================================================
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-    fig.suptitle(f'gRPC Transport Performance Summary\n{timestamp}', fontsize=14, fontweight='bold')
+    fig.suptitle(f'gRPC Transport Performance Summary (Full Stack)\n{timestamp}', fontsize=14, fontweight='bold')
 
     # Summary 1: Latency at 1KB
     ax = axes[0, 0]
@@ -557,12 +559,12 @@ KEY RESULTS (1KB messages):
     # ================================================================
     # Plot 3: Large Payload Benchmarks (1MB - 256MB) - All Transports
     # ================================================================
-    shm_large_tp = data.get("shm_large_throughput", [])
-    tcp_large_tp = data.get("tcp_large_throughput", [])
-    unix_large_tp = data.get("unix_large_throughput", [])
-    shm_large_lat = data.get("shm_large_latency", [])
-    tcp_large_lat = data.get("tcp_large_latency", [])
-    unix_large_lat = data.get("unix_large_latency", [])
+    shm_large_tp = data.get("shm_large_stream_throughput", [])
+    tcp_large_tp = data.get("tcp_large_stream_throughput", [])
+    unix_large_tp = data.get("unix_large_stream_throughput", [])
+    shm_large_lat = data.get("shm_large_stream_latency", [])
+    tcp_large_lat = data.get("tcp_large_stream_latency", [])
+    unix_large_lat = data.get("unix_large_stream_latency", [])
     large_labels = data.get("large_size_labels", [])
 
     # Only generate if we have large payload data
@@ -653,8 +655,8 @@ def generate_consolidated_plot(data: dict):
     gs = fig.add_gridspec(7, 3, hspace=0.35, wspace=0.25,
                           height_ratios=[1, 1, 1, 1, 1, 1, 0.6])
 
-    fig.suptitle(f'gRPC Shared Memory Transport - Complete Benchmark Results\n'
-                 f'64 MiB Ring Buffers • {cpu} • {timestamp}',
+    fig.suptitle(f'gRPC Shared Memory Transport - Full Stack Benchmark Results\n'
+                 f'64 MiB Ring Buffers • protobuf + gRPC framing + transport • {cpu} • {timestamp}',
                  fontsize=16, fontweight='bold', y=0.98)
 
     width = 0.25
