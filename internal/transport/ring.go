@@ -95,6 +95,17 @@ type RingState struct {
 // with zero-copy operations and minimal kernel calls through futex-based
 // synchronization.
 type ShmRing struct {
+	// pendingReadIdx tracks how far we've read (but not committed) in the ring.
+	// This is process-local (not in shared memory) and allows the reader to
+	// continue reading new frames while holding references to uncommitted buffers.
+	// The shared readIdx only advances when buffers are freed.
+	// Access via atomic operations (single reader in SPSC design).
+	//
+	// MUST be first field: on 32-bit architectures (386), 64-bit atomic
+	// operations require 8-byte alignment. Go guarantees struct starts are
+	// aligned to the largest field, so placing this first ensures alignment.
+	pendingReadIdx uint64
+
 	capMask  uint64  // capacity-1 for fast masking (capacity must be power of 2)
 	capacity uint64  // actual data area capacity in bytes
 	hdrOff   uintptr // base address of RingHeader in mmapped bytes
@@ -108,13 +119,6 @@ type ShmRing struct {
 	// but memory is still valid, so consumers can drain remaining data) from
 	// "memory being released" (ShmListener.Close → segment.Close path).
 	memInvalid uint32
-
-	// pendingReadIdx tracks how far we've read (but not committed) in the ring.
-	// This is process-local (not in shared memory) and allows the reader to
-	// continue reading new frames while holding references to uncommitted buffers.
-	// The shared readIdx only advances when buffers are freed.
-	// Access via atomic operations (single reader in SPSC design).
-	pendingReadIdx uint64
 
 	// Adaptive spin state for minimizing latency on fast paths.
 	// These are process-local and help tune spin duration based on workload.
