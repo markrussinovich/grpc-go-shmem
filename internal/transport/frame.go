@@ -500,6 +500,144 @@ func writeFrameBuffers(ctx context.Context, tx *ShmRing, fh FrameHeader, hdr []b
 	return res.Commit(total)
 }
 
+type payloadCursor struct {
+	hdr    []byte
+	hdrOff int
+	bufs   mem.BufferSlice
+	bufIdx int
+	bufOff int
+}
+
+func newPayloadCursor(hdr []byte, bufs mem.BufferSlice) *payloadCursor {
+	return &payloadCursor{hdr: hdr, bufs: bufs}
+}
+
+func (c *payloadCursor) remaining() int {
+	remaining := len(c.hdr) - c.hdrOff
+	for i := c.bufIdx; i < len(c.bufs); i++ {
+		data := c.bufs[i].ReadOnlyData()
+		if i == c.bufIdx {
+			if c.bufOff < len(data) {
+				remaining += len(data) - c.bufOff
+			}
+			continue
+		}
+		remaining += len(data)
+	}
+	return remaining
+}
+
+func (c *payloadCursor) writeN(writeSeq func([]byte) error, n int) (int, error) {
+	written := 0
+	for written < n {
+		if c.hdrOff < len(c.hdr) {
+			remaining := n - written
+			chunkLen := len(c.hdr) - c.hdrOff
+			if chunkLen > remaining {
+				chunkLen = remaining
+			}
+			if chunkLen > 0 {
+				if err := writeSeq(c.hdr[c.hdrOff : c.hdrOff+chunkLen]); err != nil {
+					return written, err
+				}
+				c.hdrOff += chunkLen
+				written += chunkLen
+				continue
+			}
+		}
+
+		for c.bufIdx < len(c.bufs) {
+			data := c.bufs[c.bufIdx].ReadOnlyData()
+			if c.bufOff >= len(data) {
+				c.bufIdx++
+				c.bufOff = 0
+				continue
+			}
+
+			remaining := n - written
+			chunkLen := len(data) - c.bufOff
+			if chunkLen > remaining {
+				chunkLen = remaining
+			}
+			if chunkLen > 0 {
+				if err := writeSeq(data[c.bufOff : c.bufOff+chunkLen]); err != nil {
+					return written, err
+				}
+				c.bufOff += chunkLen
+				written += chunkLen
+				if c.bufOff == len(data) {
+					c.bufIdx++
+					c.bufOff = 0
+				}
+				break
+			}
+		}
+
+		if c.bufIdx >= len(c.bufs) {
+			break
+		}
+	}
+
+	return written, nil
+}
+
+func writeFrameChunkFromCursor(ctx context.Context, tx *ShmRing, fh FrameHeader, cursor *payloadCursor, payloadLen int) error {
+	fh.Length = uint32(payloadLen)
+	fh.Reserved = 0
+	fh.Reserved2 = 0
+
+	total := frameHeaderSize + payloadLen
+	res, err := tx.ReserveWrite(ctx, total)
+	if err != nil {
+		return err
+	}
+
+	var fhBytes [frameHeaderSize]byte
+	encodeFrameHeaderTo(&fhBytes, fh)
+
+	written := 0
+	writeSeq := func(src []byte) error {
+		for len(src) > 0 {
+			if written < len(res.First) {
+				n := copy(res.First[written:], src)
+				written += n
+				src = src[n:]
+				if len(src) == 0 {
+					return nil
+				}
+			}
+
+			secondOff := written - len(res.First)
+			if secondOff >= len(res.Second) {
+				return errors.New("failed to copy frame bytes: reservation overflow")
+			}
+
+			n := copy(res.Second[secondOff:], src)
+			written += n
+			src = src[n:]
+		}
+		return nil
+	}
+
+	if err := writeSeq(fhBytes[:]); err != nil {
+		return err
+	}
+
+	payloadWritten, err := cursor.writeN(writeSeq, payloadLen)
+	if err != nil {
+		return err
+	}
+	if payloadWritten != payloadLen {
+		return errors.New("failed to copy frame bytes: short payload write")
+	}
+
+	if written != total {
+		return errors.New("failed to copy frame bytes: short write")
+	}
+
+	return res.Commit(total)
+}
+
 // writeFrameBuffersChunked writes a MESSAGE frame whose payload (hdr + data) may
 // exceed the ring capacity. If the payload fits in a single frame (fast path), it
 // is written directly. Otherwise, it is split into multiple frames with the MORE
@@ -527,32 +665,21 @@ func writeFrameBuffersChunked(ctx context.Context, tx *ShmRing, fh FrameHeader, 
 		return writeFrameBuffers(ctx, tx, fh, hdr, data)
 	}
 
-	// Slow path: need to chunk the payload.
-	// Materialize hdr + data into a contiguous buffer for chunking.
-	combined := make([]byte, payloadLen)
-	copy(combined, hdr)
-	offset := len(hdr)
-	for _, buf := range data {
-		n := copy(combined[offset:], buf.ReadOnlyData())
-		offset += n
-	}
-
-	// Write chunks with MORE flag on all but the last.
-	remaining := combined
-	for len(remaining) > 0 {
+	// Slow path: stream chunk payloads directly from hdr + data buffers.
+	cursor := newPayloadCursor(hdr, data)
+	for cursor.remaining() > 0 {
+		remainingBefore := cursor.remaining()
 		chunkSize := maxFramePayload
-		if chunkSize > len(remaining) {
-			chunkSize = len(remaining)
+		if chunkSize > remainingBefore {
+			chunkSize = remainingBefore
 		}
-		chunk := remaining[:chunkSize]
-		remaining = remaining[chunkSize:]
 
 		chunkFH := fh
-		if len(remaining) > 0 {
+		if remainingBefore > chunkSize {
 			chunkFH.Flags |= MessageFlagMORE
 		}
 
-		if err := writeFrame(ctx, tx, chunkFH, chunk); err != nil {
+		if err := writeFrameChunkFromCursor(ctx, tx, chunkFH, cursor, chunkSize); err != nil {
 			return err
 		}
 	}
@@ -661,12 +788,15 @@ func readFrameView(ctx context.Context, rx *ShmRing) (FrameHeader, mem.Buffer, e
 		// Fast-path: contiguous payload; wrap-around is rare with large rings.
 		if len(pSecond) == 0 {
 			contig := pFirst[:payloadLen]
-			// mem.NewBuffer ignores the pool for small buffers (<=1024 bytes),
-			// so we must commit immediately for small payloads to avoid blocking
-			// the ring buffer reader.
-			if mem.IsBelowBufferPoolingThreshold(payloadLen) {
+			// For chunked MESSAGE frames (MORE flag set), copy the payload and
+			// commit immediately. The gRPC parser accumulates all chunk buffers
+			// before freeing any of them; if those buffers hold ring space, the
+			// writer cannot push remaining chunks and the connection deadlocks.
+			// Copying here trades one memcpy for correct pipelining.
+			needsCopy := mem.IsBelowBufferPoolingThreshold(payloadLen) ||
+				(fh.Type == FrameTypeMESSAGE && fh.Flags&MessageFlagMORE != 0)
+			if needsCopy {
 				commitPayload.Commit(payloadLen)
-				// Return a copy so caller doesn't hold ring memory
 				result := make([]byte, payloadLen)
 				copy(result, contig)
 				return fh, mem.SliceBuffer(result), nil
