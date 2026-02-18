@@ -45,6 +45,13 @@ var (
 	waitCounts              sync.Map
 )
 
+const (
+	// waitOnAddressPreSpin is a bounded user-mode spin before entering
+	// WaitOnAddress. This avoids kernel calls when producer/consumer handoff is
+	// imminent.
+	waitOnAddressPreSpin = 64
+)
+
 func trackWaiter(addr *uint32) func() {
 	key := uintptr(unsafe.Pointer(addr))
 	ptr, _ := waitCounts.LoadOrStore(key, new(int64))
@@ -131,6 +138,13 @@ func futexWait(addr *uint32, val uint32) error {
 		return nil
 	}
 
+	for i := 0; i < waitOnAddressPreSpin; i++ {
+		if atomic.LoadUint32(addr) != val {
+			return nil
+		}
+		runtime_procyield(1)
+	}
+
 	futexLogf("[FUTEX] WaitOnAddress addr=%p val=%d", addr, val)
 	release := trackWaiter(addr)
 	defer release()
@@ -161,6 +175,13 @@ func futexWaitTimeout(addr *uint32, val uint32, timeoutNs int64) error {
 	// Re-check before blocking to avoid lost wake.
 	if atomic.LoadUint32(addr) != val {
 		return nil
+	}
+
+	for i := 0; i < waitOnAddressPreSpin; i++ {
+		if atomic.LoadUint32(addr) != val {
+			return nil
+		}
+		runtime_procyield(1)
 	}
 
 	futexLogf("[FUTEX] WaitOnAddress addr=%p val=%d timeoutMs=%d", addr, val, timeoutMs)
