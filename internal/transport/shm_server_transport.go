@@ -406,6 +406,15 @@ func (t *ShmServerTransport) processIncomingData(ctx context.Context) {
 		case FrameTypeTRAILERS:
 			t.handleTrailers(fh.StreamID, payload)
 			release()
+		case FrameTypeHALFCLOSE:
+			// Client signals no more messages on this stream.
+			t.mu.RLock()
+			s, ok := t.streams[fh.StreamID]
+			t.mu.RUnlock()
+			if ok {
+				s.write(recvMsg{err: io.EOF})
+			}
+			release()
 		case FrameTypeCANCEL:
 			t.handleCancel(fh.StreamID)
 			release()
@@ -598,11 +607,6 @@ func (t *ShmServerTransport) handleMessage(streamID uint32, flags uint8, payload
 	// Use mem.Copy to create a buffer from the payload
 	buf := mem.Copy(payload, mem.DefaultBufferPool())
 	s.write(recvMsg{buffer: buf})
-
-	// If this is the final client message, signal client half-close.
-	if flags&MessageFlagMORE == 0 {
-		s.write(recvMsg{err: io.EOF})
-	}
 }
 
 // handleMessageBuffer mirrors handleMessage but transfers ownership of the
@@ -634,10 +638,6 @@ func (t *ShmServerTransport) handleMessageBuffer(streamID uint32, flags uint8, b
 	}
 
 	s.write(recvMsg{buffer: buf})
-
-	if flags&MessageFlagMORE == 0 {
-		s.write(recvMsg{err: io.EOF})
-	}
 }
 
 // handlePing processes a PING frame, sends PONG, and enforces keepalive policy.

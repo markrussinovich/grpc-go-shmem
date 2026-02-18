@@ -42,7 +42,6 @@ var (
 	procWakeByAddressAll    = modSync.NewProc("WakeByAddressAll")
 	waitProcsOnce           sync.Once
 	waitProcsErr            error
-	waitCounts              sync.Map
 )
 
 const (
@@ -51,18 +50,6 @@ const (
 	// imminent.
 	waitOnAddressPreSpin = 64
 )
-
-func trackWaiter(addr *uint32) func() {
-	key := uintptr(unsafe.Pointer(addr))
-	ptr, _ := waitCounts.LoadOrStore(key, new(int64))
-	cnt := ptr.(*int64)
-	atomic.AddInt64(cnt, 1)
-	return func() {
-		if atomic.AddInt64(cnt, -1) == 0 {
-			waitCounts.Delete(key)
-		}
-	}
-}
 
 func futexLogf(format string, args ...any) {
 	if !futexDebugEnabled {
@@ -146,8 +133,6 @@ func futexWait(addr *uint32, val uint32) error {
 	}
 
 	futexLogf("[FUTEX] WaitOnAddress addr=%p val=%d", addr, val)
-	release := trackWaiter(addr)
-	defer release()
 	return waitOnAddress(addr, val, windows.INFINITE)
 }
 
@@ -185,37 +170,19 @@ func futexWaitTimeout(addr *uint32, val uint32, timeoutNs int64) error {
 	}
 
 	futexLogf("[FUTEX] WaitOnAddress addr=%p val=%d timeoutMs=%d", addr, val, timeoutMs)
-	release := trackWaiter(addr)
-	defer release()
 	return waitOnAddress(addr, val, timeoutMs)
 }
 
 // futexWake wakes up to n waiters on addr using Windows wake primitives.
+// The caller (ring-level code) already checks DataWaiters/SpaceWaiters/
+// ContigWaiters before calling, so no additional bookkeeping is needed here.
 func futexWake(addr *uint32, n int) (int, error) {
 	if n <= 0 {
 		return 0, nil
-	}
-	key := uintptr(unsafe.Pointer(addr))
-	if ptr, ok := waitCounts.Load(key); ok {
-		waiters := atomic.LoadInt64(ptr.(*int64))
-		if waiters == 0 {
-			return 0, nil
-		}
-	}
-	woken := 0
-	if ptr, ok := waitCounts.Load(key); ok {
-		waiters := atomic.LoadInt64(ptr.(*int64))
-		if waiters == 0 {
-			return 0, nil
-		}
-		woken = n
-		if int64(woken) > waiters {
-			woken = int(waiters)
-		}
 	}
 	wakeAll := n > 1
 	if err := wakeByAddress(addr, wakeAll); err != nil {
 		return 0, err
 	}
-	return woken, nil
+	return n, nil
 }

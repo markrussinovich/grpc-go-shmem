@@ -46,12 +46,15 @@ func runtime_procyield(cycles uint32)
 // Based on research from Facebook Folly's synchronization primitives.
 const (
 	// spinIterationsDefault is the default number of spin iterations before futex.
-	// At ~7ns per PAUSE instruction, 300 iterations ≈ 2µs of spinning.
-	// Folly uses 2µs as default because futex wake costs ~7-10µs.
-	spinIterationsDefault = 300
+	// At ~7ns per PAUSE instruction, 32 iterations ≈ 0.2µs of spinning.
+	// This is kept low because in ping-pong workloads the other side
+	// typically takes >3µs, so a long spin almost always fails and wastes
+	// CPU before falling back to WaitOnAddress anyway. The adaptive logic
+	// will raise the cutoff when spinning succeeds.
+	spinIterationsDefault = 32
 
 	// spinIterationsMin is the minimum spin iterations for adaptive adjustment.
-	spinIterationsMin = 50
+	spinIterationsMin = 8
 
 	// spinIterationsMax is the maximum spin iterations to prevent excessive CPU use.
 	spinIterationsMax = 2000

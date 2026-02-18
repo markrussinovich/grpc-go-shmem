@@ -120,9 +120,9 @@ func (p *ringCommitPool) Get(_ int) *[]byte { return nil }
 func (p *ringCommitPool) Put(b *[]byte) {
 	p.once.Do(func() {
 		if shmDebugEnabled {
-			log.Printf("[DEBUG] ringCommitPool.Put: committing %d bytes", len(*b))
+			log.Printf("[DEBUG] ringCommitPool.Put: committing %d bytes", p.commit.maxBytes)
 		}
-		p.commit.Commit(len(*b))
+		p.commit.Commit(p.commit.maxBytes)
 	})
 }
 
@@ -756,17 +756,19 @@ func readFrameView(ctx context.Context, rx *ShmRing) (FrameHeader, mem.Buffer, e
 		if n < frameHeaderSize && len(second) > 0 {
 			n += copy(hb[n:], second)
 		}
-		commitHeader.Commit(frameHeaderSize)
 		if n != frameHeaderSize {
+			commitHeader.Commit(frameHeaderSize)
 			return FrameHeader{}, nil, errors.New("short header read")
 		}
 
 		fh, err := decodeFrameHeader(hb[:])
 		if err != nil {
+			commitHeader.Commit(frameHeaderSize)
 			return FrameHeader{}, nil, err
 		}
 
 		if fh.Type == FrameTypePAD {
+			commitHeader.Commit(frameHeaderSize)
 			if fh.Length > 0 {
 				if _, err := rx.ReadExact(ctx, int(fh.Length), nil); err != nil {
 					return FrameHeader{}, nil, err
@@ -776,14 +778,24 @@ func readFrameView(ctx context.Context, rx *ShmRing) (FrameHeader, mem.Buffer, e
 		}
 
 		if fh.Length == 0 {
+			commitHeader.Commit(frameHeaderSize)
 			return fh, nil, nil
 		}
 
+		// Don't commit header yet — merge with the payload commit below.
+		// The writer writes header+payload atomically, so the payload
+		// ReadSlices almost always succeeds without waiting, and we
+		// save one Commit cycle (several atomics + potential wake).
 		payloadLen := int(fh.Length)
 		pFirst, pSecond, commitPayload, err := rx.ReadSlices(ctx, payloadLen)
 		if err != nil {
 			return FrameHeader{}, nil, err
 		}
+
+		// Adjust the commit to free both header and payload bytes.
+		// commitPayload.commitReadIdx captured the shared read index
+		// before the header commit, so adding both sizes is correct.
+		commitPayload.maxBytes = frameHeaderSize + payloadLen
 
 		// Fast-path: contiguous payload; wrap-around is rare with large rings.
 		if len(pSecond) == 0 {
@@ -793,10 +805,9 @@ func readFrameView(ctx context.Context, rx *ShmRing) (FrameHeader, mem.Buffer, e
 			// before freeing any of them; if those buffers hold ring space, the
 			// writer cannot push remaining chunks and the connection deadlocks.
 			// Copying here trades one memcpy for correct pipelining.
-			needsCopy := mem.IsBelowBufferPoolingThreshold(payloadLen) ||
-				(fh.Type == FrameTypeMESSAGE && fh.Flags&MessageFlagMORE != 0)
+			needsCopy := fh.Type == FrameTypeMESSAGE && fh.Flags&MessageFlagMORE != 0
 			if needsCopy {
-				commitPayload.Commit(payloadLen)
+				commitPayload.Commit(frameHeaderSize + payloadLen)
 				result := make([]byte, payloadLen)
 				copy(result, contig)
 				return fh, mem.SliceBuffer(result), nil
@@ -810,7 +821,7 @@ func readFrameView(ctx context.Context, rx *ShmRing) (FrameHeader, mem.Buffer, e
 		contig := make([]byte, payloadLen)
 		copied := copy(contig, pFirst)
 		copy(contig[copied:], pSecond)
-		commitPayload.Commit(payloadLen)
+		commitPayload.Commit(frameHeaderSize + payloadLen)
 		return fh, mem.SliceBuffer(contig), nil
 	}
 }

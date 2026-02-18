@@ -995,14 +995,15 @@ func (t *ShmClientTransport) write(s *ClientStream, hdr []byte, data mem.BufferS
 	}
 	shmDebugf("[DEBUG] ShmClientTransport.write: send quota acquired")
 
-	// Write MESSAGE frame. MessageFlagMORE indicates more data will follow.
+	// Write MESSAGE frame. The MORE flag is only set by writeFrameBuffersChunked
+	// when it splits a large payload into fragments. We do NOT set it here to
+	// indicate "more messages on the stream" — that conflation forced a copy on
+	// every streaming read in readFrameView. Half-close is signaled via a
+	// separate HALFCLOSE frame below.
 	fh := FrameHeader{
 		StreamID: s.id,
 		Type:     FrameTypeMESSAGE,
 		Flags:    0,
-	}
-	if opts != nil && !opts.Last {
-		fh.Flags = MessageFlagMORE
 	}
 
 	if shmDebugEnabled {
@@ -1016,6 +1017,14 @@ func (t *ShmClientTransport) write(s *ClientStream, hdr []byte, data mem.BufferS
 	}
 	if shmDebugEnabled {
 		log.Printf("[DEBUG] ShmClientTransport.write: frame written successfully, widx after=%d", t.clientToServer.header().WriteIndex())
+	}
+
+	// Signal client half-close with a separate frame so the server knows no
+	// more messages will arrive on this stream.
+	if opts != nil && opts.Last {
+		if err := writeFrame(s.ctx, t.clientToServer, FrameHeader{StreamID: s.id, Type: FrameTypeHALFCLOSE}, nil); err != nil {
+			return err
+		}
 	}
 
 	return nil
