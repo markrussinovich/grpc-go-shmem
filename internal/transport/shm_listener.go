@@ -61,10 +61,11 @@ type ShmListener struct {
 	ctlTxEvents *RingEvents
 
 	// Lifecycle management
-	ctx       context.Context
-	cancel    context.CancelFunc
-	closed    atomic.Bool
-	closeOnce sync.Once
+	ctx          context.Context
+	cancel       context.CancelFunc
+	closed       atomic.Bool
+	closeOnce    sync.Once
+	acceptExited chan struct{} // Closed when Accept loop exits; prevents unmap-while-reading.
 
 	// Connection handling
 	mu             sync.RWMutex
@@ -115,6 +116,7 @@ func NewShmListener(addr *ShmAddr, segmentSize, ringASize, ringBSize uint64) (*S
 		baseName:       addr.Name,
 		ctx:            ctx,
 		cancel:         cancel,
+		acceptExited:   make(chan struct{}),
 		activeSegments: make(map[string]*shmConn),
 		segmentSize:    segmentSize,
 		ringASize:      ringASize,
@@ -182,6 +184,13 @@ func (l *ShmListener) Accept() (net.Conn, error) {
 	for {
 		fh, payload, err := readFrame(l.ctx, l.ctlRx)
 		if err != nil {
+			// Signal that Accept has exited the ring read loop so Close
+			// can safely unmap the control segment.
+			select {
+			case <-l.acceptExited:
+			default:
+				close(l.acceptExited)
+			}
 			return nil, err
 		}
 		if fh.Type != FrameTypeCONNECT {
@@ -290,17 +299,26 @@ func (l *ShmListener) Close() error {
 			// The listener context cancellation alone cannot interrupt a futex wait
 			// without a deadline, so we must explicitly close the rings (which bumps
 			// sequences and futex-wakes waiters) before unmapping the segment.
-			// Note: We don't nil these pointers because Accept() might still be
-			// reading l.ctlRx concurrently. The Close() on the ring will cause
-			// the read to fail, which is the desired behavior.
 			if l.ctlRx != nil {
 				_ = l.ctlRx.Close()
-				// Mark memory invalid BEFORE unmapping to prevent segfaults
-				// in concurrent readers that may still be accessing header fields.
-				l.ctlRx.MarkMemoryInvalid()
 			}
 			if l.ctlTx != nil {
 				_ = l.ctlTx.Close()
+			}
+
+			// Wait for the Accept goroutine to exit the ring read loop before
+			// unmapping the segment. This prevents use-after-unmap crashes.
+			select {
+			case <-l.acceptExited:
+			case <-time.After(5 * time.Second):
+				// Timeout: proceed with cleanup even if Accept hasn't exited.
+			}
+
+			// Now safe to mark memory invalid and unmap.
+			if l.ctlRx != nil {
+				l.ctlRx.MarkMemoryInvalid()
+			}
+			if l.ctlTx != nil {
 				l.ctlTx.MarkMemoryInvalid()
 			}
 

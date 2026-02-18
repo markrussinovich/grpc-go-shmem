@@ -281,6 +281,11 @@ func (r *ShmRing) DebugState() RingState {
 // waitForData waits until data is available.
 // On Windows, uses named events. On Linux, uses futex.
 func (r *ShmRing) waitForData(addr *uint32, val uint32, timeout time.Duration) error {
+	// Check if memory is being unmapped before accessing the shared address.
+	// This prevents use-after-unmap crashes during ShmListener.Close.
+	if atomic.LoadUint32(&r.memInvalid) != 0 {
+		return ErrRingClosed
+	}
 	if r.events != nil {
 		return r.events.WaitData(addr, val, timeout)
 	}
@@ -293,6 +298,9 @@ func (r *ShmRing) waitForData(addr *uint32, val uint32, timeout time.Duration) e
 // waitForSpace waits until space is available.
 // On Windows, uses named events. On Linux, uses futex.
 func (r *ShmRing) waitForSpace(addr *uint32, val uint32, timeout time.Duration) error {
+	if atomic.LoadUint32(&r.memInvalid) != 0 {
+		return ErrRingClosed
+	}
 	if r.events != nil {
 		return r.events.WaitSpace(addr, val, timeout)
 	}
@@ -305,6 +313,9 @@ func (r *ShmRing) waitForSpace(addr *uint32, val uint32, timeout time.Duration) 
 // waitForContig waits until contiguous space improves.
 // On Windows, uses named events. On Linux, uses futex.
 func (r *ShmRing) waitForContig(addr *uint32, val uint32, timeout time.Duration) error {
+	if atomic.LoadUint32(&r.memInvalid) != 0 {
+		return ErrRingClosed
+	}
 	if r.events != nil {
 		return r.events.WaitContig(addr, val, timeout)
 	}
