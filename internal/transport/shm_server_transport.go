@@ -974,13 +974,45 @@ func (t *ShmServerTransport) write(s *ServerStream, hdr []byte, data mem.BufferS
 	if t.closed.Load() {
 		return ErrConnClosing
 	}
-	if err := t.maybeWriteHeader(s); err != nil {
-		return err
+
+	// Check if we need to send HEADERS before MESSAGE. If so, prepare the
+	// HEADERS payload and coalesce both frames into a single ring reservation.
+	needHeaders := !s.isHeaderSent()
+	var headerPayload []byte
+	var headerFH FrameHeader
+	if needHeaders {
+		if s.updateHeaderSent() {
+			// Another goroutine already sent headers; proceed with MESSAGE only.
+			needHeaders = false
+		} else {
+			s.hdrMu.Lock()
+			md := s.header.Copy()
+			s.hdrMu.Unlock()
+
+			var kvs []KV
+			for k, vals := range md {
+				var byteVals [][]byte
+				for _, v := range vals {
+					byteVals = append(byteVals, []byte(v))
+				}
+				kvs = append(kvs, KV{Key: k, Values: byteVals})
+			}
+			headersV1 := HeadersV1{
+				Version:  1,
+				HdrType:  1, // server-initial
+				Metadata: kvs,
+			}
+			headerPayload = encodeHeaders(headersV1)
+			headerFH = FrameHeader{
+				Type:     FrameTypeHEADERS,
+				StreamID: s.id,
+			}
+		}
 	}
 
 	payloadLen := len(hdr) + data.Len()
 	if shmDebugEnabled {
-		log.Printf("[DEBUG] ShmServerTransport.write: stream=%d, hdr_len=%d, data_bytes=%d", s.id, len(hdr), data.Len())
+		log.Printf("[DEBUG] ShmServerTransport.write: stream=%d, hdr_len=%d, data_bytes=%d, coalesce_headers=%v", s.id, len(hdr), data.Len(), needHeaders)
 	}
 
 	// Enforce outbound flow control before writing.
@@ -994,14 +1026,25 @@ func (t *ShmServerTransport) write(s *ServerStream, hdr []byte, data mem.BufferS
 		StreamID: s.id,
 	}
 
-	// Write frame to server->client ring
+	// Write frame(s) to server->client ring
 	t.writeMu.Lock()
 	defer t.writeMu.Unlock()
-	if err := writeFrameBuffersChunked(context.Background(), t.serverToClient, fh, hdr, data, 0); err != nil {
-		if shmDebugEnabled {
-			log.Printf("[ERROR] ShmServerTransport.write: Failed to write frame: %v", err)
+
+	if needHeaders {
+		// Coalesced path: HEADERS + MESSAGE in one reservation.
+		if err := writeFrameWithPrefix(context.Background(), t.serverToClient, headerFH, headerPayload, fh, hdr, data); err != nil {
+			if shmDebugEnabled {
+				log.Printf("[ERROR] ShmServerTransport.write: coalesced write failed: %v", err)
+			}
+			return err
 		}
-		return err
+	} else {
+		if err := writeFrameBuffersChunked(context.Background(), t.serverToClient, fh, hdr, data, 0); err != nil {
+			if shmDebugEnabled {
+				log.Printf("[ERROR] ShmServerTransport.write: Failed to write frame: %v", err)
+			}
+			return err
+		}
 	}
 
 	shmDebugf("[DEBUG] ShmServerTransport.write: Successfully wrote MESSAGE frame")

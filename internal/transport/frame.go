@@ -500,6 +500,215 @@ func writeFrameBuffers(ctx context.Context, tx *ShmRing, fh FrameHeader, hdr []b
 	return res.Commit(total)
 }
 
+// writeFrameBuffersWithTrailer writes a MESSAGE frame followed by a small
+// trailer frame (e.g., HALFCLOSE or TRAILERS) in a single ring reservation.
+// This coalesces two reserve/commit/signal cycles into one, reducing per-RPC
+// overhead for unary calls. The trailer frame is appended after the message
+// frame within the same contiguous reservation.
+//
+// If the message payload exceeds maxFramePayload (i.e. it would need chunking),
+// this falls back to writing them separately.
+func writeFrameBuffersWithTrailer(ctx context.Context, tx *ShmRing, msgFH FrameHeader, hdr []byte, payload mem.BufferSlice, trFH FrameHeader, trPayload []byte) error {
+	dataLen := payload.Len()
+	msgPayloadLen := len(hdr) + dataLen
+
+	// Check if payload exceeds the single-frame limit. If so, fall back to
+	// separate writes because chunking needs multiple reservations anyway.
+	cap := int(tx.Capacity())
+	maxFramePayload := cap/2 - frameHeaderSize
+	if maxFramePayload < 1024 {
+		maxFramePayload = 1024
+	}
+	if msgPayloadLen > maxFramePayload {
+		if err := writeFrameBuffersChunked(ctx, tx, msgFH, hdr, payload, 0); err != nil {
+			return err
+		}
+		return writeFrame(ctx, tx, trFH, trPayload)
+	}
+
+	// Coalesced path: single reservation for MESSAGE + trailer.
+	msgFH.Length = uint32(msgPayloadLen)
+	msgFH.Reserved = 0
+	msgFH.Reserved2 = 0
+
+	trFH.Length = uint32(len(trPayload))
+	trFH.Reserved = 0
+	trFH.Reserved2 = 0
+
+	msgFrameSize := frameHeaderSize + msgPayloadLen
+	trFrameSize := frameHeaderSize + len(trPayload)
+	total := msgFrameSize + trFrameSize
+
+	res, err := tx.ReserveWrite(ctx, total)
+	if err != nil {
+		return err
+	}
+
+	written := 0
+	writeSeq := func(src []byte) error {
+		for len(src) > 0 {
+			if written < len(res.First) {
+				n := copy(res.First[written:], src)
+				written += n
+				src = src[n:]
+				if len(src) == 0 {
+					return nil
+				}
+			}
+			secondOff := written - len(res.First)
+			if secondOff >= len(res.Second) {
+				return errors.New("failed to copy coalesced frame bytes: reservation overflow")
+			}
+			n := copy(res.Second[secondOff:], src)
+			written += n
+			src = src[n:]
+		}
+		return nil
+	}
+
+	// Write MESSAGE frame header.
+	var fhBytes [frameHeaderSize]byte
+	encodeFrameHeaderTo(&fhBytes, msgFH)
+	if err := writeSeq(fhBytes[:]); err != nil {
+		return err
+	}
+	// Write MESSAGE payload (hdr prefix + BufferSlice data).
+	if len(hdr) > 0 {
+		if err := writeSeq(hdr); err != nil {
+			return err
+		}
+	}
+	for _, buf := range payload {
+		data := buf.ReadOnlyData()
+		if len(data) == 0 {
+			continue
+		}
+		if err := writeSeq(data); err != nil {
+			return err
+		}
+	}
+
+	// Write trailer frame header.
+	encodeFrameHeaderTo(&fhBytes, trFH)
+	if err := writeSeq(fhBytes[:]); err != nil {
+		return err
+	}
+	// Write trailer payload (may be empty for HALFCLOSE).
+	if len(trPayload) > 0 {
+		if err := writeSeq(trPayload); err != nil {
+			return err
+		}
+	}
+
+	if written != total {
+		return fmt.Errorf("failed to copy coalesced frame bytes: short write (%d != %d)", written, total)
+	}
+
+	return res.Commit(total)
+}
+
+// writeFrameWithPrefix writes a small prefix frame (e.g., HEADERS) followed
+// by a MESSAGE frame in a single ring reservation. This coalesces two
+// reserve/commit/signal cycles into one, reducing per-RPC overhead when the
+// server sends HEADERS + MESSAGE together.
+//
+// If the message payload exceeds maxFramePayload, falls back to separate writes.
+func writeFrameWithPrefix(ctx context.Context, tx *ShmRing, prefixFH FrameHeader, prefixPayload []byte, msgFH FrameHeader, hdr []byte, payload mem.BufferSlice) error {
+	dataLen := payload.Len()
+	msgPayloadLen := len(hdr) + dataLen
+
+	cap := int(tx.Capacity())
+	maxFramePayload := cap/2 - frameHeaderSize
+	if maxFramePayload < 1024 {
+		maxFramePayload = 1024
+	}
+	if msgPayloadLen > maxFramePayload {
+		if err := writeFrame(ctx, tx, prefixFH, prefixPayload); err != nil {
+			return err
+		}
+		return writeFrameBuffersChunked(ctx, tx, msgFH, hdr, payload, 0)
+	}
+
+	// Coalesced path: single reservation for prefix + MESSAGE.
+	prefixFH.Length = uint32(len(prefixPayload))
+	prefixFH.Reserved = 0
+	prefixFH.Reserved2 = 0
+
+	msgFH.Length = uint32(msgPayloadLen)
+	msgFH.Reserved = 0
+	msgFH.Reserved2 = 0
+
+	prefixFrameSize := frameHeaderSize + len(prefixPayload)
+	msgFrameSize := frameHeaderSize + msgPayloadLen
+	total := prefixFrameSize + msgFrameSize
+
+	res, err := tx.ReserveWrite(ctx, total)
+	if err != nil {
+		return err
+	}
+
+	written := 0
+	writeSeq := func(src []byte) error {
+		for len(src) > 0 {
+			if written < len(res.First) {
+				n := copy(res.First[written:], src)
+				written += n
+				src = src[n:]
+				if len(src) == 0 {
+					return nil
+				}
+			}
+			secondOff := written - len(res.First)
+			if secondOff >= len(res.Second) {
+				return errors.New("failed to copy coalesced frame bytes: reservation overflow")
+			}
+			n := copy(res.Second[secondOff:], src)
+			written += n
+			src = src[n:]
+		}
+		return nil
+	}
+
+	// Write prefix frame (HEADERS).
+	var fhBytes [frameHeaderSize]byte
+	encodeFrameHeaderTo(&fhBytes, prefixFH)
+	if err := writeSeq(fhBytes[:]); err != nil {
+		return err
+	}
+	if len(prefixPayload) > 0 {
+		if err := writeSeq(prefixPayload); err != nil {
+			return err
+		}
+	}
+
+	// Write MESSAGE frame header.
+	encodeFrameHeaderTo(&fhBytes, msgFH)
+	if err := writeSeq(fhBytes[:]); err != nil {
+		return err
+	}
+	// Write MESSAGE payload.
+	if len(hdr) > 0 {
+		if err := writeSeq(hdr); err != nil {
+			return err
+		}
+	}
+	for _, buf := range payload {
+		data := buf.ReadOnlyData()
+		if len(data) == 0 {
+			continue
+		}
+		if err := writeSeq(data); err != nil {
+			return err
+		}
+	}
+
+	if written != total {
+		return fmt.Errorf("failed to copy coalesced frame bytes: short write (%d != %d)", written, total)
+	}
+
+	return res.Commit(total)
+}
+
 type payloadCursor struct {
 	hdr    []byte
 	hdrOff int

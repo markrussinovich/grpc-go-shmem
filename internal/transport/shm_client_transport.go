@@ -1009,22 +1009,27 @@ func (t *ShmClientTransport) write(s *ClientStream, hdr []byte, data mem.BufferS
 	if shmDebugEnabled {
 		log.Printf("[DEBUG] ShmClientTransport.write: writing frame to ring, widx before=%d", t.clientToServer.header().WriteIndex())
 	}
-	if err := writeFrameBuffersChunked(s.ctx, t.clientToServer, fh, hdr, data, 0); err != nil {
-		if shmDebugEnabled {
-			log.Printf("[ERROR] ShmClientTransport.write: writeFrameBuffersChunked failed: %v", err)
+
+	// If this is the last message, coalesce MESSAGE + HALFCLOSE into a single
+	// ring reservation to save one reserve/commit/signal cycle.
+	if opts != nil && opts.Last {
+		halfCloseFH := FrameHeader{StreamID: s.id, Type: FrameTypeHALFCLOSE}
+		if err := writeFrameBuffersWithTrailer(s.ctx, t.clientToServer, fh, hdr, data, halfCloseFH, nil); err != nil {
+			if shmDebugEnabled {
+				log.Printf("[ERROR] ShmClientTransport.write: coalesced write failed: %v", err)
+			}
+			return err
 		}
-		return err
+	} else {
+		if err := writeFrameBuffersChunked(s.ctx, t.clientToServer, fh, hdr, data, 0); err != nil {
+			if shmDebugEnabled {
+				log.Printf("[ERROR] ShmClientTransport.write: writeFrameBuffersChunked failed: %v", err)
+			}
+			return err
+		}
 	}
 	if shmDebugEnabled {
 		log.Printf("[DEBUG] ShmClientTransport.write: frame written successfully, widx after=%d", t.clientToServer.header().WriteIndex())
-	}
-
-	// Signal client half-close with a separate frame so the server knows no
-	// more messages will arrive on this stream.
-	if opts != nil && opts.Last {
-		if err := writeFrame(s.ctx, t.clientToServer, FrameHeader{StreamID: s.id, Type: FrameTypeHALFCLOSE}, nil); err != nil {
-			return err
-		}
 	}
 
 	return nil
