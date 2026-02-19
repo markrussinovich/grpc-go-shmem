@@ -4,6 +4,8 @@ This directory contains benchmarks comparing the performance of gRPC's shared me
 
 ## Quick Start
 
+### Local Execution
+
 ```bash
 # Generate plots from cached results (or run benchmarks if no cache exists)
 python3 benchmark_runner.py
@@ -14,6 +16,16 @@ python3 benchmark_runner.py --run
 # Only regenerate plots from cached results
 python3 benchmark_runner.py --plot-only
 ```
+
+### Cloud Execution (GitHub Actions)
+
+The benchmarks can also be run automatically in the cloud using GitHub Actions:
+
+1. **Manual Trigger**: Go to the "Actions" tab in the GitHub repository, select "Benchmarks" workflow, and click "Run workflow"
+2. **Automatic Schedule**: Benchmarks run weekly on Sundays at midnight UTC
+3. **Results**: Download benchmark results and plots from the workflow's artifacts section
+
+The cloud benchmarks run on `ubuntu-latest` GitHub-hosted runners and produce the same outputs as local execution.
 
 ## Output Files
 
