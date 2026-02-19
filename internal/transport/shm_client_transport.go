@@ -185,9 +185,9 @@ func (t *ShmClientTransport) sendWindowUpdate(streamID uint32, delta uint32) {
 	if delta == 0 || t.closed.Load() {
 		return
 	}
-	buf := make([]byte, 4)
-	binary.LittleEndian.PutUint32(buf, delta)
-	_ = writeFrame(context.Background(), t.clientToServer, FrameHeader{Type: FrameTypeWindowUpdate, StreamID: streamID}, buf)
+	var buf [4]byte
+	binary.LittleEndian.PutUint32(buf[:], delta)
+	_ = writeFrame(context.Background(), t.clientToServer, FrameHeader{Type: FrameTypeWindowUpdate, StreamID: streamID}, buf[:])
 }
 
 // test hook: allow disabling the background reader in tests to avoid

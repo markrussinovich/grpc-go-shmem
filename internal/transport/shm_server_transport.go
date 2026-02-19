@@ -177,9 +177,9 @@ func (t *ShmServerTransport) sendWindowUpdate(streamID uint32, delta uint32) {
 	if delta == 0 || t.closed.Load() {
 		return
 	}
-	buf := make([]byte, 4)
-	binary.LittleEndian.PutUint32(buf, delta)
-	_ = writeFrame(context.Background(), t.serverToClient, FrameHeader{Type: FrameTypeWindowUpdate, StreamID: streamID}, buf)
+	var buf [4]byte
+	binary.LittleEndian.PutUint32(buf[:], delta)
+	_ = writeFrame(context.Background(), t.serverToClient, FrameHeader{Type: FrameTypeWindowUpdate, StreamID: streamID}, buf[:])
 }
 
 func (t *ShmServerTransport) rejectNewStream(streamID uint32, msg string) {
