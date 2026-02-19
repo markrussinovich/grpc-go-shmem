@@ -114,6 +114,9 @@ type ShmClientTransport struct {
 	kpDormancyCond *sync.Cond
 	kpDormant      bool
 
+	// writeMu serializes writes to the client->server ring.
+	writeMu sync.Mutex
+
 	// pendingHeaders stores encoded HEADERS frames that are deferred from
 	// NewStream to be coalesced with the first write() call, reducing ring
 	// operations for unary RPCs. Keyed by stream ID.
@@ -205,7 +208,9 @@ func (t *ShmClientTransport) sendWindowUpdate(streamID uint32, delta uint32) {
 	}
 	buf := make([]byte, 4)
 	binary.LittleEndian.PutUint32(buf, delta)
+	t.writeMu.Lock()
 	_ = writeFrame(context.Background(), t.clientToServer, FrameHeader{Type: FrameTypeWindowUpdate, StreamID: streamID}, buf)
+	t.writeMu.Unlock()
 }
 
 // test hook: allow disabling the background reader in tests to avoid
@@ -520,7 +525,9 @@ func (t *ShmClientTransport) processIncomingData(ctx context.Context) {
 
 		case FrameTypePING:
 			// Respond with PONG carrying the same opaque data.
+			t.writeMu.Lock()
 			_ = writeFrame(context.Background(), t.clientToServer, FrameHeader{Type: FrameTypePONG}, payload)
+			t.writeMu.Unlock()
 			release()
 
 		case FrameTypePONG:
@@ -587,7 +594,9 @@ func (t *ShmClientTransport) Close(err error) {
 		// Best-effort GOAWAY before tearing down rings so the peer observes the
 		// shutdown intent (mirrors http2 immediate close behavior).
 		if t.clientToServer != nil && !segClosed {
+			t.writeMu.Lock()
 			_ = writeFrame(context.Background(), t.clientToServer, FrameHeader{Type: FrameTypeGOAWAY, Flags: GoAwayFlagIMMEDIATE}, []byte("client closing"))
+			t.writeMu.Unlock()
 		}
 
 		// Cancel context to stop background reader goroutine and keepalive.
@@ -671,7 +680,9 @@ func (t *ShmClientTransport) GracefulClose() {
 
 	// Best-effort notify the peer we're draining.
 	if t.clientToServer != nil {
+		t.writeMu.Lock()
 		_ = writeFrame(context.Background(), t.clientToServer, FrameHeader{Type: FrameTypeGOAWAY, Flags: GoAwayFlagDRAINING}, []byte("draining"))
+		t.writeMu.Unlock()
 	}
 
 	// If there are no active streams, close immediately.
@@ -850,7 +861,10 @@ func (t *ShmClientTransport) NewStream(ctx context.Context, callHdr *CallHdr) (*
 	if callHdr.DeferHeaders {
 		t.pendingHeaders.Store(streamID, &pendingHeaderData{fh: fh, payload: payload})
 	} else {
-		if err := writeFrame(ctx, t.clientToServer, fh, payload); err != nil {
+		t.writeMu.Lock()
+		err := writeFrame(ctx, t.clientToServer, fh, payload)
+		t.writeMu.Unlock()
+		if err != nil {
 			t.mu.Lock()
 			delete(t.streams, streamID)
 			delete(t.streamTransport, s)
@@ -1006,7 +1020,9 @@ func (t *ShmClientTransport) closeStream(s *ClientStream, err error, rst bool, _
 			Flags:    0,
 		}
 		// Best effort - ignore errors since stream is closing anyway
+		t.writeMu.Lock()
 		_ = writeFrame(context.Background(), t.clientToServer, fh, nil)
+		t.writeMu.Unlock()
 	}
 
 	// Close the done channel to unblock waiters
@@ -1082,6 +1098,11 @@ func (t *ShmClientTransport) write(s *ClientStream, hdr []byte, data mem.BufferS
 		pending = v.(*pendingHeaderData)
 	}
 
+	// Serialize all ring writes to prevent SPSC ring corruption from
+	// concurrent writers (window updates, CANCEL, PING, etc.).
+	t.writeMu.Lock()
+	defer t.writeMu.Unlock()
+
 	if opts != nil && opts.Last {
 		if pending != nil {
 			// Unary fast path: coalesce HEADERS + MESSAGE + HALFCLOSE into a
@@ -1142,7 +1163,10 @@ func (t *ShmClientTransport) sendPing() error {
 	var data [8]byte
 	// Use current time nanos as opaque payload (not strictly required, just convenient).
 	binary.LittleEndian.PutUint64(data[:], uint64(time.Now().UnixNano()))
-	return writeFrame(t.ctx, t.clientToServer, FrameHeader{Type: FrameTypePING}, data[:])
+	t.writeMu.Lock()
+	err := writeFrame(t.ctx, t.clientToServer, FrameHeader{Type: FrameTypePING}, data[:])
+	t.writeMu.Unlock()
+	return err
 }
 
 // keepalive monitors connection health and sends periodic PING frames.
