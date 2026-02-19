@@ -226,6 +226,47 @@ func warmUpGRPC(b *testing.B, client testgrpc.BenchmarkServiceClient) {
 	}
 }
 
+// warmUpStream sends several large streaming ping-pongs to fault in ring buffer
+// pages and warm CPU caches before the timed benchmark sub-tests. Without this,
+// the first sub-test (especially at large payload sizes) pays page-fault and TLB
+// miss costs that distort results vs later sub-tests on the same connection.
+func warmUpStream(b *testing.B, client testgrpc.BenchmarkServiceClient, size int) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	stream, err := client.StreamingCall(ctx)
+	if err != nil {
+		b.Fatalf("warm-up StreamingCall: %v", err)
+	}
+
+	req := &testpb.SimpleRequest{
+		ResponseType: testpb.PayloadType_COMPRESSABLE,
+		ResponseSize: int32(size),
+		Payload:      benchmark.NewPayload(testpb.PayloadType_COMPRESSABLE, size),
+	}
+
+	// Send enough data to touch all ring buffer pages (~128 MiB total for a
+	// 64 MiB ring with both directions). 200 round-trips of the target size
+	// ensures full coverage even for small payloads.
+	n := 200
+	if size > 0 {
+		// At least enough to fill the ring twice in each direction.
+		minIters := (2 * benchRing) / size
+		if minIters > n {
+			n = minIters
+		}
+	}
+	for i := 0; i < n; i++ {
+		if err := stream.Send(req); err != nil {
+			b.Fatalf("warm-up Send: %v", err)
+		}
+		if _, err := stream.Recv(); err != nil {
+			b.Fatalf("warm-up Recv: %v", err)
+		}
+	}
+	_ = stream.CloseSend()
+}
+
 // benchStream opens a StreamingCall and performs ping-pong Send/Recv for b.N iterations.
 // Each operation sends a request of `size` bytes and receives a response of `size` bytes.
 func benchStream(b *testing.B, client testgrpc.BenchmarkServiceClient, size int) {
@@ -334,6 +375,7 @@ func BenchmarkGRPCShmUnary(b *testing.B) {
 func BenchmarkGRPCShmLargeStream(b *testing.B) {
 	env := newShmEnv(b)
 	defer env.close()
+	warmUpStream(b, env.client, 1*1024*1024)
 	for _, ls := range benchLargeSizes {
 		ls := ls
 		b.Run(fmt.Sprintf("size=%dMB", ls.bytes/(1024*1024)), func(b *testing.B) {
@@ -347,6 +389,7 @@ func BenchmarkGRPCShmLargeStream(b *testing.B) {
 func BenchmarkGRPCShmLargeUnary(b *testing.B) {
 	env := newShmEnv(b)
 	defer env.close()
+	warmUpStream(b, env.client, 1*1024*1024)
 	for _, ls := range benchLargeSizes {
 		ls := ls
 		b.Run(fmt.Sprintf("size=%dMB", ls.bytes/(1024*1024)), func(b *testing.B) {
@@ -390,6 +433,7 @@ func BenchmarkGRPCTCPUnary(b *testing.B) {
 func BenchmarkGRPCTCPLargeStream(b *testing.B) {
 	env := newTCPEnv(b)
 	defer env.close()
+	warmUpStream(b, env.client, 1*1024*1024)
 	for _, ls := range benchLargeSizes {
 		ls := ls
 		b.Run(fmt.Sprintf("size=%dMB", ls.bytes/(1024*1024)), func(b *testing.B) {
@@ -403,6 +447,7 @@ func BenchmarkGRPCTCPLargeStream(b *testing.B) {
 func BenchmarkGRPCTCPLargeUnary(b *testing.B) {
 	env := newTCPEnv(b)
 	defer env.close()
+	warmUpStream(b, env.client, 1*1024*1024)
 	for _, ls := range benchLargeSizes {
 		ls := ls
 		b.Run(fmt.Sprintf("size=%dMB", ls.bytes/(1024*1024)), func(b *testing.B) {
