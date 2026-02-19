@@ -67,15 +67,18 @@ type ShmClientTransport struct {
 	// When draining, NewStream must fail and the transport should close once all
 	// active streams finish.
 	draining atomic.Bool
-	mu       sync.RWMutex
+	// mu protects lifecycle state: streamQuota, waitingStreams,
+	// streamsQuotaAvailable, streamID, kpDormant, and the streamInFlow map.
+	mu shmSpinlock
 
 	// Stream management
-	streams         map[uint32]*ClientStream
-	streamTransport map[*ClientStream]*ShmClientTransport // Track transport for each stream
-	streamID        uint32                                // next stream ID to assign
+	streams         sync.Map // map[uint32]*ClientStream
+	streamTransport sync.Map // map[*ClientStream]*ShmClientTransport
+	streamCount     atomic.Int32
+	streamID        uint32 // next stream ID to assign
 
 	// Flow control (outbound send windows)
-	sendQuotaMu           sync.Mutex
+	sendQuotaMu           shmSpinlock
 	connSendQuota         int64
 	streamSendQuota       map[uint32]int64
 	quotaSignal           chan struct{}
@@ -103,7 +106,7 @@ type ShmClientTransport struct {
 	keepaliveEnabled bool
 	keepaliveDone    chan struct{} // closed when keepalive goroutine exits
 	// kpDormancyCond signals the keepalive goroutine to exit dormant state.
-	// Guarded by mu.
+	// Guarded by mu (cold path only — sync.Cond kernel calls acceptable).
 	kpDormancyCond *sync.Cond
 	kpDormant      bool
 }
@@ -237,8 +240,6 @@ func NewShmClientTransport(segment *Segment, localAddr, remoteAddr net.Addr) (*S
 		remoteAddr:            remoteAddr,
 		ctx:                   ctx,
 		cancel:                cancel,
-		streams:               make(map[uint32]*ClientStream),
-		streamTransport:       make(map[*ClientStream]*ShmClientTransport),
 		streamSendQuota:       make(map[uint32]int64),
 		streamInFlow:          make(map[uint32]*inFlow),
 		errCh:                 make(chan struct{}),
@@ -362,9 +363,7 @@ func (t *ShmClientTransport) processIncomingData(ctx context.Context) {
 				go t.Close(errors.New("received GOAWAY (immediate)"))
 				return
 			}
-			t.mu.RLock()
-			active := len(t.streams)
-			t.mu.RUnlock()
+			active := int(t.streamCount.Load())
 			if active == 0 {
 				release()
 				go t.Close(errors.New("received GOAWAY (draining) with no active streams"))
@@ -382,15 +381,14 @@ func (t *ShmClientTransport) processIncomingData(ctx context.Context) {
 		}
 
 		// Dispatch frame to appropriate stream
-		t.mu.RLock()
-		stream, ok := t.streams[fh.StreamID]
-		t.mu.RUnlock()
+		sVal, ok := t.streams.Load(fh.StreamID)
 
 		if !ok {
 			release()
 			// Stream not found - might have been closed
 			continue
 		}
+		stream := sVal.(*ClientStream)
 
 		// Handle different frame types
 		switch fh.Type {
@@ -561,14 +559,13 @@ func (t *ShmClientTransport) Close(err error) {
 		// Terminate all active streams before closing/unmapping the segment.
 		// This prevents concurrent stream Close paths from touching unmapped ring
 		// memory.
-		t.mu.Lock()
-		streams := make([]*ClientStream, 0, len(t.streams))
-		for _, stream := range t.streams {
-			if stream != nil {
-				streams = append(streams, stream)
+		var streams []*ClientStream
+		t.streams.Range(func(key, value any) bool {
+			if s := value.(*ClientStream); s != nil {
+				streams = append(streams, s)
 			}
-		}
-		t.mu.Unlock()
+			return true
+		})
 		for _, stream := range streams {
 			t.closeStream(stream, err, false, 0, status.Convert(err), nil, false)
 		}
@@ -628,9 +625,7 @@ func (t *ShmClientTransport) GracefulClose() {
 	}
 
 	// If there are no active streams, close immediately.
-	t.mu.RLock()
-	active := len(t.streams)
-	t.mu.RUnlock()
+	active := int(t.streamCount.Load())
 	if active == 0 {
 		t.Close(errors.New("no active streams left to process while draining"))
 	}
@@ -712,9 +707,12 @@ func (t *ShmClientTransport) NewStream(ctx context.Context, callHdr *CallHdr) (*
 		}
 
 		// Register the stream
-		t.streams[streamID] = s
-		t.streamTransport[s] = t
+		t.streams.Store(streamID, s)
+		t.streamTransport.Store(s, t)
+		t.streamCount.Add(1)
+		t.sendQuotaMu.Lock()
 		t.streamSendQuota[streamID] = int64(maxWindowSize)
+		t.sendQuotaMu.Unlock()
 		t.streamInFlow[streamID] = &s.fc
 		if t.streamQuota > 0 && t.waitingStreams > 0 {
 			select {
@@ -793,9 +791,10 @@ func (t *ShmClientTransport) NewStream(ctx context.Context, callHdr *CallHdr) (*
 	}
 
 	if err := writeFrame(ctx, t.clientToServer, fh, payload); err != nil {
+		t.streams.Delete(streamID)
+		t.streamTransport.Delete(s)
+		t.streamCount.Add(-1)
 		t.mu.Lock()
-		delete(t.streams, streamID)
-		delete(t.streamTransport, s)
 		t.streamQuota++
 		if t.streamQuota > 0 && t.waitingStreams > 0 {
 			select {
@@ -807,10 +806,7 @@ func (t *ShmClientTransport) NewStream(ctx context.Context, callHdr *CallHdr) (*
 		// If draining was initiated concurrently and there are no streams left,
 		// ensure the transport completes draining.
 		if t.draining.Load() {
-			t.mu.RLock()
-			active := len(t.streams)
-			t.mu.RUnlock()
-			if active == 0 {
+			if t.streamCount.Load() == 0 {
 				go t.Close(errors.New("draining with no active streams"))
 			}
 		}
@@ -915,13 +911,18 @@ func (t *ShmClientTransport) closeStream(s *ClientStream, err error, rst bool, _
 	}
 
 	// Remove stream from active streams map and return stream quota.
+	// Use LoadAndDelete so that only one caller decrements streamCount
+	// if closeStream races with transport Close.
 	var shouldClose bool
-	t.mu.Lock()
-	delete(t.streams, s.id)
-	delete(t.streamTransport, s)
+	_, wasActive := t.streams.LoadAndDelete(s.id)
+	t.streamTransport.Delete(s)
+	if wasActive {
+		t.streamCount.Add(-1)
+	}
 	t.sendQuotaMu.Lock()
 	delete(t.streamSendQuota, s.id)
 	t.sendQuotaMu.Unlock()
+	t.mu.Lock()
 	delete(t.streamInFlow, s.id)
 	t.streamQuota++
 	if t.streamQuota > 0 && t.waitingStreams > 0 {
@@ -930,7 +931,7 @@ func (t *ShmClientTransport) closeStream(s *ClientStream, err error, rst bool, _
 		default:
 		}
 	}
-	shouldClose = t.draining.Load() && len(t.streams) == 0 && !t.closed.Load()
+	shouldClose = t.draining.Load() && t.streamCount.Load() == 0 && !t.closed.Load()
 	t.mu.Unlock()
 
 	// Send CANCEL frame if requested
@@ -1093,7 +1094,7 @@ func (t *ShmClientTransport) keepalive() {
 				t.mu.Unlock()
 				return
 			}
-			if len(t.streams) < 1 && !t.kp.PermitWithoutStream {
+			if t.streamCount.Load() < 1 && !t.kp.PermitWithoutStream {
 				// If a ping was sent out previously (because there were active
 				// streams at that point) which wasn't acked and its timeout
 				// hadn't fired, but we got here and are about to go dormant,

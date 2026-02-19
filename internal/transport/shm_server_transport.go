@@ -69,16 +69,19 @@ type ShmServerTransport struct {
 	// drainDebugData is used for error reporting when draining completes.
 	drainDebugData string
 	// writeMu serializes writes to the server->client ring.
-	writeMu sync.Mutex
-	mu      sync.RWMutex
+	writeMu shmSpinlock
+	// lifeMu protects lifecycle state: handleFunc, drainDebugData, idle,
+	// lastPingAt, pingStrikes, and the streamInFlow map.
+	lifeMu shmSpinlock
 
 	// Stream management
-	streams    map[uint32]*ServerStream
-	handleFunc func(*ServerStream)
-	maxStreams uint32
+	streams     sync.Map // map[uint32]*ServerStream
+	streamCount atomic.Int32
+	handleFunc  func(*ServerStream)
+	maxStreams  uint32
 
 	// Flow control
-	sendQuotaMu     sync.Mutex
+	sendQuotaMu     shmSpinlock
 	connSendQuota   int64
 	streamSendQuota map[uint32]int64
 	quotaSignal     chan struct{}
@@ -240,7 +243,6 @@ func NewShmServerTransport(segment *Segment, localAddr, remoteAddr net.Addr) (*S
 		},
 		ctx:             ctx,
 		cancel:          cancel,
-		streams:         make(map[uint32]*ServerStream),
 		streamSendQuota: make(map[uint32]int64),
 		streamInFlow:    make(map[uint32]*inFlow),
 		errCh:           make(chan struct{}),
@@ -264,13 +266,13 @@ func NewShmServerTransport(segment *Segment, localAddr, remoteAddr net.Addr) (*S
 // HandleStreams receives incoming streams using the given handler.
 // This is typically run in a separate goroutine.
 func (t *ShmServerTransport) HandleStreams(ctx context.Context, handle func(*ServerStream)) {
-	t.mu.Lock()
+	t.lifeMu.Lock()
 	if t.closed.Load() {
-		t.mu.Unlock()
+		t.lifeMu.Unlock()
 		return
 	}
 	t.handleFunc = handle
-	t.mu.Unlock()
+	t.lifeMu.Unlock()
 
 	// The reader and all stream contexts should be canceled when either the
 	// HandleStreams context is canceled or the transport is closed.
@@ -378,13 +380,13 @@ func (t *ShmServerTransport) processIncomingData(ctx context.Context) {
 
 			// Record draining state once.
 			if t.draining.CompareAndSwap(false, true) {
-				t.mu.Lock()
+				t.lifeMu.Lock()
 				t.drainDebugData = string(payload)
 				if t.drainDebugData == "" {
 					t.drainDebugData = "received GOAWAY (draining)"
 				}
-				active := len(t.streams)
-				t.mu.Unlock()
+				t.lifeMu.Unlock()
+				active := int(t.streamCount.Load())
 
 				if active == 0 {
 					release()
@@ -408,11 +410,8 @@ func (t *ShmServerTransport) processIncomingData(ctx context.Context) {
 			release()
 		case FrameTypeHALFCLOSE:
 			// Client signals no more messages on this stream.
-			t.mu.RLock()
-			s, ok := t.streams[fh.StreamID]
-			t.mu.RUnlock()
-			if ok {
-				s.write(recvMsg{err: io.EOF})
+			if sVal, ok := t.streams.Load(fh.StreamID); ok {
+				sVal.(*ServerStream).write(recvMsg{err: io.EOF})
 			}
 			release()
 		case FrameTypeCANCEL:
@@ -442,34 +441,26 @@ func (t *ShmServerTransport) processIncomingData(ctx context.Context) {
 
 // handleHeaders processes a HEADERS frame and creates a new ServerStream
 func (t *ShmServerTransport) handleHeaders(ctx context.Context, streamID uint32, payload []byte) error {
-	// Fast-path checks under lock.
-	t.mu.Lock()
+	// Fast-path checks (atomic/sync.Map — no lock needed).
 	if t.closed.Load() {
-		t.mu.Unlock()
 		return errors.New("transport closed")
 	}
 	if t.draining.Load() {
-		msg := "transport is draining"
-		t.mu.Unlock()
-		t.rejectNewStream(streamID, msg)
+		t.rejectNewStream(streamID, "transport is draining")
 		return nil
 	}
-	if uint32(len(t.streams)) >= t.maxStreams {
-		t.mu.Unlock()
+	if uint32(t.streamCount.Load()) >= t.maxStreams {
 		t.rejectNewStream(streamID, "max concurrent streams exceeded")
 		return nil
 	}
 	// Check if stream already exists.
-	if _, exists := t.streams[streamID]; exists {
-		t.mu.Unlock()
+	if _, exists := t.streams.Load(streamID); exists {
 		return errors.New("stream already exists")
 	}
 	// Validate stream ID (client uses odd numbers).
 	if streamID%2 != 1 {
-		t.mu.Unlock()
 		return errors.New("invalid stream ID: must be odd for client-initiated streams")
 	}
-	t.mu.Unlock()
 
 	// Decode headers using the proper frame format.
 	hdr, err := decodeHeaders(payload)
@@ -550,26 +541,27 @@ func (t *ShmServerTransport) handleHeaders(ctx context.Context, streamID uint32,
 	}
 
 	// Register the stream (re-check draining/closed).
-	t.mu.Lock()
+	t.lifeMu.Lock()
 	if t.closed.Load() {
-		t.mu.Unlock()
+		t.lifeMu.Unlock()
 		return errors.New("transport closed")
 	}
 	if t.draining.Load() {
-		t.mu.Unlock()
+		t.lifeMu.Unlock()
 		t.rejectNewStream(streamID, "transport is draining")
 		return nil
 	}
-	t.streams[streamID] = s
 	t.streamInFlow[streamID] = &s.fc
 	// Clear idle time when we have active streams.
 	t.idle = time.Time{}
 	// Reset ping strikes when streams become active.
 	t.pingStrikes = 0
 	h := t.handleFunc
-	t.mu.Unlock()
+	t.lifeMu.Unlock()
+	t.streams.Store(streamID, s)
+	t.streamCount.Add(1)
 
-	// Initialize send quota for this stream (protected by sendQuotaMu, not mu).
+	// Initialize send quota for this stream (protected by sendQuotaMu).
 	t.sendQuotaMu.Lock()
 	t.streamSendQuota[streamID] = int64(maxWindowSize)
 	t.sendQuotaMu.Unlock()
@@ -585,14 +577,13 @@ func (t *ShmServerTransport) handleHeaders(ctx context.Context, streamID uint32,
 // handleMessage processes a MESSAGE frame.
 // For client->server, the final MESSAGE is indicated by MessageFlagMORE being unset.
 func (t *ShmServerTransport) handleMessage(streamID uint32, flags uint8, payload []byte) {
-	t.mu.RLock()
-	s, exists := t.streams[streamID]
-	t.mu.RUnlock()
+	sVal, exists := t.streams.Load(streamID)
 
 	if !exists {
 		// Stream doesn't exist, drop the message
 		return
 	}
+	s := sVal.(*ServerStream)
 
 	sz := uint32(len(payload))
 	if wu := t.connInFlow.onData(sz); wu > 0 {
@@ -616,16 +607,12 @@ func (t *ShmServerTransport) handleMessageBuffer(streamID uint32, flags uint8, b
 		return
 	}
 	payload := buf.ReadOnlyData()
-	s, exists := func() (*ServerStream, bool) {
-		t.mu.RLock()
-		s, ok := t.streams[streamID]
-		t.mu.RUnlock()
-		return s, ok
-	}()
+	sVal, exists := t.streams.Load(streamID)
 	if !exists {
 		buf.Free()
 		return
 	}
+	s := sVal.(*ServerStream)
 
 	sz := uint32(len(payload))
 	if wu := t.connInFlow.onData(sz); wu > 0 {
@@ -652,37 +639,37 @@ func (t *ShmServerTransport) handlePing(ctx context.Context, payload []byte) {
 
 	now := time.Now()
 	defer func() {
-		t.mu.Lock()
+		t.lifeMu.Lock()
 		t.lastPingAt = now
-		t.mu.Unlock()
+		t.lifeMu.Unlock()
 	}()
 
 	// Check enforcement policy.
-	t.mu.Lock()
-	ns := len(t.streams)
+	t.lifeMu.Lock()
 	lastPing := t.lastPingAt
-	t.mu.Unlock()
+	t.lifeMu.Unlock()
+	ns := int(t.streamCount.Load())
 
 	if ns < 1 && !t.kep.PermitWithoutStream {
 		// Keepalive shouldn't be active; this ping should have come after
 		// at least defaultPingTimeout.
 		if !lastPing.IsZero() && lastPing.Add(defaultPingTimeout).After(now) {
-			t.mu.Lock()
+			t.lifeMu.Lock()
 			t.pingStrikes++
-			t.mu.Unlock()
+			t.lifeMu.Unlock()
 		}
 	} else {
 		// Check if keepalive policy is respected.
 		if !lastPing.IsZero() && lastPing.Add(t.kep.MinTime).After(now) {
-			t.mu.Lock()
+			t.lifeMu.Lock()
 			t.pingStrikes++
-			t.mu.Unlock()
+			t.lifeMu.Unlock()
 		}
 	}
 
-	t.mu.Lock()
+	t.lifeMu.Lock()
 	strikes := t.pingStrikes
-	t.mu.Unlock()
+	t.lifeMu.Unlock()
 	if strikes > maxPingStrikes {
 		// Send GOAWAY and close.
 		t.sendGoAway(GoAwayFlagIMMEDIATE, "too_many_pings")
@@ -692,19 +679,21 @@ func (t *ShmServerTransport) handlePing(ctx context.Context, payload []byte) {
 
 // handleTrailers processes a TRAILERS frame
 func (t *ShmServerTransport) handleTrailers(streamID uint32, payload []byte) {
-	t.mu.RLock()
-	s, exists := t.streams[streamID]
-	t.mu.RUnlock()
+	// Use LoadAndDelete to atomically claim ownership of the stream removal.
+	// writeStatus may race us for the same stream; only the winner decrements.
+	sVal, loaded := t.streams.LoadAndDelete(streamID)
 
-	if !exists {
+	if !loaded {
 		return
 	}
+	s := sVal.(*ServerStream)
 
 	// Decode trailers using the proper frame format
 	trailers, err := decodeTrailers(payload)
 	if err != nil {
 		// Send error to stream
 		s.write(recvMsg{err: err})
+		t.streamCount.Add(-1)
 		return
 	}
 
@@ -727,21 +716,21 @@ func (t *ShmServerTransport) handleTrailers(streamID uint32, payload []byte) {
 	delete(t.streamSendQuota, streamID)
 	t.sendQuotaMu.Unlock()
 
-	// Remove stream from active streams and finish draining if needed.
+	// Finish draining if needed (stream already removed by LoadAndDelete above).
 	var shouldClose bool
 	var dbg string
-	t.mu.Lock()
-	delete(t.streams, streamID)
+	newCount := t.streamCount.Add(-1)
+	t.lifeMu.Lock()
 	delete(t.streamInFlow, streamID)
 	// Mark idle when no more active streams.
-	if len(t.streams) == 0 {
+	if newCount == 0 {
 		t.idle = time.Now()
 	}
-	if t.draining.Load() && len(t.streams) == 0 && !t.closed.Load() {
+	if t.draining.Load() && newCount == 0 && !t.closed.Load() {
 		shouldClose = true
 		dbg = t.drainDebugData
 	}
-	t.mu.Unlock()
+	t.lifeMu.Unlock()
 	if shouldClose {
 		go t.Close(errors.New("transport drained: " + dbg))
 	}
@@ -749,13 +738,14 @@ func (t *ShmServerTransport) handleTrailers(streamID uint32, payload []byte) {
 
 // handleCancel processes a CANCEL frame
 func (t *ShmServerTransport) handleCancel(streamID uint32) {
-	t.mu.RLock()
-	s, exists := t.streams[streamID]
-	t.mu.RUnlock()
+	// Use LoadAndDelete to atomically claim ownership of the stream removal.
+	// writeStatus may race us for the same stream; only the winner decrements.
+	sVal, loaded := t.streams.LoadAndDelete(streamID)
 
-	if !exists {
+	if !loaded {
 		return
 	}
+	s := sVal.(*ServerStream)
 
 	// Cancel the stream context
 	s.cancel()
@@ -765,21 +755,21 @@ func (t *ShmServerTransport) handleCancel(streamID uint32) {
 	delete(t.streamSendQuota, streamID)
 	t.sendQuotaMu.Unlock()
 
-	// Remove from active streams and finish draining if needed.
+	// Finish draining if needed (stream already removed by LoadAndDelete above).
 	var shouldClose bool
 	var dbg string
-	t.mu.Lock()
-	delete(t.streams, streamID)
+	newCount := t.streamCount.Add(-1)
+	t.lifeMu.Lock()
 	delete(t.streamInFlow, streamID)
 	// Mark idle when no more active streams.
-	if len(t.streams) == 0 {
+	if newCount == 0 {
 		t.idle = time.Now()
 	}
-	if t.draining.Load() && len(t.streams) == 0 && !t.closed.Load() {
+	if t.draining.Load() && newCount == 0 && !t.closed.Load() {
 		shouldClose = true
 		dbg = t.drainDebugData
 	}
-	t.mu.Unlock()
+	t.lifeMu.Unlock()
 	if shouldClose {
 		go t.Close(errors.New("transport drained: " + dbg))
 	}
@@ -816,12 +806,11 @@ func (t *ShmServerTransport) Close(err error) {
 
 		// Snapshot and terminate all active streams.
 		var streams []*ServerStream
-		t.mu.Lock()
-		for _, s := range t.streams {
-			streams = append(streams, s)
-		}
-		t.streams = make(map[uint32]*ServerStream)
-		t.mu.Unlock()
+		t.streams.Range(func(key, value any) bool {
+			streams = append(streams, value.(*ServerStream))
+			t.streams.Delete(key)
+			return true
+		})
 		for _, s := range streams {
 			if s == nil {
 				continue
@@ -878,10 +867,10 @@ func (t *ShmServerTransport) Drain(debugData string) {
 	}
 
 	// Record debug data for the eventual close.
-	t.mu.Lock()
+	t.lifeMu.Lock()
 	t.drainDebugData = debugData
-	active := len(t.streams)
-	t.mu.Unlock()
+	t.lifeMu.Unlock()
+	active := int(t.streamCount.Load())
 
 	// Notify peer we're draining.
 	t.sendGoAway(GoAwayFlagDRAINING, debugData)
@@ -1121,22 +1110,27 @@ func (t *ShmServerTransport) writeStatus(s *ServerStream, st *status.Status) err
 	t.sendQuotaMu.Unlock()
 
 	// Remove stream from active streams and finish draining if needed.
-	var shouldClose bool
-	var dbg string
-	t.mu.Lock()
-	delete(t.streams, s.id)
-	delete(t.streamInFlow, s.id)
-	// Mark idle when no more active streams.
-	if len(t.streams) == 0 {
-		t.idle = time.Now()
-	}
-	if t.draining.Load() && len(t.streams) == 0 && !t.closed.Load() {
-		shouldClose = true
-		dbg = t.drainDebugData
-	}
-	t.mu.Unlock()
-	if shouldClose {
-		go t.Close(errors.New("transport drained: " + dbg))
+	// Use LoadAndDelete to atomically claim ownership; handleTrailers/handleCancel
+	// may race us for the same stream — only the winner decrements streamCount.
+	_, wasActive := t.streams.LoadAndDelete(s.id)
+	if wasActive {
+		var shouldClose bool
+		var dbg string
+		newCount := t.streamCount.Add(-1)
+		t.lifeMu.Lock()
+		delete(t.streamInFlow, s.id)
+		// Mark idle when no more active streams.
+		if newCount == 0 {
+			t.idle = time.Now()
+		}
+		if t.draining.Load() && newCount == 0 && !t.closed.Load() {
+			shouldClose = true
+			dbg = t.drainDebugData
+		}
+		t.lifeMu.Unlock()
+		if shouldClose {
+			go t.Close(errors.New("transport drained: " + dbg))
+		}
 	}
 
 	return nil
@@ -1190,9 +1184,9 @@ func (t *ShmServerTransport) ConfigureKeepalive(kp keepalive.ServerParameters, k
 	t.kp = kp
 	t.kep = kep
 	// Mark connection as initially idle.
-	t.mu.Lock()
+	t.lifeMu.Lock()
 	t.idle = time.Now()
-	t.mu.Unlock()
+	t.lifeMu.Unlock()
 	go t.keepalive()
 }
 
@@ -1232,16 +1226,16 @@ func (t *ShmServerTransport) keepalive() {
 	for {
 		select {
 		case <-idleTimer.C:
-			t.mu.Lock()
+			t.lifeMu.Lock()
 			idle := t.idle
 			if idle.IsZero() {
 				// Connection is not idle.
-				t.mu.Unlock()
+				t.lifeMu.Unlock()
 				idleTimer.Reset(t.kp.MaxConnectionIdle)
 				continue
 			}
 			val := t.kp.MaxConnectionIdle - time.Since(idle)
-			t.mu.Unlock()
+			t.lifeMu.Unlock()
 			if val <= 0 {
 				// Connection has been idle for MaxConnectionIdle; drain.
 				t.Drain("max_idle")

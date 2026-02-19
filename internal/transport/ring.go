@@ -42,6 +42,25 @@ import (
 //revive:disable:var-naming This name must match the Go runtime internal function
 func runtime_procyield(cycles uint32)
 
+// shmSpinlock is a user-space spinlock that avoids kernel futex calls.
+// It uses atomic CAS to acquire and store-release to unlock.
+// Suitable for short critical sections in the SHM hot path.
+type shmSpinlock struct {
+	state atomic.Int32 // 0 = unlocked, 1 = locked
+}
+
+// Lock acquires the spinlock, spinning with PAUSE instructions until successful.
+func (l *shmSpinlock) Lock() {
+	for !l.state.CompareAndSwap(0, 1) {
+		runtime_procyield(1)
+	}
+}
+
+// Unlock releases the spinlock.
+func (l *shmSpinlock) Unlock() {
+	l.state.Store(0)
+}
+
 // Spin-wait constants for adaptive spinning before falling back to futex.
 // Based on research from Facebook Folly's synchronization primitives.
 const (
