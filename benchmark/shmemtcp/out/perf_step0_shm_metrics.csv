@@ -1,0 +1,15 @@
+"Bench","NsOp","MBs"
+"BenchmarkGRPCShmStream/size=64-12","36226","1.77"
+"BenchmarkGRPCShmStream/size=256-12","37130","6.89"
+"BenchmarkGRPCShmStream/size=1024-12","48913","20.93"
+"BenchmarkGRPCShmStream/size=4096-12","1384078","2.96"
+"BenchmarkGRPCShmUnary/size=64-12","603260","0.11"
+"BenchmarkGRPCShmUnary/size=256-12","168432","1.52"
+"BenchmarkGRPCShmUnary/size=1024-12","73058","14.02"
+"BenchmarkGRPCShmUnary/size=4096-12","82600","49.59"
+"BenchmarkGRPCShmLargeStream/size=16MB-12","9763003","1718.45"
+"BenchmarkGRPCShmLargeStream/size=32MB$",,
+"BenchmarkGRPCShmLargeStream/size=64MB$",,
+"BenchmarkGRPCShmLargeUnary/size=16MB-12","10459914","1603.95"
+"BenchmarkGRPCShmLargeUnary/size=32MB$",,
+"BenchmarkGRPCShmLargeUnary/size=64MB$",,
