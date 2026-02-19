@@ -71,13 +71,13 @@ def run_benchmarks() -> dict:
             cmd,
             capture_output=True,
             text=True,
-            timeout=600,  # 10 minutes for full benchmark suite
+            timeout=1800,  # 30 minutes for full benchmark suite
             cwd=SCRIPT_DIR.parent.parent  # grpc-go-shmem root
         )
         output = proc.stdout + proc.stderr
         print(output)
     except subprocess.TimeoutExpired:
-        print("ERROR: Benchmark timed out after 10 minutes")
+        print("ERROR: Benchmark timed out after 30 minutes")
         return None
     except Exception as e:
         print(f"ERROR: Failed to run benchmarks: {e}")
@@ -499,14 +499,17 @@ def generate_plots(data: dict):
         shm_vals = [data["shm_rt_latency"][2], data["shm_stream_latency"][idx_1k]]
         tcp_vals = [data["tcp_rt_latency"][2], data["tcp_stream_latency"][idx_1k]]
         unix_vals = [data["unix_rt_latency"][2], data["unix_stream_latency"][idx_1k]]
+        has_unix = all(v is not None for v in unix_vals)
 
         x = np.arange(len(categories))
 
-        ax.bar(x - width, shm_vals, width, label='SHM', color=colors['shm'], edgecolor='black')
-
-        ax.bar(x, unix_vals, width, label='UDS', color=colors['unix'], edgecolor='black')
-
-        ax.bar(x + width, tcp_vals, width, label='TCP', color=colors['tcp'], edgecolor='black')
+        if has_unix:
+            ax.bar(x - width, shm_vals, width, label='SHM', color=colors['shm'], edgecolor='black')
+            ax.bar(x, unix_vals, width, label='UDS', color=colors['unix'], edgecolor='black')
+            ax.bar(x + width, tcp_vals, width, label='TCP', color=colors['tcp'], edgecolor='black')
+        else:
+            ax.bar(x - 0.15, shm_vals, 0.3, label='SHM', color=colors['shm'], edgecolor='black')
+            ax.bar(x + 0.15, tcp_vals, 0.3, label='TCP', color=colors['tcp'], edgecolor='black')
 
         ax.set_ylabel('Latency (ns)')
 
@@ -522,10 +525,17 @@ def generate_plots(data: dict):
 
     # Summary 2: Max throughput comparison
     ax = axes[0, 1]
-    if all(v is not None for v in shm_tp + tcp_tp + unix_tp):
-        transports = ['SHM', 'UDS', 'TCP']
-        max_tp = [max(shm_tp), max(unix_tp), max(tcp_tp)]
-        bars = ax.bar(transports, max_tp, color=[colors['shm'], colors['unix'], colors['tcp']],
+    has_unix_tp = all(v is not None for v in unix_tp)
+    if all(v is not None for v in shm_tp + tcp_tp) and (has_unix_tp or True):
+        if has_unix_tp:
+            transports = ['SHM', 'UDS', 'TCP']
+            max_tp = [max(shm_tp), max(unix_tp), max(tcp_tp)]
+            bar_colors_tp = [colors['shm'], colors['unix'], colors['tcp']]
+        else:
+            transports = ['SHM', 'TCP']
+            max_tp = [max(shm_tp), max(tcp_tp)]
+            bar_colors_tp = [colors['shm'], colors['tcp']]
+        bars = ax.bar(transports, max_tp, color=bar_colors_tp,
                      edgecolor='black')
 
         ax.set_ylabel('Throughput (MB/s)')
@@ -541,15 +551,28 @@ def generate_plots(data: dict):
     if (data["shm_rt_latency"][2] and data["tcp_rt_latency"][2] and
         data["shm_stream_latency"][idx_1k] and data["tcp_stream_latency"][idx_1k]):
 
-        categories = ['Unary\nvs UDS', 'Unary\nvs TCP', 'Stream\nvs UDS', 'Stream\nvs TCP']
-        speedups = [
-            data["unix_rt_latency"][2] / data["shm_rt_latency"][2],
-            data["tcp_rt_latency"][2] / data["shm_rt_latency"][2],
-            data["unix_stream_latency"][idx_1k] / data["shm_stream_latency"][idx_1k],
-            data["tcp_stream_latency"][idx_1k] / data["shm_stream_latency"][idx_1k],
-        ]
+        has_unix_rt = data["unix_rt_latency"][2] is not None
+        has_unix_stream = data["unix_stream_latency"][idx_1k] is not None
 
-        bar_colors = [colors['unix'], colors['tcp'], colors['unix'], colors['tcp']]
+        categories = []
+        speedups = []
+        bar_colors = []
+
+        if has_unix_rt:
+            categories.append('Unary\nvs UDS')
+            speedups.append(data["unix_rt_latency"][2] / data["shm_rt_latency"][2])
+            bar_colors.append(colors['unix'])
+        categories.append('Unary\nvs TCP')
+        speedups.append(data["tcp_rt_latency"][2] / data["shm_rt_latency"][2])
+        bar_colors.append(colors['tcp'])
+        if has_unix_stream:
+            categories.append('Stream\nvs UDS')
+            speedups.append(data["unix_stream_latency"][idx_1k] / data["shm_stream_latency"][idx_1k])
+            bar_colors.append(colors['unix'])
+        categories.append('Stream\nvs TCP')
+        speedups.append(data["tcp_stream_latency"][idx_1k] / data["shm_stream_latency"][idx_1k])
+        bar_colors.append(colors['tcp'])
+
         bars = ax.bar(categories, speedups, color=bar_colors, edgecolor='black', alpha=0.7)
 
         ax.set_ylabel('Speedup Factor (x)')
@@ -744,12 +767,15 @@ def generate_consolidated_plot(data: dict):
 
     # Unary Latency
     ax = fig.add_subplot(gs[0, 0])
-    if all(v is not None for v in (shm_rt + tcp_rt + unix_rt)):
-        ax.bar(x_rt - width, shm_rt, width, label='SHM', color=colors['shm'], edgecolor='black', linewidth=0.5)
-
-        ax.bar(x_rt, unix_rt, width, label='UDS', color=colors['unix'], edgecolor='black', linewidth=0.5)
-
-        ax.bar(x_rt + width, tcp_rt, width, label='TCP', color=colors['tcp'], edgecolor='black', linewidth=0.5)
+    if all(v is not None for v in (shm_rt + tcp_rt)):
+        has_unix = all(v is not None for v in unix_rt)
+        if has_unix:
+            ax.bar(x_rt - width, shm_rt, width, label='SHM', color=colors['shm'], edgecolor='black', linewidth=0.5)
+            ax.bar(x_rt, unix_rt, width, label='UDS', color=colors['unix'], edgecolor='black', linewidth=0.5)
+            ax.bar(x_rt + width, tcp_rt, width, label='TCP', color=colors['tcp'], edgecolor='black', linewidth=0.5)
+        else:
+            ax.bar(x_rt - 0.15, shm_rt, 0.3, label='SHM', color=colors['shm'], edgecolor='black', linewidth=0.5)
+            ax.bar(x_rt + 0.15, tcp_rt, 0.3, label='TCP', color=colors['tcp'], edgecolor='black', linewidth=0.5)
         ax.set_xlabel('Message Size')
 
         ax.set_ylabel('Latency (ns)')
@@ -764,7 +790,8 @@ def generate_consolidated_plot(data: dict):
         for i, (shm, tcp) in enumerate(zip(shm_rt, tcp_rt)):
             if shm and tcp:
                 speedup = tcp / shm
-                ax.annotate(f'{speedup:.0f}x', xy=(i - width, shm), xytext=(0, 3),
+                offset = -width if has_unix else -0.15
+                ax.annotate(f'{speedup:.0f}x', xy=(i + offset, shm), xytext=(0, 3),
                            textcoords='offset points', ha='center', fontsize=7,
                            color=colors['shm'], fontweight='bold')
     else:
@@ -774,16 +801,19 @@ def generate_consolidated_plot(data: dict):
 
     # Unary Throughput (ops/sec)
     ax = fig.add_subplot(gs[0, 1])
-    if all(v is not None for v in (shm_rt + tcp_rt + unix_rt)):
+    if all(v is not None for v in (shm_rt + tcp_rt)):
         shm_ops = [1e9 / lat / 1000 for lat in shm_rt]
         tcp_ops = [1e9 / lat / 1000 for lat in tcp_rt]
-        unix_ops = [1e9 / lat / 1000 for lat in unix_rt]
+        has_unix = all(v is not None for v in unix_rt)
 
-        ax.bar(x_rt - width, shm_ops, width, label='SHM', color=colors['shm'], edgecolor='black', linewidth=0.5)
-
-        ax.bar(x_rt, unix_ops, width, label='UDS', color=colors['unix'], edgecolor='black', linewidth=0.5)
-
-        ax.bar(x_rt + width, tcp_ops, width, label='TCP', color=colors['tcp'], edgecolor='black', linewidth=0.5)
+        if has_unix:
+            unix_ops = [1e9 / lat / 1000 for lat in unix_rt]
+            ax.bar(x_rt - width, shm_ops, width, label='SHM', color=colors['shm'], edgecolor='black', linewidth=0.5)
+            ax.bar(x_rt, unix_ops, width, label='UDS', color=colors['unix'], edgecolor='black', linewidth=0.5)
+            ax.bar(x_rt + width, tcp_ops, width, label='TCP', color=colors['tcp'], edgecolor='black', linewidth=0.5)
+        else:
+            ax.bar(x_rt - 0.15, shm_ops, 0.3, label='SHM', color=colors['shm'], edgecolor='black', linewidth=0.5)
+            ax.bar(x_rt + 0.15, tcp_ops, 0.3, label='TCP', color=colors['tcp'], edgecolor='black', linewidth=0.5)
         ax.set_xlabel('Message Size')
 
         ax.set_ylabel('Throughput (Kops/s)')
@@ -802,13 +832,16 @@ def generate_consolidated_plot(data: dict):
 
     # Unary Speedup Chart
     ax = fig.add_subplot(gs[0, 2])
-    if all(v is not None for v in (shm_rt + tcp_rt + unix_rt)):
+    if all(v is not None for v in (shm_rt + tcp_rt)):
         tcp_speedups = [tcp / shm for shm, tcp in zip(shm_rt, tcp_rt)]
-        unix_speedups = [unix / shm for shm, unix in zip(shm_rt, unix_rt)]
+        has_unix = all(v is not None for v in unix_rt)
 
-        ax.bar(x_rt - 0.15, unix_speedups, 0.3, label='vs UDS', color=colors['unix'], edgecolor='black', linewidth=0.5)
-
-        ax.bar(x_rt + 0.15, tcp_speedups, 0.3, label='vs TCP', color=colors['tcp'], edgecolor='black', linewidth=0.5)
+        if has_unix:
+            unix_speedups = [unix / shm for shm, unix in zip(shm_rt, unix_rt)]
+            ax.bar(x_rt - 0.15, unix_speedups, 0.3, label='vs UDS', color=colors['unix'], edgecolor='black', linewidth=0.5)
+            ax.bar(x_rt + 0.15, tcp_speedups, 0.3, label='vs TCP', color=colors['tcp'], edgecolor='black', linewidth=0.5)
+        else:
+            ax.bar(x_rt, tcp_speedups, 0.4, label='vs TCP', color=colors['tcp'], edgecolor='black', linewidth=0.5)
         ax.set_xlabel('Message Size')
 
         ax.set_ylabel('Speedup Factor')
@@ -822,8 +855,9 @@ def generate_consolidated_plot(data: dict):
         ax.legend(loc='upper right', fontsize=8)
 
         ax.axhline(y=1, color='gray', linestyle='--', alpha=0.5)
-        for i, (tcp_s, unix_s) in enumerate(zip(tcp_speedups, unix_speedups)):
-            ax.annotate(f'{tcp_s:.0f}x', xy=(i - 0.15, tcp_s), xytext=(0, 3),
+        for i, tcp_s in enumerate(tcp_speedups):
+            offset = 0.15 if has_unix else 0
+            ax.annotate(f'{tcp_s:.0f}x', xy=(i + offset, tcp_s), xytext=(0, 3),
                        textcoords='offset points', ha='center', fontsize=7, fontweight='bold')
     else:
         ax.text(0.5, 0.5, 'No data', ha='center', va='center', transform=ax.transAxes)
@@ -842,12 +876,15 @@ def generate_consolidated_plot(data: dict):
 
     # Streaming Latency
     ax = fig.add_subplot(gs[1, 0])
-    if all(v is not None for v in (shm_lat + tcp_lat + unix_lat)):
-        ax.bar(x_stream - width, shm_lat, width, label='SHM', color=colors['shm'], edgecolor='black', linewidth=0.5)
-
-        ax.bar(x_stream, unix_lat, width, label='UDS', color=colors['unix'], edgecolor='black', linewidth=0.5)
-
-        ax.bar(x_stream + width, tcp_lat, width, label='TCP', color=colors['tcp'], edgecolor='black', linewidth=0.5)
+    if all(v is not None for v in (shm_lat + tcp_lat)):
+        has_unix = all(v is not None for v in unix_lat)
+        if has_unix:
+            ax.bar(x_stream - width, shm_lat, width, label='SHM', color=colors['shm'], edgecolor='black', linewidth=0.5)
+            ax.bar(x_stream, unix_lat, width, label='UDS', color=colors['unix'], edgecolor='black', linewidth=0.5)
+            ax.bar(x_stream + width, tcp_lat, width, label='TCP', color=colors['tcp'], edgecolor='black', linewidth=0.5)
+        else:
+            ax.bar(x_stream - 0.15, shm_lat, 0.3, label='SHM', color=colors['shm'], edgecolor='black', linewidth=0.5)
+            ax.bar(x_stream + 0.15, tcp_lat, 0.3, label='TCP', color=colors['tcp'], edgecolor='black', linewidth=0.5)
         ax.set_xlabel('Message Size')
 
         ax.set_ylabel('Latency (ns)')
@@ -872,12 +909,15 @@ def generate_consolidated_plot(data: dict):
     tcp_tp = data["tcp_stream_throughput"]
     unix_tp = data["unix_stream_throughput"]
 
-    if all(v is not None for v in (shm_tp + tcp_tp + unix_tp)):
-        ax.bar(x_stream - width, shm_tp, width, label='SHM', color=colors['shm'], edgecolor='black', linewidth=0.5)
-
-        ax.bar(x_stream, unix_tp, width, label='UDS', color=colors['unix'], edgecolor='black', linewidth=0.5)
-
-        ax.bar(x_stream + width, tcp_tp, width, label='TCP', color=colors['tcp'], edgecolor='black', linewidth=0.5)
+    has_unix_tp = all(v is not None for v in unix_tp)
+    if all(v is not None for v in (shm_tp + tcp_tp)):
+        if has_unix_tp:
+            ax.bar(x_stream - width, shm_tp, width, label='SHM', color=colors['shm'], edgecolor='black', linewidth=0.5)
+            ax.bar(x_stream, unix_tp, width, label='UDS', color=colors['unix'], edgecolor='black', linewidth=0.5)
+            ax.bar(x_stream + width, tcp_tp, width, label='TCP', color=colors['tcp'], edgecolor='black', linewidth=0.5)
+        else:
+            ax.bar(x_stream - 0.15, shm_tp, 0.3, label='SHM', color=colors['shm'], edgecolor='black', linewidth=0.5)
+            ax.bar(x_stream + 0.15, tcp_tp, 0.3, label='TCP', color=colors['tcp'], edgecolor='black', linewidth=0.5)
         ax.set_xlabel('Message Size')
 
         ax.set_ylabel('Throughput (MB/s)')
@@ -898,13 +938,16 @@ def generate_consolidated_plot(data: dict):
 
     # Streaming Speedup
     ax = fig.add_subplot(gs[1, 2])
-    if all(v is not None for v in (shm_lat + tcp_lat + unix_lat)):
+    if all(v is not None for v in (shm_lat + tcp_lat)):
         tcp_speedups = [tcp / shm for shm, tcp in zip(shm_lat, tcp_lat)]
-        unix_speedups = [unix / shm for shm, unix in zip(shm_lat, unix_lat)]
+        has_unix = all(v is not None for v in unix_lat)
 
-        ax.bar(x_stream - 0.15, unix_speedups, 0.3, label='vs UDS', color=colors['unix'], edgecolor='black', linewidth=0.5)
-
-        ax.bar(x_stream + 0.15, tcp_speedups, 0.3, label='vs TCP', color=colors['tcp'], edgecolor='black', linewidth=0.5)
+        if has_unix:
+            unix_speedups = [unix / shm for shm, unix in zip(shm_lat, unix_lat)]
+            ax.bar(x_stream - 0.15, unix_speedups, 0.3, label='vs UDS', color=colors['unix'], edgecolor='black', linewidth=0.5)
+            ax.bar(x_stream + 0.15, tcp_speedups, 0.3, label='vs TCP', color=colors['tcp'], edgecolor='black', linewidth=0.5)
+        else:
+            ax.bar(x_stream, tcp_speedups, 0.4, label='vs TCP', color=colors['tcp'], edgecolor='black', linewidth=0.5)
         ax.set_xlabel('Message Size')
 
         ax.set_ylabel('Speedup Factor')
@@ -1257,10 +1300,16 @@ def generate_consolidated_plot(data: dict):
 
     # Peak Throughput by Transport
     ax = fig.add_subplot(gs[5, 0])
-    if _has_numeric(shm_tp) and _has_numeric(tcp_tp) and _has_numeric(unix_tp):
-        transports = ['SHM', 'UDS', 'TCP']
-        peak_tp = [max(_filter_numeric(shm_tp)), max(_filter_numeric(unix_tp)), max(_filter_numeric(tcp_tp))]
-        bar_colors = [colors['shm'], colors['unix'], colors['tcp']]
+    if _has_numeric(shm_tp) and _has_numeric(tcp_tp):
+        has_unix_tp = _has_numeric(unix_tp)
+        if has_unix_tp:
+            transports = ['SHM', 'UDS', 'TCP']
+            peak_tp = [max(_filter_numeric(shm_tp)), max(_filter_numeric(unix_tp)), max(_filter_numeric(tcp_tp))]
+            bar_colors = [colors['shm'], colors['unix'], colors['tcp']]
+        else:
+            transports = ['SHM', 'TCP']
+            peak_tp = [max(_filter_numeric(shm_tp)), max(_filter_numeric(tcp_tp))]
+            bar_colors = [colors['shm'], colors['tcp']]
 
         bars = ax.bar(transports, peak_tp, color=bar_colors, edgecolor='black', linewidth=0.5)
 
@@ -1275,10 +1324,16 @@ def generate_consolidated_plot(data: dict):
 
     # Minimum Latency by Transport
     ax = fig.add_subplot(gs[5, 1])
-    if _has_numeric(shm_lat) and _has_numeric(tcp_lat) and _has_numeric(unix_lat):
-        transports = ['SHM', 'UDS', 'TCP']
-        min_lat = [min(_filter_numeric(shm_lat)), min(_filter_numeric(unix_lat)), min(_filter_numeric(tcp_lat))]
-        bar_colors = [colors['shm'], colors['unix'], colors['tcp']]
+    if _has_numeric(shm_lat) and _has_numeric(tcp_lat):
+        has_unix_lat = _has_numeric(unix_lat)
+        if has_unix_lat:
+            transports = ['SHM', 'UDS', 'TCP']
+            min_lat = [min(_filter_numeric(shm_lat)), min(_filter_numeric(unix_lat)), min(_filter_numeric(tcp_lat))]
+            bar_colors = [colors['shm'], colors['unix'], colors['tcp']]
+        else:
+            transports = ['SHM', 'TCP']
+            min_lat = [min(_filter_numeric(shm_lat)), min(_filter_numeric(tcp_lat))]
+            bar_colors = [colors['shm'], colors['tcp']]
 
         bars = ax.bar(transports, min_lat, color=bar_colors, edgecolor='black', linewidth=0.5)
 
@@ -1292,7 +1347,7 @@ def generate_consolidated_plot(data: dict):
 
     # Overall Speedup Summary
     ax = fig.add_subplot(gs[5, 2])
-    if _has_numeric(shm_lat) and _has_numeric(tcp_lat) and _has_numeric(unix_lat) and _has_numeric(shm_rt) and _has_numeric(tcp_rt):
+    if _has_numeric(shm_lat) and _has_numeric(tcp_lat) and _has_numeric(shm_rt) and _has_numeric(tcp_rt):
         categories = ['Unary\n(1KB)', 'Stream\n(1MB)', 'Large Stream\n(64MB)', 'Large Unary\n(64MB)']
 
         speedups_tcp = []
@@ -1350,12 +1405,15 @@ def generate_consolidated_plot(data: dict):
             speedups_tcp.append(0)
             speedups_unix.append(0)
 
-        if any(v > 0 for v in speedups_tcp + speedups_unix):
+        has_unix_summary = any(v > 0 for v in speedups_unix)
+        if any(v > 0 for v in speedups_tcp):
             x_summ = np.arange(len(categories))
 
-            ax.bar(x_summ - 0.15, speedups_unix, 0.3, label='vs UDS', color=colors['unix'], edgecolor='black', linewidth=0.5)
-
-            ax.bar(x_summ + 0.15, speedups_tcp, 0.3, label='vs TCP', color=colors['tcp'], edgecolor='black', linewidth=0.5)
+            if has_unix_summary:
+                ax.bar(x_summ - 0.15, speedups_unix, 0.3, label='vs UDS', color=colors['unix'], edgecolor='black', linewidth=0.5)
+                ax.bar(x_summ + 0.15, speedups_tcp, 0.3, label='vs TCP', color=colors['tcp'], edgecolor='black', linewidth=0.5)
+            else:
+                ax.bar(x_summ, speedups_tcp, 0.4, label='vs TCP', color=colors['tcp'], edgecolor='black', linewidth=0.5)
             ax.set_ylabel('Speedup Factor')
 
             ax.set_title('SHM Performance Advantage\n(higher is better)', fontweight='bold')
@@ -1368,9 +1426,10 @@ def generate_consolidated_plot(data: dict):
 
             ax.axhline(y=1, color='gray', linestyle='--', alpha=0.5)
 
-            for i, (tcp_s, unix_s) in enumerate(zip(speedups_tcp, speedups_unix)):
+            for i, tcp_s in enumerate(speedups_tcp):
                 if tcp_s > 0:
-                    ax.annotate(f'{tcp_s:.1f}x', xy=(i - 0.15, tcp_s), xytext=(0, 3),
+                    offset = 0.15 if has_unix_summary else 0
+                    ax.annotate(f'{tcp_s:.1f}x', xy=(i + offset, tcp_s), xytext=(0, 3),
                                textcoords='offset points', ha='center', fontsize=8, fontweight='bold')
         else:
             ax.text(0.5, 0.5, 'No data', ha='center', va='center', transform=ax.transAxes)
@@ -1396,11 +1455,13 @@ def generate_consolidated_plot(data: dict):
 
     if shm_rt and tcp_rt and shm_rt[2] and tcp_rt[2]:
         unary_speedup = tcp_rt[2] / shm_rt[2]
-        summary_lines.append(f"UNARY RPC (1KB):         SHM: {shm_rt[2]:.0f} ns    TCP: {tcp_rt[2]:.0f} ns    Unix: {unix_rt[2]:.0f} ns    Speedup: {unary_speedup:.0f}x vs TCP")
+        unix_rt_str = f"Unix: {unix_rt[2]:.0f} ns    " if unix_rt[2] is not None else ""
+        summary_lines.append(f"UNARY RPC (1KB):         SHM: {shm_rt[2]:.0f} ns    TCP: {tcp_rt[2]:.0f} ns    {unix_rt_str}Speedup: {unary_speedup:.0f}x vs TCP")
 
     if shm_lat and tcp_lat and shm_lat[2] and tcp_lat[2]:
         stream_speedup = tcp_lat[2] / shm_lat[2]
-        summary_lines.append(f"STREAMING (1KB):         SHM: {shm_lat[2]:.0f} ns    TCP: {tcp_lat[2]:.0f} ns    Unix: {unix_lat[2]:.0f} ns    Speedup: {stream_speedup:.0f}x vs TCP")
+        unix_lat_str = f"Unix: {unix_lat[2]:.0f} ns    " if unix_lat[2] is not None else ""
+        summary_lines.append(f"STREAMING (1KB):         SHM: {shm_lat[2]:.0f} ns    TCP: {tcp_lat[2]:.0f} ns    {unix_lat_str}Speedup: {stream_speedup:.0f}x vs TCP")
 
     if valid_stream_idx and 3 in valid_stream_idx:
         shm_v = shm_large_stream_tp[3] / 1000
@@ -1424,7 +1485,7 @@ def generate_consolidated_plot(data: dict):
 
     # Save
     consolidated_file = OUT_DIR / "benchmark_consolidated.png"
-    plt.savefig(consolidated_file, dpi=150, bbox_inches='tight', facecolor='white')
+    plt.savefig(consolidated_file, dpi=100, facecolor='white')
     plt.close()
     print(f"Created: {consolidated_file}")
 
