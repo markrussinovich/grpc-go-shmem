@@ -115,6 +115,12 @@ type ShmServerTransport struct {
 	// coalesced with TRAILERS in writeStatus(), reducing ring operations for
 	// unary RPCs. Keyed by stream ID.
 	pendingMsgs sync.Map // map[uint32]*pendingServerMsg
+
+	// chunkBufs accumulates partial MESSAGE frame data for chunked messages
+	// (frames with MessageFlagMORE set). When a final chunk arrives (no MORE
+	// flag), the accumulated data is concatenated and delivered as one message.
+	// Keyed by stream ID.
+	chunkBufs sync.Map // map[uint32][][]byte
 }
 
 func (t *ShmServerTransport) sendGoAway(flags uint8, debugData string) {
@@ -601,7 +607,7 @@ func (t *ShmServerTransport) handleMessage(streamID uint32, flags uint8, payload
 	t.mu.RUnlock()
 
 	if !exists {
-		// Stream doesn't exist, drop the message
+		t.chunkBufs.Delete(streamID)
 		return
 	}
 
@@ -610,13 +616,40 @@ func (t *ShmServerTransport) handleMessage(streamID uint32, flags uint8, payload
 		t.sendWindowUpdate(0, wu)
 	}
 	if err := s.fc.onData(sz); err != nil {
+		t.chunkBufs.Delete(streamID)
 		s.write(recvMsg{err: err})
 		return
 	}
 
-	// Write the message data to the stream's receive buffer
-	// Use mem.Copy to create a buffer from the payload
-	buf := mem.Copy(payload, mem.DefaultBufferPool())
+	// Chunked reassembly: accumulate data when MORE flag is set.
+	if flags&MessageFlagMORE != 0 {
+		chunk := make([]byte, len(payload))
+		copy(chunk, payload)
+		if prev, ok := t.chunkBufs.Load(streamID); ok {
+			t.chunkBufs.Store(streamID, append(prev.([][]byte), chunk))
+		} else {
+			t.chunkBufs.Store(streamID, [][]byte{chunk})
+		}
+		return
+	}
+
+	// Final chunk (or single-frame message). Reassemble if needed.
+	var buf mem.Buffer
+	if prev, ok := t.chunkBufs.LoadAndDelete(streamID); ok {
+		chunks := prev.([][]byte)
+		totalLen := len(payload)
+		for _, c := range chunks {
+			totalLen += len(c)
+		}
+		assembled := make([]byte, 0, totalLen)
+		for _, c := range chunks {
+			assembled = append(assembled, c...)
+		}
+		assembled = append(assembled, payload...)
+		buf = mem.SliceBuffer(assembled)
+	} else {
+		buf = mem.Copy(payload, mem.DefaultBufferPool())
+	}
 	s.write(recvMsg{buffer: buf})
 }
 
@@ -635,6 +668,7 @@ func (t *ShmServerTransport) handleMessageBuffer(streamID uint32, flags uint8, b
 	}()
 	if !exists {
 		buf.Free()
+		t.chunkBufs.Delete(streamID)
 		return
 	}
 
@@ -644,11 +678,44 @@ func (t *ShmServerTransport) handleMessageBuffer(streamID uint32, flags uint8, b
 	}
 	if err := s.fc.onData(sz); err != nil {
 		buf.Free()
+		t.chunkBufs.Delete(streamID)
 		s.write(recvMsg{err: err})
 		return
 	}
 
-	s.write(recvMsg{buffer: buf})
+	// Chunked reassembly: accumulate data when MORE flag is set.
+	// Note: readFrameView already copies data for MORE-flagged frames,
+	// so buf here is a copied buffer (not pinning ring space).
+	if flags&MessageFlagMORE != 0 {
+		chunk := make([]byte, len(payload))
+		copy(chunk, payload)
+		buf.Free()
+		if prev, ok := t.chunkBufs.Load(streamID); ok {
+			t.chunkBufs.Store(streamID, append(prev.([][]byte), chunk))
+		} else {
+			t.chunkBufs.Store(streamID, [][]byte{chunk})
+		}
+		return
+	}
+
+	// Final chunk (or single-frame message). Reassemble if needed.
+	if prev, ok := t.chunkBufs.LoadAndDelete(streamID); ok {
+		chunks := prev.([][]byte)
+		totalLen := len(payload)
+		for _, c := range chunks {
+			totalLen += len(c)
+		}
+		assembled := make([]byte, 0, totalLen)
+		for _, c := range chunks {
+			assembled = append(assembled, c...)
+		}
+		assembled = append(assembled, payload...)
+		buf.Free()
+		s.write(recvMsg{buffer: mem.SliceBuffer(assembled)})
+	} else {
+		// Single frame, zero-copy fast path.
+		s.write(recvMsg{buffer: buf})
+	}
 }
 
 // handlePing processes a PING frame, sends PONG, and enforces keepalive policy.
@@ -733,6 +800,9 @@ func (t *ShmServerTransport) handleTrailers(streamID uint32, payload []byte) {
 	// Signal end-of-client-stream to the stream.
 	s.write(recvMsg{err: endErr})
 
+	// Clean up any in-progress chunk reassembly for this stream.
+	t.chunkBufs.Delete(streamID)
+
 	// Remove stream send quota (protected by sendQuotaMu).
 	t.sendQuotaMu.Lock()
 	delete(t.streamSendQuota, streamID)
@@ -770,6 +840,9 @@ func (t *ShmServerTransport) handleCancel(streamID uint32) {
 
 	// Cancel the stream context
 	s.cancel()
+
+	// Clean up any in-progress chunk reassembly for this stream.
+	t.chunkBufs.Delete(streamID)
 
 	// Remove stream send quota (protected by sendQuotaMu).
 	t.sendQuotaMu.Lock()
@@ -1195,6 +1268,9 @@ func (t *ShmServerTransport) writeStatus(s *ServerStream, st *status.Status) err
 	if err := t.writeStatusFrames(s, trFH, trailersPayload); err != nil {
 		return err
 	}
+
+	// Clean up any in-progress chunk reassembly for this stream.
+	t.chunkBufs.Delete(s.id)
 
 	// Remove stream send quota (protected by sendQuotaMu).
 	t.sendQuotaMu.Lock()

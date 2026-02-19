@@ -160,11 +160,9 @@ def extract_data(results: dict) -> dict:
     sizes = [64, 256, 1024, 4096, 16384, 65536, 262144, 1048576]
     size_labels = ['64B', '256B', '1KB', '4KB', '16KB', '64KB', '256KB', '1MB']
 
-    # Large payload sizes (1MB to 16MB)
-    # Capped at 16MB: payloads approaching ring buffer size (64MiB) may corrupt
-    # data during gRPC frame reassembly over SHM transport.
-    large_sizes = [1048576, 4194304, 16777216]
-    large_size_labels = ['1MB', '4MB', '16MB']
+    # Large payload sizes (1MB to 128MB)
+    large_sizes = [1048576, 4194304, 16777216, 33554432, 67108864, 134217728]
+    large_size_labels = ['1MB', '4MB', '16MB', '32MB', '64MB', '128MB']
 
     data = {
         "sizes": sizes,

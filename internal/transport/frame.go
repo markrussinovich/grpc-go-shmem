@@ -942,10 +942,23 @@ func writeFramesCoalesced(ctx context.Context, tx *ShmRing, frames []coalescedFr
 		maxReservation = 1024 + frameHeaderSize
 	}
 	if total > maxReservation {
-		// Fall back to writing frames individually.
+		// Fall back to writing frames individually. For MESSAGE frames whose
+		// payload exceeds maxFramePayload, use chunked writes.
+		maxFramePayload := cap/2 - frameHeaderSize
+		if maxFramePayload < 1024 {
+			maxFramePayload = 1024
+		}
 		for _, f := range frames {
-			if err := writeFrame(ctx, tx, f.FH, f.Payload); err != nil {
-				return err
+			if f.FH.Type == FrameTypeMESSAGE && len(f.Payload) > maxFramePayload {
+				// Use chunked writes for oversized MESSAGE payloads.
+				data := mem.BufferSlice{mem.SliceBuffer(f.Payload)}
+				if err := writeFrameBuffersChunked(ctx, tx, f.FH, nil, data, maxFramePayload); err != nil {
+					return err
+				}
+			} else {
+				if err := writeFrame(ctx, tx, f.FH, f.Payload); err != nil {
+					return err
+				}
 			}
 		}
 		return nil

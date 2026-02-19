@@ -328,9 +328,7 @@ var benchStreamSizes = []int{64, 256, 1024, 4096, 16384, 65536, 262144, 1048576}
 // Unary payload sizes (64 B to 4 KiB) — small payloads where per-call overhead dominates.
 var benchUnarySizes = []int{64, 256, 1024, 4096}
 
-// Large payload sizes (1 MiB to 16 MiB).
-// NOTE: Payloads approaching the ring buffer size (64 MiB) may corrupt data
-// during gRPC frame reassembly over SHM. Cap at 16 MiB for reliable results.
+// Large payload sizes (1 MiB to 128 MiB).
 var benchLargeSizes = []struct {
 	bytes int
 	label string
@@ -338,6 +336,9 @@ var benchLargeSizes = []struct {
 	{1 * 1024 * 1024, "1MB"},
 	{4 * 1024 * 1024, "4MB"},
 	{16 * 1024 * 1024, "16MB"},
+	{32 * 1024 * 1024, "32MB"},
+	{64 * 1024 * 1024, "64MB"},
+	{128 * 1024 * 1024, "128MB"},
 }
 
 // =============================================================================

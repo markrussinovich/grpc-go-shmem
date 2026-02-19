@@ -118,6 +118,12 @@ type ShmClientTransport struct {
 	// NewStream to be coalesced with the first write() call, reducing ring
 	// operations for unary RPCs. Keyed by stream ID.
 	pendingHeaders sync.Map // map[uint32]*pendingHeaderData
+
+	// chunkBufs accumulates partial MESSAGE frame data for chunked messages
+	// (frames with MessageFlagMORE set). When a final chunk arrives (no MORE
+	// flag), the accumulated data is concatenated and delivered as one message.
+	// Keyed by stream ID.
+	chunkBufs sync.Map // map[uint32][][]byte
 }
 
 func (t *ShmClientTransport) setGoAwayReason(flags uint8, debug string) {
@@ -460,12 +466,41 @@ func (t *ShmClientTransport) processIncomingData(ctx context.Context) {
 					log.Printf("[DEBUG] ShmClientTransport: MESSAGE flow control error: %v", err)
 				}
 				release()
+				t.chunkBufs.Delete(fh.StreamID)
 				t.closeStream(stream, err, true, http2.ErrCodeFlowControl, status.New(codes.Internal, err.Error()), nil, false)
 				continue
 			}
 
-			// Transfer ownership of the ring-backed buffer to the stream for zero-copy delivery.
-			if payloadBuf != nil {
+			// Chunked reassembly: accumulate data when MORE flag is set.
+			if fh.Flags&MessageFlagMORE != 0 {
+				// readFrameView already copied data for MORE-flagged frames.
+				chunk := make([]byte, len(payload))
+				copy(chunk, payload)
+				release()
+				if prev, ok := t.chunkBufs.Load(fh.StreamID); ok {
+					t.chunkBufs.Store(fh.StreamID, append(prev.([][]byte), chunk))
+				} else {
+					t.chunkBufs.Store(fh.StreamID, [][]byte{chunk})
+				}
+				continue
+			}
+
+			// Final chunk (or single-frame message). Reassemble if needed.
+			if prev, ok := t.chunkBufs.LoadAndDelete(fh.StreamID); ok {
+				chunks := prev.([][]byte)
+				totalLen := len(payload)
+				for _, c := range chunks {
+					totalLen += len(c)
+				}
+				assembled := make([]byte, 0, totalLen)
+				for _, c := range chunks {
+					assembled = append(assembled, c...)
+				}
+				assembled = append(assembled, payload...)
+				release()
+				stream.write(recvMsg{buffer: mem.SliceBuffer(assembled)})
+			} else if payloadBuf != nil {
+				// Single frame, zero-copy fast path.
 				if shmDebugEnabled {
 					log.Printf("[DEBUG] ShmClientTransport: MESSAGE delivering payloadBuf (len=%d) to stream %d", payloadBuf.Len(), fh.StreamID)
 				}
@@ -957,6 +992,9 @@ func (t *ShmClientTransport) closeStream(s *ClientStream, err error, rst bool, _
 
 	// Clean up any deferred HEADERS that were never sent.
 	_, hadPendingHeaders := t.pendingHeaders.LoadAndDelete(s.id)
+
+	// Clean up any partial chunk reassembly state.
+	t.chunkBufs.Delete(s.id)
 
 	// Send CANCEL frame if requested, but only if HEADERS was actually sent
 	// to the server. If HEADERS was still pending, the server doesn't know
