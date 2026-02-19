@@ -896,6 +896,109 @@ func writeFrameBuffersChunked(ctx context.Context, tx *ShmRing, fh FrameHeader, 
 	return nil
 }
 
+// coalescedFrame represents a single frame to be written as part of a
+// coalesced multi-frame ring reservation.
+type coalescedFrame struct {
+	FH      FrameHeader
+	Payload []byte
+}
+
+// materializePayload concatenates an optional header prefix and a BufferSlice
+// into a single contiguous []byte. Used to build frame payloads for coalesced
+// writes where the ring reservation must be computed upfront.
+func materializePayload(hdr []byte, data mem.BufferSlice) []byte {
+	totalLen := len(hdr) + data.Len()
+	if totalLen == 0 {
+		return nil
+	}
+	buf := make([]byte, totalLen)
+	n := copy(buf, hdr)
+	data.CopyTo(buf[n:])
+	return buf
+}
+
+// writeFramesCoalesced writes multiple frames in a single ring reservation,
+// reducing the number of reserve/commit/signal cycles. Each frame is specified
+// as a (FrameHeader, Payload) pair. This is used to coalesce
+// HEADERS+MESSAGE+HALFCLOSE/TRAILERS for unary RPCs, cutting per-RPC ring
+// operations from 2 down to 1 in each direction.
+//
+// If the total size exceeds half the ring capacity, falls back to writing
+// frames individually.
+func writeFramesCoalesced(ctx context.Context, tx *ShmRing, frames []coalescedFrame) error {
+	// Calculate total size.
+	total := 0
+	for i := range frames {
+		frames[i].FH.Length = uint32(len(frames[i].Payload))
+		frames[i].FH.Reserved = 0
+		frames[i].FH.Reserved2 = 0
+		total += frameHeaderSize + len(frames[i].Payload)
+	}
+
+	// Check if total exceeds the single-reservation limit.
+	cap := int(tx.Capacity())
+	maxReservation := cap / 2
+	if maxReservation < 1024+frameHeaderSize {
+		maxReservation = 1024 + frameHeaderSize
+	}
+	if total > maxReservation {
+		// Fall back to writing frames individually.
+		for _, f := range frames {
+			if err := writeFrame(ctx, tx, f.FH, f.Payload); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	// Single reservation for all frames.
+	res, err := tx.ReserveWrite(ctx, total)
+	if err != nil {
+		return err
+	}
+
+	written := 0
+	writeSeq := func(src []byte) error {
+		for len(src) > 0 {
+			if written < len(res.First) {
+				n := copy(res.First[written:], src)
+				written += n
+				src = src[n:]
+				if len(src) == 0 {
+					return nil
+				}
+			}
+			secondOff := written - len(res.First)
+			if secondOff >= len(res.Second) {
+				return errors.New("failed to copy coalesced frame bytes: reservation overflow")
+			}
+			n := copy(res.Second[secondOff:], src)
+			written += n
+			src = src[n:]
+		}
+		return nil
+	}
+
+	var fhBytes [frameHeaderSize]byte
+	for _, f := range frames {
+		encodeFrameHeaderTo(&fhBytes, f.FH)
+		if err := writeSeq(fhBytes[:]); err != nil {
+			return err
+		}
+		if len(f.Payload) > 0 {
+			if err := writeSeq(f.Payload); err != nil {
+				return err
+			}
+		}
+	}
+
+	if written != total {
+		return fmt.Errorf("failed to copy coalesced frame bytes: short write (%d != %d)", written, total)
+	}
+
+	return res.Commit(total)
+}
+
 // readFrame reads one non-PAD frame (skipping any PAD frames). It blocks if
 // necessary and never spins.
 func readFrame(ctx context.Context, rx *ShmRing) (FrameHeader, []byte, error) {

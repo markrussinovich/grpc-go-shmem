@@ -44,6 +44,12 @@ import (
 
 // ShmServerTransport implements the gRPC ServerTransport interface
 // for shared memory communication.
+
+// pendingServerMsg holds a buffered MESSAGE frame (and optional HEADERS frame)
+// from write(Last=true), to be coalesced with TRAILERS in writeStatus().
+type pendingServerMsg struct {
+	frames []coalescedFrame
+}
 type ShmServerTransport struct {
 	// Core state
 	segment        *Segment // The shared memory segment
@@ -104,6 +110,11 @@ type ShmServerTransport struct {
 	lastPingAt time.Time
 	// pingStrikes counts policy violations; too many triggers close.
 	pingStrikes uint8
+
+	// pendingMsgs stores buffered MESSAGE frames from write(Last=true) to be
+	// coalesced with TRAILERS in writeStatus(), reducing ring operations for
+	// unary RPCs. Keyed by stream ID.
+	pendingMsgs sync.Map // map[uint32]*pendingServerMsg
 }
 
 func (t *ShmServerTransport) sendGoAway(flags uint8, debugData string) {
@@ -970,7 +981,7 @@ func (t *ShmServerTransport) maybeWriteHeader(s *ServerStream) error {
 }
 
 // write writes header and data for a stream
-func (t *ShmServerTransport) write(s *ServerStream, hdr []byte, data mem.BufferSlice, _ *WriteOptions) error {
+func (t *ShmServerTransport) write(s *ServerStream, hdr []byte, data mem.BufferSlice, opts *WriteOptions) error {
 	if t.closed.Load() {
 		return ErrConnClosing
 	}
@@ -1026,6 +1037,20 @@ func (t *ShmServerTransport) write(s *ServerStream, hdr []byte, data mem.BufferS
 		StreamID: s.id,
 	}
 
+	// If this is the last message (unary response), buffer the frames so that
+	// writeStatus() can coalesce MESSAGE + TRAILERS into one ring write.
+	if opts != nil && opts.Last {
+		msgPayload := materializePayload(hdr, data)
+		var frames []coalescedFrame
+		if needHeaders {
+			frames = append(frames, coalescedFrame{FH: headerFH, Payload: headerPayload})
+		}
+		frames = append(frames, coalescedFrame{FH: fh, Payload: msgPayload})
+		t.pendingMsgs.Store(s.id, &pendingServerMsg{frames: frames})
+		shmDebugf("[DEBUG] ShmServerTransport.write: buffered MESSAGE for coalescing with TRAILERS")
+		return nil
+	}
+
 	// Write frame(s) to server->client ring
 	t.writeMu.Lock()
 	defer t.writeMu.Unlock()
@@ -1051,6 +1076,76 @@ func (t *ShmServerTransport) write(s *ServerStream, hdr []byte, data mem.BufferS
 	return nil
 }
 
+// writeStatusFrames writes the TRAILERS frame (and any pending MESSAGE and/or
+// HEADERS frames) to the ring. It handles three cases:
+//  1. Pending MESSAGE from write(Last=true): coalesce [HEADERS+] MESSAGE + TRAILERS.
+//  2. No pending MESSAGE, headers not yet sent: coalesce HEADERS + TRAILERS.
+//  3. No pending MESSAGE, headers already sent: write TRAILERS alone.
+func (t *ShmServerTransport) writeStatusFrames(s *ServerStream, trFH FrameHeader, trailersPayload []byte) error {
+	t.writeMu.Lock()
+	defer t.writeMu.Unlock()
+
+	if v, ok := t.pendingMsgs.LoadAndDelete(s.id); ok {
+		// Case 1: coalesced [HEADERS +] MESSAGE + TRAILERS in one ring op.
+		pm := v.(*pendingServerMsg)
+		frames := append(pm.frames, coalescedFrame{FH: trFH, Payload: trailersPayload})
+		if err := writeFramesCoalesced(context.Background(), t.serverToClient, frames); err != nil {
+			if shmDebugEnabled {
+				log.Printf("[ERROR] ShmServerTransport.writeStatusFrames: coalesced write failed: %v", err)
+			}
+			return err
+		}
+		shmDebugf("[DEBUG] ShmServerTransport.writeStatusFrames: coalesced [HEADERS+]MESSAGE+TRAILERS succeeded")
+		return nil
+	}
+
+	// No pending message. Ensure headers are sent inline (writeHeader would
+	// deadlock since we already hold writeMu).
+	if !s.isHeaderSent() && !s.updateHeaderSent() {
+		s.hdrMu.Lock()
+		md := s.header.Copy()
+		s.hdrMu.Unlock()
+		var hdrKVs []KV
+		for k, vals := range md {
+			var byteVals [][]byte
+			for _, v := range vals {
+				byteVals = append(byteVals, []byte(v))
+			}
+			hdrKVs = append(hdrKVs, KV{Key: k, Values: byteVals})
+		}
+		headersV1 := HeadersV1{
+			Version:  1,
+			HdrType:  1, // server-initial
+			Metadata: hdrKVs,
+		}
+		hdrPayload := encodeHeaders(headersV1)
+		hdrFH := FrameHeader{Type: FrameTypeHEADERS, StreamID: s.id}
+		// Case 2: coalesce HEADERS + TRAILERS.
+		frames := []coalescedFrame{
+			{FH: hdrFH, Payload: hdrPayload},
+			{FH: trFH, Payload: trailersPayload},
+		}
+		if err := writeFramesCoalesced(context.Background(), t.serverToClient, frames); err != nil {
+			if shmDebugEnabled {
+				log.Printf("[ERROR] ShmServerTransport.writeStatusFrames: HEADERS+TRAILERS write failed: %v", err)
+			}
+			return err
+		}
+		shmDebugf("[DEBUG] ShmServerTransport.writeStatusFrames: coalesced HEADERS+TRAILERS succeeded")
+		return nil
+	}
+
+	// Case 3: TRAILERS only.
+	if err := writeFrame(context.Background(), t.serverToClient, trFH, trailersPayload); err != nil {
+		if shmDebugEnabled {
+			log.Printf("[ERROR] ShmServerTransport.writeStatusFrames: Failed to write TRAILERS: %v", err)
+		}
+		return err
+	}
+	shmDebugf("[DEBUG] ShmServerTransport.writeStatusFrames: wrote TRAILERS frame")
+	return nil
+}
+
 // writeStatus writes status for a stream (trailers)
 func (t *ShmServerTransport) writeStatus(s *ServerStream, st *status.Status) error {
 	if t.closed.Load() {
@@ -1059,9 +1154,6 @@ func (t *ShmServerTransport) writeStatus(s *ServerStream, st *status.Status) err
 	// Ensure idempotence: gRPC may race multiple WriteStatus calls.
 	if s.swapState(streamDone) == streamDone {
 		return nil
-	}
-	if err := t.maybeWriteHeader(s); err != nil {
-		return err
 	}
 
 	if shmDebugEnabled {
@@ -1090,30 +1182,19 @@ func (t *ShmServerTransport) writeStatus(s *ServerStream, st *status.Status) err
 		Metadata:       kvs,
 	}
 
-	payload := encodeTrailers(trailers)
-
-	// Create frame header
-	fh := FrameHeader{
+	trailersPayload := encodeTrailers(trailers)
+	trFH := FrameHeader{
 		Type:     FrameTypeTRAILERS,
 		StreamID: s.id,
-		Length:   uint32(len(payload)),
 	}
 
 	if shmDebugEnabled {
-		log.Printf("[DEBUG] ShmServerTransport.writeStatus: Writing TRAILERS frame, streamID=%d, length=%d", s.id, fh.Length)
+		log.Printf("[DEBUG] ShmServerTransport.writeStatus: Writing TRAILERS frame, streamID=%d, length=%d", s.id, len(trailersPayload))
 	}
 
-	// Write frame to server->client ring
-	t.writeMu.Lock()
-	defer t.writeMu.Unlock()
-	if err := writeFrame(context.Background(), t.serverToClient, fh, payload); err != nil {
-		if shmDebugEnabled {
-			log.Printf("[ERROR] ShmServerTransport.writeStatus: Failed to write frame: %v", err)
-		}
+	if err := t.writeStatusFrames(s, trFH, trailersPayload); err != nil {
 		return err
 	}
-
-	shmDebugf("[DEBUG] ShmServerTransport.writeStatus: Successfully wrote TRAILERS frame")
 
 	// Remove stream send quota (protected by sendQuotaMu).
 	t.sendQuotaMu.Lock()

@@ -628,6 +628,12 @@ type CallHdr struct {
 
 	DoneFunc func() // called when the stream is finished
 
+	// DeferHeaders indicates the HEADERS frame may be deferred and coalesced
+	// with the first write() call. Only safe when write() is guaranteed to be
+	// called immediately after NewStream (e.g., unary RPCs). Transports that
+	// don't support deferral ignore this field.
+	DeferHeaders bool
+
 	// Authority is used to explicitly override the `:authority` header.
 	//
 	// This value comes from one of two sources:

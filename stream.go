@@ -322,6 +322,10 @@ func newClientStreamWithParams(ctx context.Context, desc *StreamDesc, cc *Client
 		ContentSubtype: callInfo.contentSubtype,
 		DoneFunc:       doneFunc,
 		Authority:      callInfo.authority,
+		// DeferHeaders is safe when write() will be called immediately after
+		// NewStream. This is true for unary and server-streaming RPCs where
+		// sendMsg always follows NewStream without user intervention.
+		DeferHeaders: !desc.ClientStreams,
 	}
 	if allowed := callInfo.acceptedResponseCompressors; len(allowed) > 0 {
 		headerValue := strings.Join(allowed, ",")
@@ -1314,6 +1318,7 @@ func newNonRetryClientStream(ctx context.Context, desc *StreamDesc, method strin
 		Host:           ac.cc.authority,
 		Method:         method,
 		ContentSubtype: c.contentSubtype,
+		DeferHeaders:   !desc.ClientStreams,
 	}
 
 	// Set our outgoing compression according to the UseCompressor CallOption, if

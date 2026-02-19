@@ -44,6 +44,13 @@ import (
 
 // ShmClientTransport implements the gRPC ClientTransport interface
 // for shared memory communication.
+
+// pendingHeaderData holds encoded HEADERS frame data that will be coalesced
+// with the first write() call instead of being sent separately in NewStream.
+type pendingHeaderData struct {
+	fh      FrameHeader
+	payload []byte
+}
 type ShmClientTransport struct {
 	// Core state
 	segment        *Segment // The shared memory segment
@@ -106,6 +113,11 @@ type ShmClientTransport struct {
 	// Guarded by mu.
 	kpDormancyCond *sync.Cond
 	kpDormant      bool
+
+	// pendingHeaders stores encoded HEADERS frames that are deferred from
+	// NewStream to be coalesced with the first write() call, reducing ring
+	// operations for unary RPCs. Keyed by stream ID.
+	pendingHeaders sync.Map // map[uint32]*pendingHeaderData
 }
 
 func (t *ShmClientTransport) setGoAwayReason(flags uint8, debug string) {
@@ -792,29 +804,39 @@ func (t *ShmClientTransport) NewStream(ctx context.Context, callHdr *CallHdr) (*
 		Flags:    HeadersFlagINITIAL,
 	}
 
-	if err := writeFrame(ctx, t.clientToServer, fh, payload); err != nil {
-		t.mu.Lock()
-		delete(t.streams, streamID)
-		delete(t.streamTransport, s)
-		t.streamQuota++
-		if t.streamQuota > 0 && t.waitingStreams > 0 {
-			select {
-			case t.streamsQuotaAvailable <- struct{}{}:
-			default:
+	// When DeferHeaders is set (unary and server-streaming RPCs), store the
+	// encoded HEADERS frame so that write() can coalesce HEADERS + MESSAGE +
+	// HALFCLOSE into a single ring reservation. This eliminates one
+	// reserve/commit/signal cycle per unary RPC.
+	//
+	// When DeferHeaders is not set (client-streaming and bidi RPCs), send
+	// HEADERS immediately so the server can process the stream before the
+	// client writes any data.
+	if callHdr.DeferHeaders {
+		t.pendingHeaders.Store(streamID, &pendingHeaderData{fh: fh, payload: payload})
+	} else {
+		if err := writeFrame(ctx, t.clientToServer, fh, payload); err != nil {
+			t.mu.Lock()
+			delete(t.streams, streamID)
+			delete(t.streamTransport, s)
+			t.streamQuota++
+			if t.streamQuota > 0 && t.waitingStreams > 0 {
+				select {
+				case t.streamsQuotaAvailable <- struct{}{}:
+				default:
+				}
 			}
-		}
-		t.mu.Unlock()
-		// If draining was initiated concurrently and there are no streams left,
-		// ensure the transport completes draining.
-		if t.draining.Load() {
-			t.mu.RLock()
-			active := len(t.streams)
-			t.mu.RUnlock()
-			if active == 0 {
-				go t.Close(errors.New("draining with no active streams"))
+			t.mu.Unlock()
+			if t.draining.Load() {
+				t.mu.RLock()
+				active := len(t.streams)
+				t.mu.RUnlock()
+				if active == 0 {
+					go t.Close(errors.New("draining with no active streams"))
+				}
 			}
+			return nil, &NewStreamError{Err: err, AllowTransparentRetry: true}
 		}
-		return nil, &NewStreamError{Err: err, AllowTransparentRetry: true}
 	}
 
 	return s, nil
@@ -933,8 +955,13 @@ func (t *ShmClientTransport) closeStream(s *ClientStream, err error, rst bool, _
 	shouldClose = t.draining.Load() && len(t.streams) == 0 && !t.closed.Load()
 	t.mu.Unlock()
 
-	// Send CANCEL frame if requested
-	if rst && !t.closed.Load() {
+	// Clean up any deferred HEADERS that were never sent.
+	_, hadPendingHeaders := t.pendingHeaders.LoadAndDelete(s.id)
+
+	// Send CANCEL frame if requested, but only if HEADERS was actually sent
+	// to the server. If HEADERS was still pending, the server doesn't know
+	// about this stream and a CANCEL would be meaningless.
+	if rst && !t.closed.Load() && !hadPendingHeaders {
 		fh := FrameHeader{
 			StreamID: s.id,
 			Type:     FrameTypeCANCEL,
@@ -1010,22 +1037,55 @@ func (t *ShmClientTransport) write(s *ClientStream, hdr []byte, data mem.BufferS
 		log.Printf("[DEBUG] ShmClientTransport.write: writing frame to ring, widx before=%d", t.clientToServer.header().WriteIndex())
 	}
 
-	// If this is the last message, coalesce MESSAGE + HALFCLOSE into a single
-	// ring reservation to save one reserve/commit/signal cycle.
+	// Check for deferred HEADERS from NewStream. If present, coalesce them
+	// with this write to reduce ring operations.
+	var pending *pendingHeaderData
+	if v, ok := t.pendingHeaders.LoadAndDelete(s.id); ok {
+		pending = v.(*pendingHeaderData)
+	}
+
 	if opts != nil && opts.Last {
-		halfCloseFH := FrameHeader{StreamID: s.id, Type: FrameTypeHALFCLOSE}
-		if err := writeFrameBuffersWithTrailer(s.ctx, t.clientToServer, fh, hdr, data, halfCloseFH, nil); err != nil {
-			if shmDebugEnabled {
-				log.Printf("[ERROR] ShmClientTransport.write: coalesced write failed: %v", err)
+		if pending != nil {
+			// Unary fast path: coalesce HEADERS + MESSAGE + HALFCLOSE into a
+			// single ring reservation, reducing 2 ring ops to 1.
+			msgPayload := materializePayload(hdr, data)
+			frames := []coalescedFrame{
+				{FH: pending.fh, Payload: pending.payload},
+				{FH: fh, Payload: msgPayload},
+				{FH: FrameHeader{StreamID: s.id, Type: FrameTypeHALFCLOSE}},
 			}
-			return err
+			if err := writeFramesCoalesced(s.ctx, t.clientToServer, frames); err != nil {
+				if shmDebugEnabled {
+					log.Printf("[ERROR] ShmClientTransport.write: coalesced 3-frame write failed: %v", err)
+				}
+				return err
+			}
+		} else {
+			// MESSAGE + HALFCLOSE coalesced (HEADERS already sent).
+			halfCloseFH := FrameHeader{StreamID: s.id, Type: FrameTypeHALFCLOSE}
+			if err := writeFrameBuffersWithTrailer(s.ctx, t.clientToServer, fh, hdr, data, halfCloseFH, nil); err != nil {
+				if shmDebugEnabled {
+					log.Printf("[ERROR] ShmClientTransport.write: coalesced write failed: %v", err)
+				}
+				return err
+			}
 		}
 	} else {
-		if err := writeFrameBuffersChunked(s.ctx, t.clientToServer, fh, hdr, data, 0); err != nil {
-			if shmDebugEnabled {
-				log.Printf("[ERROR] ShmClientTransport.write: writeFrameBuffersChunked failed: %v", err)
+		if pending != nil {
+			// Streaming first message: coalesce HEADERS + MESSAGE.
+			if err := writeFrameWithPrefix(s.ctx, t.clientToServer, pending.fh, pending.payload, fh, hdr, data); err != nil {
+				if shmDebugEnabled {
+					log.Printf("[ERROR] ShmClientTransport.write: HEADERS+MESSAGE coalesced write failed: %v", err)
+				}
+				return err
 			}
-			return err
+		} else {
+			if err := writeFrameBuffersChunked(s.ctx, t.clientToServer, fh, hdr, data, 0); err != nil {
+				if shmDebugEnabled {
+					log.Printf("[ERROR] ShmClientTransport.write: writeFrameBuffersChunked failed: %v", err)
+				}
+				return err
+			}
 		}
 	}
 	if shmDebugEnabled {
