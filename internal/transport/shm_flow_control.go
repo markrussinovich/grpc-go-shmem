@@ -92,7 +92,7 @@ const (
 // to avoid mutex contention on every message.
 type shmBDPEstimator struct {
 	// Fast path fields - accessed atomically without lock
-	// settled is 1 when BDP estimation is complete (bdp == bdpLimit)
+	// settled is 1 when BDP estimation is complete (bdp == shmBDPLimit)
 	settled atomic.Uint32
 	// sample is updated atomically during measurement
 	sampleAtomic atomic.Uint32
@@ -132,7 +132,7 @@ func newShmBDPEstimator(initialWindow uint32, updateFn func(n uint32)) *shmBDPEs
 // add adds bytes to the current sample. Returns true if a BDP ping should be sent.
 // This is the hot path - optimized to avoid mutex in common cases.
 func (b *shmBDPEstimator) add(n uint32) bool {
-	// Fast path: if already settled at bdpLimit, nothing to do
+	// Fast path: if already settled at shmBDPLimit, nothing to do
 	if b.settled.Load() != 0 {
 		return false
 	}
