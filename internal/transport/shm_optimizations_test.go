@@ -42,7 +42,8 @@ func testSegName(prefix string) string {
 
 func newTestFrameWriter(t *testing.T) (*shmFrameWriter, *ShmRing, *ShmRing, func()) {
 	t.Helper()
-	seg, err := CreateSegment(testSegName("test_fw"), 64*1024, 64*1024)
+	name := testSegName("test_fw")
+	seg, err := CreateSegment(name, 64*1024, 64*1024)
 	if err != nil {
 		t.Fatalf("CreateSegment: %v", err)
 	}
@@ -55,7 +56,7 @@ func newTestFrameWriter(t *testing.T) (*shmFrameWriter, *ShmRing, *ShmRing, func
 		tx.Close()
 		w.close()
 		seg.Close()
-		RemoveSegment(seg.Path)
+		RemoveSegment(name)
 	}
 	return w, tx, rx, cleanup
 }
@@ -244,7 +245,8 @@ func TestShmWindowUpdateBatching(t *testing.T) {
 }
 
 func TestShmWindowUpdateStreamCleanup(t *testing.T) {
-	// Verify that pendingStreamWU entries are cleaned up when a stream closes.
+	// Verify that pendingStreamWU entries are cleaned up via the real
+	// closeStream path (not manual delete).
 	segName := testSegName("test_wu_cleanup")
 	defer RemoveSegment(segName)
 
@@ -269,9 +271,16 @@ func TestShmWindowUpdateStreamCleanup(t *testing.T) {
 	}
 	defer ct.Close(nil)
 
-	streamID := uint32(1)
+	// Create a real stream.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	s, err := ct.NewStream(ctx, &CallHdr{Host: "localhost", Method: "/test/Cleanup"})
+	if err != nil {
+		t.Fatalf("NewStream: %v", err)
+	}
+	streamID := s.id
 
-	// Accumulate some per-stream WU below threshold.
+	// Accumulate per-stream WU below threshold.
 	ct.sendWindowUpdate(streamID, 4096)
 	ct.sendWindowUpdate(streamID, 4096)
 
@@ -282,16 +291,14 @@ func TestShmWindowUpdateStreamCleanup(t *testing.T) {
 		t.Fatal("pendingStreamWU should have entry for stream after sendWindowUpdate")
 	}
 
-	// Simulate stream cleanup (what closeStream does).
-	ct.sendQuotaMu.Lock()
-	delete(ct.pendingStreamWU, streamID)
-	ct.sendQuotaMu.Unlock()
+	// Close the stream via the real transport path.
+	ct.closeStream(s, nil, true, 0, nil, nil, false)
 
 	ct.sendQuotaMu.Lock()
 	_, exists = ct.pendingStreamWU[streamID]
 	ct.sendQuotaMu.Unlock()
 	if exists {
-		t.Error("pendingStreamWU should be cleaned up after stream close")
+		t.Error("pendingStreamWU entry should be cleaned up after closeStream")
 	}
 }
 
@@ -575,36 +582,55 @@ func TestShmServerPongPayloadCopied(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestShmFrameWriterOrdering(t *testing.T) {
+	// Verify that the single-writer goroutine preserves per-stream FIFO even
+	// when multiple goroutines enqueue concurrently. Each goroutine "owns" a
+	// different stream, so within each stream the sequence must be monotonic.
 	w, _, rx, cleanup := newTestFrameWriter(t)
 	defer cleanup()
 
-	const n = 50
-	var sent atomic.Int32
+	const streams = 4
+	const msgsPerStream = 30
+	var wg sync.WaitGroup
 
-	// Enqueue frames from multiple goroutines for the SAME stream.
-	// The writer should serialize them in FIFO order per enqueue call.
-	for i := 0; i < n; i++ {
-		payload := make([]byte, 4)
-		binary.LittleEndian.PutUint32(payload, uint32(i))
-		if err := w.enqueueAndWait(frameEntry{
-			ctx:     context.Background(),
-			fh:      FrameHeader{Type: FrameTypeMESSAGE, StreamID: 1},
-			payload: payload,
-		}); err != nil {
-			t.Fatalf("enqueueAndWait %d: %v", i, err)
-		}
-		sent.Add(1)
+	for s := 0; s < streams; s++ {
+		wg.Add(1)
+		go func(streamID uint32) {
+			defer wg.Done()
+			for i := 0; i < msgsPerStream; i++ {
+				payload := make([]byte, 4)
+				binary.LittleEndian.PutUint32(payload, uint32(i))
+				if err := w.enqueueAndWait(frameEntry{
+					ctx:     context.Background(),
+					fh:      FrameHeader{Type: FrameTypeMESSAGE, StreamID: streamID},
+					payload: payload,
+				}); err != nil {
+					t.Errorf("stream %d msg %d: enqueueAndWait: %v", streamID, i, err)
+					return
+				}
+			}
+		}(uint32(s + 1))
 	}
+	wg.Wait()
 
-	// Read and verify ordering.
-	for i := 0; i < n; i++ {
-		_, data, err := readFrame(context.Background(), rx)
+	// Read all frames and verify per-stream ordering.
+	nextSeq := make(map[uint32]uint32) // streamID → expected next sequence
+	for i := 0; i < streams*msgsPerStream; i++ {
+		fh, data, err := readFrame(context.Background(), rx)
 		if err != nil {
 			t.Fatalf("readFrame %d: %v", i, err)
 		}
-		got := binary.LittleEndian.Uint32(data)
-		if got != uint32(i) {
-			t.Errorf("frame %d: sequence = %d, want %d (ordering broken)", i, got, i)
+		seq := binary.LittleEndian.Uint32(data)
+		expected := nextSeq[fh.StreamID]
+		if seq != expected {
+			t.Errorf("stream %d: got seq %d, want %d (per-stream ordering broken)", fh.StreamID, seq, expected)
+		}
+		nextSeq[fh.StreamID] = expected + 1
+	}
+
+	// Verify all streams sent all messages.
+	for s := uint32(1); s <= streams; s++ {
+		if nextSeq[s] != msgsPerStream {
+			t.Errorf("stream %d: only %d messages received, want %d", s, nextSeq[s], msgsPerStream)
 		}
 	}
 }

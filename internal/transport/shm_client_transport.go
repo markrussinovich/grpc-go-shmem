@@ -674,6 +674,20 @@ func (t *ShmClientTransport) Close(err error) {
 		// Cancel context to stop background reader goroutine and keepalive.
 		t.cancel()
 
+		// Close the rings FIRST so any writeFrame blocked inside the writer
+		// goroutine gets ErrRingClosed and unblocks. This must happen before
+		// waiting for keepalive, because keepalive's sendPing uses
+		// enqueueAndWait which blocks on the writer goroutine.
+		if !segClosed {
+			if t.clientToServer != nil {
+				_ = t.clientToServer.Close()
+			}
+			if t.serverToClient != nil {
+				_ = t.serverToClient.Close()
+			}
+		}
+		t.frameWriter.close()
+
 		// Wake up the keepalive goroutine if it's dormant, so it can exit.
 		t.mu.Lock()
 		if t.kpDormant {
@@ -681,12 +695,12 @@ func (t *ShmClientTransport) Close(err error) {
 		}
 		t.mu.Unlock()
 
-		// Wait for keepalive goroutine to exit before unmapping the segment.
+		// Wait for keepalive goroutine to exit.
 		if t.keepaliveEnabled && t.keepaliveDone != nil {
 			<-t.keepaliveDone
 		}
 
-		// Terminate all active streams before closing/unmapping the segment.
+		// Terminate all active streams before unmapping the segment.
 		t.mu.Lock()
 		streams := make([]*ClientStream, 0, len(t.streams))
 		for _, stream := range t.streams {
@@ -699,18 +713,6 @@ func (t *ShmClientTransport) Close(err error) {
 			t.closeStream(stream, err, false, 0, status.Convert(err), nil, false)
 		}
 
-		// Close the rings FIRST so any writeFrame blocked inside the writer
-		// goroutine gets ErrRingClosed and unblocks. Then close the frame
-		// writer to drain remaining entries and stop the goroutine.
-		if !segClosed {
-			if t.clientToServer != nil {
-				_ = t.clientToServer.Close()
-			}
-			if t.serverToClient != nil {
-				_ = t.serverToClient.Close()
-			}
-		}
-		t.frameWriter.close()
 		t.readerWG.Wait()
 
 		// Close the named events (Windows)

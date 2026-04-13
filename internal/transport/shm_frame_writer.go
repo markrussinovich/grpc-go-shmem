@@ -46,7 +46,6 @@ import (
 type shmFrameWriter struct {
 	tx     *ShmRing
 	ch     chan frameEntry // data + control frames from app goroutines
-	done   chan struct{}   // closed when writer goroutine exits
 	wg     sync.WaitGroup
 	closed atomic.Bool
 }
@@ -71,9 +70,8 @@ const (
 // newShmFrameWriter creates and starts a frame writer for the given ring.
 func newShmFrameWriter(tx *ShmRing) *shmFrameWriter {
 	w := &shmFrameWriter{
-		tx:   tx,
-		ch:   make(chan frameEntry, frameWriterQueueSize),
-		done: make(chan struct{}),
+		tx: tx,
+		ch: make(chan frameEntry, frameWriterQueueSize),
 	}
 	w.wg.Add(1)
 	go w.writeLoop()
@@ -84,7 +82,6 @@ func newShmFrameWriter(tx *ShmRing) *shmFrameWriter {
 // frames to the ring sequentially, eliminating the need for writeMu.
 func (w *shmFrameWriter) writeLoop() {
 	defer w.wg.Done()
-	defer close(w.done)
 
 	for entry := range w.ch {
 		var err error

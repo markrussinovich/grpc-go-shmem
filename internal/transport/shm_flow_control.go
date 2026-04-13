@@ -22,37 +22,32 @@
 //
 // RFC A73 Phase 5: Flow Control Alignment
 //
-// The shared memory transport intentionally shares flow control settings with
-// the HTTP/2 transport configuration to provide a consistent behavior model:
+// The shared memory transport uses its own optimized flow control constants
+// that differ from HTTP/2's defaults because local shared memory has near-zero
+// RTT and much higher bandwidth than TCP:
 //
-// - Initial window size: Uses the same default (64KB) as HTTP/2
-// - Maximum window size: Aligned with HTTP/2's limit (16MB = bdpLimit)
-// - BDP estimation algorithm: Mirrors HTTP/2's exponential moving average
-// - WINDOW_UPDATE semantics: Same delta-based flow control
+// - Initial window size: 32 MB (vs HTTP/2's 64 KB) to avoid stalling on
+//   WindowUpdate round-trips for large local RPCs.
+// - Maximum BDP window: 64 MB (vs HTTP/2's 16 MB) to fully utilize local
+//   memory bandwidth.
+// - WindowUpdate batching: deltas are accumulated and only sent when they
+//   exceed shmWindowUpdateThreshold (8 MB), reducing control frame overhead.
+// - BDP estimation: same exponential moving average algorithm as HTTP/2 but
+//   with the higher shmBDPLimit ceiling.
 //
-// Key constants shared with HTTP/2:
+// Key SHM-specific constants:
+//   - shmInitialWindowSize = 32 MB: initial per-stream window
+//   - shmBDPLimit = 64 MB: maximum BDP window
+//   - shmWindowUpdateThreshold = 8 MB: batching threshold
+//
+// BDP algorithm constants (shared with HTTP/2):
 //   - alpha = 0.9: Smoothing factor for RTT estimation
 //   - beta = 0.66: Threshold for BDP increase trigger
 //   - gamma = 2: Multiplicative factor for BDP growth
-//   - bdpLimit = 1 << 20 * 16 (16MB): Maximum BDP window
 //
-// The shmBDPEstimator tracks bandwidth-delay product by:
-// 1. Sending periodic BDP pings when data flow starts
-// 2. Measuring round-trip time from ping to ack
-// 3. Calculating BDP as (bytes_received / RTT)
-// 4. Dynamically adjusting window size based on estimated BDP
-//
-// Stream Scheduling:
-// StreamScheduler implements weighted fair queueing (WFQ) based on HTTP/2's
-// priority model. Each stream gets a weight (default 16), and the scheduler
-// allocates bandwidth proportionally using deficit-based round robin.
-//
-// Configuration:
-// Flow control settings are configured via gRPC dial/server options and apply
-// uniformly to both HTTP/2 and shared memory transports:
-//   - grpc.WithInitialWindowSize() - sets initial per-stream window
-//   - grpc.WithInitialConnWindowSize() - sets initial connection window
-//   - grpc.MaxRecvMsgSize() - limits maximum message size
+// Note: gRPC dial/server options (WithInitialWindowSize, etc.) do NOT currently
+// override the SHM-specific constants. The SHM transport always uses the
+// hardcoded values above. This may change in a future revision.
 
 package transport
 
