@@ -62,6 +62,24 @@ import (
 	"time"
 )
 
+// SHM-specific flow control constants.
+// Unlike HTTP/2 over TCP, shared memory is local with near-zero RTT, so we use
+// much larger initial windows to avoid stalling on WindowUpdate round-trips.
+const (
+	// shmInitialWindowSize is the initial per-stream flow control window for
+	// the shared memory transport. Set to 32 MB to allow large local RPCs
+	// without waiting for BDP ramp-up.
+	shmInitialWindowSize = 32 * 1024 * 1024 // 32 MB
+
+	// shmBDPLimit is the maximum BDP window size for SHM. This is 4x the
+	// HTTP/2 limit (16 MB) because local memory bandwidth is much higher.
+	shmBDPLimit = 64 * 1024 * 1024 // 64 MB
+
+	// shmWindowUpdateThreshold is the minimum accumulated bytes before a
+	// WindowUpdate frame is sent. Batching reduces frame write overhead.
+	shmWindowUpdateThreshold = shmInitialWindowSize / 4 // 8 MB
+)
+
 // shmBDPEstimator provides bandwidth-delay product estimation for the shared
 // memory transport. It mirrors the bdpEstimator from HTTP/2 but is adapted for
 // the lower-latency shared memory environment.
@@ -130,7 +148,7 @@ func (b *shmBDPEstimator) add(n uint32) bool {
 	defer b.mu.Unlock()
 
 	// Double-check after acquiring lock
-	if b.bdp == bdpLimit {
+	if b.bdp == shmBDPLimit {
 		b.settled.Store(1)
 		return false
 	}
@@ -186,11 +204,11 @@ func (b *shmBDPEstimator) calculate() {
 	}
 
 	// Update BDP if the sample suggests higher capacity.
-	if float64(sample) >= beta*float64(b.bdp) && bwCurrent == b.bwMax && b.bdp != bdpLimit {
+	if float64(sample) >= beta*float64(b.bdp) && bwCurrent == b.bwMax && b.bdp != shmBDPLimit {
 		sampleFloat := float64(sample)
 		b.bdp = uint32(gamma * sampleFloat)
-		if b.bdp > bdpLimit {
-			b.bdp = bdpLimit
+		if b.bdp > shmBDPLimit {
+			b.bdp = shmBDPLimit
 			b.settled.Store(1)
 		}
 		bdp := b.bdp
