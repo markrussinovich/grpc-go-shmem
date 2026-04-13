@@ -35,27 +35,31 @@ import (
 // Design:
 //   - Callers enqueue frameEntry structs via the channel (lock-free producer side).
 //   - A single writer goroutine drains the channel and writes frames to the ring.
-//   - Control frames (WindowUpdate, Ping, Pong) use a separate high-priority channel
-//     so they are never starved behind large MESSAGE writes.
 //   - Callers that need synchronous completion (e.g., HEADERS that must know if
 //     the write failed) set a doneCh on the entry and wait for it.
+//
+// Shutdown safety:
+//   - close() marks the writer as closed and closes the channel.
+//   - enqueue/enqueueAndWait use trySend which recovers from the panic that
+//     occurs if a producer races with close(ch). This eliminates the need for
+//     a mutex on the hot path while remaining safe during shutdown.
 type shmFrameWriter struct {
-	tx   *ShmRing
-	ch   chan frameEntry // data + control frames from app goroutines
-	done chan struct{}   // closed when writer goroutine exits
-	wg   sync.WaitGroup
+	tx     *ShmRing
+	ch     chan frameEntry // data + control frames from app goroutines
+	done   chan struct{}   // closed when writer goroutine exits
+	wg     sync.WaitGroup
 	closed atomic.Bool
 }
 
 // frameEntry represents a single frame to be written to the ring.
 type frameEntry struct {
-	ctx     context.Context
-	fh      FrameHeader
-	payload []byte         // simple payload (HEADERS, TRAILERS, CANCEL, etc.)
-	hdr     []byte         // optional header prefix for BufferSlice payloads
-	data    mem.BufferSlice // zero-copy payload (MESSAGE)
-	maxChunk int           // max frame payload for chunked writes; 0 = default
-	doneCh  chan error      // if non-nil, writer sends result and caller waits
+	ctx      context.Context
+	fh       FrameHeader
+	payload  []byte         // simple payload (HEADERS, TRAILERS, CANCEL, etc.)
+	hdr      []byte         // optional header prefix for BufferSlice payloads
+	data     mem.BufferSlice // zero-copy payload (MESSAGE)
+	maxChunk int            // max frame payload for chunked writes; 0 = default
+	doneCh   chan error      // if non-nil, writer sends result and caller waits
 }
 
 const (
@@ -85,10 +89,8 @@ func (w *shmFrameWriter) writeLoop() {
 	for entry := range w.ch {
 		var err error
 		if entry.data != nil {
-			// MESSAGE path: use chunked writer for potentially large payloads
 			err = writeFrameBuffersChunked(entry.ctx, w.tx, entry.fh, entry.hdr, entry.data, entry.maxChunk)
 		} else {
-			// Simple payload path (HEADERS, TRAILERS, CANCEL, GOAWAY, PING, etc.)
 			err = writeFrame(entry.ctx, w.tx, entry.fh, entry.payload)
 		}
 		if entry.doneCh != nil {
@@ -97,14 +99,29 @@ func (w *shmFrameWriter) writeLoop() {
 	}
 }
 
-// enqueue submits a frame for asynchronous writing. The caller does not block
-// on the ring (only on channel send if the queue is full). Returns an error
-// immediately if the writer has been closed.
+// trySend attempts to send an entry to the channel. Returns false if the
+// channel is closed (recovering from the panic). This is safe because the
+// only goroutine that closes w.ch is close(), and a recovered panic here
+// simply means "writer is shutting down".
+func (w *shmFrameWriter) trySend(entry frameEntry) (ok bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			ok = false
+		}
+	}()
+	w.ch <- entry
+	return true
+}
+
+// enqueue submits a frame for asynchronous writing. Returns ErrConnClosing
+// if the writer has been closed or is racing with close.
 func (w *shmFrameWriter) enqueue(entry frameEntry) error {
 	if w.closed.Load() {
 		return ErrConnClosing
 	}
-	w.ch <- entry
+	if !w.trySend(entry) {
+		return ErrConnClosing
+	}
 	return nil
 }
 
@@ -116,12 +133,15 @@ func (w *shmFrameWriter) enqueueAndWait(entry frameEntry) error {
 		return ErrConnClosing
 	}
 	entry.doneCh = make(chan error, 1)
-	w.ch <- entry
+	if !w.trySend(entry) {
+		return ErrConnClosing
+	}
 	return <-entry.doneCh
 }
 
 // close shuts down the writer goroutine. It closes the channel, causing
 // writeLoop to drain remaining entries and exit. Blocks until completion.
+// Any concurrent enqueue calls will get ErrConnClosing via trySend's recover.
 func (w *shmFrameWriter) close() {
 	if w.closed.Swap(true) {
 		return // already closed

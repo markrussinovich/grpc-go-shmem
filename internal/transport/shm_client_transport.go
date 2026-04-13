@@ -674,9 +674,6 @@ func (t *ShmClientTransport) Close(err error) {
 		// Cancel context to stop background reader goroutine and keepalive.
 		t.cancel()
 
-		// Shut down the frame writer so pending entries drain before rings close.
-		t.frameWriter.close()
-
 		// Wake up the keepalive goroutine if it's dormant, so it can exit.
 		t.mu.Lock()
 		if t.kpDormant {
@@ -690,8 +687,6 @@ func (t *ShmClientTransport) Close(err error) {
 		}
 
 		// Terminate all active streams before closing/unmapping the segment.
-		// This prevents concurrent stream Close paths from touching unmapped ring
-		// memory.
 		t.mu.Lock()
 		streams := make([]*ClientStream, 0, len(t.streams))
 		for _, stream := range t.streams {
@@ -704,8 +699,9 @@ func (t *ShmClientTransport) Close(err error) {
 			t.closeStream(stream, err, false, 0, status.Convert(err), nil, false)
 		}
 
-		// Close the rings and wait for the background reader to exit before
-		// unmapping.
+		// Close the rings FIRST so any writeFrame blocked inside the writer
+		// goroutine gets ErrRingClosed and unblocks. Then close the frame
+		// writer to drain remaining entries and stop the goroutine.
 		if !segClosed {
 			if t.clientToServer != nil {
 				_ = t.clientToServer.Close()
@@ -714,6 +710,7 @@ func (t *ShmClientTransport) Close(err error) {
 				_ = t.serverToClient.Close()
 			}
 		}
+		t.frameWriter.close()
 		t.readerWG.Wait()
 
 		// Close the named events (Windows)
@@ -1092,6 +1089,7 @@ func (t *ShmClientTransport) closeStream(s *ClientStream, err error, rst bool, _
 	}
 	t.sendQuotaMu.Lock()
 	delete(t.streamSendQuota, s.id)
+	delete(t.pendingStreamWU, s.id)
 	t.sendQuotaMu.Unlock()
 	delete(t.streamInFlow, s.id)
 	t.streamQuota++

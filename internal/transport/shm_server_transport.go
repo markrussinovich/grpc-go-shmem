@@ -759,11 +759,14 @@ func (t *ShmServerTransport) handlePing(ctx context.Context, payload []byte) {
 	if t.closed.Load() {
 		return
 	}
-	// Send PONG.
+	// Send PONG. Copy payload because the caller releases the underlying
+	// ring memory immediately after this returns.
+	pongPayload := make([]byte, len(payload))
+	copy(pongPayload, payload)
 	_ = t.frameWriter.enqueue(frameEntry{
 		ctx:     ctx,
 		fh:      FrameHeader{Type: FrameTypePONG},
-		payload: payload,
+		payload: pongPayload,
 	})
 
 	now := time.Now()
@@ -964,14 +967,14 @@ func (t *ShmServerTransport) Close(err error) {
 		// Cancel context to stop all goroutines
 		t.cancel()
 
-		// Shut down the frame writer first so no new writes hit the ring.
-		t.frameWriter.close()
-
-		// Close the rings
+		// Close the rings FIRST so any writeFrame blocked inside the writer
+		// goroutine gets ErrRingClosed and unblocks. Then close the frame
+		// writer to drain remaining entries and stop the goroutine.
 		if !segClosed {
 			t.serverToClient.Close()
 			t.clientToServer.Close()
 		}
+		t.frameWriter.close()
 
 		// Close the named events (Windows)
 		if t.readEvents != nil {
@@ -1201,9 +1204,10 @@ func (t *ShmServerTransport) writeStatus(s *ServerStream, st *status.Status) err
 
 	shmDebugf("[DEBUG] ShmServerTransport.writeStatus: Successfully wrote TRAILERS frame")
 
-	// Remove stream send quota (protected by sendQuotaMu).
+	// Remove stream send quota and pending window update (protected by sendQuotaMu).
 	t.sendQuotaMu.Lock()
 	delete(t.streamSendQuota, s.id)
+	delete(t.pendingStreamWU, s.id)
 	t.sendQuotaMu.Unlock()
 
 	// Remove stream from active streams and finish draining if needed.
