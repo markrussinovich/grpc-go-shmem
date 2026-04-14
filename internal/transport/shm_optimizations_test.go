@@ -302,6 +302,73 @@ func TestShmWindowUpdateStreamCleanup(t *testing.T) {
 	}
 }
 
+func TestShmWindowUpdateServerStreamCleanup(t *testing.T) {
+	// Verify that pendingStreamWU entries are cleaned up on the server side
+	// when a stream is terminated via handleTrailers or handleCancel.
+	segName := testSegName("test_wu_srv_cleanup")
+	defer RemoveSegment(segName)
+
+	seg, err := CreateSegment(segName, 128*1024, 128*1024)
+	if err != nil {
+		t.Fatalf("CreateSegment: %v", err)
+	}
+	defer seg.Close()
+	seg.H.SetServerReady(true)
+
+	st, err := NewShmServerTransport(seg, &ShmAddr{Name: segName + "_s"}, &ShmAddr{Name: segName + "_c"})
+	if err != nil {
+		t.Fatalf("NewShmServerTransport: %v", err)
+	}
+	defer st.Close(nil)
+
+	// Simulate two streams with pending (sub-threshold) WindowUpdate deltas.
+	streamA := uint32(1)
+	streamB := uint32(3)
+
+	st.sendWindowUpdate(streamA, 4096)
+	st.sendWindowUpdate(streamB, 4096)
+
+	st.sendQuotaMu.Lock()
+	_, existsA := st.pendingStreamWU[streamA]
+	_, existsB := st.pendingStreamWU[streamB]
+	st.sendQuotaMu.Unlock()
+	if !existsA || !existsB {
+		t.Fatal("pendingStreamWU should have entries after sendWindowUpdate")
+	}
+
+	// handleTrailers should clean up streamA's entry.
+	// Build a minimal valid trailers payload.
+	trailers := encodeTrailers(TrailersV1{Version: 1, GRPCStatusCode: 0, GRPCStatusMsg: "OK"})
+	// Register a fake stream so handleTrailers doesn't bail early.
+	st.mu.Lock()
+	st.streams[streamA] = &ServerStream{Stream: Stream{id: streamA, ctx: context.Background()}}
+	st.mu.Unlock()
+	st.handleTrailers(streamA, trailers)
+
+	st.sendQuotaMu.Lock()
+	_, existsA = st.pendingStreamWU[streamA]
+	st.sendQuotaMu.Unlock()
+	if existsA {
+		t.Error("pendingStreamWU[streamA] should be cleaned up after handleTrailers")
+	}
+
+	// handleCancel should clean up streamB's entry.
+	cancelCtx, cancelFn := context.WithCancel(context.Background())
+	sB := &ServerStream{Stream: Stream{id: streamB, ctx: cancelCtx}}
+	sB.cancel = cancelFn
+	st.mu.Lock()
+	st.streams[streamB] = sB
+	st.mu.Unlock()
+	st.handleCancel(streamB)
+
+	st.sendQuotaMu.Lock()
+	_, existsB = st.pendingStreamWU[streamB]
+	st.sendQuotaMu.Unlock()
+	if existsB {
+		t.Error("pendingStreamWU[streamB] should be cleaned up after handleCancel")
+	}
+}
+
 // ---------------------------------------------------------------------------
 // SHM flow control constants tests
 // ---------------------------------------------------------------------------

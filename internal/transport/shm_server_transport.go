@@ -841,9 +841,10 @@ func (t *ShmServerTransport) handleTrailers(streamID uint32, payload []byte) {
 	// Signal end-of-client-stream to the stream.
 	s.write(recvMsg{err: endErr})
 
-	// Remove stream send quota (protected by sendQuotaMu).
+	// Remove stream send quota and pending window update (protected by sendQuotaMu).
 	t.sendQuotaMu.Lock()
 	delete(t.streamSendQuota, streamID)
+	delete(t.pendingStreamWU, streamID)
 	t.sendQuotaMu.Unlock()
 
 	// Remove stream from active streams and finish draining if needed.
@@ -882,9 +883,10 @@ func (t *ShmServerTransport) handleCancel(streamID uint32) {
 	// Cancel the stream context
 	s.cancel()
 
-	// Remove stream send quota (protected by sendQuotaMu).
+	// Remove stream send quota and pending window update (protected by sendQuotaMu).
 	t.sendQuotaMu.Lock()
 	delete(t.streamSendQuota, streamID)
+	delete(t.pendingStreamWU, streamID)
 	t.sendQuotaMu.Unlock()
 
 	// Remove from active streams and finish draining if needed.
