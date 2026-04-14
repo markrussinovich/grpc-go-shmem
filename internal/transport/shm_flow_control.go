@@ -76,12 +76,8 @@ const (
 )
 
 // shmBDPEstimator provides bandwidth-delay product estimation for the shared
-// memory transport. It mirrors the bdpEstimator from HTTP/2 but is adapted for
-// the lower-latency shared memory environment.
-//
-// RFC A73 Phase 5: Flow Control Alignment
-// The shmem transport shares flow control settings with HTTP/2 configuration,
-// using the same initial window sizes and dynamic BDP estimation algorithm.
+// memory transport. It uses the same exponential moving average algorithm as
+// HTTP/2's bdpEstimator but with a higher ceiling (shmBDPLimit = 64 MB).
 //
 // Performance optimization: Uses atomic operations for the hot path (add)
 // to avoid mutex contention on every message.

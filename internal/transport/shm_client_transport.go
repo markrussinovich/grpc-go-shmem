@@ -661,14 +661,18 @@ func (t *ShmClientTransport) Close(err error) {
 		t.notifyQuotaChangeLocked()
 		t.sendQuotaMu.Unlock()
 
-		// Best-effort GOAWAY before tearing down rings so the peer observes the
-		// shutdown intent (mirrors http2 immediate close behavior).
+		// Best-effort GOAWAY before tearing down rings. Uses non-blocking
+		// send to avoid deadlock if the writer queue is full.
 		if t.clientToServer != nil && !segClosed {
-			_ = t.frameWriter.enqueue(frameEntry{
+			select {
+			case t.frameWriter.ch <- frameEntry{
 				ctx:     context.Background(),
 				fh:      FrameHeader{Type: FrameTypeGOAWAY, Flags: GoAwayFlagIMMEDIATE},
 				payload: []byte("client closing"),
-			})
+			}:
+			default:
+				// Queue full, skip GOAWAY — ring is about to close anyway.
+			}
 		}
 
 		// Cancel context to stop background reader goroutine and keepalive.

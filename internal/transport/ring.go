@@ -953,7 +953,7 @@ func (r *ShmRing) ReadBlockingContext(ctx context.Context, buf []byte) (int, err
 			// Memory ordering rationale:
 			// 1) Reader copies out bytes first
 			// 2) Publish the new read index with an atomic store (acts as a release)
-			// 3) Bump contigSeq always (contiguity improved), wake spaceSeq waiters if any.
+			// 3) Bump contigSeq if waiters, wake spaceSeq waiters if any.
 			hdr.SetReadIndex(readIdx + uint64(bytesRead)) // release-publish
 
 			if bytesRead > 0 && hdr.ContigWaiters() > 0 {

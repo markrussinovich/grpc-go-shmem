@@ -938,13 +938,17 @@ func (t *ShmServerTransport) Close(err error) {
 		t.sendQuotaMu.Unlock()
 
 		// Best-effort notify peer that we're closing immediately with debug data.
-		// Use the frame writer which will drain remaining entries before close.
+		// Uses non-blocking send to avoid deadlock if the writer queue is full.
 		if t.serverToClient != nil && !segClosed {
-			_ = t.frameWriter.enqueue(frameEntry{
+			select {
+			case t.frameWriter.ch <- frameEntry{
 				ctx:     context.Background(),
 				fh:      FrameHeader{Type: FrameTypeGOAWAY, Flags: GoAwayFlagIMMEDIATE},
 				payload: []byte("server closing"),
-			})
+			}:
+			default:
+				// Queue full, skip GOAWAY — ring is about to close anyway.
+			}
 		}
 
 		// Snapshot and terminate all active streams.
