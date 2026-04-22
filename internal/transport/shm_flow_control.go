@@ -22,37 +22,32 @@
 //
 // RFC A73 Phase 5: Flow Control Alignment
 //
-// The shared memory transport intentionally shares flow control settings with
-// the HTTP/2 transport configuration to provide a consistent behavior model:
+// The shared memory transport uses its own optimized flow control constants
+// that differ from HTTP/2's defaults because local shared memory has near-zero
+// RTT and much higher bandwidth than TCP:
 //
-// - Initial window size: Uses the same default (64KB) as HTTP/2
-// - Maximum window size: Aligned with HTTP/2's limit (16MB = bdpLimit)
-// - BDP estimation algorithm: Mirrors HTTP/2's exponential moving average
-// - WINDOW_UPDATE semantics: Same delta-based flow control
+// - Initial window size: 32 MB (vs HTTP/2's 64 KB) to avoid stalling on
+//   WindowUpdate round-trips for large local RPCs.
+// - Maximum BDP window: 64 MB (vs HTTP/2's 16 MB) to fully utilize local
+//   memory bandwidth.
+// - WindowUpdate batching: deltas are accumulated and only sent when they
+//   exceed shmWindowUpdateThreshold (8 MB), reducing control frame overhead.
+// - BDP estimation: same exponential moving average algorithm as HTTP/2 but
+//   with the higher shmBDPLimit ceiling.
 //
-// Key constants shared with HTTP/2:
+// Key SHM-specific constants:
+//   - shmInitialWindowSize = 32 MB: initial per-stream window
+//   - shmBDPLimit = 64 MB: maximum BDP window
+//   - shmWindowUpdateThreshold = 8 MB: batching threshold
+//
+// BDP algorithm constants (shared with HTTP/2):
 //   - alpha = 0.9: Smoothing factor for RTT estimation
 //   - beta = 0.66: Threshold for BDP increase trigger
 //   - gamma = 2: Multiplicative factor for BDP growth
-//   - bdpLimit = 1 << 20 * 16 (16MB): Maximum BDP window
 //
-// The shmBDPEstimator tracks bandwidth-delay product by:
-// 1. Sending periodic BDP pings when data flow starts
-// 2. Measuring round-trip time from ping to ack
-// 3. Calculating BDP as (bytes_received / RTT)
-// 4. Dynamically adjusting window size based on estimated BDP
-//
-// Stream Scheduling:
-// StreamScheduler implements weighted fair queueing (WFQ) based on HTTP/2's
-// priority model. Each stream gets a weight (default 16), and the scheduler
-// allocates bandwidth proportionally using deficit-based round robin.
-//
-// Configuration:
-// Flow control settings are configured via gRPC dial/server options and apply
-// uniformly to both HTTP/2 and shared memory transports:
-//   - grpc.WithInitialWindowSize() - sets initial per-stream window
-//   - grpc.WithInitialConnWindowSize() - sets initial connection window
-//   - grpc.MaxRecvMsgSize() - limits maximum message size
+// Note: gRPC dial/server options (WithInitialWindowSize, etc.) do NOT currently
+// override the SHM-specific constants. The SHM transport always uses the
+// hardcoded values above. This may change in a future revision.
 
 package transport
 
@@ -62,19 +57,33 @@ import (
 	"time"
 )
 
+// SHM-specific flow control constants.
+// Unlike HTTP/2 over TCP, shared memory is local with near-zero RTT, so we use
+// much larger initial windows to avoid stalling on WindowUpdate round-trips.
+const (
+	// shmInitialWindowSize is the initial per-stream flow control window for
+	// the shared memory transport. Set to 32 MB to allow large local RPCs
+	// without waiting for BDP ramp-up.
+	shmInitialWindowSize = 32 * 1024 * 1024 // 32 MB
+
+	// shmBDPLimit is the maximum BDP window size for SHM. This is 4x the
+	// HTTP/2 limit (16 MB) because local memory bandwidth is much higher.
+	shmBDPLimit = 64 * 1024 * 1024 // 64 MB
+
+	// shmWindowUpdateThreshold is the minimum accumulated bytes before a
+	// WindowUpdate frame is sent. Batching reduces frame write overhead.
+	shmWindowUpdateThreshold = shmInitialWindowSize / 4 // 8 MB
+)
+
 // shmBDPEstimator provides bandwidth-delay product estimation for the shared
-// memory transport. It mirrors the bdpEstimator from HTTP/2 but is adapted for
-// the lower-latency shared memory environment.
-//
-// RFC A73 Phase 5: Flow Control Alignment
-// The shmem transport shares flow control settings with HTTP/2 configuration,
-// using the same initial window sizes and dynamic BDP estimation algorithm.
+// memory transport. It uses the same exponential moving average algorithm as
+// HTTP/2's bdpEstimator but with a higher ceiling (shmBDPLimit = 64 MB).
 //
 // Performance optimization: Uses atomic operations for the hot path (add)
 // to avoid mutex contention on every message.
 type shmBDPEstimator struct {
 	// Fast path fields - accessed atomically without lock
-	// settled is 1 when BDP estimation is complete (bdp == bdpLimit)
+	// settled is 1 when BDP estimation is complete (bdp == shmBDPLimit)
 	settled atomic.Uint32
 	// sample is updated atomically during measurement
 	sampleAtomic atomic.Uint32
@@ -114,7 +123,7 @@ func newShmBDPEstimator(initialWindow uint32, updateFn func(n uint32)) *shmBDPEs
 // add adds bytes to the current sample. Returns true if a BDP ping should be sent.
 // This is the hot path - optimized to avoid mutex in common cases.
 func (b *shmBDPEstimator) add(n uint32) bool {
-	// Fast path: if already settled at bdpLimit, nothing to do
+	// Fast path: if already settled at shmBDPLimit, nothing to do
 	if b.settled.Load() != 0 {
 		return false
 	}
@@ -130,7 +139,7 @@ func (b *shmBDPEstimator) add(n uint32) bool {
 	defer b.mu.Unlock()
 
 	// Double-check after acquiring lock
-	if b.bdp == bdpLimit {
+	if b.bdp == shmBDPLimit {
 		b.settled.Store(1)
 		return false
 	}
@@ -186,11 +195,11 @@ func (b *shmBDPEstimator) calculate() {
 	}
 
 	// Update BDP if the sample suggests higher capacity.
-	if float64(sample) >= beta*float64(b.bdp) && bwCurrent == b.bwMax && b.bdp != bdpLimit {
+	if float64(sample) >= beta*float64(b.bdp) && bwCurrent == b.bwMax && b.bdp != shmBDPLimit {
 		sampleFloat := float64(sample)
 		b.bdp = uint32(gamma * sampleFloat)
-		if b.bdp > bdpLimit {
-			b.bdp = bdpLimit
+		if b.bdp > shmBDPLimit {
+			b.bdp = shmBDPLimit
 			b.settled.Store(1)
 		}
 		bdp := b.bdp

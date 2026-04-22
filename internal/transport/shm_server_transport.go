@@ -67,9 +67,10 @@ type ShmServerTransport struct {
 	draining atomic.Bool
 	// drainDebugData is used for error reporting when draining completes.
 	drainDebugData string
-	// writeMu serializes writes to the server->client ring.
-	writeMu sync.Mutex
-	mu      sync.RWMutex
+	// frameWriter serializes writes to the server->client ring via a dedicated
+	// goroutine, eliminating lock contention from multiple stream handlers.
+	frameWriter *shmFrameWriter
+	mu          sync.RWMutex
 
 	// Stream management
 	streams    map[uint32]*ServerStream
@@ -88,6 +89,10 @@ type ShmServerTransport struct {
 	bdpEst            *shmBDPEstimator
 	initialWindowSize int32
 	streamScheduler   *StreamScheduler
+
+	// WindowUpdate batching: accumulate deltas and flush when threshold exceeded.
+	pendingConnWU   uint32
+	pendingStreamWU map[uint32]uint32
 
 	// Error handling
 	closeOnce sync.Once
@@ -114,12 +119,14 @@ func (t *ShmServerTransport) sendGoAway(flags uint8, debugData string) {
 	if t.closed.Load() || t.serverToClient == nil {
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-
-	t.writeMu.Lock()
-	defer t.writeMu.Unlock()
-	_ = writeFrame(ctx, t.serverToClient, FrameHeader{Type: FrameTypeGOAWAY, Flags: flags}, []byte(debugData))
+	// Use a background context; the frame writer will handle the write
+	// lifetime. We cannot use WithTimeout+defer cancel here because the
+	// context would be canceled before the writer goroutine processes it.
+	_ = t.frameWriter.enqueue(frameEntry{
+		ctx:     context.Background(),
+		fh:      FrameHeader{Type: FrameTypeGOAWAY, Flags: flags},
+		payload: []byte(debugData),
+	})
 }
 
 func (t *ShmServerTransport) notifyQuotaChangeLocked() {
@@ -181,14 +188,39 @@ func (t *ShmServerTransport) sendWindowUpdate(streamID uint32, delta uint32) {
 	if delta == 0 || t.closed.Load() {
 		return
 	}
+	// Batch WindowUpdate deltas: only send a frame when the accumulated
+	// delta exceeds shmWindowUpdateThreshold (8 MB).
+	t.sendQuotaMu.Lock()
+	if streamID == 0 {
+		t.pendingConnWU += delta
+		if t.pendingConnWU < shmWindowUpdateThreshold {
+			t.sendQuotaMu.Unlock()
+			return
+		}
+		delta = t.pendingConnWU
+		t.pendingConnWU = 0
+	} else {
+		t.pendingStreamWU[streamID] += delta
+		if t.pendingStreamWU[streamID] < shmWindowUpdateThreshold {
+			t.sendQuotaMu.Unlock()
+			return
+		}
+		delta = t.pendingStreamWU[streamID]
+		delete(t.pendingStreamWU, streamID)
+	}
+	t.sendQuotaMu.Unlock()
+
 	buf := make([]byte, 4)
 	binary.LittleEndian.PutUint32(buf, delta)
-	_ = writeFrame(context.Background(), t.serverToClient, FrameHeader{Type: FrameTypeWindowUpdate, StreamID: streamID}, buf)
+	_ = t.frameWriter.enqueue(frameEntry{
+		ctx:     context.Background(),
+		fh:      FrameHeader{Type: FrameTypeWindowUpdate, StreamID: streamID},
+		payload: buf,
+	})
 }
 
 // updateFlowControl updates the incoming flow control windows for the
 // transport and all active streams based on the current BDP estimation.
-// This mirrors HTTP/2's dynamic window adjustment behavior.
 func (t *ShmServerTransport) updateFlowControl(n uint32) {
 	t.mu.Lock()
 	t.initialWindowSize = int32(n)
@@ -209,7 +241,11 @@ func (t *ShmServerTransport) sendBDPPing() {
 		return
 	}
 	t.bdpEst.timesnap()
-	_ = writeFrame(context.Background(), t.serverToClient, FrameHeader{Type: FrameTypePING, Flags: PingFlagBDP}, bdpPing.data[:])
+	_ = t.frameWriter.enqueue(frameEntry{
+		ctx:     context.Background(),
+		fh:      FrameHeader{Type: FrameTypePING, Flags: PingFlagBDP},
+		payload: bdpPing.data[:],
+	})
 }
 
 func (t *ShmServerTransport) rejectNewStream(streamID uint32, msg string) {
@@ -222,12 +258,11 @@ func (t *ShmServerTransport) rejectNewStream(streamID uint32, msg string) {
 	trailers := encodeTrailers(TrailersV1{Version: 1, GRPCStatusCode: uint32(codes.Unavailable), GRPCStatusMsg: msg})
 	fh := FrameHeader{Type: FrameTypeTRAILERS, StreamID: streamID, Length: uint32(len(trailers))}
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-
-	t.writeMu.Lock()
-	defer t.writeMu.Unlock()
-	_ = writeFrame(ctx, t.serverToClient, fh, trailers)
+	_ = t.frameWriter.enqueue(frameEntry{
+		ctx:     context.Background(),
+		fh:      fh,
+		payload: trailers,
+	})
 }
 
 // NewShmServerTransport creates a new shared memory server transport.
@@ -273,20 +308,25 @@ func NewShmServerTransport(segment *Segment, localAddr, remoteAddr net.Addr) (*S
 		streams:         make(map[uint32]*ServerStream),
 		streamSendQuota: make(map[uint32]int64),
 		streamInFlow:    make(map[uint32]*inFlow),
+		pendingStreamWU: make(map[uint32]uint32),
 		errCh:           make(chan struct{}),
 		quotaSignal:     make(chan struct{}),
 		done:            make(chan struct{}),
 		keepaliveDone:   make(chan struct{}),
 	}
+	// Start the dedicated frame writer goroutine for the server→client ring.
+	t.frameWriter = newShmFrameWriter(serverToClient)
+
 	// Initialize flow control windows.
 	t.connSendQuota = int64(maxWindowSize)
 	t.connInFlow = trInFlow{limit: uint32(maxWindowSize)}
 	t.connInFlow.updateEffectiveWindowSize()
 
 	// Initialize BDP estimation for dynamic flow control (RFC A73 Phase 5).
-	// This aligns with HTTP/2's BDP-based window adjustment.
-	t.initialWindowSize = initialWindowSize
-	t.bdpEst = newShmBDPEstimator(uint32(initialWindowSize), t.updateFlowControl)
+	// SHM uses a much larger initial window (32MB) than HTTP/2 (64KB) because
+	// local memory has near-zero RTT and high bandwidth.
+	t.initialWindowSize = shmInitialWindowSize
+	t.bdpEst = newShmBDPEstimator(uint32(shmInitialWindowSize), t.updateFlowControl)
 	t.streamScheduler = NewStreamScheduler()
 
 	max := segment.H.MaxStreams()
@@ -719,10 +759,15 @@ func (t *ShmServerTransport) handlePing(ctx context.Context, payload []byte) {
 	if t.closed.Load() {
 		return
 	}
-	// Send PONG.
-	t.writeMu.Lock()
-	_ = writeFrame(ctx, t.serverToClient, FrameHeader{Type: FrameTypePONG}, payload)
-	t.writeMu.Unlock()
+	// Send PONG. Copy payload because the caller releases the underlying
+	// ring memory immediately after this returns.
+	pongPayload := make([]byte, len(payload))
+	copy(pongPayload, payload)
+	_ = t.frameWriter.enqueue(frameEntry{
+		ctx:     ctx,
+		fh:      FrameHeader{Type: FrameTypePONG},
+		payload: pongPayload,
+	})
 
 	now := time.Now()
 	defer func() {
@@ -796,9 +841,10 @@ func (t *ShmServerTransport) handleTrailers(streamID uint32, payload []byte) {
 	// Signal end-of-client-stream to the stream.
 	s.write(recvMsg{err: endErr})
 
-	// Remove stream send quota (protected by sendQuotaMu).
+	// Remove stream send quota and pending window update (protected by sendQuotaMu).
 	t.sendQuotaMu.Lock()
 	delete(t.streamSendQuota, streamID)
+	delete(t.pendingStreamWU, streamID)
 	t.sendQuotaMu.Unlock()
 
 	// Remove stream from active streams and finish draining if needed.
@@ -837,9 +883,10 @@ func (t *ShmServerTransport) handleCancel(streamID uint32) {
 	// Cancel the stream context
 	s.cancel()
 
-	// Remove stream send quota (protected by sendQuotaMu).
+	// Remove stream send quota and pending window update (protected by sendQuotaMu).
 	t.sendQuotaMu.Lock()
 	delete(t.streamSendQuota, streamID)
+	delete(t.pendingStreamWU, streamID)
 	t.sendQuotaMu.Unlock()
 
 	// Remove from active streams and finish draining if needed.
@@ -891,11 +938,17 @@ func (t *ShmServerTransport) Close(err error) {
 		t.sendQuotaMu.Unlock()
 
 		// Best-effort notify peer that we're closing immediately with debug data.
-		// Hold writeMu to avoid racing with handler goroutines that may still be writing.
+		// Uses non-blocking send to avoid deadlock if the writer queue is full.
 		if t.serverToClient != nil && !segClosed {
-			t.writeMu.Lock()
-			_ = writeFrame(context.Background(), t.serverToClient, FrameHeader{Type: FrameTypeGOAWAY, Flags: GoAwayFlagIMMEDIATE}, []byte("server closing"))
-			t.writeMu.Unlock()
+			select {
+			case t.frameWriter.ch <- frameEntry{
+				ctx:     context.Background(),
+				fh:      FrameHeader{Type: FrameTypeGOAWAY, Flags: GoAwayFlagIMMEDIATE},
+				payload: []byte("server closing"),
+			}:
+			default:
+				// Queue full, skip GOAWAY — ring is about to close anyway.
+			}
 		}
 
 		// Snapshot and terminate all active streams.
@@ -920,11 +973,14 @@ func (t *ShmServerTransport) Close(err error) {
 		// Cancel context to stop all goroutines
 		t.cancel()
 
-		// Close the rings
+		// Close the rings FIRST so any writeFrame blocked inside the writer
+		// goroutine gets ErrRingClosed and unblocks. Then close the frame
+		// writer to drain remaining entries and stop the goroutine.
 		if !segClosed {
 			t.serverToClient.Close()
 			t.clientToServer.Close()
 		}
+		t.frameWriter.close()
 
 		// Close the named events (Windows)
 		if t.readEvents != nil {
@@ -1028,10 +1084,13 @@ func (t *ShmServerTransport) writeHeader(s *ServerStream, md metadata.MD) error 
 
 	shmDebugf("[DEBUG] ShmServerTransport.writeHeader: Writing HEADERS frame, streamID=%d, length=%d", s.id, fh.Length)
 
-	// Write frame to server->client ring
-	t.writeMu.Lock()
-	defer t.writeMu.Unlock()
-	if err := writeFrame(context.Background(), t.serverToClient, fh, payload); err != nil {
+	// Write frame via the dedicated writer goroutine.
+	// HEADERS must be synchronous so the caller knows if it failed.
+	if err := t.frameWriter.enqueueAndWait(frameEntry{
+		ctx:     context.Background(),
+		fh:      fh,
+		payload: payload,
+	}); err != nil {
 		shmDebugf("[ERROR] ShmServerTransport.writeHeader: Failed to write frame: %v", err)
 		return err
 	}
@@ -1075,10 +1134,14 @@ func (t *ShmServerTransport) write(s *ServerStream, hdr []byte, data mem.BufferS
 		StreamID: s.id,
 	}
 
-	// Write frame to server->client ring
-	t.writeMu.Lock()
-	defer t.writeMu.Unlock()
-	if err := writeFrameBuffersChunked(context.Background(), t.serverToClient, fh, hdr, data, 0); err != nil {
+	// Write frame via the dedicated writer goroutine.
+	if err := t.frameWriter.enqueueAndWait(frameEntry{
+		ctx:      context.Background(),
+		fh:       fh,
+		hdr:      hdr,
+		data:     data,
+		maxChunk: 0,
+	}); err != nil {
 		shmDebugf("[ERROR] ShmServerTransport.write: Failed to write frame: %v", err)
 		return err
 	}
@@ -1135,19 +1198,22 @@ func (t *ShmServerTransport) writeStatus(s *ServerStream, st *status.Status) err
 
 	shmDebugf("[DEBUG] ShmServerTransport.writeStatus: Writing TRAILERS frame, streamID=%d, length=%d", s.id, fh.Length)
 
-	// Write frame to server->client ring
-	t.writeMu.Lock()
-	defer t.writeMu.Unlock()
-	if err := writeFrame(context.Background(), t.serverToClient, fh, payload); err != nil {
+	// Write frame via the dedicated writer goroutine.
+	if err := t.frameWriter.enqueueAndWait(frameEntry{
+		ctx:     context.Background(),
+		fh:      fh,
+		payload: payload,
+	}); err != nil {
 		shmDebugf("[ERROR] ShmServerTransport.writeStatus: Failed to write frame: %v", err)
 		return err
 	}
 
 	shmDebugf("[DEBUG] ShmServerTransport.writeStatus: Successfully wrote TRAILERS frame")
 
-	// Remove stream send quota (protected by sendQuotaMu).
+	// Remove stream send quota and pending window update (protected by sendQuotaMu).
 	t.sendQuotaMu.Lock()
 	delete(t.streamSendQuota, s.id)
+	delete(t.pendingStreamWU, s.id)
 	t.sendQuotaMu.Unlock()
 
 	// Remove stream from active streams and finish draining if needed.
@@ -1233,9 +1299,11 @@ func (t *ShmServerTransport) ConfigureKeepalive(kp keepalive.ServerParameters, k
 func (t *ShmServerTransport) sendPing() error {
 	var data [8]byte
 	binary.LittleEndian.PutUint64(data[:], uint64(time.Now().UnixNano()))
-	t.writeMu.Lock()
-	defer t.writeMu.Unlock()
-	return writeFrame(context.Background(), t.serverToClient, FrameHeader{Type: FrameTypePING}, data[:])
+	return t.frameWriter.enqueueAndWait(frameEntry{
+		ctx:     context.Background(),
+		fh:      FrameHeader{Type: FrameTypePING},
+		payload: data[:],
+	})
 }
 
 // keepalive monitors connection health and enforces server-side policies:
