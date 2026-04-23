@@ -27,6 +27,7 @@ import (
 	"os"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 	"unsafe"
 
@@ -42,20 +43,13 @@ var (
 	procWakeByAddressAll    = modSync.NewProc("WakeByAddressAll")
 	waitProcsOnce           sync.Once
 	waitProcsErr            error
-	waitCounts              sync.Map
-)
 
-func trackWaiter(addr *uint32) func() {
-	key := uintptr(unsafe.Pointer(addr))
-	ptr, _ := waitCounts.LoadOrStore(key, new(int64))
-	cnt := ptr.(*int64)
-	atomic.AddInt64(cnt, 1)
-	return func() {
-		if atomic.AddInt64(cnt, -1) == 0 {
-			waitCounts.Delete(key)
-		}
-	}
-}
+	// Cached proc addresses for direct syscall, avoiding LazyProc.Call()
+	// overhead (2 extra function calls + variadic slice allocations per call).
+	waitOnAddressAddr       uintptr
+	wakeByAddressSingleAddr uintptr
+	wakeByAddressAllAddr    uintptr
+)
 
 func futexLogf(format string, args ...any) {
 	if !futexDebugEnabled {
@@ -76,6 +70,11 @@ func ensureWaitProcs() error {
 				return
 			}
 		}
+		// Cache raw addresses so we can call syscall.Syscall6 directly,
+		// bypassing LazyProc.Call() → Proc.Call() → SyscallN() overhead.
+		waitOnAddressAddr = procWaitOnAddress.Addr()
+		wakeByAddressSingleAddr = procWakeByAddressSingle.Addr()
+		wakeByAddressAllAddr = procWakeByAddressAll.Addr()
 	})
 	if waitProcsErr != nil {
 		return fmt.Errorf("wait-on-address unavailable: %w", waitProcsErr)
@@ -87,18 +86,22 @@ func waitOnAddress(addr *uint32, val uint32, timeoutMs uint32) error {
 	if err := ensureWaitProcs(); err != nil {
 		return fmt.Errorf("%w: %v", ErrFutexNotSupported, err)
 	}
-	r1, _, e1 := procWaitOnAddress.Call(uintptr(unsafe.Pointer(addr)), uintptr(unsafe.Pointer(&val)), unsafe.Sizeof(val), uintptr(timeoutMs))
-	if errno, ok := e1.(windows.Errno); ok && errno == windows.ERROR_SUCCESS {
+	// Use syscall.Syscall6 directly with cached proc address to avoid
+	// LazyProc.Call() overhead (mustFind check + 2 variadic forwardings).
+	r1, _, e1 := syscall.Syscall6(waitOnAddressAddr, 4,
+		uintptr(unsafe.Pointer(addr)),
+		uintptr(unsafe.Pointer(&val)),
+		unsafe.Sizeof(val),
+		uintptr(timeoutMs),
+		0, 0)
+	if e1 == 0 {
 		return nil
 	}
 	if r1 == 0 {
-		if errno, ok := e1.(windows.Errno); ok {
-			if errno == windows.ERROR_TIMEOUT {
-				return ErrFutexTimeout
-			}
-			return fmt.Errorf("WaitOnAddress: %w", errno)
+		if e1 == syscall.Errno(windows.ERROR_TIMEOUT) {
+			return ErrFutexTimeout
 		}
-		return fmt.Errorf("WaitOnAddress: %v", e1)
+		return fmt.Errorf("WaitOnAddress: %w", e1)
 	}
 	return nil
 }
@@ -107,19 +110,19 @@ func wakeByAddress(addr *uint32, wakeAll bool) error {
 	if err := ensureWaitProcs(); err != nil {
 		return fmt.Errorf("%w: %v", ErrFutexNotSupported, err)
 	}
-	proc := procWakeByAddressSingle
+	// Use syscall.Syscall directly with cached proc address.
+	fnAddr := wakeByAddressSingleAddr
 	if wakeAll {
-		proc = procWakeByAddressAll
+		fnAddr = wakeByAddressAllAddr
 	}
-	r1, _, e1 := proc.Call(uintptr(unsafe.Pointer(addr)))
-	if errno, ok := e1.(windows.Errno); ok && errno == windows.ERROR_SUCCESS {
+	r1, _, e1 := syscall.Syscall(fnAddr, 1,
+		uintptr(unsafe.Pointer(addr)),
+		0, 0)
+	if e1 == 0 {
 		return nil
 	}
 	if r1 == 0 {
-		if errno, ok := e1.(windows.Errno); ok {
-			return fmt.Errorf("WakeByAddress: %w", errno)
-		}
-		return fmt.Errorf("WakeByAddress: %v", e1)
+		return fmt.Errorf("WakeByAddress: %w", e1)
 	}
 	return nil
 }
@@ -132,8 +135,6 @@ func futexWait(addr *uint32, val uint32) error {
 	}
 
 	futexLogf("[FUTEX] WaitOnAddress addr=%p val=%d", addr, val)
-	release := trackWaiter(addr)
-	defer release()
 	return waitOnAddress(addr, val, windows.INFINITE)
 }
 
@@ -164,37 +165,21 @@ func futexWaitTimeout(addr *uint32, val uint32, timeoutNs int64) error {
 	}
 
 	futexLogf("[FUTEX] WaitOnAddress addr=%p val=%d timeoutMs=%d", addr, val, timeoutMs)
-	release := trackWaiter(addr)
-	defer release()
 	return waitOnAddress(addr, val, timeoutMs)
 }
 
 // futexWake wakes up to n waiters on addr using Windows wake primitives.
+// Waiter tracking is done at the ring level (DataWaiters/SpaceWaiters/ContigWaiters)
+// so we don't need redundant sync.Map tracking here.
+// Returns 0 as the woken count since WakeByAddress doesn't report how many
+// threads were actually woken.
 func futexWake(addr *uint32, n int) (int, error) {
 	if n <= 0 {
 		return 0, nil
-	}
-	key := uintptr(unsafe.Pointer(addr))
-	if ptr, ok := waitCounts.Load(key); ok {
-		waiters := atomic.LoadInt64(ptr.(*int64))
-		if waiters == 0 {
-			return 0, nil
-		}
-	}
-	woken := 0
-	if ptr, ok := waitCounts.Load(key); ok {
-		waiters := atomic.LoadInt64(ptr.(*int64))
-		if waiters == 0 {
-			return 0, nil
-		}
-		woken = n
-		if int64(woken) > waiters {
-			woken = int(waiters)
-		}
 	}
 	wakeAll := n > 1
 	if err := wakeByAddress(addr, wakeAll); err != nil {
 		return 0, err
 	}
-	return woken, nil
+	return 0, nil
 }

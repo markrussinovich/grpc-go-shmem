@@ -34,6 +34,7 @@ type clientTransport interface {
 	incrMsgRecv()
 	closeStream(s *ClientStream, err error, rst bool, rstCode http2.ErrCode, st *status.Status, mdata map[string][]string, eosReceived bool)
 	write(s *ClientStream, hdr []byte, data mem.BufferSlice, opts *WriteOptions) error
+	writeProto(s *ClientStream, msg any, opts *WriteOptions) (bool, error)
 	adjustWindow(s *ClientStream, n uint32)
 	updateWindow(s *ClientStream, n uint32)
 }
@@ -91,6 +92,12 @@ func (s *ClientStream) Close(err error) {
 // Write writes the hdr and data bytes to the output stream.
 func (s *ClientStream) Write(hdr []byte, data mem.BufferSlice, opts *WriteOptions) error {
 	return s.ct.write(s, hdr, data, opts)
+}
+
+// WriteProto attempts zero-copy serialization directly into the transport's
+// buffer. Returns (true, err) if handled, (false, nil) to fall back.
+func (s *ClientStream) WriteProto(msg any, opts *WriteOptions) (bool, error) {
+	return s.ct.writeProto(s, msg, opts)
 }
 
 // BytesReceived indicates whether any bytes have been received on this stream.

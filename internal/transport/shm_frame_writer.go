@@ -48,6 +48,10 @@ type shmFrameWriter struct {
 	ch     chan frameEntry // data + control frames from app goroutines
 	wg     sync.WaitGroup
 	closed atomic.Bool
+	// inlineMu protects direct ring writes in the enqueueAndWait fast path.
+	// The writer goroutine also holds this when active, ensuring no two
+	// writers access the ring simultaneously.
+	inlineMu sync.Mutex
 }
 
 // frameEntry represents a single frame to be written to the ring.
@@ -80,19 +84,44 @@ func newShmFrameWriter(tx *ShmRing) *shmFrameWriter {
 
 // writeLoop is the single writer goroutine. It drains the channel and writes
 // frames to the ring sequentially, eliminating the need for writeMu.
+// When multiple frames are pending, it uses batch mode to suppress per-frame
+// signals and issue a single reader wakeup after the batch.
 func (w *shmFrameWriter) writeLoop() {
 	defer w.wg.Done()
 
 	for entry := range w.ch {
-		var err error
-		if entry.data != nil {
-			err = writeFrameBuffersChunked(entry.ctx, w.tx, entry.fh, entry.hdr, entry.data, entry.maxChunk)
+		w.inlineMu.Lock()
+		// Check if more frames are queued behind this one.
+		pending := len(w.ch)
+		if pending > 0 {
+			w.tx.BeginBatch()
+			w.processEntry(entry)
+			for i := 0; i < pending; i++ {
+				next, ok := <-w.ch
+				if !ok {
+					break
+				}
+				w.processEntry(next)
+			}
+			w.tx.EndBatch()
 		} else {
-			err = writeFrame(entry.ctx, w.tx, entry.fh, entry.payload)
+			w.processEntry(entry)
 		}
-		if entry.doneCh != nil {
-			entry.doneCh <- err
-		}
+		w.inlineMu.Unlock()
+	}
+}
+
+// processEntry writes a single frame entry to the ring and signals
+// completion to the caller if doneCh is set.
+func (w *shmFrameWriter) processEntry(entry frameEntry) {
+	var err error
+	if entry.data != nil {
+		err = writeFrameBuffersChunked(entry.ctx, w.tx, entry.fh, entry.hdr, entry.data, entry.maxChunk)
+	} else {
+		err = writeFrame(entry.ctx, w.tx, entry.fh, entry.payload)
+	}
+	if entry.doneCh != nil {
+		entry.doneCh <- err
 	}
 }
 
@@ -122,13 +151,27 @@ func (w *shmFrameWriter) enqueue(entry frameEntry) error {
 	return nil
 }
 
-// enqueueAndWait submits a frame and blocks until the write completes,
-// returning the write error (if any). Use this for frames where the caller
-// must know the outcome (e.g., HEADERS in NewStream).
+// enqueueAndWait submits a frame and blocks until the write completes.
+//
+// Fast path: if the inline mutex is available (writer goroutine is idle
+// or between entries), the caller executes the write directly in its own
+// goroutine. This avoids channel send + goroutine scheduling (~100-200ns).
 func (w *shmFrameWriter) enqueueAndWait(entry frameEntry) error {
 	if w.closed.Load() {
 		return ErrConnClosing
 	}
+	// Fast path: try to acquire inline write lock without blocking.
+	if w.inlineMu.TryLock() {
+		var err error
+		if entry.data != nil {
+			err = writeFrameBuffersChunked(entry.ctx, w.tx, entry.fh, entry.hdr, entry.data, entry.maxChunk)
+		} else {
+			err = writeFrame(entry.ctx, w.tx, entry.fh, entry.payload)
+		}
+		w.inlineMu.Unlock()
+		return err
+	}
+	// Slow path: writer goroutine is busy, enqueue to channel.
 	entry.doneCh = make(chan error, 1)
 	if !w.trySend(entry) {
 		return ErrConnClosing

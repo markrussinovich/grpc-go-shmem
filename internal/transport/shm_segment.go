@@ -249,7 +249,11 @@ type RingHeader struct {
 	spaceWaiters  uint32  // 0x2C: number of writers waiting on space
 	contigWaiters uint32  // 0x30: number of writers waiting on contiguity
 	dataWaiters   uint32  // 0x34: number of readers waiting for data
-	reserved      [8]byte // 0x38-0x3F: reserved/padding to 64B
+	// speculativeReserved is the number of bytes speculatively committed by
+	// the reader (readIdx advanced) but still referenced by zero-copy buffers.
+	// Writers deduct this from available space so they cannot overwrite ring
+	// memory still in use by the reader. Accessed atomically.
+	speculativeReserved int64 // 0x38-0x3F
 	// data area starts at offset 0x40
 }
 
@@ -329,10 +333,7 @@ func (r *RingHeader) IncrementContigSequence() uint32 {
 	return atomic.AddUint32(&r.contigSeq, 1)
 }
 
-// AddSpaceWaiter adds delta to the spaceWaiters counter (use +1 and ^uint32(0) for -1)
-func (r *RingHeader) AddSpaceWaiter(delta uint32) uint32 {
-	return atomic.AddUint32(&r.spaceWaiters, delta)
-}
+
 
 // IncSpaceWaiters increments the space waiters counter
 func (r *RingHeader) IncSpaceWaiters() uint32 {
@@ -349,10 +350,7 @@ func (r *RingHeader) SpaceWaiters() uint32 {
 	return atomic.LoadUint32(&r.spaceWaiters)
 }
 
-// AddContigWaiter adds delta to the contigWaiters counter (use +1 and ^uint32(0) for -1)
-func (r *RingHeader) AddContigWaiter(delta uint32) uint32 {
-	return atomic.AddUint32(&r.contigWaiters, delta)
-}
+
 
 // IncContigWaiters increments the contiguity waiters counter
 func (r *RingHeader) IncContigWaiters() uint32 {
@@ -382,6 +380,16 @@ func (r *RingHeader) DecDataWaiters() uint32 {
 // DataWaiters returns the current number of readers waiting for data
 func (r *RingHeader) DataWaiters() uint32 {
 	return atomic.LoadUint32(&r.dataWaiters)
+}
+
+// SpeculativeReserved returns the bytes speculatively reserved by the reader.
+func (r *RingHeader) SpeculativeReserved() int64 {
+	return atomic.LoadInt64(&r.speculativeReserved)
+}
+
+// AddSpeculativeReserved atomically adds n to speculativeReserved.
+func (r *RingHeader) AddSpeculativeReserved(n int64) {
+	atomic.AddInt64(&r.speculativeReserved, n)
 }
 
 // DataArea returns a pointer to the ring's data area

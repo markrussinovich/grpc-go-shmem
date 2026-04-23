@@ -77,6 +77,23 @@ type ShmServerTransport struct {
 	handleFunc func(*ServerStream)
 	maxStreams uint32
 
+	// cachedStream caches the only active stream pointer for single-stream
+	// connections, allowing frame dispatch to skip the map lookup + RLock.
+	// Reset to nil when stream count changes (0 or >1).
+	//
+	// Read without t.mu in handleMessage/handleMessageBuffer (hot path).
+	// Written under t.mu in updateStreamCache. This is an intentional
+	// benign race: a stale read falls through to the locked map lookup.
+	// The race detector may flag it; acceptable for the performance gain.
+	cachedStream   *ServerStream
+	cachedStreamID uint32
+
+	// singleStreamMode is negotiated via the CONNECT frame. When true,
+	// both sides agree to use single-stream optimizations (inline writes,
+	// writer loop bypass via inlineMu.TryLock, cachedStream fast path).
+	// Automatically disabled when more than one stream is active.
+	singleStreamMode bool
+
 	// Flow control
 	sendQuotaMu     sync.Mutex
 	connSendQuota   int64
@@ -113,6 +130,22 @@ type ShmServerTransport struct {
 	lastPingAt time.Time
 	// pingStrikes counts policy violations; too many triggers close.
 	pingStrikes uint8
+}
+
+// updateStreamCache updates the single-stream cache. Must be called with
+// t.mu held (Lock or RLock). When exactly one stream is active, cache it
+// for lock-free lookup in the frame dispatch hot path.
+func (t *ShmServerTransport) updateStreamCache() {
+	if len(t.streams) == 1 {
+		for id, s := range t.streams {
+			t.cachedStream = s
+			t.cachedStreamID = id
+			break
+		}
+	} else {
+		t.cachedStream = nil
+		t.cachedStreamID = 0
+	}
 }
 
 func (t *ShmServerTransport) sendGoAway(flags uint8, debugData string) {
@@ -491,10 +524,11 @@ func (t *ShmServerTransport) processIncomingData(ctx context.Context) {
 			release()
 			continue
 		case FrameTypePONG:
-			// Handle BDP ping acknowledgment if applicable
-			if t.bdpEst != nil && len(payload) >= 1 {
-				// Check if this PONG corresponds to a BDP ping
-				if payload[0]&PingFlagACK != 0 {
+			// Check if this is a BDP ping acknowledgment
+			if t.bdpEst != nil && len(payload) >= 8 {
+				var data [8]byte
+				copy(data[:], payload[:8])
+				if data == bdpPing.data {
 					t.bdpEst.calculate()
 				}
 			}
@@ -629,6 +663,13 @@ func (t *ShmServerTransport) handleHeaders(ctx context.Context, streamID uint32,
 	}
 	t.streams[streamID] = s
 	t.streamInFlow[streamID] = &s.fc
+	// Update single-stream cache.
+	if len(t.streams) == 1 {
+		t.cachedStream = s
+		t.cachedStreamID = streamID
+	} else {
+		t.cachedStream = nil
+	}
 	// Add stream to scheduler with default priority
 	if t.streamScheduler != nil {
 		t.streamScheduler.AddStream(StreamPriority{
@@ -659,13 +700,16 @@ func (t *ShmServerTransport) handleHeaders(ctx context.Context, streamID uint32,
 // handleMessage processes a MESSAGE frame.
 // For client->server, the final MESSAGE is indicated by MessageFlagMORE being unset.
 func (t *ShmServerTransport) handleMessage(streamID uint32, flags uint8, payload []byte) {
-	t.mu.RLock()
-	s, exists := t.streams[streamID]
-	t.mu.RUnlock()
-
-	if !exists {
-		// Stream doesn't exist, drop the message
-		return
+	// Fast path: if we have a cached single stream, skip map lookup + RLock.
+	s := t.cachedStream
+	if s == nil || t.cachedStreamID != streamID {
+		t.mu.RLock()
+		var exists bool
+		s, exists = t.streams[streamID]
+		t.mu.RUnlock()
+		if !exists {
+			return
+		}
 	}
 
 	sz := uint32(len(payload))
@@ -711,15 +755,17 @@ func (t *ShmServerTransport) handleMessageBuffer(streamID uint32, flags uint8, b
 		return
 	}
 	payload := buf.ReadOnlyData()
-	s, exists := func() (*ServerStream, bool) {
+	// Fast path: if we have a cached single stream, skip map lookup + RLock.
+	s := t.cachedStream
+	if s == nil || t.cachedStreamID != streamID {
+		var exists bool
 		t.mu.RLock()
-		s, ok := t.streams[streamID]
+		s, exists = t.streams[streamID]
 		t.mu.RUnlock()
-		return s, ok
-	}()
-	if !exists {
-		buf.Free()
-		return
+		if !exists {
+			buf.Free()
+			return
+		}
 	}
 
 	sz := uint32(len(payload))
@@ -853,6 +899,7 @@ func (t *ShmServerTransport) handleTrailers(streamID uint32, payload []byte) {
 	t.mu.Lock()
 	delete(t.streams, streamID)
 	delete(t.streamInFlow, streamID)
+	t.updateStreamCache()
 	if t.streamScheduler != nil {
 		t.streamScheduler.RemoveStream(streamID)
 	}
@@ -895,6 +942,7 @@ func (t *ShmServerTransport) handleCancel(streamID uint32) {
 	t.mu.Lock()
 	delete(t.streams, streamID)
 	delete(t.streamInFlow, streamID)
+	t.updateStreamCache()
 	if t.streamScheduler != nil {
 		t.streamScheduler.RemoveStream(streamID)
 	}
@@ -1111,6 +1159,69 @@ func (t *ShmServerTransport) maybeWriteHeader(s *ServerStream) error {
 	return t.writeHeader(s, md)
 }
 
+// writeProto serializes a proto.Message directly into the ring buffer,
+// bypassing the standard encode→copy path. Returns (true, err) if handled,
+// (false, nil) if the caller should fall back to the standard path.
+//
+// Only handles contiguous (non-wrap-around) writes. Wrap-around, non-proto
+// messages, and oversized messages fall back.
+func (t *ShmServerTransport) writeProto(s *ServerStream, msg any, opts *WriteOptions) (bool, error) {
+	pm, ok := msg.(protoMessage)
+	if !ok {
+		return false, nil
+	}
+	if t.closed.Load() {
+		return false, ErrConnClosing
+	}
+
+	// Check stream is still active before doing work.
+	if s.getState() != streamActive {
+		return false, errStreamDone
+	}
+
+	if err := t.maybeWriteHeader(s); err != nil {
+		return false, err
+	}
+
+	pSize := protoSize(pm)
+	totalSize := frameHeaderSize + 5 + pSize
+
+	// Skip ZC if the message is too large for a single frame.
+	// Must check before acquiring flow control quota to avoid double-acquire
+	// when the caller falls back to the standard write path.
+	if uint64(totalSize) > t.serverToClient.Capacity()/3 {
+		return false, nil
+	}
+
+	// Flow control
+	if err := t.acquireSendQuota(s.ctx, s.id, totalSize); err != nil {
+		return false, err
+	}
+
+	// Acquire the frame writer's inline mutex to serialize with writeLoop.
+	// writeProtoToRing writes directly to the ring, bypassing the frame
+	// writer channel. Without this lock, concurrent control frame writes
+	// (PING, WINDOW_UPDATE, etc.) would violate the SPSC ring invariant.
+	if !t.frameWriter.inlineMu.TryLock() {
+		t.sendQuotaMu.Lock()
+		t.connSendQuota += int64(totalSize)
+		t.streamSendQuota[s.id] += int64(totalSize)
+		t.sendQuotaMu.Unlock()
+		return false, nil
+	}
+	ok2, err := writeProtoToRing(s.ctx, t.serverToClient, s.id, pm, pSize, 0)
+	t.frameWriter.inlineMu.Unlock()
+	if !ok2 && err == nil {
+		// ZC failed (e.g., insufficient contiguous space). Release the quota
+		// so the fallback standard write path can re-acquire without leak.
+		t.sendQuotaMu.Lock()
+		t.connSendQuota += int64(totalSize)
+		t.streamSendQuota[s.id] += int64(totalSize)
+		t.sendQuotaMu.Unlock()
+	}
+	return ok2, err
+}
+
 // write writes header and data for a stream
 func (t *ShmServerTransport) write(s *ServerStream, hdr []byte, data mem.BufferSlice, _ *WriteOptions) error {
 	if t.closed.Load() {
@@ -1222,6 +1333,7 @@ func (t *ShmServerTransport) writeStatus(s *ServerStream, st *status.Status) err
 	t.mu.Lock()
 	delete(t.streams, s.id)
 	delete(t.streamInFlow, s.id)
+	t.updateStreamCache()
 	if t.streamScheduler != nil {
 		t.streamScheduler.RemoveStream(s.id)
 	}

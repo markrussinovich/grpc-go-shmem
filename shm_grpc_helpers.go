@@ -67,6 +67,13 @@ type ShmTransportConfig struct {
 	// When true, non-shm addresses will use standard TCP dial.
 	// Default is true for RFC A73 compliance.
 	AllowMixedTransport bool
+
+	// SingleStreamMode requests single-stream optimizations from the server.
+	// When enabled, the CONNECT frame includes a flag that both sides use to
+	// activate inline write paths (bypassing the writer goroutine queue).
+	// Enable this for unary or single-session benchmark scenarios.
+	// Default: false.
+	SingleStreamMode bool
 }
 
 // DefaultShmTransportConfig returns the default configuration.
@@ -116,6 +123,7 @@ func WithShmTransportConfig(cfg *ShmTransportConfig) DialOption {
 	if cfg.DialOptions == nil {
 		cfg.DialOptions = transport.DefaultDialOptions()
 	}
+	cfg.DialOptions.SingleStreamMode = cfg.SingleStreamMode
 
 	fallbackHandler := transport.NewShmFallbackHandler()
 
@@ -240,4 +248,60 @@ func (c *shmClientConn) SetWriteDeadline(_ time.Time) error {
 // This is used internally by gRPC to access the transport after dialing.
 func (c *shmClientConn) GetClientTransport() transport.ClientTransport {
 	return c.transport
+}
+
+// --- Server-side public API ---
+
+// ShmListenerConfig configures the shared memory listener.
+type ShmListenerConfig struct {
+	// SegmentSize is the total size of the shared memory segment in bytes.
+	// Default: 136 MiB (covers two 64 MiB rings plus headers).
+	SegmentSize uint64
+
+	// RingSize is the capacity of each ring buffer in bytes.
+	// There are two rings: client→server and server→client.
+	// Default: 64 MiB.
+	RingSize uint64
+}
+
+// DefaultShmListenerConfig returns the default listener configuration.
+func DefaultShmListenerConfig() *ShmListenerConfig {
+	return &ShmListenerConfig{
+		SegmentSize: transport.DefaultSegmentSize,
+		RingSize:    transport.DefaultRingASize,
+	}
+}
+
+// NewShmListener creates a net.Listener that accepts gRPC connections over
+// shared memory. The segmentName identifies the shared memory segment and
+// must match the name used by the client (e.g., "shm://segmentName").
+//
+// Example:
+//
+//	lis, err := grpc.NewShmListener("my_segment", nil)
+//	if err != nil {
+//	    log.Fatal(err)
+//	}
+//	s := grpc.NewServer()
+//	pb.RegisterMyServiceServer(s, &myServer{})
+//	s.Serve(lis)
+func NewShmListener(segmentName string, cfg *ShmListenerConfig) (net.Listener, error) {
+	if segmentName == "" {
+		return nil, fmt.Errorf("segmentName must not be empty")
+	}
+	if cfg == nil {
+		cfg = DefaultShmListenerConfig()
+	}
+	if cfg.SegmentSize == 0 {
+		cfg.SegmentSize = transport.DefaultSegmentSize
+	}
+	if cfg.RingSize == 0 {
+		cfg.RingSize = transport.DefaultRingASize
+	}
+	return transport.NewShmListener(
+		&transport.ShmAddr{Name: segmentName},
+		cfg.SegmentSize,
+		cfg.RingSize,
+		cfg.RingSize,
+	)
 }

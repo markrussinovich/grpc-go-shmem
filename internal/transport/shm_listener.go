@@ -101,9 +101,10 @@ type shmConn struct {
 	writeEvents *RingEvents
 
 	// Connection state
-	established atomic.Bool
-	closed      atomic.Bool
-	closeOnce   sync.Once
+	established      atomic.Bool
+	closed           atomic.Bool
+	closeOnce        sync.Once
+	singleStreamMode bool
 
 	// Security handshake result
 	authInfo credentials.AuthInfo
@@ -194,7 +195,8 @@ func (l *ShmListener) Accept() (net.Conn, error) {
 		if fh.Type != FrameTypeCONNECT {
 			continue
 		}
-		if _, err := decodeConnectRequest(payload); err != nil {
+		connReq, err := decodeConnectRequest(payload)
+		if err != nil {
 			_ = writeFrame(l.ctx, l.ctlTx, FrameHeader{Type: FrameTypeREJECT}, encodeConnectReject(connectReject{message: err.Error()}))
 			continue
 		}
@@ -256,15 +258,16 @@ func (l *ShmListener) Accept() (net.Conn, error) {
 		}
 
 		conn := &shmConn{
-			segment:     segment,
-			segmentName: segmentName,
-			listener:    l,
-			localAddr:   l.addr,
-			remoteAddr:  &ShmAddr{Name: segmentName + "_client"},
-			readRing:    readRing,
-			writeRing:   writeRing,
-			readEvents:  readEvents,
-			writeEvents: writeEvents,
+			segment:          segment,
+			segmentName:      segmentName,
+			listener:         l,
+			localAddr:        l.addr,
+			remoteAddr:       &ShmAddr{Name: segmentName + "_client"},
+			readRing:         readRing,
+			writeRing:        writeRing,
+			readEvents:       readEvents,
+			writeEvents:      writeEvents,
+			singleStreamMode: connReq.singleStreamMode,
 		}
 
 		// Perform security handshake if configured
@@ -298,6 +301,7 @@ func (l *ShmListener) Accept() (net.Conn, error) {
 		}
 		// Configure keepalive on the server transport.
 		serverTransport.ConfigureKeepalive(l.kp, l.kep)
+		serverTransport.singleStreamMode = conn.singleStreamMode
 		conn.transport = serverTransport
 		conn.established.Store(true)
 		l.mu.Lock()

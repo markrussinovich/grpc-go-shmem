@@ -39,8 +39,9 @@ const (
 )
 
 type connectRequest struct {
-	ringA uint64
-	ringB uint64
+	ringA           uint64
+	ringB           uint64
+	singleStreamMode bool
 }
 
 type connectResponse struct {
@@ -52,15 +53,15 @@ type connectReject struct {
 }
 
 func encodeConnectRequest(req connectRequest) []byte {
-	// v1 CONNECT is intentionally minimal. We keep the ring offset fields for
-	// forward-compat, but the current transport always uses the Segment header's
-	// ring offsets.
-	//
-	// version(1) + ringA(8) + ringB(8)
-	b := make([]byte, 1+8+8)
+	// v1 CONNECT: version(1) + ringA(8) + ringB(8) + flags(1) = 18 bytes.
+	// flags bit 0: singleStreamMode requested.
+	b := make([]byte, 1+8+8+1)
 	b[0] = controlWireV1
 	binary.LittleEndian.PutUint64(b[1:9], req.ringA)
 	binary.LittleEndian.PutUint64(b[9:17], req.ringB)
+	if req.singleStreamMode {
+		b[17] = 1
+	}
 	return b
 }
 
@@ -71,14 +72,23 @@ func decodeConnectRequest(b []byte) (connectRequest, error) {
 	if b[0] != controlWireV1 {
 		return connectRequest{}, fmt.Errorf("unsupported connect request version %d", b[0])
 	}
-	// Allow minimal v1 payloads.
-	if len(b) == 1 {
-		return connectRequest{}, nil
+	if len(b) < 1+8+8 {
+		if len(b) == 1 {
+			// Minimal v1 payload: just version, no ring sizes.
+			return connectRequest{}, nil
+		}
+		return connectRequest{}, fmt.Errorf("connect request invalid length %d (need >= 17)", len(b))
 	}
-	if len(b) != 1+8+8 {
-		return connectRequest{}, errors.New("connect request invalid length")
+	// Accept >= 17 bytes for forward compatibility: .NET sends 18 bytes
+	// with a flags byte at offset 17. Go also sends 18 bytes now.
+	req := connectRequest{
+		ringA: binary.LittleEndian.Uint64(b[1:9]),
+		ringB: binary.LittleEndian.Uint64(b[9:17]),
 	}
-	return connectRequest{ringA: binary.LittleEndian.Uint64(b[1:9]), ringB: binary.LittleEndian.Uint64(b[9:17])}, nil
+	if len(b) > 17 {
+		req.singleStreamMode = b[17]&1 != 0
+	}
+	return req, nil
 }
 
 func encodeConnectResponse(resp connectResponse) []byte {
