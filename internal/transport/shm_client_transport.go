@@ -74,8 +74,21 @@ type ShmClientTransport struct {
 
 	// Stream management
 	streams         map[uint32]*ClientStream
-	streamTransport map[*ClientStream]*ShmClientTransport // Track transport for each stream
-	streamID        uint32                                // next stream ID to assign
+	streamID uint32 // next stream ID to assign
+
+	// cachedStream caches the only active stream for single-stream connections,
+	// allowing frame dispatch to skip the map lookup + RLock.
+	//
+	// Read without t.mu in handleMessage/handleMessageBuffer (hot path).
+	// Written under t.mu in updateStreamCache. This is an intentional
+	// benign race: a stale read falls through to the locked map lookup.
+	cachedStream   *ClientStream
+	cachedStreamID uint32
+
+	// singleStreamMode is negotiated via the CONNECT frame. When true,
+	// the client requested single-stream optimizations and the transport
+	// uses inline writes via inlineMu.TryLock and cachedStream fast path.
+	singleStreamMode bool
 
 	// Flow control (outbound send windows)
 	sendQuotaMu           sync.Mutex
@@ -315,7 +328,7 @@ func NewShmClientTransport(segment *Segment, localAddr, remoteAddr net.Addr) (*S
 		ctx:                   ctx,
 		cancel:                cancel,
 		streams:               make(map[uint32]*ClientStream),
-		streamTransport:       make(map[*ClientStream]*ShmClientTransport),
+
 		streamSendQuota:       make(map[uint32]int64),
 		streamInFlow:          make(map[uint32]*inFlow),
 		pendingStreamWU:       make(map[uint32]uint32),
@@ -414,7 +427,7 @@ func (t *ShmClientTransport) processIncomingData(ctx context.Context) {
 			return
 		}
 		shmDebugf("[DEBUG] ShmClientTransport.processIncomingData: waiting for frame from server...")
-		// Event-driven: block on next frame from rx ring using zero-copy payload views.
+		// Event-driven: block on next frame from rx ring.
 		fh, payloadBuf, err := readFrameView(ctx, t.serverToClient)
 		if err != nil {
 			shmDebugf("[DEBUG] ShmClientTransport.processIncomingData: readFrame error: %v", err)
@@ -486,15 +499,18 @@ func (t *ShmClientTransport) processIncomingData(ctx context.Context) {
 			continue
 		}
 
-		// Dispatch frame to appropriate stream
-		t.mu.RLock()
-		stream, ok := t.streams[fh.StreamID]
-		t.mu.RUnlock()
-
-		if !ok {
-			release()
-			// Stream not found - might have been closed
-			continue
+		// Dispatch frame to appropriate stream.
+		// Fast path: if we have a cached single stream, skip map lookup + RLock.
+		stream := t.cachedStream
+		if stream == nil || t.cachedStreamID != fh.StreamID {
+			t.mu.RLock()
+			var ok bool
+			stream, ok = t.streams[fh.StreamID]
+			t.mu.RUnlock()
+			if !ok {
+				release()
+				continue
+			}
 		}
 
 		// Handle different frame types
@@ -861,7 +877,13 @@ func (t *ShmClientTransport) NewStream(ctx context.Context, callHdr *CallHdr) (*
 
 		// Register the stream
 		t.streams[streamID] = s
-		t.streamTransport[s] = t
+		// Update single-stream cache.
+		if len(t.streams) == 1 {
+			t.cachedStream = s
+			t.cachedStreamID = streamID
+		} else {
+			t.cachedStream = nil
+		}
 		t.sendQuotaMu.Lock()
 		t.streamSendQuota[streamID] = int64(maxWindowSize)
 		t.sendQuotaMu.Unlock()
@@ -957,7 +979,6 @@ func (t *ShmClientTransport) NewStream(ctx context.Context, callHdr *CallHdr) (*
 	}); err != nil {
 		t.mu.Lock()
 		delete(t.streams, streamID)
-		delete(t.streamTransport, s)
 		if t.streamScheduler != nil {
 			t.streamScheduler.RemoveStream(streamID)
 		}
@@ -1089,7 +1110,16 @@ func (t *ShmClientTransport) closeStream(s *ClientStream, err error, rst bool, _
 	var shouldClose bool
 	t.mu.Lock()
 	delete(t.streams, s.id)
-	delete(t.streamTransport, s)
+	// Update single-stream cache.
+	if len(t.streams) == 1 {
+		for id, cs := range t.streams {
+			t.cachedStream = cs
+			t.cachedStreamID = id
+			break
+		}
+	} else {
+		t.cachedStream = nil
+	}
 	if t.streamScheduler != nil {
 		t.streamScheduler.RemoveStream(s.id)
 	}
@@ -1134,6 +1164,87 @@ func (t *ShmClientTransport) closeStream(s *ClientStream, err error, rst bool, _
 	if s.doneFunc != nil {
 		s.doneFunc()
 	}
+}
+
+// writeProto serializes a proto.Message directly into the ring buffer,
+// bypassing the standard encode→copy path.
+func (t *ShmClientTransport) writeProto(s *ClientStream, msg any, opts *WriteOptions) (bool, error) {
+	pm, ok := msg.(protoMessage)
+	if !ok {
+		return false, nil
+	}
+	if t.closed.Load() {
+		return false, ErrConnClosing
+	}
+
+	// Do NOT check/modify stream state here. If ZC fails, the caller falls
+	// back to write() which does its own CAS. Doing it here would leave the
+	// stream in streamWriteDone, causing the fallback to return errStreamDone.
+
+	// Check stream is active (read-only — no CAS yet).
+	if s.getState() != streamActive {
+		return false, errStreamDone
+	}
+
+	pSize := protoSize(pm)
+	totalSize := frameHeaderSize + 5 + pSize
+
+	// Skip ZC if the message is too large for a single frame.
+	// Must check before acquiring flow control quota to avoid double-acquire
+	// when the caller falls back to the standard write path.
+	if uint64(totalSize) > t.clientToServer.Capacity()/3 {
+		return false, nil
+	}
+
+	// Flow control
+	if err := t.acquireSendQuota(s.ctx, s.id, totalSize); err != nil {
+		return false, err
+	}
+
+	// Set MessageFlagMORE if this is not the last message in the stream.
+	// The server's handleMessage uses MORE=0 to detect client half-close.
+	var frameFlags uint8
+	if opts != nil && !opts.Last {
+		frameFlags = MessageFlagMORE
+	}
+
+	// Acquire the frame writer's inline mutex to serialize with writeLoop.
+	// writeProtoToRing writes directly to the ring, bypassing the frame
+	// writer channel. Without this lock, concurrent control frame writes
+	// (PING, WINDOW_UPDATE, etc.) would violate the SPSC ring invariant.
+	if !t.frameWriter.inlineMu.TryLock() {
+		// Writer goroutine is busy — release quota and let caller fall back
+		// to the standard write path (which goes through enqueueAndWait).
+		t.sendQuotaMu.Lock()
+		t.connSendQuota += int64(totalSize)
+		t.streamSendQuota[s.id] += int64(totalSize)
+		t.sendQuotaMu.Unlock()
+		return false, nil
+	}
+	ok2, err := writeProtoToRing(s.ctx, t.clientToServer, s.id, pm, pSize, frameFlags)
+	t.frameWriter.inlineMu.Unlock()
+	if !ok2 && err == nil {
+		// ZC failed (e.g., insufficient contiguous space). Release the quota
+		// so the fallback standard write path can re-acquire without leak.
+		t.sendQuotaMu.Lock()
+		t.connSendQuota += int64(totalSize)
+		t.streamSendQuota[s.id] += int64(totalSize)
+		t.sendQuotaMu.Unlock()
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+
+	// ZC succeeded — transition stream state if this is the last message.
+	if opts.Last {
+		if !s.compareAndSwapState(streamActive, streamWriteDone) {
+			// Race: stream was closed concurrently. Data is already written
+			// to the ring which is harmless (reader will process it).
+			return true, errStreamDone
+		}
+	}
+	return true, nil
 }
 
 // write writes data to the stream via the shared memory transport.
@@ -1273,9 +1384,9 @@ func (t *ShmClientTransport) keepalive() {
 			// created which unblocked the Wait() call, or because the
 			// keepalive timer expired. In both cases, we need to send a ping.
 			if !outstandingPing {
-				if err := t.sendPing(); err != nil {
+				if pingErr := t.sendPing(); pingErr != nil {
 					// Failed to send ping; connection may be broken.
-					err = connectionErrorf(true, err, "keepalive failed to send ping")
+					err = connectionErrorf(true, pingErr, "keepalive failed to send ping")
 					return
 				}
 				timeoutLeft = t.kp.Timeout

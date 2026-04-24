@@ -701,3 +701,385 @@ func TestShmFrameWriterOrdering(t *testing.T) {
 		}
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Batch signal suppression tests
+// ---------------------------------------------------------------------------
+
+func TestShmBatchSignalSuppression(t *testing.T) {
+	// Verify that BeginBatch/EndBatch suppresses per-frame signals
+	// and issues a single signal at the end.
+	segName := testSegName("test_batch")
+	defer RemoveSegment(segName)
+
+	seg, err := CreateSegment(segName, 64*1024, 64*1024)
+	if err != nil {
+		t.Fatalf("CreateSegment: %v", err)
+	}
+	defer seg.Close()
+
+	tx := NewShmRingFromSegment(seg.A, seg.Mem)
+	rx := NewShmRingFromSegment(seg.A, seg.Mem)
+
+	hdr := tx.header()
+
+	// Record initial DataSequence.
+	seqBefore := hdr.DataSequence()
+
+	// Write 5 frames in batch mode.
+	tx.BeginBatch()
+	for i := 0; i < 5; i++ {
+		payload := []byte(fmt.Sprintf("batch-msg-%d", i))
+		if err := writeFrame(context.Background(), tx, FrameHeader{Type: FrameTypeMESSAGE, StreamID: 1}, payload); err != nil {
+			t.Fatalf("writeFrame %d: %v", i, err)
+		}
+	}
+	// During batch, DataSequence should NOT have been incremented.
+	seqDuring := hdr.DataSequence()
+	if seqDuring != seqBefore {
+		t.Errorf("DataSeq changed during batch: before=%d, during=%d (should be suppressed)", seqBefore, seqDuring)
+	}
+
+	tx.EndBatch()
+
+	// After EndBatch, DataSequence should have been incremented exactly once.
+	seqAfter := hdr.DataSequence()
+	if seqAfter != seqBefore+1 {
+		t.Errorf("DataSeq after EndBatch=%d, want %d (single increment)", seqAfter, seqBefore+1)
+	}
+
+	// Verify all 5 frames are readable.
+	for i := 0; i < 5; i++ {
+		fh, data, err := readFrame(context.Background(), rx)
+		if err != nil {
+			t.Fatalf("readFrame %d: %v", i, err)
+		}
+		if fh.Type != FrameTypeMESSAGE {
+			t.Errorf("frame %d: type=%d, want MESSAGE", i, fh.Type)
+		}
+		want := fmt.Sprintf("batch-msg-%d", i)
+		if string(data) != want {
+			t.Errorf("frame %d: payload=%q, want %q", i, data, want)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Single stream cache tests
+// ---------------------------------------------------------------------------
+
+func TestShmSingleStreamCache(t *testing.T) {
+	// Verify that cachedStream is set when there's exactly one active stream
+	// and cleared when there are zero or multiple streams.
+	segName := testSegName("test_ssm")
+	defer RemoveSegment(segName)
+
+	seg, err := CreateSegment(segName, 128*1024, 128*1024)
+	if err != nil {
+		t.Fatalf("CreateSegment: %v", err)
+	}
+	defer seg.Close()
+	seg.H.SetServerReady(true)
+
+	clientSeg, err := OpenSegment(segName)
+	if err != nil {
+		t.Fatalf("OpenSegment: %v", err)
+	}
+
+	ct, err := NewShmClientTransport(clientSeg, &ShmAddr{Name: segName + "_c"}, &ShmAddr{Name: segName + "_s"})
+	if err != nil {
+		t.Fatalf("NewShmClientTransport: %v", err)
+	}
+	defer ct.Close(nil)
+
+	// No streams → cache should be nil.
+	if ct.cachedStream != nil {
+		t.Error("cachedStream should be nil with no streams")
+	}
+
+	// Create first stream → cache should be set.
+	ctx := context.Background()
+	s1, err := ct.NewStream(ctx, &CallHdr{Host: "localhost", Method: "/test/SSM1"})
+	if err != nil {
+		t.Fatalf("NewStream 1: %v", err)
+	}
+	if ct.cachedStream != s1 {
+		t.Error("cachedStream should point to s1 with one stream")
+	}
+
+	// Create second stream → cache should be nil.
+	s2, err := ct.NewStream(ctx, &CallHdr{Host: "localhost", Method: "/test/SSM2"})
+	if err != nil {
+		t.Fatalf("NewStream 2: %v", err)
+	}
+	if ct.cachedStream != nil {
+		t.Error("cachedStream should be nil with two streams")
+	}
+
+	// Close second stream → cache should be set to s1.
+	ct.closeStream(s2, nil, true, 0, nil, nil, false)
+	if ct.cachedStream != s1 {
+		t.Error("cachedStream should point to s1 after closing s2")
+	}
+
+	// Close first stream → cache should be nil.
+	ct.closeStream(s1, nil, true, 0, nil, nil, false)
+	if ct.cachedStream != nil {
+		t.Error("cachedStream should be nil after closing all streams")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Zero-copy read tests
+// ---------------------------------------------------------------------------
+
+func TestShmZeroCopyContiguousMessage(t *testing.T) {
+	// Verify that contiguous MESSAGE payloads are returned via zero-copy
+	// (SliceBuffer referencing ring memory).
+	segName := testSegName("test_zc_contig")
+	defer RemoveSegment(segName)
+
+	seg, err := CreateSegment(segName, 64*1024, 64*1024)
+	if err != nil {
+		t.Fatalf("CreateSegment: %v", err)
+	}
+	defer seg.Close()
+
+	tx := NewShmRingFromSegment(seg.A, seg.Mem)
+	rx := NewShmRingFromSegment(seg.A, seg.Mem)
+
+	payload := make([]byte, 4096)
+	for i := range payload {
+		payload[i] = byte(i % 251)
+	}
+	if err := writeFrame(context.Background(), tx, FrameHeader{
+		Type: FrameTypeMESSAGE, StreamID: 1,
+	}, payload); err != nil {
+		t.Fatalf("writeFrame: %v", err)
+	}
+
+	fh, buf, err := readFrameView(context.Background(), rx)
+	if err != nil {
+		t.Fatalf("readFrameView: %v", err)
+	}
+	if fh.Type != FrameTypeMESSAGE {
+		t.Fatalf("type = %d, want MESSAGE", fh.Type)
+	}
+	data := buf.ReadOnlyData()
+	if len(data) != len(payload) {
+		t.Fatalf("len = %d, want %d", len(data), len(payload))
+	}
+	for i := range data {
+		if data[i] != payload[i] {
+			t.Fatalf("byte[%d] = %d, want %d", i, data[i], payload[i])
+		}
+	}
+	buf.Free()
+}
+
+func TestShmZeroCopyWrapAroundCopies(t *testing.T) {
+	// Verify that wrap-around payloads are copied (not zero-copy).
+	segName := testSegName("test_zc_wrap")
+	defer RemoveSegment(segName)
+
+	seg, err := CreateSegment(segName, 4096, 4096)
+	if err != nil {
+		t.Fatalf("CreateSegment: %v", err)
+	}
+	defer seg.Close()
+
+	tx := NewShmRingFromSegment(seg.A, seg.Mem)
+	rx := NewShmRingFromSegment(seg.A, seg.Mem)
+
+	// Fill most of the ring to force next write to wrap.
+	pad := make([]byte, 3500)
+	if err := writeFrame(context.Background(), tx, FrameHeader{
+		Type: FrameTypeMESSAGE, StreamID: 1,
+	}, pad); err != nil {
+		t.Fatalf("writeFrame pad: %v", err)
+	}
+	_, padBuf, err := readFrameView(context.Background(), rx)
+	if err != nil {
+		t.Fatalf("readFrameView pad: %v", err)
+	}
+	if padBuf != nil {
+		padBuf.Free()
+	}
+
+	payload := []byte("wrap-around-test-data-payload")
+	if err := writeFrame(context.Background(), tx, FrameHeader{
+		Type: FrameTypeMESSAGE, StreamID: 1,
+	}, payload); err != nil {
+		t.Fatalf("writeFrame: %v", err)
+	}
+
+	_, buf, err := readFrameView(context.Background(), rx)
+	if err != nil {
+		t.Fatalf("readFrameView: %v", err)
+	}
+	if string(buf.ReadOnlyData()) != string(payload) {
+		t.Fatalf("payload = %q, want %q", buf.ReadOnlyData(), payload)
+	}
+	buf.Free()
+}
+
+func TestShmZeroCopyNonMessageCopies(t *testing.T) {
+	// Verify that non-MESSAGE frames are always copied.
+	segName := testSegName("test_zc_nonmsg")
+	defer RemoveSegment(segName)
+
+	seg, err := CreateSegment(segName, 64*1024, 64*1024)
+	if err != nil {
+		t.Fatalf("CreateSegment: %v", err)
+	}
+	defer seg.Close()
+
+	tx := NewShmRingFromSegment(seg.A, seg.Mem)
+	rx := NewShmRingFromSegment(seg.A, seg.Mem)
+
+	headersPayload := []byte("test-headers-payload")
+	if err := writeFrame(context.Background(), tx, FrameHeader{
+		Type: FrameTypeHEADERS, StreamID: 1,
+	}, headersPayload); err != nil {
+		t.Fatalf("writeFrame: %v", err)
+	}
+
+	fh, buf, err := readFrameView(context.Background(), rx)
+	if err != nil {
+		t.Fatalf("readFrameView: %v", err)
+	}
+	if fh.Type != FrameTypeHEADERS {
+		t.Fatalf("type = %d, want HEADERS", fh.Type)
+	}
+	if string(buf.ReadOnlyData()) != string(headersPayload) {
+		t.Fatalf("payload = %q, want %q", buf.ReadOnlyData(), headersPayload)
+	}
+	buf.Free()
+}
+
+func TestShmZeroCopyMultiStreamCorrectness(t *testing.T) {
+	// Verify zero-copy works correctly with interleaved multi-stream messages.
+	segName := testSegName("test_zc_multi")
+	defer RemoveSegment(segName)
+
+	seg, err := CreateSegment(segName, 1024*1024, 1024*1024)
+	if err != nil {
+		t.Fatalf("CreateSegment: %v", err)
+	}
+	defer seg.Close()
+
+	tx := NewShmRingFromSegment(seg.A, seg.Mem)
+	rx := NewShmRingFromSegment(seg.A, seg.Mem)
+
+	const streams = 4
+	const msgsPerStream = 20
+	payloadSize := 2048
+
+	// Write interleaved messages.
+	for i := 0; i < streams*msgsPerStream; i++ {
+		streamID := uint32((i % streams) + 1)
+		seqNum := i / streams
+		payload := make([]byte, payloadSize)
+		binary.LittleEndian.PutUint32(payload[0:4], streamID)
+		binary.LittleEndian.PutUint32(payload[4:8], uint32(seqNum))
+		for j := 8; j < len(payload); j++ {
+			payload[j] = byte(streamID)*37 + byte(seqNum)
+		}
+		if err := writeFrame(context.Background(), tx, FrameHeader{
+			Type: FrameTypeMESSAGE, StreamID: streamID,
+		}, payload); err != nil {
+			t.Fatalf("writeFrame stream=%d seq=%d: %v", streamID, seqNum, err)
+		}
+	}
+
+	// Read back and verify.
+	streamSeq := make(map[uint32]int)
+	for i := 0; i < streams*msgsPerStream; i++ {
+		fh, buf, err := readFrameView(context.Background(), rx)
+		if err != nil {
+			t.Fatalf("readFrameView %d: %v", i, err)
+		}
+		data := buf.ReadOnlyData()
+		gotStream := binary.LittleEndian.Uint32(data[0:4])
+		gotSeq := binary.LittleEndian.Uint32(data[4:8])
+
+		if fh.StreamID != gotStream {
+			t.Errorf("frame %d: header streamID=%d, payload says %d", i, fh.StreamID, gotStream)
+		}
+		if int(gotSeq) != streamSeq[gotStream] {
+			t.Errorf("stream %d: got seq %d, want %d", gotStream, gotSeq, streamSeq[gotStream])
+		}
+		streamSeq[gotStream]++
+
+		expectedByte := byte(gotStream)*37 + byte(gotSeq)
+		for j := 8; j < len(data); j++ {
+			if data[j] != expectedByte {
+				t.Fatalf("stream %d seq %d: data[%d]=%d, want %d", gotStream, gotSeq, j, data[j], expectedByte)
+			}
+		}
+		buf.Free()
+	}
+
+	for s := uint32(1); s <= streams; s++ {
+		if streamSeq[s] != msgsPerStream {
+			t.Errorf("stream %d: got %d msgs, want %d", s, streamSeq[s], msgsPerStream)
+		}
+	}
+}
+
+func TestShmZeroCopyDataSurvivesSubsequentWrites(t *testing.T) {
+	// Verify that zero-copy data remains valid after subsequent writes
+	// (as long as the ring doesn't wrap over it).
+	segName := testSegName("test_zc_survive")
+	defer RemoveSegment(segName)
+
+	seg, err := CreateSegment(segName, 64*1024, 64*1024)
+	if err != nil {
+		t.Fatalf("CreateSegment: %v", err)
+	}
+	defer seg.Close()
+
+	tx := NewShmRingFromSegment(seg.A, seg.Mem)
+	rx := NewShmRingFromSegment(seg.A, seg.Mem)
+
+	payloadA := []byte("AAAA-important-data-AAAA")
+	if err := writeFrame(context.Background(), tx, FrameHeader{
+		Type: FrameTypeMESSAGE, StreamID: 1,
+	}, payloadA); err != nil {
+		t.Fatalf("writeFrame A: %v", err)
+	}
+
+	// Read A (zero-copy — holds ring memory).
+	_, bufA, err := readFrameView(context.Background(), rx)
+	if err != nil {
+		t.Fatalf("readFrameView A: %v", err)
+	}
+
+	// Write more messages after A.
+	for _, name := range []string{"BBBB", "CCCC", "DDDD"} {
+		p := []byte(name + "-subsequent-data-" + name)
+		if err := writeFrame(context.Background(), tx, FrameHeader{
+			Type: FrameTypeMESSAGE, StreamID: 1,
+		}, p); err != nil {
+			t.Fatalf("writeFrame %s: %v", name, err)
+		}
+	}
+
+	// A's data must still be intact (ring hasn't wrapped).
+	if string(bufA.ReadOnlyData()) != string(payloadA) {
+		t.Fatalf("A corrupted: got %q, want %q", bufA.ReadOnlyData(), payloadA)
+	}
+	bufA.Free()
+
+	// Read and verify B, C, D.
+	for _, want := range []string{"BBBB", "CCCC", "DDDD"} {
+		_, buf, err := readFrameView(context.Background(), rx)
+		if err != nil {
+			t.Fatalf("readFrameView: %v", err)
+		}
+		if string(buf.ReadOnlyData()[:4]) != want {
+			t.Errorf("expected prefix %s, got %s", want, buf.ReadOnlyData()[:4])
+		}
+		buf.Free()
+	}
+}

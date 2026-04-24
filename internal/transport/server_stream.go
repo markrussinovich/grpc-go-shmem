@@ -71,6 +71,12 @@ func (s *ServerStream) Write(hdr []byte, data mem.BufferSlice, opts *WriteOption
 	return s.st.write(s, hdr, data, opts)
 }
 
+// WriteProto attempts zero-copy serialization directly into the transport's
+// buffer. Returns (true, err) if handled, (false, nil) to fall back.
+func (s *ServerStream) WriteProto(msg any, opts *WriteOptions) (bool, error) {
+	return s.st.writeProto(s, msg, opts)
+}
+
 // WriteStatus sends the status of a stream to the client.  WriteStatus is
 // the final call made on a stream and always occurs.
 func (s *ServerStream) WriteStatus(st *status.Status) error {

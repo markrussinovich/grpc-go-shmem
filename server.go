@@ -1169,6 +1169,29 @@ func (s *Server) incrCallsFailed() {
 }
 
 func (s *Server) sendResponse(ctx context.Context, stream *transport.ServerStream, msg any, cp Compressor, opts *transport.WriteOptions, comp encoding.Compressor) error {
+	// Zero-copy fast path: when no compression is configured and the codec
+	// is the default proto codec, serialize directly into the ring buffer.
+	// Custom codecs (JSON, etc.) must go through the standard encode path.
+	if cp == nil && comp == nil && stream.ContentSubtype() == "" {
+		// Enforce max send message size before ZC write.
+		if pm, ok := msg.(protoV2Message); ok {
+			pSize := protoSizeOf(pm)
+			if pSize > s.opts.maxSendMessageSize {
+				return status.Errorf(codes.ResourceExhausted, "grpc: trying to send message larger than max (%d vs. %d)", pSize, s.opts.maxSendMessageSize)
+			}
+		}
+		if handled, err := stream.WriteProto(msg, opts); handled {
+			if err != nil {
+				return err
+			}
+			if s.statsHandler != nil {
+				pSize := protoSizeOf(msg)
+				s.statsHandler.HandleRPC(ctx, outPayload(false, msg, pSize, pSize, time.Now()))
+			}
+			return nil
+		}
+	}
+
 	data, err := encode(s.getCodec(stream.ContentSubtype()), msg)
 	if err != nil {
 		channelz.Error(logger, s.channelz, "grpc: server failed to encode response: ", err)

@@ -1108,6 +1108,10 @@ func (t *http2Client) GracefulClose() {
 	t.controlBuf.put(&incomingGoAway{})
 }
 
+func (t *http2Client) writeProto(_ *ClientStream, _ any, _ *WriteOptions) (bool, error) {
+	return false, nil
+}
+
 // Write formats the data into HTTP2 data frame(s) and sends it out. The caller
 // should proceed only if Write returns nil.
 func (t *http2Client) write(s *ClientStream, hdr []byte, data mem.BufferSlice, opts *WriteOptions) error {

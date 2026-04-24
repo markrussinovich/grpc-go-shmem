@@ -42,23 +42,9 @@ import (
 //revive:disable:var-naming This name must match the Go runtime internal function
 func runtime_procyield(cycles uint32)
 
-// Spin-wait constants for adaptive spinning before falling back to futex.
-// Tuned for shared-memory IPC where data typically arrives within 5-20µs.
-// Higher spin counts than Folly's defaults (designed for general mutexes)
-// because SHM peer latency is predictably low and a futex wake costs ~7-10µs.
-const (
-	// spinIterationsDefault is the default number of spin iterations before futex.
-	// At ~7ns per PAUSE instruction, 1000 iterations ≈ 7µs of spinning,
-	// which covers the typical SHM peer write latency without falling back
-	// to a futex syscall.
-	spinIterationsDefault = 1000
-
-	// spinIterationsMin is the minimum spin iterations for adaptive adjustment.
-	spinIterationsMin = 200
-
-	// spinIterationsMax is the maximum spin iterations to prevent excessive CPU use.
-	spinIterationsMax = 4000
-)
+// Spin-wait constants are defined in platform-specific files:
+//   shm_spin_linux.go  — low values (Linux futex costs ~1-2µs)
+//   shm_spin_windows.go — high values (Windows WaitOnAddress/cgocall costs ~40µs)
 
 var shmDebugEnabled = os.Getenv("GRPC_SHM_DEBUG") != ""
 
@@ -118,6 +104,12 @@ type ShmRing struct {
 	// events holds Windows named event handles for cross-mapping synchronization.
 	// On Linux, this is nil and futex is used directly.
 	events *RingEvents
+
+	// batchDepth tracks nested batch-write operations. When > 0, Commit
+	// suppresses DataSequence increments and reader wakeups. The final
+	// EndBatch call performs a single increment + signal, amortizing the
+	// cost of multiple frame writes.
+	batchDepth uint32
 }
 
 // ReadCommit holds the state needed to commit a read operation.
@@ -161,6 +153,41 @@ func (rc *ReadCommit) Commit(consumed int) {
 	if consumed > 0 && hdr.SpaceWaiters() > 0 {
 		hdr.IncrementSpaceSequence()
 		rc.ring.signalSpace(&hdr.spaceSeq)
+	}
+}
+
+// speculativeReleasePool implements mem.BufferPool. When the buffer is freed,
+// Put decrements the ring's speculativeReserved counter and wakes blocked
+// writers. The buffer data (ring memory) is not actually pooled.
+type speculativeReleasePool struct {
+	ring     *ShmRing
+	reserved int64
+}
+
+func (p *speculativeReleasePool) Get(n int) *[]byte {
+	buf := make([]byte, n)
+	return &buf
+}
+
+func (p *speculativeReleasePool) Put(_ *[]byte) {
+	if p.ring == nil {
+		return
+	}
+	if atomic.LoadUint32(&p.ring.closed) != 0 {
+		return
+	}
+	hdr := p.ring.header()
+	hdr.AddSpeculativeReserved(-p.reserved)
+
+	// Wake any writers waiting for space, since freeing speculative bytes
+	// effectively increases the writer's available space.
+	if hdr.SpaceWaiters() > 0 {
+		hdr.IncrementSpaceSequence()
+		p.ring.signalSpace(&hdr.spaceSeq)
+	}
+	if hdr.ContigWaiters() > 0 {
+		hdr.IncrementContigSequence()
+		p.ring.signalContig(&hdr.contigSeq)
 	}
 }
 
@@ -357,9 +384,19 @@ func (r *ShmRing) WriteBlocking(data []byte) error {
 		writeIdx := hdr.WriteIndex()
 		readIdx := hdr.ReadIndex()
 
-		// Calculate available space using indices
+		// Calculate available space, deducting speculative reserved bytes
+		// so the writer cannot overwrite ring memory still held by zero-copy
+		// read buffers.
 		usedBefore := writeIdx - readIdx
 		available := r.capacity - usedBefore
+		specReserved := hdr.SpeculativeReserved()
+		if specReserved > 0 {
+			sr := uint64(specReserved)
+			if sr > available {
+				sr = available
+			}
+			available -= sr
+		}
 
 		if uint64(len(data)) <= available {
 			// Space available - perform the write
@@ -412,6 +449,14 @@ func (r *ShmRing) WriteBlocking(data []byte) error {
 		readIdx = hdr.ReadIndex()
 		usedBefore = writeIdx - readIdx
 		available = r.capacity - usedBefore
+		specReserved = hdr.SpeculativeReserved()
+		if specReserved > 0 {
+			sr := uint64(specReserved)
+			if sr > available {
+				sr = available
+			}
+			available -= sr
+		}
 		if available == 0 {
 			// Full: spin-wait then wait on spaceSeq (full→not-full)
 			// Phase 1: Spin-wait before falling back to futex
@@ -688,7 +733,60 @@ func (r *ShmRing) Available() uint64 {
 	if atomic.LoadUint32(&r.closed) != 0 {
 		return 0
 	}
-	return r.header().Available()
+	return r.effectiveAvailable()
+}
+
+// effectiveAvailable returns the bytes available for writing, deducting
+// speculativeReserved so the writer cannot overwrite ring memory still
+// referenced by zero-copy reader buffers.
+func (r *ShmRing) effectiveAvailable() uint64 {
+	hdr := r.header()
+	writeIdx := hdr.WriteIndex()
+	readIdx := hdr.ReadIndex()
+	used := writeIdx - readIdx
+	raw := r.capacity - used
+
+	specReserved := hdr.SpeculativeReserved()
+	if specReserved <= 0 {
+		return raw
+	}
+	sr := uint64(specReserved)
+	if sr > raw {
+		sr = raw
+	}
+	return raw - sr
+}
+
+// ContiguousWriteSpace returns the number of contiguous bytes available for
+// writing from the current write position to the end of the ring buffer
+// (before wrap-around). This is useful for zero-copy writes that require
+// a single contiguous slice.
+func (r *ShmRing) ContiguousWriteSpace() uint64 {
+	if atomic.LoadUint32(&r.closed) != 0 {
+		return 0
+	}
+	hdr := r.header()
+	writeIdx := hdr.WriteIndex()
+	readIdx := hdr.ReadIndex()
+	used := writeIdx - readIdx
+	available := r.capacity - used
+
+	// Deduct speculative reserved bytes (zero-copy reads still in use).
+	specReserved := hdr.SpeculativeReserved()
+	if specReserved > 0 {
+		sr := uint64(specReserved)
+		if sr > available {
+			sr = available
+		}
+		available -= sr
+	}
+
+	writePos := writeIdx & r.capMask
+	toEnd := r.capacity - writePos
+	if toEnd < available {
+		return toEnd
+	}
+	return available
 }
 
 // Used returns the number of bytes currently used in the ring
@@ -1084,6 +1182,8 @@ type WriteReservation struct {
 
 // Commit commits the written bytes and advances the write index.
 // written must not exceed maxBytes (the reservation size).
+// If the ring is in batch mode (BeginBatch), the DataSequence increment
+// and reader signal are deferred until EndBatch.
 func (wr *WriteReservation) Commit(written int) error {
 	if written < 0 || written > wr.maxBytes {
 		return fmt.Errorf("invalid written count %d, expected 0-%d", written, wr.maxBytes)
@@ -1094,7 +1194,8 @@ func (wr *WriteReservation) Commit(written int) error {
 	// Publish new write index.
 	hdr.SetWriteIndex(wr.writeIdx + uint64(written)) // release-publish
 
-	if written > 0 {
+	// In batch mode, skip the signal — EndBatch will do it once.
+	if written > 0 && atomic.LoadUint32(&wr.ring.batchDepth) == 0 {
 		hdr.IncrementDataSequence()
 		newSeq := hdr.DataSequence()
 		waiters := hdr.DataWaiters()
@@ -1107,6 +1208,26 @@ func (wr *WriteReservation) Commit(written int) error {
 	}
 
 	return nil
+}
+
+// BeginBatch starts a batch write session. While in batch mode, Commit calls
+// will advance the write index but suppress the DataSequence increment and
+// reader signal. This amortizes the signaling cost when writing multiple
+// frames in quick succession.
+func (r *ShmRing) BeginBatch() {
+	atomic.AddUint32(&r.batchDepth, 1)
+}
+
+// EndBatch ends a batch write session and signals the reader if any data
+// was written during the batch. Must be paired with BeginBatch.
+func (r *ShmRing) EndBatch() {
+	if atomic.AddUint32(&r.batchDepth, ^uint32(0)) == 0 { // decrement
+		hdr := r.header()
+		hdr.IncrementDataSequence()
+		if hdr.DataWaiters() > 0 {
+			r.signalData(&hdr.dataSeq)
+		}
+	}
 }
 
 // ReserveWrite blocks until at least n bytes of contiguous space is available, then returns
@@ -1150,9 +1271,17 @@ func (r *ShmRing) ReserveWrite(ctx context.Context, n int) (WriteReservation, er
 		writeIdx := hdr.WriteIndex()
 		readIdx := hdr.ReadIndex()
 
-		// Calculate available space
+		// Calculate available space, deducting speculative reserved bytes.
 		usedBefore := writeIdx - readIdx
 		available := r.capacity - usedBefore
+		specReserved := hdr.SpeculativeReserved()
+		if specReserved > 0 {
+			sr := uint64(specReserved)
+			if sr > available {
+				sr = available
+			}
+			available -= sr
+		}
 
 		if uint64(n) <= available {
 			// Space available - create reservation
@@ -1195,7 +1324,16 @@ func (r *ShmRing) ReserveWrite(ctx context.Context, n int) (WriteReservation, er
 			runtime_procyield(1) // PAUSE instruction to reduce power/contention
 			writeIdx = hdr.WriteIndex()
 			readIdx = hdr.ReadIndex()
-			if (r.capacity - (writeIdx - readIdx)) >= uint64(n) {
+			avail := r.capacity - (writeIdx - readIdx)
+			sr := hdr.SpeculativeReserved()
+			if sr > 0 {
+				sru := uint64(sr)
+				if sru > avail {
+					sru = avail
+				}
+				avail -= sru
+			}
+			if avail >= uint64(n) {
 				spinSuccess = true
 				// Adapt spin cutoff upward
 				newCutoff := (7*spinCutoff + spinIterationsMax) / 8

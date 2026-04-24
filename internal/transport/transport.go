@@ -704,6 +704,11 @@ type internalServerTransport interface {
 	writeHeader(s *ServerStream, md metadata.MD) error
 	write(s *ServerStream, hdr []byte, data mem.BufferSlice, opts *WriteOptions) error
 	writeStatus(s *ServerStream, st *status.Status) error
+	// writeProto attempts to serialize a proto.Message directly into the
+	// transport's buffer (e.g., ring memory for SHM). Returns (true, err) if
+	// handled; (false, nil) if unsupported and caller should use the standard
+	// encode+write path. This eliminates intermediate allocations and copies.
+	writeProto(s *ServerStream, msg any, opts *WriteOptions) (bool, error)
 	incrMsgRecv()
 	adjustWindow(s *ServerStream, n uint32)
 	updateWindow(s *ServerStream, n uint32)

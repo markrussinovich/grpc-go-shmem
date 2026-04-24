@@ -51,6 +51,12 @@ type DialOptions struct {
 	// Handshaker is the security handshaker for the client.
 	// If nil, no security handshake is performed.
 	Handshaker *ShmSecurityHandshaker
+
+	// SingleStreamMode requests single-stream optimizations from the server.
+	// When enabled and the server agrees, both sides can use inline writes
+	// and skip the frame writer queue for reduced latency.
+	// Default: false.
+	SingleStreamMode bool
 }
 
 // DefaultDialOptions returns sensible defaults for dialing
@@ -112,7 +118,9 @@ func DialShm(ctx context.Context, addr string, opts *DialOptions) (ClientTranspo
 	ctlTx.SetEvents(ctlTxEvents)
 	ctlRx.SetEvents(ctlRxEvents)
 
-	if err := writeFrame(ctx, ctlTx, FrameHeader{Type: FrameTypeCONNECT}, encodeConnectRequest(connectRequest{})); err != nil {
+	if err := writeFrame(ctx, ctlTx, FrameHeader{Type: FrameTypeCONNECT}, encodeConnectRequest(connectRequest{
+		singleStreamMode: opts.SingleStreamMode,
+	})); err != nil {
 		return nil, NewShmErrorWithCause(ShmErrConnectionRefused, "send connect request", err)
 	}
 	respFH, respPayload, err := readFrame(ctx, ctlRx)
@@ -181,6 +189,7 @@ func DialShm(ctx context.Context, addr string, opts *DialOptions) (ClientTranspo
 			segment.Close()
 			return nil, NewShmErrorWithCause(ShmErrUnknown, "failed to create client transport", err)
 		}
+		clientTransport.singleStreamMode = opts.SingleStreamMode
 		// Store auth info on transport
 		if authInfo != nil {
 			clientTransport.SetAuthInfo(authInfo)

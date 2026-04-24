@@ -1020,6 +1020,26 @@ func recv(p *parser, c baseCodec, s recvCompressor, dc Decompressor, m any, maxR
 	// free the buffers.
 	defer data.Free()
 
+	// Zero-copy fast path: if the data is a single contiguous buffer (e.g.,
+	// ring-backed SliceBuffer from SHM transport), the message is a proto,
+	// and the codec is the default proto codec, unmarshal directly from the
+	// buffer without MaterializeToBuffer copy. Custom codecs are not
+	// bypassed — they may have validation or different serialization.
+	if len(data) == 1 {
+		if pm, ok := m.(protoV2Message); ok {
+			isProtoCodec := true
+			if nc, ok := c.(interface{ Name() string }); ok {
+				isProtoCodec = nc.Name() == "proto"
+			}
+			if isProtoCodec {
+				if err := protoUnmarshalDirect(data[0].ReadOnlyData(), pm); err != nil {
+					return status.Errorf(codes.Internal, "grpc: failed to unmarshal the received message: %v", err)
+				}
+				return nil
+			}
+		}
+	}
+
 	if err := c.Unmarshal(data, m); err != nil {
 		return status.Errorf(codes.Internal, "grpc: failed to unmarshal the received message: %v", err)
 	}

@@ -333,6 +333,10 @@ func (ht *serverHandlerTransport) writeCustomHeaders(s *ServerStream) {
 	s.hdrMu.Unlock()
 }
 
+func (ht *serverHandlerTransport) writeProto(_ *ServerStream, _ any, _ *WriteOptions) (bool, error) {
+	return false, nil
+}
+
 func (ht *serverHandlerTransport) write(s *ServerStream, hdr []byte, data mem.BufferSlice, _ *WriteOptions) error {
 	// Always take a reference because otherwise there is no guarantee the data will
 	// be available after this function returns. This is what callers to Write

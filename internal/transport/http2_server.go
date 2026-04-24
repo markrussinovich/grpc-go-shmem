@@ -1152,6 +1152,11 @@ func (t *http2Server) writeStatus(s *ServerStream, st *status.Status) error {
 	return nil
 }
 
+// writeProto is not supported by HTTP/2 transport; always returns false.
+func (t *http2Server) writeProto(_ *ServerStream, _ any, _ *WriteOptions) (bool, error) {
+	return false, nil
+}
+
 // Write converts the data into HTTP2 data frame and sends it out. Non-nil error
 // is returns if it fails (e.g., framing error, transport error).
 func (t *http2Server) write(s *ServerStream, hdr []byte, data mem.BufferSlice, _ *WriteOptions) error {
