@@ -1,847 +1,640 @@
-Shared Memory Transport for gRPC
+G3: Shared Memory Transport for gRPC
 ----
-* Author(s): Mark Russinovich
+* Author(s): Mark Russinovich, Qiming Sun
 * Approver: a11r
 * Status: Draft
-* Implemented in: Go
-* Last updated: 2026-02-02
-* Discussion at: (pending)
+* Implemented in: n/a
+* Last updated: 2026-04-10
+* Discussion at: (TBD)
 
 ## Abstract
 
-This proposal introduces a shared memory transport for gRPC, enabling high-performance inter-process communication (IPC) for gRPC services running on the same machine. The shared memory transport achieves 10-50x lower latency and 15-40x higher throughput compared to TCP loopback by eliminating kernel network stack overhead through memory-mapped regions and efficient synchronization primitives.
-
-**Supported Platforms**: This implementation supports **Linux** (using futex for synchronization) and **Windows** (using `WaitOnAddress()` for synchronization). Both platforms provide equivalent functionality with platform-native primitives for optimal performance.
+This proposal defines a protocol for gRPC over shared memory, for
+inter-process calls on the same host. Two processes map the same memory
+region and exchange gRPC frames through SPSC (single-producer /
+single-consumer) ring buffers, using OS address-wait/wake primitives for
+synchronization.
 
 ## Background
 
-### The Problem
+gRPC uses HTTP/2 over TCP. When both the client and server are on the same
+host, the TCP path still traverses the full kernel networking stack — socket
+buffers, TCP state machine, congestion control — which is unnecessary for
+local IPC.
 
-gRPC is widely used for microservices communication, but many deployments involve services running on the same physical or virtual machine communicating via localhost. In these scenarios, the TCP network stack introduces unnecessary overhead:
+Shared memory lets two processes read and write the same physical pages
+directly. This document specifies a framing protocol, metadata encoding,
+and connection lifecycle for gRPC over shared memory.
 
-1. **Kernel crossings**: Each send/receive requires multiple syscalls (write/read, poll/epoll)
-2. **Data copying**: Data is copied from user space to kernel buffers and back
-3. **Protocol overhead**: TCP congestion control, checksumming, and buffering add latency
-4. **Socket buffer management**: The kernel manages send/receive buffers with additional overhead
+### Related Proposals:
 
-For latency-sensitive workloads (ML inference, real-time analytics, high-frequency trading), even the ~10-20µs latency of TCP loopback can be significant.
-
-### Shared Memory Advantages
-
-A shared memory transport provides:
-
-1. **Zero kernel involvement in data path**: After initial setup, data transfer is pure user-space memory copy
-2. **Platform-native synchronization**: Efficient cross-process blocking with minimal syscalls using futex (Linux) or `WaitOnAddress()` (Windows)
-3. **Zero-copy potential**: With careful design, data can remain in shared memory without copies
-4. **Lower latency**: Sub-microsecond roundtrip times are achievable
-5. **Higher throughput**: Memory bandwidth limited rather than socket-limited
-
-### Related Proposals
-
-* [RFC A73: Requirements for New Transports](https://github.com/grpc/proposal/blob/master/A73-requirements-for-new-transports.md) - Defines requirements that new transports must satisfy
-* [L73: Java BinderChannel](https://github.com/grpc/proposal/blob/master/L73-java-binderchannel) - Android Binder transport, demonstrates custom transport integration
-
-This proposal implements a transport that fully honors RFC A73's requirements for new transports, including:
-- Proper integration with gRPC's connectivity state management
-- Support for flow control with BDP estimation
-- Graceful shutdown semantics
-- Keepalive support
-- Deadline propagation
+n/a
 
 ## Proposal
 
-### High-Level Design Overview
+### Design Overview
 
-The shared memory transport consists of the following components:
+Each SHM connection consists of a single memory-mapped segment containing two
+unidirectional SPSC ring buffers:
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                         Shared Memory Segment                               │
-│  ┌───────────────────────────────────────────────────────────────────────┐  │
-│  │  Segment Header (128 bytes)                                           │  │
-│  │  - Magic, Version, Flags, PID tracking, Ready flags                   │  │
-│  └───────────────────────────────────────────────────────────────────────┘  │
-│  ┌───────────────────────────────────────────────────────────────────────┐  │
-│  │  Ring A: Client → Server (64 MiB default)                             │  │
-│  │  ┌────────────────────────────────────────────────────────────────┐   │  │
-│  │  │ Ring Header (64 bytes)                                         │   │  │
-│  │  │ - Capacity, Write/Read indices, Futex sequences                │   │  │
-│  │  └────────────────────────────────────────────────────────────────┘   │  │
-│  │  ┌────────────────────────────────────────────────────────────────┐   │  │
-│  │  │ Data Area (power-of-2 capacity)                                │   │  │
-│  │  └────────────────────────────────────────────────────────────────┘   │  │
-│  └───────────────────────────────────────────────────────────────────────┘  │
-│  ┌───────────────────────────────────────────────────────────────────────┐  │
-│  │  Ring B: Server → Client (64 MiB default)                             │  │
-│  │  [Same structure as Ring A]                                           │  │
-│  └───────────────────────────────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────────────────────────────┘
-         ↑                                        ↑
-         │                                        │
-    ┌────┴─────┐                              ┌───┴─────┐
-    │  Client  │                              │  Server │
-    │ Process  │                              │ Process │
-    └──────────┘                              └─────────┘
-```
+- **Ring A**: Client → Server
+- **Ring B**: Server → Client
 
-### RFC A73 Compliance
+The client writes to Ring A and reads from Ring B; the server does the
+reverse. All multi-byte integers in the protocol are **little-endian**.
 
-This transport fully complies with RFC A73 requirements:
+Stream multiplexing, flow control, and keepalive follow the same semantic
+model as
+[gRPC over HTTP/2](https://github.com/grpc/grpc/blob/master/doc/PROTOCOL-HTTP2.md)
+and [RFC 7540](https://httpwg.org/specs/rfc7540.html). Only the wire
+encoding differs; behavioral semantics are inherited.
 
-| Requirement | Implementation |
-|-------------|----------------|
-| **ClientTransport interface** | `ShmClientTransport` implements all required methods |
-| **ServerTransport interface** | `ShmServerTransport` implements all required methods |
-| **Connectivity state management** | `onClose` callback for state transitions |
-| **Flow control** | HTTP/2-style window management with WINDOW_UPDATE frames |
-| **BDP estimation** | Adaptive window sizing based on bandwidth-delay product |
-| **Graceful shutdown** | GOAWAY frame with DRAINING flag, waits for active streams |
-| **Keepalive** | PING/PONG frames with configurable parameters |
-| **Deadline propagation** | Deadline encoded in HEADERS frame |
-| **Metadata propagation** | Full metadata support in HEADERS and TRAILERS |
-| **Stream multiplexing** | Stream IDs with configurable max concurrent streams |
+gRPC
+[Length-Prefixed-Message](https://github.com/grpc/grpc/blob/master/doc/PROTOCOL-HTTP2.md)
+encoding, status codes, metadata conventions, and compression negotiation
+apply without modification.
 
-### Core gRPC Modifications
+![Dual-Ring Architecture](G3_graphics/dual_ring_architecture.png)
 
-The shared memory transport integrates with gRPC-Go with **minimal modifications to core files**:
+## Shared Memory Segment Layout
 
-#### 1. ClientTransportProvider Interface (http2_client.go)
+### Segment Header (128 bytes)
 
-A single interface addition allows custom transports to bypass HTTP/2 wrapping:
+The segment header resides at offset 0 of the mapped region.
 
-```go
-// ClientTransportProvider is an interface for connections that provide
-// their own ClientTransport. This allows custom transports (like shared
-// memory) to be used with gRPC's standard APIs.
-type ClientTransportProvider interface {
-    GetClientTransport() ClientTransport
-}
-```
+| Offset | Size | Field | Description |
+|--------|------|-------|-------------|
+| 0x00 | 8B | Magic | Fixed value `"GRPCSHM\0"` (0x47 52 50 43 53 48 4D 00) |
+| 0x08 | 4B | Version | Protocol version (current = 1) |
+| 0x0C | 4B | Flags | Reserved; MUST be 0 |
+| 0x10 | 8B | TotalSize | Total mapped region size in bytes |
+| 0x18 | 8B | RingAOffset | Byte offset to Ring A header |
+| 0x20 | 8B | RingACapacity | Ring A data area capacity; MUST be a power of 2 |
+| 0x28 | 8B | RingBOffset | Byte offset to Ring B header |
+| 0x30 | 8B | RingBCapacity | Ring B data area capacity; MUST be a power of 2 |
+| 0x38 | 4B | ServerPID | Server process ID |
+| 0x3C | 4B | ClientPID | Client process ID |
+| 0x40 | 4B | ServerReady | Server ready flag (0 or 1) |
+| 0x44 | 4B | ClientReady | Client ready flag (0 or 1) |
+| 0x48 | 4B | Closed | Connection closed flag (0 or 1) |
+| 0x4C | 4B | Pad | Alignment padding |
+| 0x50 | 4B | MaxStreams | Maximum concurrent streams (server-enforced) |
+| 0x54–0x7F | 44B | Reserved | MUST be 0 |
 
-The `NewHTTP2Client` function checks for this interface after dialing:
+Implementations MUST validate Magic and Version after mapping. An
+unrecognized Magic or Version MUST cause the mapping to be discarded.
 
-```go
-func NewHTTP2Client(connectCtx, ctx context.Context, addr resolver.Address,
-    opts ConnectOptions, onClose func(GoAwayReason)) (ClientTransport, error) {
-    // ... dial connection ...
+`MaxStreams` is set by the server when it creates the data segment. The
+client MUST NOT open more concurrent streams than this value. A value of 0
+means no limit.
 
-    // Check if the connection provides its own transport
-    if provider, ok := conn.(ClientTransportProvider); ok {
-        return provider.GetClientTransport(), nil
-    }
+**Ready flag rules:**
 
-    // Continue with HTTP2 client creation...
-}
-```
+- The server sets `ServerReady = 1` after the segment is fully initialized.
+  The client MUST NOT read any other header field until `ServerReady == 1`.
+- The client sets `ClientReady = 1` after it has mapped the data segment and
+  is prepared to receive frames.
+- Both flags transition only from 0 → 1; the reverse is never valid.
+- `Closed` in the **segment header** transitions only from 0 → 1 and
+  indicates the connection is shutting down. Either side may set it. Once
+  set, no new streams may be opened. Existing data already written to the
+  rings MUST still be consumed (drained) before unmapping, unless the
+  shutdown was triggered by GOAWAY with the IMMEDIATE flag (see
+  [GOAWAY Flags](#goaway-flags)), in which case unprocessed ring data MAY be
+  discarded.
+- `Closed` in a **ring header** is set by that ring's producer (the side
+  that writes to it) to indicate it will write no more data. The consumer
+  MUST drain any remaining bytes before treating the ring as closed. The
+  segment-level `Closed` flag is typically set after both rings are closed.
+- All flag reads and writes MUST use acquire/release memory ordering.
 
-#### 2. WithShmTransport Dial Option (shm_grpc_helpers.go)
+### Ring Header (64 bytes)
 
-A new dial option enables shared memory transport:
+Each ring buffer has a 64-byte header at the byte offset given by
+`RingAOffset` or `RingBOffset` in the segment header.
 
-```go
-// WithShmTransport returns a DialOption that configures the client to use
-// shared memory transport for shm:// addresses.
-func WithShmTransport() DialOption {
-    return WithContextDialer(func(ctx context.Context, addr string) (net.Conn, error) {
-        // Parse segment name from address
-        // Create/open shared memory segment
-        // Return shmClientConn implementing ClientTransportProvider
-    })
-}
-```
+| Offset | Size | Field | Description |
+|--------|------|-------|-------------|
+| 0x00 | 8B | Capacity | Data area capacity in bytes; power of 2 |
+| 0x08 | 8B | WriteIdx | Monotonically increasing write index (producer) |
+| 0x10 | 8B | ReadIdx | Monotonically increasing read index (consumer) |
+| 0x18 | 4B | DataSeq | Data-available sequence (wait/wake target) |
+| 0x1C | 4B | SpaceSeq | Space-available sequence |
+| 0x20 | 4B | Closed | Ring closed flag; producer sets to 1 |
+| 0x24 | 4B | Pad | Alignment padding |
+| 0x28 | 4B | ContigSeq | Contiguity sequence (optional; see below) |
+| 0x2C | 4B | SpaceWaiters | Writers blocked waiting for space |
+| 0x30 | 4B | ContigWaiters | Writers blocked waiting for contiguity (optional) |
+| 0x34 | 4B | DataWaiters | Readers blocked waiting for data |
+| 0x38–0x3F | 8B | Reserved | MUST be 0 |
 
-#### 3. SHM Resolver (resolver.go)
+### Ring Data Area
 
-A resolver for the `shm://` URL scheme:
+Immediately following the ring header is a contiguous region of `Capacity`
+bytes used as a circular buffer:
 
-```go
-func init() {
-    resolver.Register(&shmResolverBuilder{})
-}
+- Write position: `WriteIdx & (Capacity - 1)`
+- Read position: `ReadIdx & (Capacity - 1)`
+- Readable bytes: `WriteIdx - ReadIdx`
+- Writable bytes: `Capacity - (WriteIdx - ReadIdx)`
 
-type shmResolverBuilder struct{}
-
-func (b *shmResolverBuilder) Scheme() string { return "shm" }
-```
-
-#### Summary of Core Changes
-
-| File | Change | Lines |
-|------|--------|-------|
-| `internal/transport/http2_client.go` | Added `ClientTransportProvider` interface and check | ~15 lines |
-| `shm_grpc_helpers.go` | New file: `WithShmTransport()` dial option | ~250 lines |
-| `internal/transport/resolver.go` | New file: `shm://` resolver | ~100 lines |
-
-All other code is additive in new files, with no modifications to existing gRPC behavior.
-
----
-
-## Connection Setup
-
-### HTTP/2 vs Shared Memory Connection Flow
-
-The following diagrams illustrate the difference in connection establishment between HTTP/2 and shared memory transports.
-
-#### HTTP/2 Connection Setup
+### Overall Memory Layout
 
 ```
-   ┌──────────┐                                        ┌──────────┐
-   │  Client  │                                        │  Server  │
-   └────┬─────┘                                        └────┬─────┘
-        │                                                   │
-        │  1. DNS resolve target                            │
-        │  ───────────────────────>                         │
-        │                                                   │
-        │  2. TCP connect (SYN/SYN-ACK/ACK)                 │
-        │  ←────────────────────────────────────────────────│
-        │                                                   │
-        │  3. TLS handshake (if secure)                     │
-        │  ←────────────────────────────────────────────────│
-        │                                                   │
-        │  4. HTTP/2 connection preface                     │
-        │  ─────────────────────────────────────────────────>
-        │                                                   │
-        │  5. SETTINGS frame exchange                       │
-        │  ←────────────────────────────────────────────────│
-        │                                                   │
-        │  6. SETTINGS ACK                                  │
-        │  ─────────────────────────────────────────────────>
-        │                                                   │
-        ▼                                                   ▼
-   Connection Ready (~3-5 RTT)
+Offset 0:          Segment Header (128B)
+Offset 128:        Ring A Header  (64B)     [Client → Server]
+Offset 192:        Ring A Data    (N bytes, power-of-2)
+Offset 192+N:      Ring B Header  (64B)     [Server → Client]
+Offset 256+N:      Ring B Data    (M bytes, power-of-2)
 ```
 
-#### Shared Memory Connection Setup
+![Segment Memory Layout](G3_graphics/segment_memory_layout.png)
 
-```
-   ┌──────────┐                                        ┌──────────┐
-   │  Client  │                                        │  Server  │
-   └────┬─────┘                                        └────┬─────┘
-        │                                                   │
-        │  1. Resolve "shm://service_name"                  │
-        │     (local resolution - no network)               │
-        │                                                   │
-        │  2. Open control segment (mmap)                   │
-        │  ─────────────────────(shm_open)──────────────────│
-        │                                                   │
-        │  3. Check serverReady flag                        │
-        │     (atomic read from shared memory)              │
-        │                                                   │
-        │  4. Map data segment                              │
-        │  ─────────────────────(mmap)──────────────────────│
-        │                                                   │
-        │  5. Set clientReady flag                          │
-        │     (atomic write + futex_wake)                   │
-        │                                                   │
-        ▼                                                   ▼
-   Connection Ready (0 RTT - pure memory operations)
-```
+## Frame Format
 
-### Connection Setup Implementation
+### Frame Header (16 bytes)
 
-#### Server-Side Setup
-
-```go
-// Create listener
-lis, err := transport.NewShmListener(
-    &transport.ShmAddr{Name: "my_service"},
-    2*1024*1024,   // 2MB segment size
-    512*1024,      // 512KB ring A (client→server)
-    512*1024,      // 512KB ring B (server→client)
-)
-
-// Standard gRPC server
-server := grpc.NewServer()
-pb.RegisterMyServiceServer(server, &myImpl{})
-server.Serve(lis)
-```
-
-The server:
-1. Creates a shared memory segment in `/dev/shm/` (Linux) or named file mapping (Windows)
-2. Initializes segment header with magic number, version, and ring offsets
-3. Sets `serverReady` flag
-4. Waits for client connections on the control segment
-
-#### Client-Side Setup
-
-```go
-conn, err := grpc.NewClient(
-    "shm://my_service",
-    grpc.WithShmTransport(),
-    grpc.WithTransportCredentials(insecure.NewCredentials()),
-)
-```
-
-The client:
-1. Resolves `shm://my_service` to segment name
-2. Opens the shared memory segment
-3. Validates header (magic, version compatibility)
-4. Maps ring buffers
-5. Sets `clientReady` flag
-6. Wakes server via futex if waiting
-
-### Connection Handshake Sequence
-
-```
-┌───────────────────────────────────────────────────────────────────────────────┐
-│                           Connection Handshake                                 │
-├───────────────────────────────────────────────────────────────────────────────┤
-│                                                                               │
-│  Server                                    Client                             │
-│  ──────                                    ──────                             │
-│                                                                               │
-│  CreateSegment("service_name")                                                │
-│        │                                                                      │
-│        ├─→ mmap() segment                                                     │
-│        ├─→ Initialize header                                                  │
-│        ├─→ Set serverReady = 1                                                │
-│        ├─→ futex_wait(clientReady)         OpenSegment("service_name")        │
-│        │                                         │                            │
-│        │                                         ├─→ mmap() segment           │
-│        │                                         ├─→ Validate header          │
-│        │                                         ├─→ Set clientReady = 1      │
-│        │                                         ├─→ futex_wake(clientReady)  │
-│        │◄────────────────────────────────────────┤                            │
-│        │                                         │                            │
-│  [Server wakes, creates transport]         [Client creates transport]         │
-│        │                                         │                            │
-│        ▼                                         ▼                            │
-│  ShmServerTransport ready                  ShmClientTransport ready           │
-│                                                                               │
-└───────────────────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## Read/Write Flows
-
-### HTTP/2 vs Shared Memory Write Path
-
-#### HTTP/2 Write Flow
-
-```
-Application                    gRPC Core                      Transport Layer
-    │                              │                              │
-    ▼                              │                              │
-clientStream.SendMsg(m)            │                              │
-    │                              │                              │
-    └──► prepareMsg()              │                              │
-         (marshal + compress)      │                              │
-              │                    │                              │
-              ▼                    │                              │
-         csAttempt.sendMsg()       │                              │
-              │                    │                              │
-              ▼                    │                              │
-         transportStream.Write(hdr, payload, opts)                │
-              │                    │                              │
-              ├────────────────────┼──► http2Client.write()       │
-              │                    │          │                   │
-              │                    │          ▼                   │
-              │                    │    s.wq.get(sz)              │
-              │                    │    (wait for flow quota)     │
-              │                    │          │                   │
-              │                    │          ▼                   │
-              │                    │    controlBuf.put(dataFrame) │
-              │                    │          │                   │
-              │                    │          ▼                   │
-              │                    │    [loopyWriter goroutine]   │
-              │                    │          │                   │
-              │                    │          ▼                   │
-              │                    │    framer.writeData()        │
-              │                    │          │                   │
-              │                    │          ▼                   │
-              │                    │    net.Conn.Write()          │
-              │                    │    (syscall: write)          │
-```
-
-**Key characteristics:**
-- Asynchronous write via controlBuf queue
-- Separate loopyWriter goroutine
-- Multiple goroutine synchronizations
-- Kernel syscall for socket write
-- HTTP/2 framing overhead (9-byte header per frame)
-
-#### Shared Memory Write Flow
-
-```
-Application                    gRPC Core                      Transport Layer
-    │                              │                              │
-    ▼                              │                              │
-clientStream.SendMsg(m)            │                              │
-    │                              │                              │
-    └──► prepareMsg()              │                              │
-         (marshal + compress)      │                              │
-              │                    │                              │
-              ▼                    │                              │
-         csAttempt.sendMsg()       │                              │
-              │                    │                              │
-              ▼                    │                              │
-         transportStream.Write(hdr, payload, opts)                │
-              │                    │                              │
-              └────────────────────┼──► ShmClientTransport.write()│
-                                   │          │                   │
-                                   │          ▼                   │
-                                   │    acquireSendQuota()        │
-                                   │          │                   │
-                                   │          ▼                   │
-                                   │    ShmRing.ReserveWrite(n)   │
-                                   │    ┌──────────────────────┐  │
-                                   │    │ Atomic check space   │  │
-                                   │    │ If full: futex_wait  │  │
-                                   │    │ Return slices        │  │
-                                   │    └──────────────────────┘  │
-                                   │          │                   │
-                                   │          ▼                   │
-                                   │    copy(res.First, hdr)      │
-                                   │    copy(res.First/Second,    │
-                                   │          payload)            │
-                                   │          │                   │
-                                   │          ▼                   │
-                                   │    res.Commit()              │
-                                   │    (atomic widx update)      │
-                                   │          │                   │
-                                   │          ▼                   │
-                                   │    futex_wake() if readers   │
-                                   │    waiting                   │
-```
-
-**Key characteristics:**
-- Synchronous write (no queue)
-- Direct memory copy to shared region
-- Atomic operations for index updates
-- Futex only when blocking needed
-- Simpler 16-byte frame header
-
-### HTTP/2 vs Shared Memory Read Path
-
-#### HTTP/2 Read Flow
-
-```
-                      Transport Layer                      gRPC Core
-                           │                                  │
-                           ▼                                  │
-                    [readerLoop goroutine]                    │
-                           │                                  │
-                           ▼                                  │
-                    net.Conn.Read()                           │
-                    (syscall: read)                           │
-                           │                                  │
-                           ▼                                  │
-                    http2.Framer.ReadFrame()                  │
-                           │                                  │
-                           ▼                                  │
-                    switch frame.Type {                       │
-                    case DATA:                                │
-                        ├──────────────────────────────────────►
-                        │                                     │
-                        │                              s.buf.put(data)
-                        │                                     │
-                        ▼                                     ▼
-                    handleData()                        RecvMsg() unblocks
-```
-
-#### Shared Memory Read Flow
-
-```
-                      Transport Layer                      gRPC Core
-                           │                                  │
-                           ▼                                  │
-                    [processIncomingData goroutine]           │
-                           │                                  │
-                           ▼                                  │
-                    ShmRing.ReadSlices(ctx, n)                │
-                    ┌─────────────────────────┐               │
-                    │ Atomic check data avail │               │
-                    │ If empty: futex_wait    │               │
-                    │ Return slices           │               │
-                    └─────────────────────────┘               │
-                           │                                  │
-                           ▼                                  │
-                    decodeFrameHeader()                       │
-                    (from shared memory)                      │
-                           │                                  │
-                           ▼                                  │
-                    switch fh.Type {                          │
-                    case MESSAGE:                             │
-                        ├──────────────────────────────────────►
-                        │                                     │
-                        │                              s.buf <- payload
-                        │                                     │
-                        ▼                                     ▼
-                    handleMessage()                     RecvMsg() unblocks
-```
-
-### Bidirectional Streaming: Deadlock Prevention
-
-A critical design consideration is preventing deadlock in bidirectional streaming:
-
-```
-                    Problem Scenario:
-┌─────────────┐                              ┌─────────────┐
-│   Client    │                              │   Server    │
-├─────────────┤                              ├─────────────┤
-│ Ring A full │◄───────────────────────────────Ring B full │
-│ Blocked on  │                              │ Blocked on  │
-│ write()     │                              │ write()     │
-│             │                              │             │
-│ Can't read  │                              │ Can't read  │
-│ Ring B      │                              │ Ring A      │
-│             │                              │             │
-│ DEADLOCK!   │                              │ DEADLOCK!   │
-└─────────────┘                              └─────────────┘
-```
-
-**Solution: Concurrent Read/Write Goroutines**
-
-```
-┌──────────────┐                      ┌──────────────┐
-│   Client     │                      │   Server     │
-├──────────────┤                      ├──────────────┤
-│ Reader       │◄──── Ring B ─────────│ Sender       │
-│ Goroutine    │      (S→C)           │ Goroutine    │
-│              │                      │              │
-│ Sender       │───── Ring A ────────►│ Reader       │
-│ Goroutine    │      (C→S)           │ Goroutine    │
-└──────────────┘                      └──────────────┘
-```
-
-Each side has independent reader and sender goroutines:
-- Reader can always drain incoming data
-- Sender can block waiting for space
-- No circular dependency possible
-
----
-
-## Framing Implementation
-
-### Frame Header Format (16 bytes)
-
-The shared memory transport uses a compact 16-byte frame header, optimized for memory alignment and efficient parsing:
+Every frame begins with a 16-byte little-endian header.
 
 ```
  0                   1                   2                   3
  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|                         Length (32)                           |
+|                        Length (32)                             |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|                        Stream ID (32)                         |
+|     Type      |     Flags     |         Reserved (16)         |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|    Type (8)   |   Flags (8)   |        Reserved (16)          |
+|                       Stream ID (32)                          |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|                        Reserved2 (32)                         |
+|                       Reserved2 (32)                          |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 ```
+
+| Offset | Size | Field | Description |
+|--------|------|-------|-------------|
+| 0 | 4B | Length | Payload length; excludes the 16-byte header |
+| 4 | 1B | Type | Frame type |
+| 5 | 1B | Flags | Type-specific flags |
+| 6 | 2B | Reserved | MUST be 0 |
+| 8 | 4B | StreamID | Stream identifier; 0 = connection-level frame |
+| 12 | 4B | Reserved2 | MUST be 0 |
+
+The header is 16 bytes to align to power-of-2 boundaries in the ring
+buffer.
 
 ### Frame Types
 
-| Type | Value | Description |
-|------|-------|-------------|
-| `PAD` | 0x00 | Padding (reserved) |
-| `HEADERS` | 0x01 | Initial headers (method, authority, metadata) |
-| `MESSAGE` | 0x02 | gRPC message payload |
-| `TRAILERS` | 0x03 | Final status and trailing metadata |
-| `CANCEL` | 0x04 | Stream cancellation |
-| `GOAWAY` | 0x05 | Connection shutdown |
-| `PING` | 0x06 | Keepalive ping |
-| `PONG` | 0x07 | Keepalive response |
-| `HALFCLOSE` | 0x08 | Client finished sending |
-| `WindowUpdate` | 0x09 | Flow control window update |
+Frames whose semantics match HTTP/2 are marked with their equivalent. Only
+the wire encoding differs (16-byte LE header, LE payload fields). Receivers
+MUST skip unknown frame types by reading `Length` bytes without error.
+Frame type 0x07 is reserved.
+
+| Value | Name | H2 Equivalent | StreamID | Payload |
+|-------|------|---------------|----------|---------|
+| 0x00 | PAD | PADDING | 0 | 0..N opaque bytes |
+| 0x01 | HEADERS | HEADERS | >0 | [Headers V1](#headers-payload-version-1) |
+| 0x02 | MESSAGE | DATA | >0 | [gRPC LPM](https://github.com/grpc/grpc/blob/master/doc/PROTOCOL-HTTP2.md); MORE flag (0x01) for chunking |
+| 0x03 | TRAILERS | HEADERS+ES | >0 | [Trailers V1](#trailers-payload-version-1) |
+| 0x04 | CANCEL | RST_STREAM | >0 | (none; Length = 0) |
+| 0x05 | GOAWAY | GOAWAY | 0 | `LastStreamID(4B LE) | ErrorCode(4B LE)` |
+| 0x06 | PING | PING | 0 | Variable-length opaque bytes; ACK = 0x01 |
+| 0x08 | HALF_CLOSE | END_STREAM | >0 | (none; Length = 0) |
+| 0x09 | WINDOW_UPDATE | WINDOW_UPDATE | >=0 | `Increment(4B LE)`; MUST be > 0 |
+| 0x10 | CONNECT | (n/a) | 0 | Control segment only (see below) |
+| 0x11 | ACCEPT | (n/a) | 0 | Control segment only (see below) |
+| 0x12 | REJECT | (n/a) | 0 | Control segment only (see below) |
+| 0x20-0x2F | (reserved) | (n/a) | — | Reserved for security-handshake extensions |
+
+### SHM-Specific Frame Details
+
+The frames below either have no direct HTTP/2 equivalent or extend it.
+
+#### GOAWAY Flags
+
+GOAWAY adds two flags not present in HTTP/2:
+
+- **DRAINING (0x01)**: streams with IDs <= LastStreamID may complete; no new
+  streams.
+- **IMMEDIATE (0x02)**: all open streams are failed; unprocessed ring data
+  MAY be discarded.
+
+#### MESSAGE Chunking
+
+A MESSAGE frame carries one gRPC
+[Length-Prefixed-Message](https://github.com/grpc/grpc/blob/master/doc/PROTOCOL-HTTP2.md)
+(`Compressed-Flag(1B) | Message-Length(4B big-endian) | Message-Bytes`).
+Compression semantics are unchanged from gRPC over HTTP/2.
+
+When the encoded message fits in one frame it MUST be sent whole. When it
+exceeds available ring space, the sender splits it across multiple MESSAGE
+frames with the `MORE` flag (0x01) set on all but the last. The 5-byte
+prefix appears only at the start of the first chunk; the receiver
+reassembles all chunks in order. Each chunk's `Length` is deducted from
+the stream's flow-control window.
+
+Chunks for a single message MUST appear consecutively on the stream. No
+other frames for the same StreamID (including WINDOW_UPDATE or HALF_CLOSE)
+may be interleaved between the first chunk and the final (non-MORE) chunk.
+Messages larger than the ring capacity are supported through chunking.
+The maximum message size is bounded by the 4-byte Message-Length field in
+the gRPC Length-Prefixed-Message encoding (~4 GB).
+
+#### PING
+
+PING payloads are variable-length (not fixed at 8 bytes as in HTTP/2).
+A PING without the ACK flag is a probe; the peer replies with a PING that
+has ACK set and the same payload bytes. A PING with ACK MUST NOT trigger a
+response.
+
+#### Ring Wrap and PAD
+
+The ring is circular. A frame's payload may wrap around the end of the data
+area; implementations MUST handle writes and reads that span the wrap
+point. PAD frames MAY be used to skip unused tail bytes but are not
+required.
+
+Implementations that choose to require contiguous (non-wrapping) frames MAY
+use the `ContigSeq` and `ContigWaiters` fields in the ring header for
+wait/wake signaling when the writer needs contiguous tail space.
+Implementations that allow split-wrap need not use these fields.
+
+#### HALF_CLOSE
+
+In HTTP/2, END_STREAM is a flag on HEADERS or DATA. In this protocol it is
+a separate frame type so that it can be written to the ring independently
+of the preceding MESSAGE.
+
+## Metadata Encoding
+
+Instead of HPACK, metadata is carried in length-prefixed binary fields
+(see [Rationale](#why-not-http2-framing)). Standard gRPC metadata
+conventions (key casing, `-bin` suffix, value ordering) apply unchanged.
+
+The gRPC method path, authority, and deadline are carried in the fixed
+fields of the Headers payload and MUST NOT appear as key-value metadata
+entries. Likewise, gRPC status code and status message are carried in the
+fixed fields of the Trailers payload and MUST NOT be duplicated as
+metadata.
 
 ### Headers Payload (Version 1)
 
+Payload of HEADERS frames (Type = 0x01):
+
 ```
-┌────────────────────────────────────────────────────────────────┐
-│  Version (1 byte)      = 1                                     │
-├────────────────────────────────────────────────────────────────┤
-│  HdrType (1 byte)      0=client-initial, 1=server-initial      │
-├────────────────────────────────────────────────────────────────┤
-│  Method Length (4 bytes, little-endian)                        │
-├────────────────────────────────────────────────────────────────┤
-│  Method (variable)     e.g., "/package.Service/Method"         │
-├────────────────────────────────────────────────────────────────┤
-│  Authority Length (4 bytes)                                    │
-├────────────────────────────────────────────────────────────────┤
-│  Authority (variable)                                          │
-├────────────────────────────────────────────────────────────────┤
-│  Deadline (8 bytes)    Unix nanoseconds, 0 if none             │
-├────────────────────────────────────────────────────────────────┤
-│  Metadata Count (2 bytes)                                      │
-├────────────────────────────────────────────────────────────────┤
-│  For each metadata entry:                                      │
-│    Key Length (2 bytes)                                        │
-│    Key (variable)                                              │
-│    Value Count (2 bytes)                                       │
-│    For each value:                                             │
-│      Value Length (4 bytes)                                    │
-│      Value (variable)                                          │
-└────────────────────────────────────────────────────────────────┘
+Version(1B) | HeaderType(1B) |
+MethodLen(4B LE) | Method(var, UTF-8) |
+AuthorityLen(4B LE) | Authority(var, UTF-8) |
+DeadlineUnixNano(8B LE) |
+MetadataCount(2B LE) | [Key-Value pairs]*
 ```
+
+Each key-value pair:
+
+```
+KeyLen(2B LE) | Key(var, UTF-8) |
+ValueCount(2B LE) | [ValueLen(4B LE) | Value(var, bytes)]*
+```
+
+Field semantics:
+
+- Version: MUST be 1.
+- HeaderType: 0 = request headers, 1 = response headers.
+- Method: full gRPC method path (e.g. `/package.Service/Method`).
+- Authority: target host. MAY be empty (AuthorityLen = 0).
+- DeadlineUnixNano: absolute deadline as Unix nanoseconds; 0 = no deadline.
+- MetadataCount: number of key-value pairs that follow. Each key supports
+  multiple values via ValueCount.
 
 ### Trailers Payload (Version 1)
 
-```
-┌────────────────────────────────────────────────────────────────┐
-│  Version (1 byte)      = 1                                     │
-├────────────────────────────────────────────────────────────────┤
-│  gRPC Status Code (4 bytes)                                    │
-├────────────────────────────────────────────────────────────────┤
-│  Status Message Length (4 bytes)                               │
-├────────────────────────────────────────────────────────────────┤
-│  Status Message (variable)                                     │
-├────────────────────────────────────────────────────────────────┤
-│  Metadata Count (2 bytes)                                      │
-├────────────────────────────────────────────────────────────────┤
-│  [Metadata entries - same format as Headers]                   │
-└────────────────────────────────────────────────────────────────┘
-```
-
-### Cross-Language Implementation Guide
-
-For other gRPC language implementations to support this shared memory transport, they must implement:
-
-#### 1. Platform-Specific Shared Memory
-
-| Platform | Mechanism | Key APIs |
-|----------|-----------|----------|
-| **Linux** | POSIX shm + mmap | `shm_open()`, `mmap()`, `futex()` |
-| **Windows** | Named File Mapping | `CreateFileMapping()`, `MapViewOfFile()`, `WaitOnAddress()` |
-| **macOS** | POSIX shm + mmap | `shm_open()`, `mmap()`, `pthread_cond` (no futex) |
-
-#### 2. Ring Buffer Implementation
-
-The ring buffer must implement:
-- Power-of-2 capacity for efficient modulo (bitwise AND)
-- Monotonically increasing read/write indices
-- Atomic index updates
-- Cross-process futex/event synchronization
-
-```c
-// C implementation sketch
-typedef struct {
-    uint64_t capacity;      // Power of 2
-    uint64_t widx;          // Monotonic write index
-    uint64_t ridx;          // Monotonic read index
-    uint32_t dataSeq;       // Futex for readers
-    uint32_t spaceSeq;      // Futex for writers
-    uint32_t closed;        // Closed flag
-    // ... padding to 64 bytes
-} RingHeader;
-
-// Available space = capacity - (widx - ridx)
-// Write position = widx & (capacity - 1)
-// Read position = ridx & (capacity - 1)
-```
-
-#### 3. Frame Encoding/Decoding
-
-All implementations must use:
-- **Little-endian** byte order
-- **16-byte aligned** frame headers
-- **Version 1** headers/trailers format
-
-#### 4. Segment Layout
+Payload of TRAILERS frames (Type = 0x03):
 
 ```
-Offset 0:     Segment Header (128 bytes)
-Offset 128:   Ring A Header (64 bytes)
-Offset 192:   Ring A Data Area (ringASize bytes)
-Offset 192 + ringASize: Ring B Header (64 bytes)
-Offset 256 + ringASize: Ring B Data Area (ringBSize bytes)
+Version(1B) | StatusCode(4B LE) |
+MsgLen(4B LE) | StatusMsg(var, UTF-8) |
+MetadataCount(2B LE) | [Key-Value pairs]*
 ```
 
----
+- Version: MUST be 1.
+- StatusCode: a gRPC status code as defined in
+  [grpc/status](https://grpc.github.io/grpc/core/md_doc_statuscodes.html).
+- StatusMsg: human-readable status message; MAY be empty (MsgLen = 0).
+- Key-value encoding is identical to the Headers payload.
 
-## Performance Benefits
+## Transport Discovery
 
-### Benchmark Methodology
+Before using shared memory, the client and server exchange transport
+capabilities over an existing HTTP/2 connection. Discovery uses gRPC
+metadata on any RPC:
 
-Benchmarks were run on:
-- **CPU**: AMD EPYC 7763 64-Core Processor
-- **OS**: Linux (Alpine)
-- **gRPC-Go**: v1.68.x with shared memory transport
-- **Test**: Raw ring buffer operations and gRPC RPC roundtrips
+1. The client sends initial metadata key `shm-offer` with an empty value.
+2. If the server supports shared memory and the connection originates from
+   the same host, the server includes trailing metadata key `shm-ctl` whose
+   value is the control segment name.
+3. The client opens the control segment and proceeds with the
+   [Establishment Sequence](#establishment-sequence).
 
-### Unary RPC Performance
+If the server does not return `shm-ctl`, or if the client fails to open
+the control segment, the client continues using HTTP/2.
 
-#### Unary Latency
+The negotiation is backward compatible. A server that does not
+implement this protocol ignores the unknown `shm-offer` key (per standard
+gRPC metadata handling) and never returns `shm-ctl`; the client stays on
+HTTP/2. A client that does not implement this protocol never sends
+`shm-offer`; the server does not push SHM. Either side may be upgraded
+independently without breaking existing deployments.
 
-Roundtrip latency for single request/response (lower is better):
+`shm-offer` and `shm-ctl` are reserved metadata keys. Applications and
+interceptors MUST NOT modify them. The discovered control segment name
+applies to the lifetime of the HTTP/2 connection; the client SHOULD NOT
+repeat discovery on the same connection. Discovery affects subsequent RPCs
+on that connection, not the RPC carrying `shm-offer` itself.
 
-| Payload | TCP Loopback | Unix Socket | Shared Memory | SHM vs TCP |
-|---------|--------------|-------------|---------------|------------|
-| 64 B    | 17,897 ns    | 2,459 ns    | 307 ns        | 58x faster |
-| 256 B   | 18,376 ns    | 2,375 ns    | 366 ns        | 50x faster |
-| 1 KB    | 17,738 ns    | 2,600 ns    | 335 ns        | 53x faster |
-| 4 KB    | 19,864 ns    | 3,498 ns    | 550 ns        | 36x faster |
+### Control Segment Naming
 
-![Unary Latency Comparison](unary_latency_comparison.svg)
+The control segment name returned in `shm-ctl` SHOULD contain a
+cryptographically random component to prevent name-guessing attacks.
+Recommended format:
 
-#### Unary Throughput
+```
+<server-id>_<uuid>_ctl
+```
 
-Messages per second for unary RPCs (higher is better):
+The server generates the name when it receives `shm-offer` and creates
+the control segment before returning the trailing metadata.
 
-| Payload | TCP Loopback | Unix Socket | Shared Memory | SHM Advantage |
-|---------|--------------|-------------|---------------|---------------|
-| 64 B    | 7.4 MB/s     | 26.0 MB/s   | 988 MB/s      | 133x vs TCP   |
-| 256 B   | 29.1 MB/s    | 107.8 MB/s  | 3,045 MB/s    | 105x vs TCP   |
-| 1 KB    | 132.5 MB/s   | 393.8 MB/s  | 9,054 MB/s    | 68x vs TCP    |
-| 4 KB    | 571.8 MB/s   | 1,170.9 MB/s| 12,637 MB/s   | 22x vs TCP    |
+### Same-Host Detection
 
-![Unary Throughput Comparison](unary_throughput_comparison.svg)
+The server SHOULD verify that the client is on the same host before
+returning `shm-ctl`. The verification method is implementation-defined.
 
-#### Unary Latency Percentiles
+## Connection Establishment
 
-For 1KB unary messages (10,000 iterations):
+### Control Segment
 
-| Percentile | Shared Memory | TCP Loopback | Improvement |
-|------------|---------------|--------------|-------------|
-| p50        | 301 ns        | ~18,000 ns   | 60x         |
-| p90        | 331 ns        | ~22,000 ns   | 67x         |
-| p99        | 3,256 ns      | ~35,000 ns   | 11x         |
-| p99.9      | 4,929 ns      | ~80,000 ns   | 16x         |
-| max        | 32,370 ns     | ~200,000 ns  | 6x          |
+Connection establishment uses a shared control segment. The control
+segment name is provided by the server during
+[Transport Discovery](#transport-discovery) or through an out-of-band
+mechanism. The control segment uses the same binary layout as a data
+segment; fields that are connection-specific (ClientPID, ClientReady)
+apply to the current exchange only and are reset between connections.
 
----
+The control segment is shared among all clients connecting to the same
+server. Because Ring A of the control segment may receive CONNECT frames
+from multiple client processes, the SPSC assumption does not hold on this
+ring. Implementations MUST serialize writes to Ring A using an OS-level
+mutual exclusion primitive tied to the control segment name:
 
-### Streaming RPC Performance
+- **Linux / POSIX**: advisory lock (`flock`) on the control segment's
+  backing file.
+- **Windows**: a named mutex whose name is the control segment name with
+  a `.lock` suffix (e.g. if the control segment is `grpc_ctl`, the mutex
+  is `grpc_ctl.lock`).
 
-#### Streaming Latency
+The client acquires the lock before writing CONNECT and releases it after
+reading ACCEPT or REJECT. While the lock is held, the holding client is
+the sole reader of Ring B; other clients MUST NOT read or advance Ring B
+state. Both rings are therefore single-producer / single-consumer for the duration of each exchange.
 
-End-to-end latency for streaming RPCs with 100 messages:
+All control frames use StreamID = 0.
 
-| RPC Type            | TCP Loopback | Unix Socket | Shared Memory | SHM vs TCP |
-|---------------------|--------------|-------------|---------------|------------|
-| Server Streaming    | ~1,200 µs    | ~350 µs     | ~45 µs        | 27x faster |
-| Client Streaming    | ~1,100 µs    | ~320 µs     | ~40 µs        | 28x faster |
-| Bidirectional (200) | ~2,500 µs    | ~700 µs     | ~85 µs        | 29x faster |
+### Control Frame Payloads
 
-![Streaming Latency Comparison](streaming_latency_comparison.svg)
+#### CONNECT Payload (18 bytes)
 
-#### Streaming Throughput
+```
+Version(1B) | RingACapacity(8B LE) | RingBCapacity(8B LE) | Flags(1B)
+```
 
-Sustained throughput for large payloads in streaming RPCs:
+- Version: control-frame encoding version (current = 1). This is
+  independent of the segment header Version field, which describes the
+  segment binary layout.
+- RingACapacity / RingBCapacity: client's preferred ring sizes in bytes.
+  A value of 0 means "use the server's default." The server is free to
+  choose smaller capacities.
+- Flags: bitfield for connection options. Defined bits:
 
-| Payload | TCP Loopback | Unix Socket  | Shared Memory | SHM Advantage |
-|---------|--------------|--------------|---------------|---------------|
-| 16 KB   | 1,744.6 MB/s | 3,347.8 MB/s | 13,873 MB/s   | 8x vs TCP     |
-| 64 KB   | 2,639.9 MB/s | 4,836.0 MB/s | 13,793 MB/s   | 5x vs TCP     |
-| 256 KB  | 3,944.9 MB/s | 5,635.4 MB/s | 14,611 MB/s   | 4x vs TCP     |
-| 1 MB    | 4,190.6 MB/s | 5,705.9 MB/s | 29,518 MB/s   | 7x vs TCP     |
+  | Bit | Name | Description |
+  |-----|------|-------------|
+  | 0 | SINGLE_STREAM | Client requests single-stream mode |
+  | 1–7 | (reserved) | MUST be 0 |
 
-![Streaming Throughput Comparison](streaming_throughput_comparison.svg)
+  Receivers MUST ignore unknown flag bits for forward compatibility.
 
-#### Per-Message Latency in Streams
+#### ACCEPT Payload (variable)
 
-Latency per message within an active stream (1KB messages):
+```
+Version(1B) | NameLen(4B LE) | DataSegmentName(var, UTF-8)
+```
 
-| Metric  | Shared Memory | TCP Loopback | Improvement |
-|---------|---------------|--------------|-------------|
-| Average | ~400 ns       | ~11,000 ns   | 28x         |
-| p50     | ~280 ns       | ~10,500 ns   | 38x         |
-| p99     | ~2,800 ns     | ~25,000 ns   | 9x          |
+Contains the name of the data segment the server has allocated. After
+receiving ACCEPT, the client maps the named segment. The negotiated ring
+capacities are read from the data segment's header.
 
-### Summary
+#### REJECT Payload (variable)
 
-| Metric | SHM vs TCP | SHM vs UDS |
-|--------|------------|------------|
-| **Latency (small msgs)** | 36-58x lower | 7-8x lower |
-| **Latency (large msgs)** | 10-20x lower | 5-6x lower |
-| **Throughput** | 4-133x higher | 2-38x higher |
-| **CPU efficiency** | 20-40% lower CPU usage | 10-20% lower |
+```
+Version(1B) | MsgLen(4B LE) | ErrorMessage(var, UTF-8)
+```
 
----
+The connection attempt has failed; ErrorMessage is diagnostic text.
+
+### Establishment Sequence
+
+![Connection Establishment](G3_graphics/connection_establishment.png)
+
+1. Server creates the control segment and sets `ServerReady = 1`.
+2. Client opens the control segment. It MUST wait until `ServerReady == 1`
+   and then validate Magic and Version.
+3. Client acquires the control-segment write lock and sends CONNECT on
+   Ring A.
+4. Server reads CONNECT, allocates a data segment, and responds with ACCEPT
+   (or REJECT) on Ring B.
+5. Client reads the response and releases the write lock.
+6. Client maps the data segment and sets `ClientReady = 1` in the **data**
+   segment header.
+7. Data frames begin flowing on Ring A and Ring B of the data segment.
+
+### Security Handshake Extension (0x20–0x2F)
+
+Frame types 0x20 through 0x2F are reserved for security-handshake extensions.
+A future document may define a handshake protocol using these types for
+authentication. The base protocol does not require a security handshake;
+implementations that do not support it MUST silently ignore frames in this
+range.
+
+## Synchronization
+
+### SPSC Ring Contract
+
+- The producer MUST only write `WriteIdx`; the consumer MUST only write
+  `ReadIdx`.
+- Updates to `WriteIdx` and `ReadIdx` MUST use release semantics; reads MUST
+  use acquire semantics.
+- All payload bytes MUST be written before `WriteIdx` is advanced.
+
+### Wait/Wake
+
+When the ring is empty or full, the protocol uses address-wait primitives
+provided by the OS to avoid busy-waiting. The portable abstraction is:
+
+- **WaitOnAddress(addr, expected)**: block until `*addr != expected`.
+- **WakeByAddress(addr)**: unblock one thread waiting on `addr`.
+
+Concrete mappings:
+
+| Operation | Linux | Windows |
+|-----------|-------|---------|
+| Wait | `futex(addr, FUTEX_WAIT, expected)` | `WaitOnAddress(addr, expected, 4)` |
+| Wake | `futex(addr, FUTEX_WAKE, 1)` | `WakeByAddressSingle(addr)` |
+
+The `DataSeq` and `SpaceSeq` fields are the primary wait/wake target
+addresses. After writing data, the producer increments `DataSeq` and wakes
+if `DataWaiters > 0`. After consuming data, the consumer increments
+`SpaceSeq` and wakes if `SpaceWaiters > 0`. Implementations that require
+contiguous tail space also use `ContigSeq` and `ContigWaiters` for the
+same purpose (see [Ring Wrap and PAD](#ring-wrap-and-pad)).
+
+To avoid lost wakes, a waiter MUST increment the waiter count and re-check
+the ring condition before entering the wait syscall.
+
+### Adaptive Spin-Then-Block
+
+Before falling back to a kernel wait, implementations SHOULD spin for a
+bounded number of iterations.
+
+## Stream Lifecycle
+
+Stream ID allocation, stream states, and stream state transitions follow
+[RFC 7540 Section 5.1](https://httpwg.org/specs/rfc7540.html#StreamStates).
+The mapping of SHM frame types to HTTP/2 concepts is given in the
+[Frame Types](#frame-types) table. Frames received in CLOSED state MUST be
+silently ignored.
+
+### Unary RPC
+
+![Unary RPC](G3_graphics/unary_rpc.png)
+
+A unary RPC exchanges six frames:
+
+| # | Ring | Frame | Content |
+|---|------|-------|---------|
+| 1 | A | HEADERS | method, authority, request metadata |
+| 2 | A | MESSAGE | request payload |
+| 3 | A | HALF_CLOSE | (empty) |
+| 4 | B | HEADERS | response metadata |
+| 5 | B | MESSAGE | response payload |
+| 6 | B | TRAILERS | grpc-status, trailing metadata |
+
+### Streaming RPC
+
+![Streaming RPC](G3_graphics/streaming_rpc.png)
+
+Both sides send MESSAGE frames concurrently on their respective rings.
+The client ends with HALF_CLOSE; the server ends with TRAILERS.
+
+## Flow Control
+
+Per-stream flow control follows the HTTP/2 WINDOW_UPDATE model. The
+initial window is 33554432 bytes (32 MiB) and is not negotiated.
+WINDOW_UPDATE with StreamID = 0 MAY be sent but has no effect; receivers
+MUST ignore it. The ring buffer itself provides additional coarse-grained
+backpressure.
+
+## Rationale
+
+### Why Not HTTP/2 Framing?
+
+We looked at reusing HTTP/2 framing (9-byte header + HPACK) over the ring
+buffers:
+
+* HPACK is a stateful codec: the receiver must decode HEADERS payloads
+  into an intermediate structure before it can read method, authority, or
+  custom metadata. This rules out reading metadata directly from ring
+  memory, the primary use case for this transport. The Headers V1 encoding used here is a flat
+  length-prefixed format that can be parsed in place from the ring.
+
+* Dropping HPACK but keeping the H2 frame header does not recover parser
+  reuse. Existing HTTP/2 stacks (Go, Java, C++, Rust) couple frame
+  parsing with socket I/O; none of them accept an arbitrary memory span
+  as input. An implementation would need to write a new frame reader
+  regardless of whether the header layout matches H2.
+
+* A 16-byte frame header aligns to power-of-2 offsets in the ring,
+  avoiding reads that straddle cache lines. A 9-byte header does not.
+
+* H2's 3-byte Length field caps a single frame at 16 MB. A 4-byte field
+  supports up to ~4 GB, which reduces fragmentation for large messages.
+
+## Security Considerations
+
+### Threat Model
+
+SHM transport runs on a single host. Its security model relies on OS
+process isolation, similar to Unix domain sockets. The protocol does not
+defend against a malicious process that already has permission to map the
+shared memory region.
+
+### Segment Names
+
+Control segment names SHOULD contain a cryptographically random component
+(see [Control Segment Naming](#control-segment-naming)). A predictable
+name allows a rogue process to pre-create a segment with the same name and
+intercept connections.
+
+### File Permissions
+
+The shared memory backing file SHOULD be readable and writable only by
+processes that need access. When server and client run as the same OS user,
+Linux file mode 0600 is sufficient. Cross-user deployments require broader
+permissions (e.g. a shared group), which increases the attack surface.
+
+### Data Confidentiality and Integrity
+
+Segment contents are neither encrypted nor signed. Any process with
+mapping permission can read and write arbitrary bytes. Deployments that
+require confidentiality SHOULD restrict access through OS file permissions
+rather than protocol-level encryption, which would negate the performance
+benefit of shared memory.
+
+### Process Identity
+
+The ServerPID and ClientPID fields in the segment header are informational
+and MUST NOT be used for authentication (PIDs may be recycled). Process
+authentication beyond PID is deferred to the security handshake extension
+(0x20–0x2F); see
+[Security Handshake Extension](#security-handshake-extension-0x200x2f).
+
+### Denial of Service
+
+A malicious client may hold the control-segment write lock indefinitely,
+preventing other clients from connecting. Implementations SHOULD apply a
+timeout when acquiring the lock. A malicious peer may also fill the ring
+without reading, causing the other side to block on writes; ring-level
+backpressure is inherent to the protocol.
 
 ## Implementation
 
-### File Location Guide
+The protocol requires a platform that supports:
 
-The shared memory transport implementation is organized across the repository as follows:
+- Memory-mapped files shared between processes.
+- An address-wait/wake primitive (e.g. Linux `futex`, Windows
+  `WaitOnAddress`).
 
-#### Core Transport Code (`internal/transport/`)
+## Open issues (if applicable)
 
-| File | Description |
-|------|-------------|
-| `shm_client_transport.go` | Client-side transport implementation |
-| `shm_server_transport.go` | Server-side transport implementation |
-| `shm_segment.go` | Shared memory segment management |
-| `ring.go`, `ringbuf.go` | Ring buffer implementation |
-| `shm_flow_control.go` | Flow control with WINDOW_UPDATE frames |
-| `shm_listener.go` | SHM listener for server-side accept |
-| `shm_dialer.go` | SHM dialer for client connections |
-| `shm_aware_dialer.go` | Automatic SHM/TCP selection |
-| `resolver.go` | `shm://` resolver registration |
-| `handshake.go` | Connection handshake logic |
-| `shm_futex_linux.go` | Linux futex synchronization |
-| `shm_futex_windows.go` | Windows WaitOnAddress fallback |
-| `shm_mmap_unix.go` | Unix memory mapping |
-| `shm_mmap_windows.go` | Windows memory mapping |
+* **macOS support.** macOS does not provide `futex`. Possible alternatives
+  include `os_unfair_lock`, `pthread` condition variables, and
+  `dispatch_semaphore`; their suitability has not yet been evaluated.
 
-#### gRPC Helpers (root directory)
+* **ARM64 memory ordering.** The protocol specifies acquire/release semantics.
+  On x86-64 these are implicit under TSO, but ARM64 implementations need
+  explicit barriers.
 
-| File | Description |
-|------|-------------|
-| `shm_grpc_helpers.go` | `WithShmTransport()` dial option |
-| `shm_grpc_helpers_test.go` | Integration tests for dial options |
-| `shm_fullgrpc_test.go` | Full gRPC integration tests |
+* **Cross-container IPC.** Containers isolate IPC namespaces by default.
+  Shared memory between containers requires either a shared IPC namespace or
+  a volume pointing to the same backing file.
 
-#### Balancer (`balancer/shm/`)
-
-| File | Description |
-|------|-------------|
-| `shm_lb.go` | SHM-aware load balancer |
-| `shm_lb_test.go` | Load balancer unit tests |
-| `shm_lb_integration_test.go` | Integration tests |
-
-#### Examples (`examples/shm/`)
-
-| Directory | Description |
-|-----------|-------------|
-| `helloworld/` | Basic unary RPC example |
-| `route_guide/` | Streaming RPC example |
-| `features/` | Advanced feature examples |
-
-#### Benchmarks (`benchmark/shmemtcp/`)
-
-Performance comparison benchmarks between SHM and TCP transports.
-
-#### RFC Documentation (`shm-rfc/`)
-
-| File | Description |
-|------|-------------|
-| `A-shared-memory-transport.md` | This RFC document |
-| `README.md` | Diagram and benchmark information |
-| `*.svg` | Performance comparison charts |
-
-### Temporary Environment Variable Protection
-
-The feature is controlled by:
-
-```bash
-export GRPC_SHM_TRANSPORT_ENABLED=true    # Enable shm transport (default: true when linked)
-export GRPC_SHM_DEBUG=1                    # Enable debug logging
-export GRPC_SHM_FUTEX_DEBUG=1              # Enable futex debug logging
-```
-
----
-
-## Open Issues
-
-1. **macOS Support**: macOS lacks futex. Support would require `pthread_cond` with additional synchronization overhead, or a polling fallback.
-
-2. **Security Model**: Shared memory segments are accessible to any process with the name. Should we support access control?
-
-3. **Segment Discovery**: Currently requires knowing segment name. Should we support a discovery mechanism?
-
-4. **Multi-tenant Isolation**: How to handle multiple clients sharing a segment with isolation?
-
-5. **Hot Restart**: How to handle server restart without losing in-flight messages?
-
----
-
-## References
-
-- [gRPC-Go Repository](https://github.com/grpc/grpc-go)
-- [Linux futex(2) man page](https://man7.org/linux/man-pages/man2/futex.2.html)
-- [POSIX Shared Memory](https://man7.org/linux/man-pages/man7/shm_overview.7.html)
-- [HTTP/2 Frame Format](https://httpwg.org/specs/rfc9113.html#FrameHeader)
-- [RFC A73: Requirements for New Transports](https://github.com/grpc/proposal)
+* **Stale segment cleanup.** If a server process crashes, its shared memory
+  backing files and lock files may remain on disk. Cleanup of stale
+  segments is implementation-defined.
