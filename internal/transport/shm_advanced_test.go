@@ -70,8 +70,10 @@ func TestShmPingPongSizes(t *testing.T) {
 			}
 			defer lis.Close()
 
-			// Server responder goroutine (HEADERSâ†’echo MESSAGEâ†’TRAILERS OK)
+			// Server responder goroutine (HEADERS→echo MESSAGE→TRAILERS OK)
+			serverDone := make(chan struct{})
 			go func() {
+				defer close(serverDone)
 				c, err := lis.Accept()
 				if err != nil {
 					t.Errorf("server accept: %v", err)
@@ -123,6 +125,7 @@ func TestShmPingPongSizes(t *testing.T) {
 			if err != nil {
 				t.Fatalf("client factory: %v", err)
 			}
+			defer ct.Close(fmt.Errorf("test done"))
 
 			// Unary call
 			runtime.Gosched()
@@ -158,6 +161,7 @@ func TestShmPingPongSizes(t *testing.T) {
 				}
 			}
 			_ = cli.Close()
+			<-serverDone
 
 			t.Logf("Successfully ping-ponged %d bytes", tc.size)
 		})
@@ -183,7 +187,9 @@ func TestShmConcurrentStreams(t *testing.T) {
 
 	// Server responder goroutine - read all requests first, then respond. This
 	// ensures multiple client streams are in-flight concurrently.
+	serverDone := make(chan struct{})
 	go func() {
+		defer close(serverDone)
 		c, err := lis.Accept()
 		if err != nil {
 			t.Errorf("server accept: %v", err)
@@ -244,6 +250,7 @@ func TestShmConcurrentStreams(t *testing.T) {
 	if err != nil {
 		t.Fatalf("client factory: %v", err)
 	}
+	defer ct.Close(fmt.Errorf("test done"))
 
 	// Create multiple concurrent calls.
 	seg := ct.(*ShmClientTransport).segment
@@ -301,6 +308,7 @@ func TestShmConcurrentStreams(t *testing.T) {
 	if errCount > 0 {
 		t.Fatalf("%d calls failed", errCount)
 	}
+	<-serverDone
 
 	t.Logf("Successfully ran %d concurrent calls", numCalls)
 }
@@ -321,7 +329,9 @@ func TestShmStreamError(t *testing.T) {
 	defer lis.Close()
 
 	// Server responder - return error status
+	serverDone := make(chan struct{})
 	go func() {
+		defer close(serverDone)
 		c, err := lis.Accept()
 		if err != nil {
 			t.Errorf("server accept: %v", err)
@@ -358,6 +368,7 @@ func TestShmStreamError(t *testing.T) {
 	if err != nil {
 		t.Fatalf("client factory: %v", err)
 	}
+	defer ct.Close(fmt.Errorf("test done"))
 
 	runtime.Gosched()
 	seg := ct.(*ShmClientTransport).segment
@@ -379,6 +390,7 @@ func TestShmStreamError(t *testing.T) {
 	if tr.GRPCStatusCode != uint32(codes.Internal) {
 		t.Logf("Got status code %d (expected %d)", tr.GRPCStatusCode, codes.Internal)
 	}
+	<-serverDone
 
 	t.Log("Stream error handling verified")
 }

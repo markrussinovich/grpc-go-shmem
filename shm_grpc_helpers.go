@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"net"
 	"strings"
+	"sync"
 	"time"
 
 	"google.golang.org/grpc/grpclog"
@@ -196,7 +197,7 @@ type shmClientConn struct {
 	transport  *transport.ShmClientTransport
 	localAddr  net.Addr
 	remoteAddr net.Addr
-	closed     bool
+	closeOnce  sync.Once
 }
 
 // Read implements net.Conn - not used directly in gRPC transport layer
@@ -211,11 +212,9 @@ func (c *shmClientConn) Write(_ []byte) (n int, err error) {
 
 // Close implements net.Conn
 func (c *shmClientConn) Close() error {
-	if c.closed {
-		return nil
-	}
-	c.closed = true
-	c.transport.Close(fmt.Errorf("connection closed"))
+	c.closeOnce.Do(func() {
+		c.transport.Close(fmt.Errorf("connection closed"))
+	})
 	return nil
 }
 

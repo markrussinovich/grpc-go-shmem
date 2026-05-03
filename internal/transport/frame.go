@@ -782,7 +782,6 @@ func readFrameView(ctx context.Context, rx *ShmRing) (FrameHeader, mem.Buffer, e
 		//    chunks to ~1), hurting throughput for large payloads.
 		// This matches the C# implementation which only uses speculative ZC
 		// for single-frame final messages (!isMore).
-		var buf mem.Buffer
 		isMore := fh.Flags&MessageFlagMORE != 0
 
 		// When MORE flag is set, boost the reader's spin cutoff so the
@@ -794,39 +793,33 @@ func readFrameView(ctx context.Context, rx *ShmRing) (FrameHeader, mem.Buffer, e
 		if isMore {
 			atomic.StoreUint32(&rx.dataSpinCutoff, spinMoreBoost)
 		}
-		if len(pSecond) == 0 && fh.Type == FrameTypeMESSAGE && !isMore && !mem.IsBelowBufferPoolingThreshold(payloadLen) {
-			// Zero-copy: wrap ring slice directly. The speculative
-			// reservation prevents the writer from overwriting this
-			// memory before the caller frees the buffer.
-			//
-			// IMPORTANT: payloadLen must exceed the buffer pooling
-			// threshold (1024). For smaller payloads, mem.NewBuffer
-			// returns SliceBuffer with no-op Free(), which would leak
-			// speculativeReserved bytes indefinitely → ring deadlock.
-			totalBytes := int64(frameHeaderSize + payloadLen)
-			rxHdr := rx.header()
-			rxHdr.AddSpeculativeReserved(totalBytes)
-			commitPayload.Commit(payloadLen)
-			// Wrap the ring slice in a buffer with a release pool.
-			// Three-index slice sets cap=len to prevent accidental out-of-bounds.
-			ringSlice := pFirst[:payloadLen:payloadLen]
-			pool := &speculativeReleasePool{ring: rx, reserved: totalBytes}
-			buf = mem.NewBuffer(&ringSlice, pool)
-		} else if len(pSecond) == 0 {
-			// Contiguous MORE chunk or non-MESSAGE: copy to pooled buffer.
-			// Using DefaultBufferPool avoids repeated make()+memclr for
-			// same-sized chunks — the pool returns a reused buffer that
-			// doesn't need zeroing. Saves ~10% CPU for large payloads.
-			commitPayload.Commit(payloadLen)
+
+		// All read paths copy data BEFORE calling Commit. Commit frees
+		// ring space for the writer; without copying first, the writer
+		// could overwrite the data between Commit and Copy.
+		//
+		// Zero-copy reads (wrapping ring memory in a mem.Buffer with
+		// speculativeReserved) have been removed. The speculativeReserved
+		// counter is a suffix behind readIdx, so any subsequent Commit
+		// (even from copy-path frames) advances readIdx past the ZC
+		// buffer's position, allowing the writer to wrap and overwrite it.
+		// A correct implementation would require pinning readIdx until
+		// the ZC buffer is freed (deferred-commit model). For now, the
+		// copy path is used unconditionally; the ZC write path
+		// (writeProtoToRing) provides the primary performance benefit.
+		var buf mem.Buffer
+		if len(pSecond) == 0 {
 			buf = mem.Copy(pFirst[:payloadLen], mem.DefaultBufferPool())
+			commitPayload.Commit(payloadLen)
 		} else {
 			// Wrap-around case: copy both parts to pooled buffer.
-			commitPayload.Commit(payloadLen)
+			// Copy BEFORE Commit for the same reason as above.
 			pool := mem.DefaultBufferPool()
 			poolBuf := pool.Get(payloadLen)
 			copied := copy(*poolBuf, pFirst)
 			copy((*poolBuf)[copied:], pSecond)
 			buf = mem.NewBuffer(poolBuf, pool)
+			commitPayload.Commit(payloadLen)
 		}
 		return fh, buf, nil
 	}

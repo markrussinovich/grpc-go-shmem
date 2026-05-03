@@ -66,6 +66,8 @@ type ShmListener struct {
 	cancel    context.CancelFunc
 	closed    atomic.Bool
 	closeOnce sync.Once
+	acceptMu  sync.Mutex     // serializes Accept admission with Close
+	acceptWG  sync.WaitGroup // tracks goroutines in Accept touching ctlRx/ctlTx
 
 	// Connection handling
 	mu             sync.RWMutex
@@ -182,9 +184,18 @@ func (l *ShmListener) SetMaxStreams(max uint32) {
 // Accept waits for and returns the next connection to the listener
 // Creates a new segment for each connection, similar to TCP socket model
 func (l *ShmListener) Accept() (net.Conn, error) {
+	// Serialize with Close() to prevent Add(1) while Wait() is active.
+	// Close() holds acceptMu while setting closed, so after this lock
+	// either: (a) closed is true and we return immediately, or (b) closed
+	// is false and our Add(1) happens-before Close's Wait().
+	l.acceptMu.Lock()
 	if l.closed.Load() {
+		l.acceptMu.Unlock()
 		return nil, errors.New("listener closed")
 	}
+	l.acceptWG.Add(1)
+	l.acceptMu.Unlock()
+	defer l.acceptWG.Done()
 
 	// Read a CONNECT request from the control ring.
 	for {
@@ -242,6 +253,7 @@ func (l *ShmListener) Accept() (net.Conn, error) {
 				writeEvents.Close()
 			}
 			segment.Close()
+			_ = RemoveSegment(segmentName)
 			return nil, err
 		}
 
@@ -254,6 +266,7 @@ func (l *ShmListener) Accept() (net.Conn, error) {
 				writeEvents.Close()
 			}
 			segment.Close()
+			_ = RemoveSegment(segmentName)
 			return nil, err
 		}
 
@@ -286,6 +299,7 @@ func (l *ShmListener) Accept() (net.Conn, error) {
 					writeEvents.Close()
 				}
 				segment.Close()
+				_ = RemoveSegment(segmentName)
 				return nil, fmt.Errorf("security handshake failed: %v", err)
 			}
 			conn.authInfo = authInfo
@@ -297,6 +311,7 @@ func (l *ShmListener) Accept() (net.Conn, error) {
 			delete(l.activeSegments, segmentName)
 			l.mu.Unlock()
 			segment.Close()
+			_ = RemoveSegment(segmentName)
 			return nil, fmt.Errorf("failed to create server transport: %v", err)
 		}
 		// Configure keepalive on the server transport.
@@ -314,17 +329,20 @@ func (l *ShmListener) Accept() (net.Conn, error) {
 // Close closes the listener
 func (l *ShmListener) Close() error {
 	l.closeOnce.Do(func() {
+		// Hold acceptMu while setting closed so no new Accept() can call
+		// acceptWG.Add(1) after we observe the counter at zero.
+		l.acceptMu.Lock()
 		l.closed.Store(true)
+		l.acceptMu.Unlock()
+
 		l.cancel()
 
 		if l.ctlSegment != nil {
-			// Wake any goroutine blocked in Accept() waiting for a CONNECT frame.
-			// The listener context cancellation alone cannot interrupt a futex wait
-			// without a deadline, so we must explicitly close the rings (which bumps
-			// sequences and futex-wakes waiters) before unmapping the segment.
-			// Note: We don't nil these pointers because Accept() might still be
-			// reading l.ctlRx concurrently. The Close() on the ring will cause
-			// the read to fail, which is the desired behavior.
+			// Close rings first — this bumps sequences and wakes any
+			// goroutine blocked in Accept()'s readFrame/ReadSlices.
+			// The ring's closed flag causes spin loops to exit immediately
+			// (checked before each memory access) and futex waiters to
+			// wake and see ErrRingClosed.
 			if l.ctlRx != nil {
 				_ = l.ctlRx.Close()
 			}
@@ -332,7 +350,13 @@ func (l *ShmListener) Close() error {
 				_ = l.ctlTx.Close()
 			}
 
+			// Wait for Accept to finish touching control ring memory.
+			// The ring closures above ensure Accept's readFrame returns
+			// promptly with an error, so this won't block indefinitely.
+			l.acceptWG.Wait()
+
 			l.ctlSegment.Close()
+			CloseHandshakeEvents(l.baseName + shmControlSuffix)
 			_ = RemoveSegment(l.baseName + shmControlSuffix)
 		}
 
@@ -420,6 +444,7 @@ func (c *shmConn) Close() error {
 			c.segment.Close()
 		}
 		if c.segmentName != "" {
+			CloseHandshakeEvents(c.segmentName)
 			_ = RemoveSegment(c.segmentName)
 		}
 	})

@@ -458,11 +458,13 @@ func TestShmTransportInitialWindowSize(t *testing.T) {
 
 func TestShmSpinConstants(t *testing.T) {
 	// Verify spin parameters are tuned for SHM (higher than Folly defaults).
-	if spinIterationsDefault < 500 {
-		t.Errorf("spinIterationsDefault = %d, should be >= 500 for SHM", spinIterationsDefault)
+	// Values are platform-specific: Windows uses higher values due to
+	// costlier WaitOnAddress/cgocall (~40µs), Linux uses lower values.
+	if spinIterationsDefault < 100 {
+		t.Errorf("spinIterationsDefault = %d, should be >= 100 for SHM", spinIterationsDefault)
 	}
-	if spinIterationsMin < 100 {
-		t.Errorf("spinIterationsMin = %d, should be >= 100 for SHM", spinIterationsMin)
+	if spinIterationsMin < 10 {
+		t.Errorf("spinIterationsMin = %d, should be >= 10 for SHM", spinIterationsMin)
 	}
 	if spinIterationsMax < 2000 {
 		t.Errorf("spinIterationsMax = %d, should be >= 2000 for SHM", spinIterationsMax)
@@ -793,7 +795,7 @@ func TestShmSingleStreamCache(t *testing.T) {
 	defer ct.Close(nil)
 
 	// No streams → cache should be nil.
-	if ct.cachedStream != nil {
+	if ct.cachedStream.Load() != nil {
 		t.Error("cachedStream should be nil with no streams")
 	}
 
@@ -803,7 +805,7 @@ func TestShmSingleStreamCache(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewStream 1: %v", err)
 	}
-	if ct.cachedStream != s1 {
+	if c := ct.cachedStream.Load(); c == nil || c.stream != s1 {
 		t.Error("cachedStream should point to s1 with one stream")
 	}
 
@@ -812,19 +814,19 @@ func TestShmSingleStreamCache(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewStream 2: %v", err)
 	}
-	if ct.cachedStream != nil {
+	if ct.cachedStream.Load() != nil {
 		t.Error("cachedStream should be nil with two streams")
 	}
 
 	// Close second stream → cache should be set to s1.
 	ct.closeStream(s2, nil, true, 0, nil, nil, false)
-	if ct.cachedStream != s1 {
+	if c := ct.cachedStream.Load(); c == nil || c.stream != s1 {
 		t.Error("cachedStream should point to s1 after closing s2")
 	}
 
 	// Close first stream → cache should be nil.
 	ct.closeStream(s1, nil, true, 0, nil, nil, false)
-	if ct.cachedStream != nil {
+	if ct.cachedStream.Load() != nil {
 		t.Error("cachedStream should be nil after closing all streams")
 	}
 }

@@ -123,6 +123,13 @@ func readZC(ctx context.Context, rx *ShmRing, msg proto.Message) error {
 			buf.Free()
 			return fmt.Errorf("short payload %d", len(data))
 		}
+		payloadLen := int(binary.BigEndian.Uint32(data[1:5]))
+		actualPayload := len(data) - 5
+		if payloadLen != actualPayload {
+			buf.Free()
+			return fmt.Errorf("CORRUPTION: grpcLen=%d actual=%d fhLen=%d",
+				payloadLen, actualPayload, fh.Length)
+		}
 		err = proto.Unmarshal(data[5:], msg)
 		buf.Free()
 		return err

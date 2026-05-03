@@ -30,12 +30,3 @@ type protoV2Message = proto.Message
 func protoUnmarshalDirect(b []byte, msg proto.Message) error {
 	return proto.Unmarshal(b, msg)
 }
-
-// protoSizeOf returns the serialized size of a proto message, or 0 if the
-// message does not implement the proto.Message interface.
-func protoSizeOf(m any) int {
-	if pm, ok := m.(proto.Message); ok {
-		return proto.Size(pm)
-	}
-	return 0
-}

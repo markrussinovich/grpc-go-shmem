@@ -25,6 +25,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"runtime"
 	"sync/atomic"
 	"time"
 	"unsafe"
@@ -139,8 +140,9 @@ func (rc *ReadCommit) Commit(consumed int) {
 
 	hdr := rc.ring.header()
 
+	newRI := rc.commitReadIdx + uint64(consumed)
 	// Advance shared read index (release-publish) - frees space for writer
-	hdr.SetReadIndex(rc.commitReadIdx + uint64(consumed))
+	hdr.SetReadIndex(newRI)
 
 	// Contiguity: only bump and signal when a writer is actually waiting.
 	// Skipping the atomic increment when no waiters exist saves ~1-2% overhead.
@@ -153,41 +155,6 @@ func (rc *ReadCommit) Commit(consumed int) {
 	if consumed > 0 && hdr.SpaceWaiters() > 0 {
 		hdr.IncrementSpaceSequence()
 		rc.ring.signalSpace(&hdr.spaceSeq)
-	}
-}
-
-// speculativeReleasePool implements mem.BufferPool. When the buffer is freed,
-// Put decrements the ring's speculativeReserved counter and wakes blocked
-// writers. The buffer data (ring memory) is not actually pooled.
-type speculativeReleasePool struct {
-	ring     *ShmRing
-	reserved int64
-}
-
-func (p *speculativeReleasePool) Get(n int) *[]byte {
-	buf := make([]byte, n)
-	return &buf
-}
-
-func (p *speculativeReleasePool) Put(_ *[]byte) {
-	if p.ring == nil {
-		return
-	}
-	if atomic.LoadUint32(&p.ring.closed) != 0 {
-		return
-	}
-	hdr := p.ring.header()
-	hdr.AddSpeculativeReserved(-p.reserved)
-
-	// Wake any writers waiting for space, since freeing speculative bytes
-	// effectively increases the writer's available space.
-	if hdr.SpaceWaiters() > 0 {
-		hdr.IncrementSpaceSequence()
-		p.ring.signalSpace(&hdr.spaceSeq)
-	}
-	if hdr.ContigWaiters() > 0 {
-		hdr.IncrementContigSequence()
-		p.ring.signalContig(&hdr.contigSeq)
 	}
 }
 
@@ -447,16 +414,7 @@ func (r *ShmRing) WriteBlocking(data []byte) error {
 		// Re-check under the same loop to avoid missed wake.
 		writeIdx = hdr.WriteIndex()
 		readIdx = hdr.ReadIndex()
-		usedBefore = writeIdx - readIdx
-		available = r.capacity - usedBefore
-		specReserved = hdr.SpeculativeReserved()
-		if specReserved > 0 {
-			sr := uint64(specReserved)
-			if sr > available {
-				sr = available
-			}
-			available -= sr
-		}
+		available = r.effectiveSpace(writeIdx, readIdx)
 		if available == 0 {
 			// Full: spin-wait then wait on spaceSeq (full→not-full)
 			// Phase 1: Spin-wait before falling back to futex
@@ -465,7 +423,7 @@ func (r *ShmRing) WriteBlocking(data []byte) error {
 			for spin := uint32(0); spin < spinLimit; spin++ {
 				writeIdx = hdr.WriteIndex()
 				readIdx = hdr.ReadIndex()
-				if (r.capacity - (writeIdx - readIdx)) >= uint64(len(data)) {
+				if r.effectiveSpace(writeIdx, readIdx) >= uint64(len(data)) {
 					// Space available! Update adaptive cutoff
 					if spin > 0 {
 						target := min(spinIterationsMax, spin*2)
@@ -492,7 +450,7 @@ func (r *ShmRing) WriteBlocking(data []byte) error {
 			// Re-check condition to avoid missed wake
 			writeIdx = hdr.WriteIndex()
 			readIdx = hdr.ReadIndex()
-			if (r.capacity - (writeIdx - readIdx)) >= uint64(len(data)) {
+			if r.effectiveSpace(writeIdx, readIdx) >= uint64(len(data)) {
 				hdr.DecSpaceWaiters()
 				continue
 			}
@@ -511,7 +469,7 @@ func (r *ShmRing) WriteBlocking(data []byte) error {
 		for spin := uint32(0); spin < spinLimit; spin++ {
 			writeIdx = hdr.WriteIndex()
 			readIdx = hdr.ReadIndex()
-			if (r.capacity - (writeIdx - readIdx)) >= uint64(len(data)) {
+			if r.effectiveSpace(writeIdx, readIdx) >= uint64(len(data)) {
 				if spin > 0 {
 					target := min(spinIterationsMax, spin*2)
 					newCutoff := (7*spinLimit + target) / 8
@@ -537,7 +495,7 @@ func (r *ShmRing) WriteBlocking(data []byte) error {
 		// Re-check prior to waiting
 		writeIdx = hdr.WriteIndex()
 		readIdx = hdr.ReadIndex()
-		if (r.capacity - (writeIdx - readIdx)) >= uint64(len(data)) {
+		if r.effectiveSpace(writeIdx, readIdx) >= uint64(len(data)) {
 			hdr.DecContigWaiters()
 			continue
 		}
@@ -659,11 +617,12 @@ func (r *ShmRing) ReadBlocking(buf []byte) (int, error) {
 						newCutoff := (7*spinLimit + target) / 8
 						atomic.StoreUint32(&r.dataSpinCutoff, max(spinIterationsMin, newCutoff))
 					}
-					continue // Re-enter main loop to read data
+					break // Exit spin loop; outer loop will read data
 				}
-				// Check closure during spin
+				// Check closure during spin — break to let the outer
+				// loop's drain logic decide whether data should be read.
 				if hdr.Closed() {
-					return 0, io.EOF
+					break
 				}
 				// PAUSE instruction - yields to hyperthread, saves power
 				runtime_procyield(1)
@@ -684,10 +643,11 @@ func (r *ShmRing) ReadBlocking(buf []byte) (int, error) {
 				continue
 			}
 			// Re-check closed flag to avoid missing a close that happened
-			// after our initial check but before we entered futexWait
+			// after our initial check but before we entered futexWait.
+			// If closed, re-enter the main loop which checks data-then-close.
 			if hdr.Closed() {
 				hdr.DecDataWaiters()
-				return 0, io.EOF
+				continue
 			}
 			if err := r.waitForData(&hdr.dataSeq, dataSeq, 0); err != nil {
 				// Spurious wake or other wake reasons - just continue the loop
@@ -746,6 +706,22 @@ func (r *ShmRing) effectiveAvailable() uint64 {
 	used := writeIdx - readIdx
 	raw := r.capacity - used
 
+	specReserved := hdr.SpeculativeReserved()
+	if specReserved <= 0 {
+		return raw
+	}
+	sr := uint64(specReserved)
+	if sr > raw {
+		sr = raw
+	}
+	return raw - sr
+}
+
+// effectiveSpace returns the writable space given current indices,
+// deducting bytes speculatively reserved by zero-copy readers.
+func (r *ShmRing) effectiveSpace(writeIdx, readIdx uint64) uint64 {
+	raw := r.capacity - (writeIdx - readIdx)
+	hdr := r.header()
 	specReserved := hdr.SpeculativeReserved()
 	if specReserved <= 0 {
 		return raw
@@ -854,9 +830,18 @@ func (r *ShmRing) WriteBlockingContext(ctx context.Context, data []byte) error {
 		writeIdx := hdr.WriteIndex()
 		readIdx := hdr.ReadIndex()
 
-		// Calculate available space using indices
+		// Calculate available space using indices, deducting bytes
+		// speculatively reserved by zero-copy readers.
 		usedBefore := writeIdx - readIdx
 		available := r.capacity - usedBefore
+		specReserved := hdr.SpeculativeReserved()
+		if specReserved > 0 {
+			sr := uint64(specReserved)
+			if sr > available {
+				sr = available
+			}
+			available -= sr
+		}
 
 		if uint64(len(data)) <= available {
 			// Space available - perform the write (same as original WriteBlocking)
@@ -914,8 +899,7 @@ func (r *ShmRing) WriteBlockingContext(ctx context.Context, data []byte) error {
 			// Re-check and choose wait primitive
 			writeIdx = hdr.WriteIndex()
 			readIdx = hdr.ReadIndex()
-			usedBefore = writeIdx - readIdx
-			available = r.capacity - usedBefore
+			available = r.effectiveSpace(writeIdx, readIdx)
 			if uint64(len(data)) <= available {
 				continue
 			}
@@ -925,7 +909,7 @@ func (r *ShmRing) WriteBlockingContext(ctx context.Context, data []byte) error {
 				// Re-check
 				writeIdx = hdr.WriteIndex()
 				readIdx = hdr.ReadIndex()
-				if (r.capacity - (writeIdx - readIdx)) >= uint64(len(data)) {
+				if r.effectiveSpace(writeIdx, readIdx) >= uint64(len(data)) {
 					hdr.DecSpaceWaiters()
 					continue
 				}
@@ -937,7 +921,7 @@ func (r *ShmRing) WriteBlockingContext(ctx context.Context, data []byte) error {
 				// Re-check
 				writeIdx = hdr.WriteIndex()
 				readIdx = hdr.ReadIndex()
-				if (r.capacity - (writeIdx - readIdx)) >= uint64(len(data)) {
+				if r.effectiveSpace(writeIdx, readIdx) >= uint64(len(data)) {
 					hdr.DecContigWaiters()
 					continue
 				}
@@ -948,8 +932,7 @@ func (r *ShmRing) WriteBlockingContext(ctx context.Context, data []byte) error {
 			// No timeout: same logic with infinite waits
 			writeIdx = hdr.WriteIndex()
 			readIdx = hdr.ReadIndex()
-			usedBefore = writeIdx - readIdx
-			available = r.capacity - usedBefore
+			available = r.effectiveSpace(writeIdx, readIdx)
 			if uint64(len(data)) <= available {
 				continue
 			}
@@ -959,7 +942,7 @@ func (r *ShmRing) WriteBlockingContext(ctx context.Context, data []byte) error {
 				// Re-check
 				writeIdx = hdr.WriteIndex()
 				readIdx = hdr.ReadIndex()
-				if (r.capacity - (writeIdx - readIdx)) >= uint64(len(data)) {
+				if r.effectiveSpace(writeIdx, readIdx) >= uint64(len(data)) {
 					hdr.DecSpaceWaiters()
 					continue
 				}
@@ -971,7 +954,7 @@ func (r *ShmRing) WriteBlockingContext(ctx context.Context, data []byte) error {
 				// Re-check
 				writeIdx = hdr.WriteIndex()
 				readIdx = hdr.ReadIndex()
-				if (r.capacity - (writeIdx - readIdx)) >= uint64(len(data)) {
+				if r.effectiveSpace(writeIdx, readIdx) >= uint64(len(data)) {
 					hdr.DecContigWaiters()
 					continue
 				}
@@ -1092,10 +1075,11 @@ func (r *ShmRing) ReadBlockingContext(ctx context.Context, buf []byte) (int, err
 		}
 
 		// Re-check closed flag after incrementing waiters to avoid missing
-		// a close that happened between our initial check and now
+		// a close that happened between our initial check and now.
+		// If closed, re-enter the main loop which checks data-then-close.
 		if hdr.Closed() {
 			hdr.DecDataWaiters()
-			return 0, io.EOF
+			continue
 		}
 
 		// Calculate timeout from context deadline
@@ -1321,6 +1305,9 @@ func (r *ShmRing) ReserveWrite(ctx context.Context, n int) (WriteReservation, er
 		spinCutoff := atomic.LoadUint32(&r.spaceSpinCutoff)
 		spinSuccess := false
 		for i := uint32(0); i < spinCutoff; i++ {
+			if atomic.LoadUint32(&r.closed) != 0 {
+				return WriteReservation{}, ErrRingClosed
+			}
 			runtime_procyield(1) // PAUSE instruction to reduce power/contention
 			writeIdx = hdr.WriteIndex()
 			readIdx = hdr.ReadIndex()
@@ -1363,7 +1350,7 @@ func (r *ShmRing) ReserveWrite(ctx context.Context, n int) (WriteReservation, er
 		// Spin failed - fall back to futex, choosing wait type based on fullness
 		writeIdx = hdr.WriteIndex()
 		readIdx = hdr.ReadIndex()
-		free := r.capacity - (writeIdx - readIdx)
+		free := r.effectiveSpace(writeIdx, readIdx)
 		if free == 0 {
 			hdr.IncSpaceWaiters()
 			exp := hdr.SpaceSequence()
@@ -1372,7 +1359,7 @@ func (r *ShmRing) ReserveWrite(ctx context.Context, n int) (WriteReservation, er
 			// Re-check
 			writeIdx = hdr.WriteIndex()
 			readIdx = hdr.ReadIndex()
-			if (r.capacity - (writeIdx - readIdx)) >= uint64(n) {
+			if r.effectiveSpace(writeIdx, readIdx) >= uint64(n) {
 				hdr.DecSpaceWaiters()
 				continue
 			}
@@ -1411,7 +1398,7 @@ func (r *ShmRing) ReserveWrite(ctx context.Context, n int) (WriteReservation, er
 		// Re-check
 		writeIdx = hdr.WriteIndex()
 		readIdx = hdr.ReadIndex()
-		if (r.capacity - (writeIdx - readIdx)) >= uint64(n) {
+		if r.effectiveSpace(writeIdx, readIdx) >= uint64(n) {
 			hdr.DecContigWaiters()
 			continue
 		}
@@ -1542,7 +1529,24 @@ func (r *ShmRing) ReadSlices(ctx context.Context, n int) (first, second []byte, 
 		spinCutoff := atomic.LoadUint32(&r.dataSpinCutoff)
 		spinSuccess := false
 		for i := uint32(0); i < spinCutoff; i++ {
-			runtime_procyield(1) // PAUSE instruction to reduce power/contention
+			// Mixed spin strategy: PAUSE for first phase, then Gosched
+			// to let writer goroutine run (critical for same-process
+			// unary ping-pong where reader and writer compete for CPU).
+			if i > 0 && i%100 == 0 {
+				// Check closed before AND after Gosched — the segment may
+				// be unmapped during Gosched, making hdr access unsafe.
+				// Break out of spin and let the outer loop's drain logic
+				// decide whether remaining data should be read.
+				if atomic.LoadUint32(&r.closed) != 0 {
+					break
+				}
+				runtime.Gosched()
+				if atomic.LoadUint32(&r.closed) != 0 {
+					break
+				}
+			} else {
+				runtime_procyield(1)
+			}
 			writeIdx = hdr.WriteIndex()
 			pendingIdx = atomic.LoadUint64(&r.pendingReadIdx)
 			if writeIdx-pendingIdx >= uint64(n) {

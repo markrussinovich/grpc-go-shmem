@@ -44,7 +44,9 @@ func TestSelection_ChoosesSHM_and_ExecutesUnary(t *testing.T) {
 	defer lis.Close()
 
 	// Server responder goroutine (HEADERS→MESSAGE→TRAILERS OK)
+	serverDone := make(chan struct{})
 	go func() {
+		defer close(serverDone)
 		c, err := lis.Accept()
 		if err != nil {
 			t.Errorf("server accept: %v", err)
@@ -104,6 +106,7 @@ func TestSelection_ChoosesSHM_and_ExecutesUnary(t *testing.T) {
 	if err != nil {
 		t.Fatalf("client factory: %v", err)
 	}
+	defer ct.Close(fmt.Errorf("test done"))
 
 	// Unary call over the shared memory segment
 	runtime.Gosched()
@@ -142,4 +145,5 @@ func TestSelection_ChoosesSHM_and_ExecutesUnary(t *testing.T) {
 	if shmClientConnectCount.Load() == 0 {
 		t.Fatalf("client factory counter not incremented")
 	}
+	<-serverDone
 }
