@@ -53,6 +53,7 @@ import (
 	"google.golang.org/grpc/stats"
 	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/tap"
+	protobuf "google.golang.org/protobuf/proto"
 )
 
 const (
@@ -1169,26 +1170,24 @@ func (s *Server) incrCallsFailed() {
 }
 
 func (s *Server) sendResponse(ctx context.Context, stream *transport.ServerStream, msg any, cp Compressor, opts *transport.WriteOptions, comp encoding.Compressor) error {
-	// Zero-copy fast path: when no compression is configured and the codec
-	// is the default proto codec, serialize directly into the ring buffer.
-	// Custom codecs (JSON, etc.) must go through the standard encode path.
+	// Zero-copy fast path: when no compression is configured, the codec is
+	// the default proto codec, and the message is a proto.Message (not an
+	// adapted v1 message), try to serialize directly into the ring buffer.
 	if cp == nil && comp == nil && stream.ContentSubtype() == "" {
-		// Enforce max send message size before ZC write.
 		if pm, ok := msg.(protoV2Message); ok {
-			pSize := protoSizeOf(pm)
+			pSize := protobuf.Size(pm)
 			if pSize > s.opts.maxSendMessageSize {
 				return status.Errorf(codes.ResourceExhausted, "grpc: trying to send message larger than max (%d vs. %d)", pSize, s.opts.maxSendMessageSize)
 			}
-		}
-		if handled, err := stream.WriteProto(msg, opts); handled {
-			if err != nil {
-				return err
+			if handled, err := stream.WriteProto(msg, opts); handled {
+				if err != nil {
+					return err
+				}
+				if s.statsHandler != nil {
+					s.statsHandler.HandleRPC(ctx, outPayload(false, msg, pSize, pSize, time.Now()))
+				}
+				return nil
 			}
-			if s.statsHandler != nil {
-				pSize := protoSizeOf(msg)
-				s.statsHandler.HandleRPC(ctx, outPayload(false, msg, pSize, pSize, time.Now()))
-			}
-			return nil
 		}
 	}
 
