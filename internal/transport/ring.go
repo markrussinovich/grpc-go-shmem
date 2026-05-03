@@ -111,6 +111,18 @@ type ShmRing struct {
 	// EndBatch call performs a single increment + signal, amortizing the
 	// cost of multiple frame writes.
 	batchDepth uint32
+
+	// wire is the on-ring frame encoding negotiated during the CONNECT
+	// handshake. Both ends of a ring use the same wire format. Set once
+	// at construction (or via SetWireFormat) and never mutated thereafter.
+	wire WireFormat
+
+	// h2Enc / h2Dec are the per-ring HPACK encoder/decoder state, used
+	// only when wire == WireFormatHTTP2. The encoder is single-threaded
+	// (writer goroutine via inlineMu); the decoder is single-threaded
+	// (reader goroutine in processIncomingData).
+	h2Enc        *hpackEncoderHolder
+	h2Dec        *hpackDecoderHolder
 }
 
 // ReadCommit holds the state needed to commit a read operation.
@@ -197,6 +209,18 @@ func NewShmRingFromSegment(ringView *ringView, mem []byte) *ShmRing {
 // On Linux, this is a no-op since futex works natively across mappings.
 func (r *ShmRing) SetEvents(events *RingEvents) {
 	r.events = events
+}
+
+// SetWireFormat configures the on-ring frame encoding. Must be called after
+// the CONNECT handshake completes and before any frames are written/read.
+// Both rings of a connection use the same wire format.
+func (r *ShmRing) SetWireFormat(w WireFormat) {
+	r.wire = w
+}
+
+// WireFormat returns the on-ring frame encoding for this ring.
+func (r *ShmRing) WireFormat() WireFormat {
+	return r.wire
 }
 
 // header returns a pointer to the RingHeader in shared memory

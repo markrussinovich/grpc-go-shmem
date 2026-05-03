@@ -54,6 +54,12 @@ func writeProtoToRing(ctx context.Context, tx *ShmRing, streamID uint32, msg pro
 	if pSize < 0 {
 		pSize = proto.Size(msg)
 	}
+
+	// Dispatch to the H2 ZC path when the ring is configured for HTTP/2.
+	if tx.wire == WireFormatHTTP2 {
+		return writeProtoToRingH2(ctx, tx, streamID, msg, pSize, flags)
+	}
+
 	total := frameHeaderSize + 5 + pSize
 
 	// Skip ZC for messages that will never fit in a single frame.

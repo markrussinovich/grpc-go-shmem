@@ -240,6 +240,10 @@ func readCopy(ctx context.Context, rx *ShmRing, msg proto.Message) error {
 // ---------------------------------------------------------------------------
 
 func benchUnary(b *testing.B, bodySize int, useZC bool) {
+	benchUnaryWire(b, bodySize, useZC, WireFormatCustom16)
+}
+
+func benchUnaryWire(b *testing.B, bodySize int, useZC bool, wire WireFormat) {
 	// Skip very large payloads in short mode to avoid hangs.
 	if testing.Short() && bodySize > 16*1024*1024 {
 		b.Skipf("skipping %s in short mode", sizeLabel(bodySize))
@@ -248,7 +252,7 @@ func benchUnary(b *testing.B, bodySize int, useZC bool) {
 	if useZC {
 		tag = "zc"
 	}
-	segName := fmt.Sprintf("bp-%s-%d-%d", tag, bodySize, time.Now().UnixNano())
+	segName := fmt.Sprintf("bp-%s-%s-%d-%d", wire, tag, bodySize, time.Now().UnixNano())
 	seg, err := CreateSegment(segName, benchRingSize, benchRingSize)
 	if err != nil {
 		b.Fatalf("CreateSegment: %v", err)
@@ -259,6 +263,10 @@ func benchUnary(b *testing.B, bodySize int, useZC bool) {
 	rxA := NewShmRingFromSegment(seg.A, seg.Mem)
 	txB := NewShmRingFromSegment(seg.B, seg.Mem)
 	rxB := NewShmRingFromSegment(seg.B, seg.Mem)
+	txA.SetWireFormat(wire)
+	rxA.SetWireFormat(wire)
+	txB.SetWireFormat(wire)
+	rxB.SetWireFormat(wire)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second); defer cancel()
 
 	req := makePayload(bodySize)
@@ -317,6 +325,30 @@ func BenchmarkShmProtoUnaryZC(b *testing.B) {
 func BenchmarkShmProtoUnaryCopy(b *testing.B) {
 	for _, s := range protoSizes() {
 		b.Run(sizeLabel(s), func(b *testing.B) { benchUnary(b, s, false) })
+	}}
+
+// BenchmarkShmProtoUnaryZCH2 measures the ZC unary path on rings using
+// the HTTP/2 wire format. Provides a side-by-side comparison with
+// BenchmarkShmProtoUnaryZC (which uses Custom16) to verify ZC parity.
+//
+// Note: H2 frames have a 16MB-1 maximum payload (RFC 7540 §4.2). Sizes
+// above that require multi-frame DATA emission with LPM accumulation on
+// the reader, which is future work; benchmarks above 4MB are skipped.
+func BenchmarkShmProtoUnaryZCH2(b *testing.B) {
+	for _, s := range protoSizes() {
+		if s > 4*1024*1024 {
+			continue
+		}
+		b.Run(sizeLabel(s), func(b *testing.B) { benchUnaryWire(b, s, true, WireFormatHTTP2) })
+	}
+}
+
+func BenchmarkShmProtoUnaryCopyH2(b *testing.B) {
+	for _, s := range protoSizes() {
+		if s > 4*1024*1024 {
+			continue
+		}
+		b.Run(sizeLabel(s), func(b *testing.B) { benchUnaryWire(b, s, false, WireFormatHTTP2) })
 	}
 }
 

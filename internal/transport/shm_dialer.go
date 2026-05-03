@@ -57,6 +57,13 @@ type DialOptions struct {
 	// and skip the frame writer queue for reduced latency.
 	// Default: false.
 	SingleStreamMode bool
+
+	// SupportedWireFormats lists wire formats the client is willing to
+	// accept, in preference order. When non-empty, the client advertises
+	// these in CONNECT and the server picks one (echoed back in ACCEPT).
+	// When empty (default), the client uses the legacy Custom16 format
+	// for backward compatibility.
+	SupportedWireFormats []WireFormat
 }
 
 // DefaultDialOptions returns sensible defaults for dialing
@@ -119,7 +126,8 @@ func DialShm(ctx context.Context, addr string, opts *DialOptions) (ClientTranspo
 	ctlRx.SetEvents(ctlRxEvents)
 
 	if err := writeFrame(ctx, ctlTx, FrameHeader{Type: FrameTypeCONNECT}, encodeConnectRequest(connectRequest{
-		singleStreamMode: opts.SingleStreamMode,
+		singleStreamMode:     opts.SingleStreamMode,
+		supportedWireFormats: opts.SupportedWireFormats,
 	})); err != nil {
 		return nil, NewShmErrorWithCause(ShmErrConnectionRefused, "send connect request", err)
 	}
@@ -190,6 +198,12 @@ func DialShm(ctx context.Context, addr string, opts *DialOptions) (ClientTranspo
 			return nil, NewShmErrorWithCause(ShmErrUnknown, "failed to create client transport", err)
 		}
 		clientTransport.singleStreamMode = opts.SingleStreamMode
+		// Apply negotiated wire format (default Custom16). Both data rings
+		// use the same format.
+		if resp.selectedWire.IsValid() {
+			clientTransport.clientToServer.SetWireFormat(resp.selectedWire)
+			clientTransport.serverToClient.SetWireFormat(resp.selectedWire)
+		}
 		// Store auth info on transport
 		if authInfo != nil {
 			clientTransport.SetAuthInfo(authInfo)
