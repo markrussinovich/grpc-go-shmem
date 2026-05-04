@@ -298,3 +298,104 @@ func memBufferPoolingAvailable() bool {
 	buf.Free()
 	return ok
 }
+
+// TestChainZc_TinyTailChunk regression-tests the scenario where a
+// multi-frame chain ZC's final continuation chunk is small enough that
+// mem.NewBuffer would otherwise return a no-op SliceBuffer (cap below
+// the 1 KiB pooling threshold). Before the fix, that buffer's Free()
+// would not invoke zcChainReleasePool.Put, leaving zcInFlight stuck
+// > 0 forever and freezing header.ReadIdx — a deadlock observed at
+// 16 MiB unary ZC where chunking produces 8 MiB / 8 MiB / 5 B chunks.
+//
+// The fix copies sub-threshold continuation chunks to a heap buffer
+// (without AddChainZcInFlight) so the chain's lifecycle is driven by
+// the larger chunks alone.
+func TestChainZc_TinyTailChunk(t *testing.T) {
+	if !memBufferPoolingAvailable() {
+		t.Skip("mem.Buffer pooling not available")
+	}
+	ctx := context.Background()
+	segName := fmt.Sprintf("zctail-%d", time.Now().UnixNano())
+	defer RemoveSegment(segName)
+	// 4 MiB ring → ChainZcBudget = 2 MiB. Send a chain whose total
+	// stays under budget but whose final chunk is sub-threshold.
+	seg, err := CreateSegment(segName, 4*1024*1024, 4*1024*1024)
+	if err != nil {
+		t.Fatalf("CreateSegment: %v", err)
+	}
+	defer seg.Close()
+
+	tx := NewShmRingFromSegment(seg.A, seg.Mem)
+	rx := NewShmRingFromSegment(seg.A, seg.Mem)
+
+	// Two chunks: 200 KiB body chunk (ZC-eligible: ≥ 64 KiB on a 4 MiB
+	// ring) followed by a 5-byte tail (well below the 1 KiB pooling
+	// threshold). Total = 200 KiB + 5 B < 2 MiB budget.
+	bigSize := 200 * 1024
+	tailSize := 5
+	totalBody := bigSize + tailSize - 5 // exclude the 5-byte LPM header
+	chunkBig := make([]byte, bigSize)
+	chunkBig[0] = 0
+	binary.BigEndian.PutUint32(chunkBig[1:5], uint32(totalBody))
+	chunkTail := make([]byte, tailSize)
+
+	if err := writeFrame(ctx, tx, FrameHeader{
+		Type: FrameTypeMESSAGE, StreamID: 1, Flags: MessageFlagMORE,
+	}, chunkBig); err != nil {
+		t.Fatalf("writeFrame chunkBig: %v", err)
+	}
+	if err := writeFrame(ctx, tx, FrameHeader{
+		Type: FrameTypeMESSAGE, StreamID: 1,
+	}, chunkTail); err != nil {
+		t.Fatalf("writeFrame chunkTail: %v", err)
+	}
+
+	hdr := rx.header()
+	readIdxBefore := hdr.ReadIndex()
+
+	// Read the first (big) chunk — opens the chain ZC anchor.
+	_, bufBig, err := readFrameView(ctx, rx)
+	if err != nil {
+		t.Fatalf("readFrameView big: %v", err)
+	}
+	if !rx.IsZcChainActive() {
+		t.Fatal("expected chain ZC active after first chunk")
+	}
+	if !rx.IsChainOpen() {
+		t.Fatal("expected chain open after first chunk")
+	}
+
+	// Read the tail chunk — must take the tiny-chunk copy branch
+	// (NOT a ring-backed no-op SliceBuffer).
+	_, bufTail, err := readFrameView(ctx, rx)
+	if err != nil {
+		t.Fatalf("readFrameView tail: %v", err)
+	}
+	if rx.IsChainOpen() {
+		t.Error("expected chain closed after final chunk")
+	}
+
+	// Free the tail buffer first. With the fix, this is a heap-backed
+	// SliceBuffer that does NOT decrement zcInFlight (because the
+	// codec didn't AddChainZcInFlight for it). The big chunk's
+	// in-flight count is still 1.
+	bufTail.Free()
+	if !rx.IsZcChainActive() {
+		t.Error("ZC anchor must remain held while big chunk is outstanding")
+	}
+
+	// Free the big buffer — this is the true ring-backed ZC; its
+	// pool.Put decrements zcInFlight to 0; chain is already closed
+	// (CloseZcChain ran on the final chunk) → EndZcReservation fires.
+	bufBig.Free()
+	if rx.IsZcChainActive() {
+		t.Error("expected zcActive=0 after final ZC buffer Free")
+	}
+
+	// header.ReadIdx must have advanced past both chunks (2 frame
+	// headers + both payloads).
+	expectedAfter := readIdxBefore + 2*frameHeaderSize + uint64(bigSize+tailSize)
+	if got := hdr.ReadIndex(); got != expectedAfter {
+		t.Errorf("readIdx after Free: got %d want %d", got, expectedAfter)
+	}
+}

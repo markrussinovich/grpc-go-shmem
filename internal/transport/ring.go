@@ -509,8 +509,35 @@ func (r *ShmRing) OpenZcChain() {
 // CloseZcChain marks the codec as finished with a multi-frame ZC
 // chain. The consumer's eventual Buffer.Free of the chain's buffers
 // then triggers EndZcReservation when zcInFlight reaches 0.
+//
+// Race fixup: if the LAST in-flight ZC chunk was already freed BEFORE
+// this call (zcInFlight==0 at close time), ReleaseChainZcBuffer would
+// have observed IsChainOpen()==true and skipped EndZcReservation.
+// Symmetrically, if the chain's final chunk falls back to the copy
+// path (e.g., the payload straddles a wrap boundary so the chain ZC
+// fast-path's len(pSecond)==0 guard rejects it), no AddChainZcInFlight
+// is performed for that chunk, so zcInFlight has already been driven
+// to 0 by the previous chunk's buf.Free. In either case nothing else
+// will fire EndZcReservation, header.ReadIdx stays frozen at the
+// chain start, and the writer eventually fills the ring and
+// deadlocks. We must fire it here.
+//
+// Idempotency: EndZcReservation is gated by atomic.StoreUint32 of
+// zcActive=0. If a concurrent ReleaseChainZcBuffer races us and fires
+// first, our LoadUint32(zcActive) returns 0 and we skip — no double
+// publish. If we win the race, ReleaseChainZcBuffer's later check
+// observes zcInFlight==0 && !IsChainOpen() but zcActive==0 means
+// EndZcReservation's CAS-on-header.ReadIdx is a forward-only no-op.
 func (r *ShmRing) CloseZcChain() {
 	atomic.StoreUint32(&r.chainOpen, 0)
+	// Ordering: chainOpen must be cleared BEFORE we check zcInFlight.
+	// If a concurrent ReleaseChainZcBuffer reads zcInFlight==0 it then
+	// loads chainOpen — by the time it does, our store above is
+	// visible (atomic store has release semantics) so it observes
+	// chainOpen==0 and fires EndZcReservation itself.
+	if atomic.LoadInt64(&r.zcInFlight) == 0 && atomic.LoadUint32(&r.zcActive) != 0 {
+		r.EndZcReservation()
+	}
 }
 
 // SetChainCopyMode marks the codec as committed to copy-mode for the

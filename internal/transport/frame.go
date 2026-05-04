@@ -893,6 +893,37 @@ func readFrameView(ctx context.Context, rx *ShmRing) (FrameHeader, mem.Buffer, e
 			// goes through the regular copy path and its commit is
 			// deferred via the zcActive=1 branch in ReadCommit.Commit.
 			if rx.IsChainOpen() && !rx.ChainCopyMode() {
+				// Tiny continuation chunks (typically the residual tail
+				// after a clean (cap/8)-aligned split, e.g. a 5-byte
+				// last chunk for a 16 MiB body chunked at 8 MiB) cannot
+				// safely use the ring-backed ZC path: mem.NewBuffer
+				// returns a no-op SliceBuffer when cap(data) is below
+				// the buffer-pooling threshold (1 KiB), and a no-op
+				// Buffer.Free never invokes our pool's Put — so
+				// zcInFlight would never decrement, EndZcReservation
+				// would never fire, and header.ReadIdx would freeze
+				// (deadlocking the writer).
+				//
+				// Copy these tiny chunks to a heap buffer instead. The
+				// deferred Commit is still issued (zcActive=1 routes it
+				// into zcDeferredTarget) so the chain's accumulated
+				// target advances correctly; we simply skip
+				// AddChainZcInFlight for this chunk because no ring
+				// memory is held past return. CloseZcChain (called for
+				// the final chunk) then either fires EndZcReservation
+				// itself (if all earlier ZC chunks were already freed)
+				// or yields to a later Buffer.Free which will.
+				if mem.IsBelowBufferPoolingThreshold(payloadLen) {
+					copied := make([]byte, payloadLen)
+					copy(copied, pFirst[:payloadLen])
+					commitPayload.Commit(payloadLen)
+					if !isMore {
+						rx.CloseZcChain()
+						rx.SetChainCopyMode(false)
+					}
+					return fh, mem.SliceBuffer(copied), nil
+				}
+
 				// Anchor already open. Just hand back ring slice; the
 				// chain anchor's deferred-publish handles the read
 				// index. AddChainZcInFlight + deferred Commit on this
