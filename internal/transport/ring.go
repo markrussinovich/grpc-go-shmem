@@ -114,8 +114,17 @@ type ShmRing struct {
 
 	// wire is the on-ring frame encoding negotiated during the CONNECT
 	// handshake. Both ends of a ring use the same wire format. Set once
-	// at construction (or via SetWireFormat) and never mutated thereafter.
-	wire WireFormat
+	// after construction (via SetWireFormat) and never mutated again.
+	//
+	// Accessed via atomic.LoadUint32 / atomic.StoreUint32 because
+	// SetWireFormat may be called by the dialer goroutine after the
+	// transport's reader/writer goroutines have already started (they
+	// receive the ring before the negotiation completes). The race
+	// detector flagged a benign data race here; using atomic primitives
+	// makes it explicit and provides release/acquire ordering so a
+	// reader that observes wire==Http2 also sees any other state that
+	// was published before SetWireFormat returned.
+	wire uint32
 
 	// h2Enc / h2Dec are the per-ring HPACK encoder/decoder state, used
 	// only when wire == WireFormatHTTP2. The encoder is single-threaded
@@ -578,16 +587,22 @@ func (r *ShmRing) SetEvents(events *RingEvents) {
 	r.events = events
 }
 
-// SetWireFormat configures the on-ring frame encoding. Must be called after
-// the CONNECT handshake completes and before any frames are written/read.
-// Both rings of a connection use the same wire format.
+// SetWireFormat configures the on-ring frame encoding. Must be called
+// after the CONNECT handshake completes; safe to call after the
+// transport's reader/writer goroutines have started because the field
+// is accessed via atomic primitives.
+//
+// Atomic store provides a release barrier: any goroutine that observes
+// wire == Http2 (via WireFormat()) is guaranteed to see all state
+// published by SetWireFormat's caller before this call.
 func (r *ShmRing) SetWireFormat(w WireFormat) {
-	r.wire = w
+	atomic.StoreUint32(&r.wire, uint32(w))
 }
 
-// WireFormat returns the on-ring frame encoding for this ring.
+// WireFormat returns the on-ring frame encoding for this ring. Acquire
+// load to pair with SetWireFormat's release store.
 func (r *ShmRing) WireFormat() WireFormat {
-	return r.wire
+	return WireFormat(atomic.LoadUint32(&r.wire))
 }
 
 // header returns a pointer to the RingHeader in shared memory

@@ -56,7 +56,7 @@ func writeProtoToRing(ctx context.Context, tx *ShmRing, streamID uint32, msg pro
 	}
 
 	// Dispatch to the H2 ZC path when the ring is configured for HTTP/2.
-	if tx.wire == WireFormatHTTP2 {
+	if tx.WireFormat() == WireFormatHTTP2 {
 		return writeProtoToRingH2(ctx, tx, streamID, msg, pSize, flags)
 	}
 

@@ -371,7 +371,7 @@ func decodeTrailers(b []byte) (TrailersV1, error) {
 // can return split slices which are both written.
 func writeFrame(ctx context.Context, tx *ShmRing, fh FrameHeader, payload []byte) error {
 	// Dispatch to the H2 codec when the ring is configured for HTTP/2.
-	if tx.wire == WireFormatHTTP2 {
+	if tx.WireFormat() == WireFormatHTTP2 {
 		holder := tx.h2Encoder()
 		return writeFrameH2(ctx, tx, fh, payload, holder.enc, holder.scratch)
 	}
@@ -430,7 +430,7 @@ func writeFrame(ctx context.Context, tx *ShmRing, fh FrameHeader, payload []byte
 // header prefix plus a BufferSlice. It avoids building an intermediate
 // contiguous payload, reducing allocations and copies on the hot path.
 func writeFrameBuffers(ctx context.Context, tx *ShmRing, fh FrameHeader, hdr []byte, payload mem.BufferSlice) error {
-	if tx.wire == WireFormatHTTP2 {
+	if tx.WireFormat() == WireFormatHTTP2 {
 		// Materialize hdr + payload into a contiguous buffer for the H2 codec.
 		// The H2 codec further translates HEADERS/TRAILERS into HPACK; for
 		// MESSAGE frames the bytes are written directly as DATA.
@@ -517,7 +517,7 @@ func writeFrameBuffers(ctx context.Context, tx *ShmRing, fh FrameHeader, hdr []b
 // zero, it defaults to ringCapacity - frameHeaderSize - safetyMargin. A sensible
 // default is 32KB or (capacity/2) whichever is smaller.
 func writeFrameBuffersChunked(ctx context.Context, tx *ShmRing, fh FrameHeader, hdr []byte, data mem.BufferSlice, maxFramePayload int) error {
-	if tx.wire == WireFormatHTTP2 {
+	if tx.WireFormat() == WireFormatHTTP2 {
 		// H2 path doesn't currently chunk: H2's max frame size is 16MB which
 		// is sufficient for almost all gRPC messages. For larger messages,
 		// future work is to emit multiple H2 DATA frames with END_STREAM=0.
@@ -687,7 +687,7 @@ func writeFrameChunkFromCursor(ctx context.Context, tx *ShmRing, fh FrameHeader,
 // readFrame reads one non-PAD frame (skipping any PAD frames). It blocks if
 // necessary and never spins.
 func readFrame(ctx context.Context, rx *ShmRing) (FrameHeader, []byte, error) {
-	if rx.wire == WireFormatHTTP2 {
+	if rx.WireFormat() == WireFormatHTTP2 {
 		return readFrameH2(ctx, rx, rx.h2Decoder())
 	}
 	for {
@@ -750,7 +750,7 @@ func readFrame(ctx context.Context, rx *ShmRing) (FrameHeader, []byte, error) {
 // microseconds while filling 64MB takes milliseconds, this is safe for
 // all practical workloads.
 func readFrameView(ctx context.Context, rx *ShmRing) (FrameHeader, mem.Buffer, error) {
-	if rx.wire == WireFormatHTTP2 {
+	if rx.WireFormat() == WireFormatHTTP2 {
 		return readFrameViewH2(ctx, rx, rx.h2Decoder())
 	}
 	for {

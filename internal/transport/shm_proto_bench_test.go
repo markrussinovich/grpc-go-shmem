@@ -144,35 +144,26 @@ func readZC(ctx context.Context, rx *ShmRing, msg proto.Message) error {
 	assembled = append(assembled, data...)
 	buf.Free()
 
-	// Read remaining chunks directly into assembled, avoiding per-chunk
-	// temp allocation. This matches production's MaterializeToBuffer which
-	// does pool.Get(totalLength) then CopyTo — a single target buffer that
-	// ring data is copied into without intermediate allocations.
+	// Read remaining chunks via readFrameView so the chain-ZC codec
+	// sees them and can close the chain on the final !MORE chunk.
+	// Using raw ReadSlices/ReadExact here would bypass the chain
+	// state machine and freeze header.ReadIdx forever (the open ZC
+	// anchor would never be released because the codec never observes
+	// the final chunk).
 	for {
-		// Read frame header
-		first2, second2, commitHdr, err := rx.ReadSlices(ctx, frameHeaderSize)
-		if err != nil {
-			return err
-		}
-		var hb [frameHeaderSize]byte
-		n := copy(hb[:], first2)
-		if n < frameHeaderSize && len(second2) > 0 {
-			copy(hb[n:], second2)
-		}
-		commitHdr.Commit(frameHeaderSize)
-		fh2, err := decodeFrameHeader(hb[:])
+		fh2, buf2, err := readFrameView(ctx, rx)
 		if err != nil {
 			return err
 		}
 		if fh2.Type != FrameTypeMESSAGE {
+			if buf2 != nil {
+				buf2.Free()
+			}
 			return fmt.Errorf("unexpected frame type %d", fh2.Type)
 		}
-		// Read payload directly into assembled (zero temp alloc)
-		payloadLen := int(fh2.Length)
-		offset := len(assembled)
-		assembled = assembled[:offset+payloadLen]
-		if _, err := rx.ReadExact(ctx, payloadLen, assembled[offset:]); err != nil {
-			return err
+		if buf2 != nil {
+			assembled = append(assembled, buf2.ReadOnlyData()...)
+			buf2.Free()
 		}
 		if fh2.Flags&MessageFlagMORE == 0 {
 			break
