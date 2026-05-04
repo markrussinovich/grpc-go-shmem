@@ -245,10 +245,10 @@ type RingHeader struct {
 	closed   uint32 // 0x20: closed flag (producer sets to 1)
 	pad      uint32 // 0x24: padding
 	// 0x28-0x3F: synchronization fields
-	contigSeq     uint32  // 0x28: contiguity sequence (consumer increments on every read commit)
-	spaceWaiters  uint32  // 0x2C: number of writers waiting on space
-	contigWaiters uint32  // 0x30: number of writers waiting on contiguity
-	dataWaiters   uint32  // 0x34: number of readers waiting for data
+	contigSeq     uint32 // 0x28: contiguity sequence (consumer increments on every read commit)
+	spaceWaiters  uint32 // 0x2C: number of writers waiting on space
+	contigWaiters uint32 // 0x30: number of writers waiting on contiguity
+	dataWaiters   uint32 // 0x34: number of readers waiting for data
 	// speculativeReserved is the number of bytes speculatively committed by
 	// the reader (readIdx advanced) but still referenced by zero-copy buffers.
 	// Writers deduct this from available space so they cannot overwrite ring
@@ -287,6 +287,14 @@ func (r *RingHeader) ReadIndex() uint64 {
 // SetReadIndex sets the monotonic read index (consumer)
 func (r *RingHeader) SetReadIndex(idx uint64) {
 	atomic.StoreUint64(&r.ridx, idx)
+}
+
+// CompareAndSwapReadIndex atomically sets r.ridx to new if it currently
+// equals old. Used by the deferred-publish ZC protocol to ensure
+// header.ReadIdx never regresses when multiple sources (deferred Commit,
+// EndZcReservation publish) race.
+func (r *RingHeader) CompareAndSwapReadIndex(old, new uint64) bool {
+	return atomic.CompareAndSwapUint64(&r.ridx, old, new)
 }
 
 // DataSequence returns the data sequence number for futex
@@ -333,8 +341,6 @@ func (r *RingHeader) IncrementContigSequence() uint32 {
 	return atomic.AddUint32(&r.contigSeq, 1)
 }
 
-
-
 // IncSpaceWaiters increments the space waiters counter
 func (r *RingHeader) IncSpaceWaiters() uint32 {
 	return atomic.AddUint32(&r.spaceWaiters, 1)
@@ -349,8 +355,6 @@ func (r *RingHeader) DecSpaceWaiters() uint32 {
 func (r *RingHeader) SpaceWaiters() uint32 {
 	return atomic.LoadUint32(&r.spaceWaiters)
 }
-
-
 
 // IncContigWaiters increments the contiguity waiters counter
 func (r *RingHeader) IncContigWaiters() uint32 {

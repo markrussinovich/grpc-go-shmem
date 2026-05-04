@@ -121,8 +121,36 @@ type ShmRing struct {
 	// only when wire == WireFormatHTTP2. The encoder is single-threaded
 	// (writer goroutine via inlineMu); the decoder is single-threaded
 	// (reader goroutine in processIncomingData).
-	h2Enc        *hpackEncoderHolder
-	h2Dec        *hpackDecoderHolder
+	h2Enc *hpackEncoderHolder
+	h2Dec *hpackDecoderHolder
+
+	// ===== Position-aware speculative ZC protection =====
+	//
+	// Problem: SpeculativeReservedBytes is a count, not a position; it
+	// cannot tell the writer WHERE the held bytes are. If a non-ZC frame
+	// commits AFTER a ZC frame, header.ReadIdx advances past the ZC
+	// region's tail, and the writer's available-space formula allows
+	// wrapping onto still-held bytes.
+	//
+	// Solution (ported from grpc-dotnet-shm): don't advance the SHARED
+	// header.ReadIdx while a ZC frame is in flight. Reader keeps its
+	// progress in zcDeferredTarget; on ZC release the deferred value is
+	// published to header.ReadIdx in one shot. Cross-process writer
+	// reads header.ReadIdx normally and is correct without knowing
+	// anything about ZC.
+	//
+	// Invariants enforced by callers:
+	//   - At most ONE ZC in flight per ring (gated by IsSpeculativeZCEligible).
+	//   - BeginZcReservation/EndZcReservation are paired exactly once per ZC.
+	//   - The reader-side processIncomingData loop is single-threaded;
+	//     ReadCommit.Commit is only called from that thread or from
+	//     EndZcReservation (consumer side).
+	//
+	// Accessed via atomic.LoadUint32 / atomic.StoreUint32 with explicit
+	// fencing rather than the sync/atomic.Bool wrapper to make the
+	// release/acquire ordering explicit at every site.
+	zcActive         uint32 // 1 while a speculative-ZC anchor is held
+	zcDeferredTarget uint64 // furthest absolute idx wanting commit while zcActive
 }
 
 // ReadCommit holds the state needed to commit a read operation.
@@ -136,6 +164,23 @@ type ReadCommit struct {
 // Commit advances the shared read index to free space for the writer.
 // consumed must not exceed maxBytes.
 // Safe to call after the ring is closed - silently does nothing.
+//
+// While a speculative-ZC anchor is held (BeginZcReservation called and not
+// yet matched by EndZcReservation), Commit defers the shared-memory write
+// and instead bumps the local zcDeferredTarget. EndZcReservation publishes
+// the accumulated target in one shot. This ensures the cross-process
+// writer never sees a header.ReadIdx that points inside a still-held ZC
+// region.
+//
+// CRITICAL: Use ADDITIVE accumulation here (target += consumed), not the
+// absolute (baseCommitReadIdx + consumed) formula used in the non-deferred
+// branch. While zcActive is true, header.ReadIdx is FROZEN at the ZC
+// frame's start, so every subsequent ReadSlices captures the STALE
+// header.ReadIdx as its commitReadIdx. A naive (staleBase + perFrameBytes)
+// formula yields a value at most ~one frame past baseZc — far behind the
+// actual cumulative consumed position once several frames have been
+// parsed. The reader thread is single-threaded so additive accumulation
+// is race-free on the local field.
 func (rc *ReadCommit) Commit(consumed int) {
 	if consumed < 0 || consumed > rc.maxBytes {
 		return // Invalid consumption, ignore
@@ -150,11 +195,32 @@ func (rc *ReadCommit) Commit(consumed int) {
 		return
 	}
 
+	// ZC-active path: defer the shared-memory write; advance
+	// zcDeferredTarget by the bytes the caller is committing. Reader is
+	// single-threaded so the additive accumulation is race-free on the
+	// local field. EndZcReservation reads this and publishes in one shot.
+	if atomic.LoadUint32(&rc.ring.zcActive) != 0 {
+		atomic.AddUint64(&rc.ring.zcDeferredTarget, uint64(consumed))
+		return
+	}
+
 	hdr := rc.ring.header()
 
 	newRI := rc.commitReadIdx + uint64(consumed)
-	// Advance shared read index (release-publish) - frees space for writer
-	hdr.SetReadIndex(newRI)
+	// Advance shared read index (release-publish) - frees space for writer.
+	// CAS loop ensures ReadIdx only moves forward — a concurrent
+	// EndZcReservation publish must not be regressed by a deferred
+	// Commit that captured an earlier baseCommitReadIdx.
+	for {
+		current := hdr.ReadIndex()
+		if newRI <= current {
+			// Already past this point — nothing to do.
+			break
+		}
+		if hdr.CompareAndSwapReadIndex(current, newRI) {
+			break
+		}
+	}
 
 	// Contiguity: only bump and signal when a writer is actually waiting.
 	// Skipping the atomic increment when no waiters exist saves ~1-2% overhead.
@@ -168,6 +234,195 @@ func (rc *ReadCommit) Commit(consumed int) {
 		hdr.IncrementSpaceSequence()
 		rc.ring.signalSpace(&hdr.spaceSeq)
 	}
+}
+
+// ===== Speculative ZC deferred-publish protocol (ported from grpc-dotnet-shm) =====
+//
+// Single source of truth: ZC safety is achieved on the READER side by
+// deferring header.ReadIdx advancement while a ZC frame is in flight. The
+// writer's plain `used = writeIdx - readIdx` formula is automatically
+// correct — no shared-memory ZC field, no protocol change.
+//
+// Invariants enforced by callers:
+//   - At most ONE ZC in flight per ring (gated by IsSpeculativeZCEligible).
+//   - BeginZcReservation/EndZcReservation are paired exactly once per ZC.
+//   - The reader-side processIncomingData loop is single-threaded;
+//     ReadCommit.Commit is only called from that thread or from
+//     EndZcReservation (consumer side).
+
+// BeginZcReservation begins a speculative-zero-copy reservation. Subsequent
+// ReadCommit.Commit calls on this ring will be deferred (do not touch the
+// shared header.ReadIdx) until EndZcReservation is called.
+//
+// baseIdx is the absolute read index at which the ZC frame starts. The ZC
+// frame's own Commit (called right after BeginZcReservation) bumps the
+// deferred target by the frame size.
+//
+// Pair every call with EndZcReservation via the buffer's Free() callback.
+//
+// Ordering: write the target FIRST, then set zcActive. The atomic store
+// on zcActive provides a release barrier so any reader-thread Commit that
+// observes zcActive=true (acquire load) will see the initialised target,
+// never a leftover stale value from the previous ZC cycle.
+func (r *ShmRing) BeginZcReservation(baseIdx uint64) {
+	atomic.StoreUint64(&r.zcDeferredTarget, baseIdx)
+	atomic.StoreUint32(&r.zcActive, 1)
+}
+
+// BeginSingleFrameZcCommit is the single-frame fast path: fuses
+// BeginZcReservation + the frame's own deferred Commit bump into one
+// atomic sequence. The reader thread is single-threaded so no other
+// Commit can race between Begin and the frame's own deferred bump; we
+// therefore set zcDeferredTarget directly to its post-frame value
+// instead of doing the standard
+//
+//	(write base) → (read base) → (write base+totalBytes)
+//
+// triple-step. Saves 1 Load and 1 Store per single-frame ZC compared to
+// the two-call sequence.
+//
+// Only safe when:
+//   - This is a SINGLE-frame ZC anchor (no chain follows). Multi-frame
+//     chains must use the separate BeginZcReservation + per-frame Commit
+//     sequence so that intervening non-chain frames committed during the
+//     chain hold are also captured into zcDeferredTarget.
+//   - At-most-one-ZC FIFO invariant holds (caller already verified
+//     IsSpeculativeZCEligible).
+func (r *ShmRing) BeginSingleFrameZcCommit(baseIdx uint64, totalBytes int) {
+	atomic.StoreUint64(&r.zcDeferredTarget, baseIdx+uint64(totalBytes))
+	atomic.StoreUint32(&r.zcActive, 1)
+}
+
+// EndZcReservation ends the in-flight ZC reservation: publishes the
+// deferred read index to the shared header.ReadIdx, releasing all bytes
+// consumed during the ZC hold (the ZC frame itself plus any non-ZC
+// frames that were committed-deferred while ZC was active).
+//
+// CRITICAL ordering: PUBLISH header.ReadIdx FIRST, then clear zcActive.
+// The reverse order has a window where a concurrent reader-thread Commit
+// observes zcActive=false but header.ReadIdx is still at the ZC start
+// (we haven't published yet); the reader then takes the immediate-
+// publish branch with a STALE commitReadIdx (= ZC start) and CASes
+// header.ReadIdx to a value INSIDE the still-held ZC region. The cross-
+// process writer then sees those bytes as free, wraps onto them, and
+// corrupts the in-flight payload.
+//
+// After clearing zcActive, a small race window remains where the reader
+// bumped zcDeferredTarget with zcActive=true still observed but our
+// publish happened with the older snapshot. We catch that by re-reading
+// and re-publishing. Once zcActive is false, no further bumps can occur
+// (reader's Commit goes to the CAS path), so a single refresh suffices.
+func (r *ShmRing) EndZcReservation() {
+	if atomic.LoadUint32(&r.closed) != 0 {
+		// Ring closed; do not touch shared memory which may be unmapped.
+		atomic.StoreUint32(&r.zcActive, 0)
+		return
+	}
+	hdr := r.header()
+	target := atomic.LoadUint64(&r.zcDeferredTarget)
+
+	// Phase 1: publish target while zcActive is still true. Any concurrent
+	// reader-thread Commit still sees zcActive=true and stays on the
+	// deferred path, which only bumps zcDeferredTarget — never touches
+	// header.ReadIdx. So our CAS here is uncontended on the reader-thread
+	// side; only cross-process EndZcReservation-on-the-other-side could
+	// compete (impossible: ZC is per-direction).
+	r.publishTarget(hdr, target)
+
+	// Phase 2: drop the active flag. From this point the reader thread
+	// will route future Commit calls through the CAS path. A frame whose
+	// commitReadIdx was captured before our publish has newReadIdx <=
+	// target and is a no-op (CAS sees current >= newReadIdx).
+	atomic.StoreUint32(&r.zcActive, 0)
+
+	// Phase 3: catch the small window where the reader bumped
+	// zcDeferredTarget after our LoadUint64(target) above but before
+	// StoreUint32(zcActive=0). Such a bump would have been routed to the
+	// deferred path (reader saw zcActive=true) and is therefore NOT
+	// reflected in header.ReadIdx yet. Publish it now.
+	refreshed := atomic.LoadUint64(&r.zcDeferredTarget)
+	if refreshed > target {
+		r.publishTarget(hdr, refreshed)
+	}
+
+	// Wake the writer if it was waiting on space.
+	if hdr.ContigWaiters() > 0 {
+		hdr.IncrementContigSequence()
+		r.signalContig(&hdr.contigSeq)
+	}
+	if hdr.SpaceWaiters() > 0 {
+		hdr.IncrementSpaceSequence()
+		r.signalSpace(&hdr.spaceSeq)
+	}
+}
+
+// publishTarget CAS-loops header.ReadIdx forward to target, never
+// regressing it.
+func (r *ShmRing) publishTarget(hdr *RingHeader, target uint64) {
+	for {
+		current := hdr.ReadIndex()
+		if target <= current {
+			return
+		}
+		if hdr.CompareAndSwapReadIndex(current, target) {
+			return
+		}
+	}
+}
+
+// IsSpeculativeZCEligible is the centralised speculative-ZC eligibility
+// check, applied identically by every wire-format reader (Custom16 + H2).
+// Single source of truth for the heuristic so the two code paths cannot
+// drift.
+//
+// payloadLength is the byte length of the candidate frame payload
+// (excluding wire headers). contiguous is true iff the payload reservation
+// is contiguous (no ring wrap).
+//
+// Heuristic (mirrors grpc-dotnet-shm):
+//
+//   - Adaptive minimum payload threshold: 64 KiB on rings ≥ 1 MiB
+//     (large enough that a 64 KiB ZC hold leaves >> 90% of the ring
+//     free for the writer); progressively smaller on smaller rings
+//     so ZC stays useful for the dominant message size; never below
+//     4 KiB where memcpy is faster than ZC bookkeeping.
+//   - Disabled entirely on rings below 1 MiB: a single 64 KiB ZC hold
+//     would freeze 25% of a 256 KiB ring and stall the writer.
+//   - Back-pressure self-disable: if the ring is already > 75% full
+//     (used×4 > cap×3), taking ZC would risk stalling the writer.
+//   - At-most-one-ZC: zcActive==0 enforces a single ZC payload in
+//     flight per ring. The deferred-publish protocol assumes a single
+//     producer of bumps to zcDeferredTarget; multiple concurrent ZC
+//     frames would require multi-producer ordering not yet implemented.
+func (r *ShmRing) IsSpeculativeZCEligible(payloadLength int, contiguous bool) bool {
+	if !contiguous {
+		return false
+	}
+	const minRingForZC = uint64(1) << 20 // 1 MiB
+	if r.capacity < minRingForZC {
+		return false
+	}
+	// Adaptive minimum: min(64 KiB, cap/16), floored at 4 KiB.
+	adaptiveMin := uint64(64 * 1024)
+	if r.capacity/16 < adaptiveMin {
+		adaptiveMin = r.capacity / 16
+	}
+	if adaptiveMin < 4*1024 {
+		adaptiveMin = 4 * 1024
+	}
+	if uint64(payloadLength) < adaptiveMin {
+		return false
+	}
+	if atomic.LoadUint32(&r.zcActive) != 0 {
+		return false
+	}
+	// Back-pressure auto-degrade.
+	hdr := r.header()
+	used := hdr.WriteIndex() - hdr.ReadIndex()
+	if used*4 > r.capacity*3 {
+		return false
+	}
+	return true
 }
 
 // SMF (Shared Memory Framing) helpers are defined in frame.go. This file uses
@@ -226,6 +481,13 @@ func (r *ShmRing) WireFormat() WireFormat {
 // header returns a pointer to the RingHeader in shared memory
 func (r *ShmRing) header() *RingHeader {
 	return (*RingHeader)(unsafe.Pointer(uintptr(unsafe.Pointer(&r.mem[0])) + r.hdrOff))
+}
+
+// isRingClosed returns true if the ring's local closed flag is set.
+// Cheap atomic load used by deferred-Free callbacks to avoid use-after-
+// unmap when the segment is torn down between buffer creation and Free.
+func isRingClosed(r *ShmRing) bool {
+	return atomic.LoadUint32(&r.closed) != 0
 }
 
 // dataPtr returns a pointer to the data area in shared memory

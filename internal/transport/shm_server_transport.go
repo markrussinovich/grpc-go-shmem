@@ -415,9 +415,13 @@ func (t *ShmServerTransport) HandleStreams(ctx context.Context, handle func(*Ser
 
 // processIncomingData reads data from the client->server ring and processes gRPC frames
 func (t *ShmServerTransport) processIncomingData(ctx context.Context) {
-	if shmDebugEnabled { shmDebugf("[DEBUG] ShmServerTransport.processIncomingData: STARTED, ring=%p", t.clientToServer) }
+	if shmDebugEnabled {
+		shmDebugf("[DEBUG] ShmServerTransport.processIncomingData: STARTED, ring=%p", t.clientToServer)
+	}
 	defer func() {
-		if shmDebugEnabled { shmDebugf("[DEBUG] ShmServerTransport.processIncomingData: EXITING") }
+		if shmDebugEnabled {
+			shmDebugf("[DEBUG] ShmServerTransport.processIncomingData: EXITING")
+		}
 		if !t.closed.Load() {
 			go t.Close(errors.New("incoming data processing ended"))
 		}
@@ -425,26 +429,36 @@ func (t *ShmServerTransport) processIncomingData(ctx context.Context) {
 
 	for {
 		if t.closed.Load() {
-			if shmDebugEnabled { shmDebugf("[DEBUG] ShmServerTransport.processIncomingData: transport closed, exiting") }
+			if shmDebugEnabled {
+				shmDebugf("[DEBUG] ShmServerTransport.processIncomingData: transport closed, exiting")
+			}
 			return
 		}
-		if shmDebugEnabled { shmDebugf("[DEBUG] ShmServerTransport.processIncomingData: waiting for frame from client... widx=%d, ridx=%d", t.clientToServer.header().WriteIndex(), t.clientToServer.header().ReadIndex()) }
+		if shmDebugEnabled {
+			shmDebugf("[DEBUG] ShmServerTransport.processIncomingData: waiting for frame from client... widx=%d, ridx=%d", t.clientToServer.header().WriteIndex(), t.clientToServer.header().ReadIndex())
+		}
 		fh, payloadBuf, err := readFrameView(ctx, t.clientToServer)
 		if err != nil {
-			if shmDebugEnabled { shmDebugf("[DEBUG] ShmServerTransport.processIncomingData: readFrameView error: %v", err) }
+			if shmDebugEnabled {
+				shmDebugf("[DEBUG] ShmServerTransport.processIncomingData: readFrameView error: %v", err)
+			}
 			if errors.Is(err, ErrRingClosed) || errors.Is(err, io.EOF) || errors.Is(err, context.Canceled) || t.closed.Load() {
 				return
 			}
 			continue
 		}
-		if shmDebugEnabled { shmDebugf("[DEBUG] ShmServerTransport.processIncomingData: received frame type=%d, streamID=%d, length=%d", fh.Type, fh.StreamID, fh.Length) }
+		if shmDebugEnabled {
+			shmDebugf("[DEBUG] ShmServerTransport.processIncomingData: received frame type=%d, streamID=%d, length=%d", fh.Type, fh.StreamID, fh.Length)
+		}
 
 		// Update last read timestamp for keepalive tracking.
 		atomic.StoreInt64(&t.lastRead, time.Now().UnixNano())
 
 		payloadTransferred := false
 		release := func() {
-			if shmDebugEnabled { shmDebugf("[DEBUG] ShmServerTransport.processIncomingData: release() called, payloadTransferred=%v, payloadBuf=%v", payloadTransferred, payloadBuf) }
+			if shmDebugEnabled {
+				shmDebugf("[DEBUG] ShmServerTransport.processIncomingData: release() called, payloadTransferred=%v, payloadBuf=%v", payloadTransferred, payloadBuf)
+			}
 			if !payloadTransferred && payloadBuf != nil {
 				payloadBuf.Free()
 				payloadBuf = nil
@@ -1081,7 +1095,9 @@ func (t *ShmServerTransport) writeHeader(s *ServerStream, md metadata.MD) error 
 		return nil
 	}
 
-	if shmDebugEnabled { shmDebugf("[DEBUG] ShmServerTransport.writeHeader: stream=%d, metadata keys=%v", s.id, len(md)) }
+	if shmDebugEnabled {
+		shmDebugf("[DEBUG] ShmServerTransport.writeHeader: stream=%d, metadata keys=%v", s.id, len(md))
+	}
 
 	// Convert metadata.MD to []KV format
 	var kvs []KV
@@ -1117,7 +1133,9 @@ func (t *ShmServerTransport) writeHeader(s *ServerStream, md metadata.MD) error 
 		Length:   uint32(len(payload)),
 	}
 
-	if shmDebugEnabled { shmDebugf("[DEBUG] ShmServerTransport.writeHeader: Writing HEADERS frame, streamID=%d, length=%d", s.id, fh.Length) }
+	if shmDebugEnabled {
+		shmDebugf("[DEBUG] ShmServerTransport.writeHeader: Writing HEADERS frame, streamID=%d, length=%d", s.id, fh.Length)
+	}
 
 	// Write frame via the dedicated writer goroutine.
 	// HEADERS must be synchronous so the caller knows if it failed.
@@ -1126,11 +1144,15 @@ func (t *ShmServerTransport) writeHeader(s *ServerStream, md metadata.MD) error 
 		fh:      fh,
 		payload: payload,
 	}); err != nil {
-		if shmDebugEnabled { shmDebugf("[ERROR] ShmServerTransport.writeHeader: Failed to write frame: %v", err) }
+		if shmDebugEnabled {
+			shmDebugf("[ERROR] ShmServerTransport.writeHeader: Failed to write frame: %v", err)
+		}
 		return err
 	}
 
-	if shmDebugEnabled { shmDebugf("[DEBUG] ShmServerTransport.writeHeader: Successfully wrote HEADERS frame") }
+	if shmDebugEnabled {
+		shmDebugf("[DEBUG] ShmServerTransport.writeHeader: Successfully wrote HEADERS frame")
+	}
 	return nil
 }
 
@@ -1235,7 +1257,9 @@ func (t *ShmServerTransport) write(s *ServerStream, hdr []byte, data mem.BufferS
 	}
 
 	payloadLen := len(hdr) + data.Len()
-	if shmDebugEnabled { shmDebugf("[DEBUG] ShmServerTransport.write: stream=%d, hdr_len=%d, data_bytes=%d", s.id, len(hdr), data.Len()) }
+	if shmDebugEnabled {
+		shmDebugf("[DEBUG] ShmServerTransport.write: stream=%d, hdr_len=%d, data_bytes=%d", s.id, len(hdr), data.Len())
+	}
 
 	// Enforce outbound flow control before writing.
 	if err := t.acquireSendQuota(s.ctx, s.id, payloadLen); err != nil {
@@ -1256,11 +1280,15 @@ func (t *ShmServerTransport) write(s *ServerStream, hdr []byte, data mem.BufferS
 		data:     data,
 		maxChunk: 0,
 	}); err != nil {
-		if shmDebugEnabled { shmDebugf("[ERROR] ShmServerTransport.write: Failed to write frame: %v", err) }
+		if shmDebugEnabled {
+			shmDebugf("[ERROR] ShmServerTransport.write: Failed to write frame: %v", err)
+		}
 		return err
 	}
 
-	if shmDebugEnabled { shmDebugf("[DEBUG] ShmServerTransport.write: Successfully wrote MESSAGE frame") }
+	if shmDebugEnabled {
+		shmDebugf("[DEBUG] ShmServerTransport.write: Successfully wrote MESSAGE frame")
+	}
 	return nil
 }
 
@@ -1277,7 +1305,9 @@ func (t *ShmServerTransport) writeStatus(s *ServerStream, st *status.Status) err
 		return err
 	}
 
-	if shmDebugEnabled { shmDebugf("[DEBUG] ShmServerTransport.writeStatus: stream=%d, code=%v, msg=%s", s.id, st.Code(), st.Message()) }
+	if shmDebugEnabled {
+		shmDebugf("[DEBUG] ShmServerTransport.writeStatus: stream=%d, code=%v, msg=%s", s.id, st.Code(), st.Message())
+	}
 
 	// Snapshot trailer metadata.
 	s.hdrMu.Lock()
@@ -1310,7 +1340,9 @@ func (t *ShmServerTransport) writeStatus(s *ServerStream, st *status.Status) err
 		Length:   uint32(len(payload)),
 	}
 
-	if shmDebugEnabled { shmDebugf("[DEBUG] ShmServerTransport.writeStatus: Writing TRAILERS frame, streamID=%d, length=%d", s.id, fh.Length) }
+	if shmDebugEnabled {
+		shmDebugf("[DEBUG] ShmServerTransport.writeStatus: Writing TRAILERS frame, streamID=%d, length=%d", s.id, fh.Length)
+	}
 
 	// Write frame via the dedicated writer goroutine.
 	if err := t.frameWriter.enqueueAndWait(frameEntry{
@@ -1318,11 +1350,15 @@ func (t *ShmServerTransport) writeStatus(s *ServerStream, st *status.Status) err
 		fh:      fh,
 		payload: payload,
 	}); err != nil {
-		if shmDebugEnabled { shmDebugf("[ERROR] ShmServerTransport.writeStatus: Failed to write frame: %v", err) }
+		if shmDebugEnabled {
+			shmDebugf("[ERROR] ShmServerTransport.writeStatus: Failed to write frame: %v", err)
+		}
 		return err
 	}
 
-	if shmDebugEnabled { shmDebugf("[DEBUG] ShmServerTransport.writeStatus: Successfully wrote TRAILERS frame") }
+	if shmDebugEnabled {
+		shmDebugf("[DEBUG] ShmServerTransport.writeStatus: Successfully wrote TRAILERS frame")
+	}
 
 	// Remove stream send quota and pending window update (protected by sendQuotaMu).
 	t.sendQuotaMu.Lock()

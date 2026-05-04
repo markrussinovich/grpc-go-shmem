@@ -61,10 +61,10 @@ type shmFrameWriter struct {
 type frameEntry struct {
 	ctx      context.Context
 	fh       FrameHeader
-	payload  []byte         // simple payload (HEADERS, TRAILERS, CANCEL, etc.)
-	hdr      []byte         // optional header prefix for BufferSlice payloads
+	payload  []byte          // simple payload (HEADERS, TRAILERS, CANCEL, etc.)
+	hdr      []byte          // optional header prefix for BufferSlice payloads
 	data     mem.BufferSlice // zero-copy payload (MESSAGE)
-	maxChunk int            // max frame payload for chunked writes; 0 = default
+	maxChunk int             // max frame payload for chunked writes; 0 = default
 	doneCh   chan error      // if non-nil, writer sends result and caller waits
 }
 

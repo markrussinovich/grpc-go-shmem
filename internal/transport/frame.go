@@ -807,13 +807,13 @@ func readFrameView(ctx context.Context, rx *ShmRing) (FrameHeader, mem.Buffer, e
 
 		// Zero-copy for contiguous single-frame MESSAGE payloads only.
 		//
-		// Multi-frame chunks (MORE flag set) always use the copy path because:
-		// 1. The caller must reassemble chunks into a contiguous buffer anyway,
-		//    so speculative ZC provides no copy savings.
-		// 2. Speculative reservation reduces writer pipeline depth (from 3
-		//    chunks to ~1), hurting throughput for large payloads.
-		// This matches the C# implementation which only uses speculative ZC
-		// for single-frame final messages (!isMore).
+		// Multi-frame chunks (MORE flag set) always use the copy path:
+		// the caller must reassemble chunks into a contiguous buffer
+		// anyway, so speculative ZC provides no copy savings, and the
+		// deferred-publish protocol holds header.ReadIdx across the
+		// chain which would stall the writer for chains larger than
+		// cap/2. Matches grpc-dotnet-shm's chain-zc-only-for-cap/2 rule
+		// (which we don't yet implement on the Go side).
 		isMore := fh.Flags&MessageFlagMORE != 0
 
 		// When MORE flag is set, boost the reader's spin cutoff so the
@@ -826,26 +826,48 @@ func readFrameView(ctx context.Context, rx *ShmRing) (FrameHeader, mem.Buffer, e
 			atomic.StoreUint32(&rx.dataSpinCutoff, spinMoreBoost)
 		}
 
-		// All read paths copy data BEFORE calling Commit. Commit frees
-		// ring space for the writer; without copying first, the writer
-		// could overwrite the data between Commit and Copy.
-		//
-		// Zero-copy reads (wrapping ring memory in a mem.Buffer with
-		// speculativeReserved) have been removed. The speculativeReserved
-		// counter is a suffix behind readIdx, so any subsequent Commit
-		// (even from copy-path frames) advances readIdx past the ZC
-		// buffer's position, allowing the writer to wrap and overwrite it.
-		// A correct implementation would require pinning readIdx until
-		// the ZC buffer is freed (deferred-commit model). For now, the
-		// copy path is used unconditionally; the ZC write path
-		// (writeProtoToRing) provides the primary performance benefit.
+		// Speculative zero-copy: when the payload is contiguous, single-
+		// frame MESSAGE, and the ring is large enough, return a buffer
+		// backed by ring memory. Safety is provided by the deferred-
+		// publish ZC protocol: BeginSingleFrameZcCommit freezes
+		// header.ReadIdx at the ZC frame's tail; intervening Commits
+		// from copy-path frames are deferred (accumulated locally).
+		// EndZcReservation publishes the accumulated target when the
+		// caller frees the buffer. This guarantees the cross-process
+		// writer never sees a header.ReadIdx that points inside a
+		// still-held ZC region, regardless of how many copy-path
+		// frames are committed in between.
+		if !isMore && fh.Type == FrameTypeMESSAGE && len(pSecond) == 0 &&
+			rx.IsSpeculativeZCEligible(payloadLen, true) {
+			// Capture the absolute base index of the ZC frame BEFORE
+			// any deferred commit happens, then arm the ZC anchor with
+			// the post-frame target so subsequent deferred Commits
+			// accumulate from there.
+			baseIdx := commitPayload.commitReadIdx
+			rx.BeginSingleFrameZcCommit(baseIdx, payloadLen)
+			// Don't call commitPayload.Commit(payloadLen) here — the
+			// fused BeginSingleFrameZcCommit already represents this
+			// frame's bytes in zcDeferredTarget. A subsequent Commit
+			// would (correctly, additively) bump the target again,
+			// over-counting this frame's bytes.
+
+			// Three-index slice: cap=len prevents accidental writes
+			// past the payload region.
+			ringSlice := pFirst[:payloadLen:payloadLen]
+			pool := &zcReleasePool{ring: rx}
+			buf := mem.NewBuffer(&ringSlice, pool)
+			return fh, buf, nil
+		}
+
+		// Copy paths: copy data BEFORE Commit. Commit frees ring space
+		// for the writer; without copying first, the writer could
+		// overwrite the data between Commit and Copy.
 		var buf mem.Buffer
 		if len(pSecond) == 0 {
 			buf = mem.Copy(pFirst[:payloadLen], mem.DefaultBufferPool())
 			commitPayload.Commit(payloadLen)
 		} else {
-			// Wrap-around case: copy both parts to pooled buffer.
-			// Copy BEFORE Commit for the same reason as above.
+			// Wrap-around: copy both parts to pooled buffer.
 			pool := mem.DefaultBufferPool()
 			poolBuf := pool.Get(payloadLen)
 			copied := copy(*poolBuf, pFirst)

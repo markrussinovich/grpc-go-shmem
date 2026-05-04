@@ -664,4 +664,3 @@ func writeProtoToRingH2(ctx context.Context, tx *ShmRing, streamID uint32, msg p
 
 	return true, res.Commit(total)
 }
-

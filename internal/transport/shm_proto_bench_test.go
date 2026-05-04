@@ -267,7 +267,8 @@ func benchUnaryWire(b *testing.B, bodySize int, useZC bool, wire WireFormat) {
 	rxA.SetWireFormat(wire)
 	txB.SetWireFormat(wire)
 	rxB.SetWireFormat(wire)
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second); defer cancel()
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
 
 	req := makePayload(bodySize)
 	resp := makePayload(bodySize)
@@ -325,7 +326,8 @@ func BenchmarkShmProtoUnaryZC(b *testing.B) {
 func BenchmarkShmProtoUnaryCopy(b *testing.B) {
 	for _, s := range protoSizes() {
 		b.Run(sizeLabel(s), func(b *testing.B) { benchUnary(b, s, false) })
-	}}
+	}
+}
 
 // BenchmarkShmProtoUnaryZCH2 measures the ZC unary path on rings using
 // the HTTP/2 wire format. Provides a side-by-side comparison with
@@ -375,7 +377,8 @@ func benchStreaming(b *testing.B, msgCount, bodySize int, useZC bool) {
 	rxA := NewShmRingFromSegment(seg.A, seg.Mem)
 	txB := NewShmRingFromSegment(seg.B, seg.Mem)
 	rxB := NewShmRingFromSegment(seg.B, seg.Mem)
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second); defer cancel()
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
 
 	req := makePayload(bodySize)
 	resp := makePayload(bodySize)
@@ -478,7 +481,8 @@ func benchBidi(b *testing.B, bodySize int, useZC bool) {
 	rxA := NewShmRingFromSegment(seg.A, seg.Mem)
 	txB := NewShmRingFromSegment(seg.B, seg.Mem)
 	rxB := NewShmRingFromSegment(seg.B, seg.Mem)
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second); defer cancel()
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
 
 	req := makePayload(bodySize)
 	resp := makePayload(bodySize)
@@ -771,103 +775,127 @@ func BenchmarkTCPProtoUnary(b *testing.B) {
 // ---------------------------------------------------------------------------
 
 func udsPath(b *testing.B) string {
-dir := b.TempDir()
-return filepath.Join(dir, "bench.sock")
+	dir := b.TempDir()
+	return filepath.Join(dir, "bench.sock")
 }
 
 func benchUDSRoundtrip(b *testing.B, bodySize int) {
-sock := udsPath(b)
-ln, err := net.Listen("unix", sock)
-if err != nil {
-b.Fatal(err)
-}
-defer ln.Close()
-defer os.Remove(sock)
-req := makePayload(bodySize)
-resp := makePayload(bodySize)
-b.SetBytes(int64(proto.Size(req) * 2))
-var wg sync.WaitGroup
-started := make(chan struct{})
-wg.Add(1)
-go func() {
-defer wg.Done()
-conn, err := ln.Accept()
-if err != nil { return }
-defer conn.Close()
-close(started)
-recv := &wrapperspb.BytesValue{}
-for i := 0; i < b.N; i++ {
-if err := readProtoTCP(conn, recv); err != nil { return }
-if err := writeProtoTCP(conn, 1, resp); err != nil { return }
-}
-}()
-conn, err := net.Dial("unix", sock)
-if err != nil { b.Fatal(err) }
-defer conn.Close()
-<-started
-b.ResetTimer()
-recv := &wrapperspb.BytesValue{}
-for i := 0; i < b.N; i++ {
-if err := writeProtoTCP(conn, 1, req); err != nil { b.Fatal(err) }
-if err := readProtoTCP(conn, recv); err != nil { b.Fatal(err) }
-}
-wg.Wait()
+	sock := udsPath(b)
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer ln.Close()
+	defer os.Remove(sock)
+	req := makePayload(bodySize)
+	resp := makePayload(bodySize)
+	b.SetBytes(int64(proto.Size(req) * 2))
+	var wg sync.WaitGroup
+	started := make(chan struct{})
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		close(started)
+		recv := &wrapperspb.BytesValue{}
+		for i := 0; i < b.N; i++ {
+			if err := readProtoTCP(conn, recv); err != nil {
+				return
+			}
+			if err := writeProtoTCP(conn, 1, resp); err != nil {
+				return
+			}
+		}
+	}()
+	conn, err := net.Dial("unix", sock)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer conn.Close()
+	<-started
+	b.ResetTimer()
+	recv := &wrapperspb.BytesValue{}
+	for i := 0; i < b.N; i++ {
+		if err := writeProtoTCP(conn, 1, req); err != nil {
+			b.Fatal(err)
+		}
+		if err := readProtoTCP(conn, recv); err != nil {
+			b.Fatal(err)
+		}
+	}
+	wg.Wait()
 }
 
 func benchUDSStreaming(b *testing.B, msgCount, bodySize int) {
-sock := udsPath(b)
-ln, err := net.Listen("unix", sock)
-if err != nil {
-b.Fatal(err)
-}
-defer ln.Close()
-defer os.Remove(sock)
-req := makePayload(bodySize)
-resp := makePayload(bodySize)
-b.SetBytes(int64(proto.Size(req) * (msgCount + 1)))
-var wg sync.WaitGroup
-started := make(chan struct{})
-wg.Add(1)
-go func() {
-defer wg.Done()
-conn, err := ln.Accept()
-if err != nil { return }
-defer conn.Close()
-close(started)
-recv := &wrapperspb.BytesValue{}
-for i := 0; i < b.N; i++ {
-if err := readProtoTCP(conn, recv); err != nil { return }
-for j := 0; j < msgCount; j++ {
-if err := writeProtoTCP(conn, 1, resp); err != nil { return }
-}
-}
-}()
-conn, err := net.Dial("unix", sock)
-if err != nil { b.Fatal(err) }
-defer conn.Close()
-<-started
-b.ResetTimer()
-recv := &wrapperspb.BytesValue{}
-for i := 0; i < b.N; i++ {
-if err := writeProtoTCP(conn, 1, req); err != nil { b.Fatal(err) }
-for j := 0; j < msgCount; j++ {
-if err := readProtoTCP(conn, recv); err != nil { b.Fatal(err) }
-}
-}
-wg.Wait()
+	sock := udsPath(b)
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer ln.Close()
+	defer os.Remove(sock)
+	req := makePayload(bodySize)
+	resp := makePayload(bodySize)
+	b.SetBytes(int64(proto.Size(req) * (msgCount + 1)))
+	var wg sync.WaitGroup
+	started := make(chan struct{})
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		close(started)
+		recv := &wrapperspb.BytesValue{}
+		for i := 0; i < b.N; i++ {
+			if err := readProtoTCP(conn, recv); err != nil {
+				return
+			}
+			for j := 0; j < msgCount; j++ {
+				if err := writeProtoTCP(conn, 1, resp); err != nil {
+					return
+				}
+			}
+		}
+	}()
+	conn, err := net.Dial("unix", sock)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer conn.Close()
+	<-started
+	b.ResetTimer()
+	recv := &wrapperspb.BytesValue{}
+	for i := 0; i < b.N; i++ {
+		if err := writeProtoTCP(conn, 1, req); err != nil {
+			b.Fatal(err)
+		}
+		for j := 0; j < msgCount; j++ {
+			if err := readProtoTCP(conn, recv); err != nil {
+				b.Fatal(err)
+			}
+		}
+	}
+	wg.Wait()
 }
 
 func BenchmarkUDSProtoUnary(b *testing.B) {
-for _, size := range protoSizes() {
-b.Run(sizeLabel(size), func(b *testing.B) { benchUDSRoundtrip(b, size) })
-}
+	for _, size := range protoSizes() {
+		b.Run(sizeLabel(size), func(b *testing.B) { benchUDSRoundtrip(b, size) })
+	}
 }
 
 func BenchmarkUDSProtoStreaming(b *testing.B) {
-for _, size := range []int{64, 256, 1024, 4096, 16384, 64 * 1024, 256 * 1024, 1024 * 1024, 4 * 1024 * 1024, 16 * 1024 * 1024} {
-b.Run(fmt.Sprintf("%s/msgs=100", sizeLabel(size)), func(b *testing.B) { benchUDSStreaming(b, 100, size) })
-}
-for _, size := range []int{64 * 1024 * 1024, 256 * 1024 * 1024} {
-b.Run(fmt.Sprintf("%s/msgs=10", sizeLabel(size)), func(b *testing.B) { benchUDSStreaming(b, 10, size) })
-}
+	for _, size := range []int{64, 256, 1024, 4096, 16384, 64 * 1024, 256 * 1024, 1024 * 1024, 4 * 1024 * 1024, 16 * 1024 * 1024} {
+		b.Run(fmt.Sprintf("%s/msgs=100", sizeLabel(size)), func(b *testing.B) { benchUDSStreaming(b, 100, size) })
+	}
+	for _, size := range []int{64 * 1024 * 1024, 256 * 1024 * 1024} {
+		b.Run(fmt.Sprintf("%s/msgs=10", sizeLabel(size)), func(b *testing.B) { benchUDSStreaming(b, 10, size) })
+	}
 }
