@@ -624,25 +624,246 @@ func readFrameH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolder) (
 	}
 }
 
-// readFrameViewH2 is the H2 analogue of readFrameView (zero-copy capable).
-// Single-frame DATA payloads return a ring-backed mem.Buffer; HEADERS and
-// other small frames always copy.
+// readFrameViewH2 is the H2 analogue of readFrameView. For single-frame
+// DATA payloads carrying exactly one complete LPM, returns a ring-backed
+// mem.Buffer using the deferred-publish ZC protocol — same model as
+// Custom16's readFrameView. HEADERS, multi-frame DATA, and other small
+// frames go through the copy path.
+//
+// ZC eligibility (mirrors Custom16):
+//   - DATA frame with one complete LPM in body (body == 5+lpmLen)
+//   - lpmAccumulator is empty (no in-progress chain)
+//   - body slice contiguous in the ring (no wrap)
+//   - rx.IsSpeculativeZCEligible (ring large enough, payload large
+//     enough, at-most-one-ZC, < 75% full)
 func readFrameViewH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolder) (FrameHeader, mem.Buffer, error) {
-	fh, payload, err := readFrameH2(ctx, rx, holder)
-	if err != nil {
-		return FrameHeader{}, nil, err
+	dec := holder.dec
+	for {
+		// Drain any pending leftover from a previous DATA frame first.
+		// These bytes already lived in heap-allocated form (pendingFrame
+		// is a copy, not a ring slice), so ZC isn't applicable here.
+		if len(holder.pendingFrame) > 0 {
+			sid := holder.pendingStreamID
+			data := holder.pendingFrame
+			holder.pendingFrame = nil
+			acc := holder.getLpmAccumulator(sid)
+			msg, leftover, ferr := acc.feed(data, 0)
+			if ferr != nil {
+				return FrameHeader{}, nil, ferr
+			}
+			if len(leftover) > 0 {
+				holder.pendingFrame = leftover
+				holder.pendingStreamID = sid
+			}
+			if msg != nil {
+				buf := mem.Copy(msg, mem.DefaultBufferPool())
+				return FrameHeader{
+					Type:     FrameTypeMESSAGE,
+					StreamID: sid,
+					Length:   uint32(len(msg)),
+				}, buf, nil
+			}
+		}
+
+		// Read 9-byte H2 frame header.
+		first, second, commitHdr, err := rx.ReadSlices(ctx, h2FrameHeaderSize)
+		if err != nil {
+			return FrameHeader{}, nil, err
+		}
+		var hb [h2FrameHeaderSize]byte
+		n := copy(hb[:], first)
+		if n < h2FrameHeaderSize && len(second) > 0 {
+			n += copy(hb[n:], second)
+		}
+		if n != h2FrameHeaderSize {
+			commitHdr.Commit(h2FrameHeaderSize)
+			return FrameHeader{}, nil, errors.New("h2: short frame header")
+		}
+		h2fh, err := decodeH2FrameHeader(hb[:])
+		if err != nil {
+			commitHdr.Commit(h2FrameHeaderSize)
+			return FrameHeader{}, nil, err
+		}
+		commitHdr.Commit(h2FrameHeaderSize)
+
+		// Reserve payload — but DON'T commit yet. We want to inspect
+		// the body to decide between ZC and copy paths.
+		var pFirst, pSecond []byte
+		var commitPayload *ReadCommit
+		if h2fh.Length > 0 {
+			pFirst, pSecond, commitPayload, err = rx.ReadSlices(ctx, int(h2fh.Length))
+			if err != nil {
+				return FrameHeader{}, nil, err
+			}
+		}
+
+		switch h2fh.Type {
+		case H2FrameSETTINGS, H2FramePRIORITY, H2FramePUSHPROMISE:
+			if commitPayload != nil {
+				commitPayload.Commit(int(h2fh.Length))
+			}
+			continue
+
+		case H2FrameDATA:
+			if h2fh.Length == 0 {
+				if h2fh.Flags&H2FlagEndStream != 0 {
+					return FrameHeader{
+						Type: FrameTypeHALFCLOSE, StreamID: h2fh.StreamID,
+					}, nil, nil
+				}
+				continue
+			}
+
+			// === ZC fast path ===
+			//
+			// Conditions:
+			//   - accumulator empty (no in-progress chain)
+			//   - body contiguous (no ring wrap)
+			//   - body fully contains exactly one LPM
+			//   - rx.IsSpeculativeZCEligible (large enough ring/payload,
+			//     at-most-one-ZC, not under back-pressure)
+			//
+			// The body bytes returned to the caller include the gRPC LPM
+			// 5-byte prefix, matching Custom16 readFrameView.
+			acc := holder.getLpmAccumulator(h2fh.StreamID)
+			if !acc.inProgress() && len(pSecond) == 0 && len(pFirst) >= 5 {
+				bodyLen := int(binary.BigEndian.Uint32(pFirst[1:5]))
+				payloadLen := int(h2fh.Length)
+				if 5+bodyLen == payloadLen && rx.IsSpeculativeZCEligible(payloadLen, true) {
+					// Arm the ZC anchor with the post-frame target, then
+					// don't call commitPayload.Commit — the deferred
+					// target already accounts for these bytes.
+					baseIdx := commitPayload.commitReadIdx
+					rx.BeginSingleFrameZcCommit(baseIdx, payloadLen)
+
+					// Pre-emptively clean accumulator state if END_STREAM
+					// arrives on this DATA frame.
+					if h2fh.Flags&H2FlagEndStream != 0 {
+						holder.removeLpmAccumulator(h2fh.StreamID)
+					}
+
+					ringSlice := pFirst[:payloadLen:payloadLen]
+					pool := &zcReleasePool{ring: rx}
+					buf := mem.NewBuffer(&ringSlice, pool)
+					return FrameHeader{
+						Type:     FrameTypeMESSAGE,
+						StreamID: h2fh.StreamID,
+						Length:   uint32(payloadLen),
+					}, buf, nil
+				}
+			}
+
+			// === Copy path ===
+			//
+			// Materialize body to a heap buffer, commit, then run it
+			// through the lpmAccumulator. Same as readFrameH2's logic.
+			payload := make([]byte, h2fh.Length)
+			cn := copy(payload, pFirst)
+			if cn < int(h2fh.Length) && len(pSecond) > 0 {
+				copy(payload[cn:], pSecond)
+			}
+			commitPayload.Commit(int(h2fh.Length))
+
+			data := payload
+			for len(data) > 0 {
+				msg, leftover, ferr := acc.feed(data, 0)
+				if ferr != nil {
+					return FrameHeader{}, nil, ferr
+				}
+				if msg != nil {
+					if len(leftover) > 0 {
+						holder.pendingFrame = leftover
+						holder.pendingStreamID = h2fh.StreamID
+					}
+					buf := mem.Copy(msg, mem.DefaultBufferPool())
+					return FrameHeader{
+						Type:     FrameTypeMESSAGE,
+						StreamID: h2fh.StreamID,
+						Length:   uint32(len(msg)),
+					}, buf, nil
+				}
+				break
+			}
+			if h2fh.Flags&H2FlagEndStream != 0 && acc.inProgress() {
+				return FrameHeader{}, nil, errors.New("h2: END_STREAM with incomplete LPM in accumulator")
+			}
+			continue
+
+		case H2FrameHEADERS:
+			payload := make([]byte, h2fh.Length)
+			if h2fh.Length > 0 {
+				cn := copy(payload, pFirst)
+				if cn < int(h2fh.Length) && len(pSecond) > 0 {
+					copy(payload[cn:], pSecond)
+				}
+				commitPayload.Commit(int(h2fh.Length))
+			}
+			h, t, isTrailers, derr := h2DecodeHeaders(dec, payload)
+			if derr != nil {
+				return FrameHeader{}, nil, derr
+			}
+			if isTrailers {
+				holder.removeLpmAccumulator(h2fh.StreamID)
+				out := encodeTrailers(t)
+				return FrameHeader{
+					Type:     FrameTypeTRAILERS,
+					StreamID: h2fh.StreamID,
+					Length:   uint32(len(out)),
+					Flags:    TrailersFlagEndStream,
+				}, mem.Copy(out, mem.DefaultBufferPool()), nil
+			}
+			out := encodeHeaders(h)
+			return FrameHeader{
+				Type:     FrameTypeHEADERS,
+				StreamID: h2fh.StreamID,
+				Length:   uint32(len(out)),
+				Flags:    HeadersFlagINITIAL,
+			}, mem.Copy(out, mem.DefaultBufferPool()), nil
+
+		case H2FrameRSTSTREAM:
+			payload := make([]byte, h2fh.Length)
+			if h2fh.Length > 0 {
+				cn := copy(payload, pFirst)
+				if cn < int(h2fh.Length) && len(pSecond) > 0 {
+					copy(payload[cn:], pSecond)
+				}
+				commitPayload.Commit(int(h2fh.Length))
+			}
+			holder.removeLpmAccumulator(h2fh.StreamID)
+			return FrameHeader{
+				Type:     FrameTypeCANCEL,
+				StreamID: h2fh.StreamID,
+				Length:   uint32(len(payload)),
+			}, mem.Copy(payload, mem.DefaultBufferPool()), nil
+
+		case H2FrameGOAWAY, H2FramePING, H2FrameWINDOWUPDATE:
+			payload := make([]byte, h2fh.Length)
+			if h2fh.Length > 0 {
+				cn := copy(payload, pFirst)
+				if cn < int(h2fh.Length) && len(pSecond) > 0 {
+					copy(payload[cn:], pSecond)
+				}
+				commitPayload.Commit(int(h2fh.Length))
+			}
+			ft, fl, ok := translateH2ToCustom(h2fh.Type, h2fh.Flags)
+			if !ok {
+				continue
+			}
+			return FrameHeader{
+				Type:     ft,
+				StreamID: h2fh.StreamID,
+				Length:   uint32(len(payload)),
+				Flags:    fl,
+			}, mem.Copy(payload, mem.DefaultBufferPool()), nil
+
+		default:
+			// Unknown frame type. Per RFC 7540 §4.1, ignore after consuming.
+			if commitPayload != nil {
+				commitPayload.Commit(int(h2fh.Length))
+			}
+			continue
+		}
 	}
-	if payload == nil {
-		return fh, nil, nil
-	}
-	// readFrameH2 has already gone through the LpmAccumulator and
-	// returns a heap-allocated assembled message. Wrap it in a
-	// pooled mem.Buffer for downstream consumers. ZC for the
-	// single-frame fast path (where readFrameH2 returns the raw
-	// DATA body slice) would require coordinating the deferred
-	// CommitReadIdx with the H2 path; deferred to a follow-up.
-	buf := mem.Copy(payload, mem.DefaultBufferPool())
-	return fh, buf, nil
 }
 
 // writeFrameH2 writes one logical SHM frame on a ring whose wire format is
