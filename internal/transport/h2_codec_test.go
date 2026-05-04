@@ -21,6 +21,7 @@ package transport
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"fmt"
 	"testing"
 	"time"
@@ -177,8 +178,14 @@ func TestH2WriteReadFrame_RoundTrip(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	// Write a MESSAGE frame.
-	payload := []byte("hello h2")
+	// Write a MESSAGE frame. The body must include the gRPC LPM prefix
+	// (5 bytes: 1-byte compressed flag + 4-byte big-endian length) so
+	// the H2 reader's lpmAccumulator can identify a complete message.
+	body := []byte("hello h2")
+	payload := make([]byte, 5+len(body))
+	payload[0] = 0
+	binary.BigEndian.PutUint32(payload[1:5], uint32(len(body)))
+	copy(payload[5:], body)
 	if err := writeFrame(ctx, tx, FrameHeader{
 		Type:     FrameTypeMESSAGE,
 		StreamID: 3,

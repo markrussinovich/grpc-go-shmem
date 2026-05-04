@@ -20,6 +20,7 @@ package transport
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"testing"
 	"time"
@@ -125,7 +126,13 @@ func TestH2NegotiatedDial(t *testing.T) {
 	}, encodeHeaders(HeadersV1{Version: 1, HdrType: 0, Method: "/svc/Hi"})); err != nil {
 		t.Fatalf("client write headers: %v", err)
 	}
-	payload := []byte("hello h2 world")
+	// MESSAGE bodies must include the gRPC LPM prefix (5 bytes) so the
+	// H2 reader's lpmAccumulator can identify a complete message.
+	body := []byte("hello h2 world")
+	payload := make([]byte, 5+len(body))
+	payload[0] = 0
+	binary.BigEndian.PutUint32(payload[1:5], uint32(len(body)))
+	copy(payload[5:], body)
 	if err := writeFrame(testCtx, ct.clientToServer, FrameHeader{
 		StreamID: streamID, Type: FrameTypeMESSAGE,
 	}, payload); err != nil {

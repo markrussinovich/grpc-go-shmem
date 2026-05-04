@@ -688,7 +688,7 @@ func writeFrameChunkFromCursor(ctx context.Context, tx *ShmRing, fh FrameHeader,
 // necessary and never spins.
 func readFrame(ctx context.Context, rx *ShmRing) (FrameHeader, []byte, error) {
 	if rx.wire == WireFormatHTTP2 {
-		return readFrameH2(ctx, rx, rx.h2Decoder().dec)
+		return readFrameH2(ctx, rx, rx.h2Decoder())
 	}
 	for {
 		// Read exactly the header size, but allow it to straddle the wrap
@@ -751,7 +751,7 @@ func readFrame(ctx context.Context, rx *ShmRing) (FrameHeader, []byte, error) {
 // all practical workloads.
 func readFrameView(ctx context.Context, rx *ShmRing) (FrameHeader, mem.Buffer, error) {
 	if rx.wire == WireFormatHTTP2 {
-		return readFrameViewH2(ctx, rx, rx.h2Decoder().dec)
+		return readFrameViewH2(ctx, rx, rx.h2Decoder())
 	}
 	for {
 		first, second, commitHeader, err := rx.ReadSlices(ctx, frameHeaderSize)

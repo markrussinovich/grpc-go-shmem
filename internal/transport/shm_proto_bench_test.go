@@ -332,24 +332,14 @@ func BenchmarkShmProtoUnaryCopy(b *testing.B) {
 // BenchmarkShmProtoUnaryZCH2 measures the ZC unary path on rings using
 // the HTTP/2 wire format. Provides a side-by-side comparison with
 // BenchmarkShmProtoUnaryZC (which uses Custom16) to verify ZC parity.
-//
-// Note: H2 frames have a 16MB-1 maximum payload (RFC 7540 §4.2). Sizes
-// above that require multi-frame DATA emission with LPM accumulation on
-// the reader, which is future work; benchmarks above 4MB are skipped.
 func BenchmarkShmProtoUnaryZCH2(b *testing.B) {
 	for _, s := range protoSizes() {
-		if s > 4*1024*1024 {
-			continue
-		}
 		b.Run(sizeLabel(s), func(b *testing.B) { benchUnaryWire(b, s, true, WireFormatHTTP2) })
 	}
 }
 
 func BenchmarkShmProtoUnaryCopyH2(b *testing.B) {
 	for _, s := range protoSizes() {
-		if s > 4*1024*1024 {
-			continue
-		}
 		b.Run(sizeLabel(s), func(b *testing.B) { benchUnaryWire(b, s, false, WireFormatHTTP2) })
 	}
 }
