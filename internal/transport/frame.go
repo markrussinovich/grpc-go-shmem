@@ -826,42 +826,103 @@ func readFrameView(ctx context.Context, rx *ShmRing) (FrameHeader, mem.Buffer, e
 			atomic.StoreUint32(&rx.dataSpinCutoff, spinMoreBoost)
 		}
 
-		// Speculative zero-copy: when the payload is contiguous, single-
-		// frame MESSAGE, and the ring is large enough, return a buffer
-		// backed by ring memory. Safety is provided by the deferred-
-		// publish ZC protocol: BeginSingleFrameZcCommit freezes
-		// header.ReadIdx at the ZC frame's tail; intervening Commits
-		// from copy-path frames are deferred (accumulated locally).
-		// EndZcReservation publishes the accumulated target when the
-		// caller frees the buffer. This guarantees the cross-process
-		// writer never sees a header.ReadIdx that points inside a
-		// still-held ZC region, regardless of how many copy-path
-		// frames are committed in between.
-		if !isMore && fh.Type == FrameTypeMESSAGE && len(pSecond) == 0 &&
-			rx.IsSpeculativeZCEligible(payloadLen, true) {
-			// Capture the absolute base index of the ZC frame BEFORE
-			// any deferred commit happens, then arm the ZC anchor with
-			// the post-frame target so subsequent deferred Commits
-			// accumulate from there.
-			baseIdx := commitPayload.commitReadIdx
-			rx.BeginSingleFrameZcCommit(baseIdx, payloadLen)
-			// Don't call commitPayload.Commit(payloadLen) here — the
-			// fused BeginSingleFrameZcCommit already represents this
-			// frame's bytes in zcDeferredTarget. A subsequent Commit
-			// would (correctly, additively) bump the target again,
-			// over-counting this frame's bytes.
+		// Speculative zero-copy decision tree for MESSAGE frames:
+		//
+		// Single-frame (!isMore) message:
+		//   * ZC if eligible (no chain in flight, large enough payload,
+		//     contiguous, ring not under back-pressure). Uses the fused
+		//     single-frame anchor for one Begin+Commit step.
+		//
+		// Multi-frame chain:
+		//   * First chunk (isMore && !chainOpen && !chainCopyMode):
+		//     peek the LPM length; if totalMsg ≤ ChainZcBudget AND
+		//     IsSpeculativeZCEligible passes, open a chain anchor.
+		//     Otherwise enter chainCopyMode for the rest of the message.
+		//   * Continuation chunk in ZC mode (isMore && chainOpen):
+		//     emit body as ring-backed buffer, deferred Commit, no new
+		//     anchor.
+		//   * Final chunk in ZC mode (!isMore && chainOpen):
+		//     emit ring-backed buffer, close the chain marker; the
+		//     consumer's last Buffer.Free triggers EndZcReservation.
+		//   * Any chunk in chainCopyMode: copy.
+		if fh.Type == FrameTypeMESSAGE && len(pSecond) == 0 {
+			// === Single-frame (no MORE) ===
+			if !isMore && !rx.IsZcChainActive() && !rx.ChainCopyMode() &&
+				rx.IsSpeculativeZCEligible(payloadLen, true) {
+				baseIdx := commitPayload.commitReadIdx
+				rx.BeginSingleFrameZcCommit(baseIdx, payloadLen)
+				rx.AddChainZcInFlight()
+				ringSlice := pFirst[:payloadLen:payloadLen]
+				pool := &zcChainReleasePool{ring: rx}
+				buf := mem.NewBuffer(&ringSlice, pool)
+				return fh, buf, nil
+			}
 
-			// Three-index slice: cap=len prevents accidental writes
-			// past the payload region.
-			ringSlice := pFirst[:payloadLen:payloadLen]
-			pool := &zcReleasePool{ring: rx}
-			buf := mem.NewBuffer(&ringSlice, pool)
-			return fh, buf, nil
+			// === Multi-frame chain start ===
+			if isMore && !rx.IsZcChainActive() && !rx.ChainCopyMode() {
+				// Peek LPM length to decide ZC vs copy for the chain.
+				// LPM = 5 bytes: 1-byte compressed flag + 4-byte big-
+				// endian length. Total message bytes = 5 + lpmBodyLen.
+				if payloadLen >= 5 && rx.IsSpeculativeZCEligible(payloadLen, true) {
+					lpmBodyLen := int64(binary.BigEndian.Uint32(pFirst[1:5]))
+					totalMsg := int64(5) + lpmBodyLen
+					if totalMsg > 0 && totalMsg <= rx.ChainZcBudget() {
+						// Open chain anchor.
+						baseIdx := commitPayload.commitReadIdx
+						rx.BeginZcReservation(baseIdx)
+						rx.OpenZcChain()
+						rx.AddChainZcInFlight()
+						commitPayload.Commit(payloadLen)
+						ringSlice := pFirst[:payloadLen:payloadLen]
+						pool := &zcChainReleasePool{ring: rx}
+						buf := mem.NewBuffer(&ringSlice, pool)
+						return fh, buf, nil
+					}
+				}
+				// Reject: enter copy mode for the rest of the message.
+				rx.SetChainCopyMode(true)
+			}
+
+			// === Multi-frame chain continuation in ZC mode ===
+			//
+			// Gate on IsChainOpen (codec-side chain marker), NOT
+			// IsZcChainActive (which includes single-frame holds where
+			// no chain is in progress). A single-frame ZC buffer being
+			// held while a subsequent unrelated message arrives must
+			// NOT enter chain continuation; that subsequent message
+			// goes through the regular copy path and its commit is
+			// deferred via the zcActive=1 branch in ReadCommit.Commit.
+			if rx.IsChainOpen() && !rx.ChainCopyMode() {
+				// Anchor already open. Just hand back ring slice; the
+				// chain anchor's deferred-publish handles the read
+				// index. AddChainZcInFlight + deferred Commit on this
+				// chunk's bytes accumulate into zcDeferredTarget.
+				rx.AddChainZcInFlight()
+				commitPayload.Commit(payloadLen)
+				if !isMore {
+					// Final chunk — close chain marker. The consumer's
+					// last Buffer.Free triggers EndZcReservation.
+					rx.CloseZcChain()
+					rx.SetChainCopyMode(false)
+				}
+				ringSlice := pFirst[:payloadLen:payloadLen]
+				pool := &zcChainReleasePool{ring: rx}
+				buf := mem.NewBuffer(&ringSlice, pool)
+				return fh, buf, nil
+			}
 		}
 
 		// Copy paths: copy data BEFORE Commit. Commit frees ring space
 		// for the writer; without copying first, the writer could
 		// overwrite the data between Commit and Copy.
+		//
+		// Chain bookkeeping: zcInFlight ONLY tracks ring-backed ZC
+		// buffers, not copy buffers. But chainOpen MUST be cleared on
+		// the final !MORE chunk regardless of which path it took, so
+		// the consumer's eventual Free of the chain's ZC buffers can
+		// fire EndZcReservation. If the final chunk happens to be in
+		// the copy path (wrap, mid-chain rejection, etc.), we close
+		// the chain marker here.
 		var buf mem.Buffer
 		if len(pSecond) == 0 {
 			buf = mem.Copy(pFirst[:payloadLen], mem.DefaultBufferPool())
@@ -874,6 +935,16 @@ func readFrameView(ctx context.Context, rx *ShmRing) (FrameHeader, mem.Buffer, e
 			copy((*poolBuf)[copied:], pSecond)
 			buf = mem.NewBuffer(poolBuf, pool)
 			commitPayload.Commit(payloadLen)
+		}
+		// Final chunk of a multi-frame message — close any chain state
+		// so the consumer's last ZC buffer Free triggers EndZc.
+		if fh.Type == FrameTypeMESSAGE && !isMore {
+			if rx.IsChainOpen() {
+				rx.CloseZcChain()
+			}
+			if rx.ChainCopyMode() {
+				rx.SetChainCopyMode(false)
+			}
 		}
 		return fh, buf, nil
 	}

@@ -781,6 +781,7 @@ func readFrameViewH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolde
 					// target already accounts for these bytes.
 					baseIdx := commitPayload.commitReadIdx
 					rx.BeginSingleFrameZcCommit(baseIdx, payloadLen)
+					rx.AddChainZcInFlight()
 
 					// Pre-emptively clean accumulator state if END_STREAM
 					// arrives on this DATA frame.
@@ -789,7 +790,7 @@ func readFrameViewH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolde
 					}
 
 					ringSlice := pFirst[:payloadLen:payloadLen]
-					pool := &zcReleasePool{ring: rx}
+					pool := &zcChainReleasePool{ring: rx}
 					buf := mem.NewBuffer(&ringSlice, pool)
 					return FrameHeader{
 						Type:     FrameTypeMESSAGE,

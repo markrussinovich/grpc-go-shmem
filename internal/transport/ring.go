@@ -151,6 +151,22 @@ type ShmRing struct {
 	// release/acquire ordering explicit at every site.
 	zcActive         uint32 // 1 while a speculative-ZC anchor is held
 	zcDeferredTarget uint64 // furthest absolute idx wanting commit while zcActive
+	// zcInFlight tracks the number of ZC buffers held by the consumer
+	// for the current chain. Decremented by zcReleasePool.Put on each
+	// buffer Free. When it reaches 0 AND the codec has closed the chain
+	// (chainOpen=false), EndZcReservation fires.
+	zcInFlight int64
+	// chainOpen tracks codec-side chain state: 1 between the codec
+	// emitting the first chunk of a multi-frame message and the final
+	// (!MORE) chunk. zcReleasePool.Put gates EndZcReservation on
+	// (zcInFlight == 0 && chainOpen == 0) so a partial chain can
+	// never publish ReadIdx mid-message.
+	chainOpen uint32
+	// chainCopyMode tracks the codec-side per-message decision: the
+	// codec rejected chain ZC for the in-progress multi-frame message
+	// and will copy all remaining chunks. Cleared on the message's
+	// final (!MORE) chunk so the next message starts fresh.
+	chainCopyMode uint32
 }
 
 // ReadCommit holds the state needed to commit a read operation.
@@ -423,6 +439,102 @@ func (r *ShmRing) IsSpeculativeZCEligible(payloadLength int, contiguous bool) bo
 		return false
 	}
 	return true
+}
+
+// ===== Multi-frame chain ZC (Custom16 MORE-chunked messages) =====
+//
+// Custom16 supports a per-message MORE flag that lets a single logical
+// gRPC message span multiple frames. When chunking, the writer emits
+// MESSAGE frames with MORE=1 followed by a final MESSAGE with MORE=0.
+//
+// Chain ZC: when the FIRST chunk arrives, the codec peeks the LPM
+// length to compute totalMsg. If totalMsg ≤ ChainZcBudget (cap/2) AND
+// the regular IsSpeculativeZCEligible passes, the chain enters ZC
+// mode: every chunk in the chain returns its body as a ring-backed
+// mem.Buffer; the consumer aggregates them via mem.BufferSlice. The
+// anchor opens on the first chunk via BeginZcReservation; per-chunk
+// Commit is deferred via zcInFlight bookkeeping; the anchor closes
+// when the final !MORE chunk's buffer is freed (the consumer's last
+// Buffer.Free triggers EndZcReservation).
+//
+// Why no tail-ZC? The savings would be at most ChainZcBudget worth of
+// memcpy on the codec→pool boundary, but the upper-layer protobuf
+// parser already needs a contiguous buffer for messages spanning
+// multiple segments. Keeping the codec simple — single mode decision
+// per message — is worth more than the marginal gain.
+//
+// Why cap/2 budget? Under sustained back-to-back streaming, the
+// writer must have ≥ cap/2 of headroom to begin emitting the next
+// message while the consumer is still parsing the current one.
+// A larger budget (e.g., cap - 64 KiB) works for unary but deadlocks
+// streaming: holding nearly the whole ring leaves no room for the
+// writer to progress on the next message.
+
+// ChainZcBudget is the maximum totalMsg (5-byte LPM header + body)
+// that may enter chain-ZC mode. cap/2 ensures the writer always has
+// at least cap/2 of headroom for the next message.
+func (r *ShmRing) ChainZcBudget() int64 {
+	return int64(r.capacity / 2)
+}
+
+// IsZcChainActive reports whether a speculative-ZC anchor is held
+// (zcActive==1). Used by the codec to decide whether a continuation
+// chunk should ride the existing anchor or open a new one.
+func (r *ShmRing) IsZcChainActive() bool {
+	return atomic.LoadUint32(&r.zcActive) != 0
+}
+
+// IsChainOpen reports whether the codec is mid-multi-frame-message
+// (between the first MORE chunk and the final !MORE chunk).
+func (r *ShmRing) IsChainOpen() bool {
+	return atomic.LoadUint32(&r.chainOpen) != 0
+}
+
+// OpenZcChain marks the codec as inside a multi-frame ZC chain.
+// Called when emitting the first chunk of a chain that opted into ZC.
+// Must be paired with CloseZcChain on the message's final chunk.
+func (r *ShmRing) OpenZcChain() {
+	atomic.StoreUint32(&r.chainOpen, 1)
+}
+
+// CloseZcChain marks the codec as finished with a multi-frame ZC
+// chain. The consumer's eventual Buffer.Free of the chain's buffers
+// then triggers EndZcReservation when zcInFlight reaches 0.
+func (r *ShmRing) CloseZcChain() {
+	atomic.StoreUint32(&r.chainOpen, 0)
+}
+
+// SetChainCopyMode marks the codec as committed to copy-mode for the
+// in-progress multi-frame message. Cleared on the message's final
+// chunk so the next message starts fresh.
+func (r *ShmRing) SetChainCopyMode(v bool) {
+	if v {
+		atomic.StoreUint32(&r.chainCopyMode, 1)
+	} else {
+		atomic.StoreUint32(&r.chainCopyMode, 0)
+	}
+}
+
+// ChainCopyMode reports whether the codec is in copy-mode for the
+// in-progress multi-frame message.
+func (r *ShmRing) ChainCopyMode() bool {
+	return atomic.LoadUint32(&r.chainCopyMode) != 0
+}
+
+// AddChainZcInFlight increments the count of ZC buffers held by the
+// consumer for the active chain. Called by the codec for each chunk
+// emitted as a ring-backed buffer.
+func (r *ShmRing) AddChainZcInFlight() {
+	atomic.AddInt64(&r.zcInFlight, 1)
+}
+
+// ReleaseChainZcBuffer decrements the in-flight count and, when the
+// count reaches 0 AND the chain is closed, fires EndZcReservation.
+// Called by zcReleasePool.Put on each Buffer.Free.
+func (r *ShmRing) ReleaseChainZcBuffer() {
+	if atomic.AddInt64(&r.zcInFlight, -1) == 0 && !r.IsChainOpen() {
+		r.EndZcReservation()
+	}
 }
 
 // SMF (Shared Memory Framing) helpers are defined in frame.go. This file uses

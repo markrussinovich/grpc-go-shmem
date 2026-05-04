@@ -18,25 +18,31 @@
 
 package transport
 
-// zcReleasePool implements mem.BufferPool. When the wrapped ring-backed
-// buffer is freed, Put calls EndZcReservation on the ring, publishing the
-// deferred ReadIdx and freeing space for the writer. The buffer's data is
-// not actually pooled — the byte slice points into ring memory.
+// zcChainReleasePool implements mem.BufferPool. Each chunk emitted by
+// readFrameView during a multi-frame ZC chain (or single-frame ZC, which
+// is treated as a chain of size 1) wraps its ring slice in a buffer
+// backed by this pool. The Put callback decrements the per-ring
+// zcInFlight counter; only when the count reaches 0 AND the chain has
+// been closed by the codec (chainOpen=0) does EndZcReservation fire and
+// publish the deferred ReadIdx in one shot.
+//
+// This guarantees the cross-process writer never sees a header.ReadIdx
+// pointing inside any still-held chain segment.
 //
 // Get returns a small heap allocation: gRPC's mem.Buffer occasionally
 // asks the pool for new buffers (e.g., when growing for split). These
-// allocations are independent of the ZC ring slice and don't need to
+// allocations are independent of the ring slice and don't need to
 // touch the ring.
-type zcReleasePool struct {
+type zcChainReleasePool struct {
 	ring *ShmRing
 }
 
-func (p *zcReleasePool) Get(n int) *[]byte {
+func (p *zcChainReleasePool) Get(n int) *[]byte {
 	buf := make([]byte, n)
 	return &buf
 }
 
-func (p *zcReleasePool) Put(_ *[]byte) {
+func (p *zcChainReleasePool) Put(_ *[]byte) {
 	if p.ring == nil {
 		return
 	}
@@ -44,10 +50,10 @@ func (p *zcReleasePool) Put(_ *[]byte) {
 	// called after the transport has been closed and the segment
 	// unmapped (race with shutdown). The atomic load is cheap (~1ns).
 	// Once closed is set to 1 it never reverts; a stale "0" just means
-	// we run EndZcReservation on still-valid memory; a "1" means we
-	// skip it (leak is acceptable at shutdown).
+	// we run ReleaseChainZcBuffer on still-valid memory; a "1" means
+	// we skip it (leak is acceptable at shutdown).
 	if isRingClosed(p.ring) {
 		return
 	}
-	p.ring.EndZcReservation()
+	p.ring.ReleaseChainZcBuffer()
 }
