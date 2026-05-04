@@ -81,7 +81,13 @@ func newHpackEncoderHolder() *hpackEncoderHolder {
 // LPM accumulators used to reassemble multi-frame DATA messages.
 // Single-threaded (reader goroutine).
 type hpackDecoderHolder struct {
-	dec *hpack.Decoder
+	dec      *hpack.Decoder
+	decState *h2DecodeState // pre-bound to dec.SetEmitFunc — avoids per-call closure alloc
+	// hdrScratch is a reusable buffer for materializing HEADERS / RST_STREAM /
+	// GOAWAY / PING / WINDOW_UPDATE H2 payloads from the ring before HPACK
+	// decode. Avoids one allocation per non-DATA frame on the read path.
+	// The buffer grows as needed; small frames stay small.
+	hdrScratch []byte
 	// lpmAccumulators maps stream ID → in-progress LPM reassembly state.
 	// Reader is single-threaded so a plain map (no mutex) is sufficient.
 	// Cleaned up when the stream's RST_STREAM / TRAILERS arrives or when
@@ -95,9 +101,29 @@ type hpackDecoderHolder struct {
 	pendingStreamID uint32
 }
 
+// scratchBytes returns a slice of length n drawn from the holder's
+// reusable hdrScratch buffer. The contents are NOT zero-initialised
+// (caller is expected to overwrite). The returned slice is invalidated
+// on the next scratchBytes call — the holder is single-reader so this
+// is safe.
+func (h *hpackDecoderHolder) scratchBytes(n int) []byte {
+	if cap(h.hdrScratch) < n {
+		h.hdrScratch = make([]byte, n)
+	} else {
+		h.hdrScratch = h.hdrScratch[:n]
+	}
+	return h.hdrScratch
+}
+
 func newHpackDecoderHolder() *hpackDecoderHolder {
+	st := &h2DecodeState{}
+	st.reset()
+	dec := hpack.NewDecoder(4096, nil)
+	dec.SetEmitEnabled(true)
+	dec.SetEmitFunc(st.emit)
 	return &hpackDecoderHolder{
-		dec:             hpack.NewDecoder(4096, nil),
+		dec:             dec,
+		decState:        st,
 		lpmAccumulators: make(map[uint32]*lpmAccumulator),
 	}
 }
@@ -189,60 +215,82 @@ func h2EncodeTrailers(enc *hpack.Encoder, scratch *bytes.Buffer, t TrailersV1) [
 	return scratch.Bytes()
 }
 
+// h2DecodeState holds per-decode-call mutable state for the HPACK
+// decoder's emit callback. Pre-allocated on the hpackDecoderHolder so
+// the emit closure can be set once at decoder construction (capturing
+// only the holder pointer) — avoiding a per-call closure allocation
+// that would otherwise show up as 1 alloc + ~40 ns per HEADERS frame.
+type h2DecodeState struct {
+	h          HeadersV1
+	t          TrailersV1
+	isTrailers bool
+}
+
+// reset prepares the state for a new HEADERS decode.
+func (s *h2DecodeState) reset() {
+	s.h = HeadersV1{Version: 1}
+	s.t = TrailersV1{Version: 1}
+	s.isTrailers = false
+}
+
+// emit is the HPACK emit callback. Bound once to the decoder via
+// SetEmitFunc on the holder; the holder pointer captures `s`.
+func (s *h2DecodeState) emit(hf hpack.HeaderField) {
+	switch hf.Name {
+	case ":method":
+		// POST always for gRPC; ignore.
+	case ":scheme":
+		// http; ignore.
+	case ":path":
+		s.h.Method = hf.Value
+		s.h.HdrType = 0
+	case ":authority":
+		s.h.Authority = hf.Value
+	case ":status":
+		s.h.HdrType = 1
+	case "te", "content-type":
+		// Standard gRPC headers; ignore for in-memory model.
+	case "grpc-timeout":
+		if d, perr := parseGrpcTimeout(hf.Value); perr == nil {
+			s.h.DeadlineUnixNano = uint64(time.Now().Add(d).UnixNano())
+		}
+	case "grpc-status":
+		s.isTrailers = true
+		if v, cerr := strconv.ParseUint(hf.Value, 10, 32); cerr == nil {
+			s.t.GRPCStatusCode = uint32(v)
+		}
+	case "grpc-message":
+		s.isTrailers = true
+		s.t.GRPCStatusMsg = hf.Value
+	default:
+		// User metadata.
+		val := append([]byte(nil), hf.Value...)
+		if s.isTrailers {
+			appendKV(&s.t.Metadata, hf.Name, val)
+		} else {
+			appendKV(&s.h.Metadata, hf.Name, val)
+		}
+	}
+}
+
 // h2DecodeHeaders parses an HPACK-encoded HEADERS payload into a HeadersV1.
 // hdrType=0 means client-initial, 1=server-initial. trailers=true tells the
 // decoder to populate a TrailersV1-like struct (caller dispatches on
 // presence of grpc-status). Returns isTrailers=true when grpc-status was
 // observed (HEADERS frame may be initial or trailers; the only distinction
 // is the presence of grpc-status).
-func h2DecodeHeaders(dec *hpack.Decoder, b []byte) (h HeadersV1, t TrailersV1, isTrailers bool, err error) {
-	dec.SetEmitEnabled(true)
-	dec.SetEmitFunc(func(hf hpack.HeaderField) {
-		switch hf.Name {
-		case ":method":
-			// POST always for gRPC; ignore.
-		case ":scheme":
-			// http; ignore.
-		case ":path":
-			h.Method = hf.Value
-			h.HdrType = 0
-		case ":authority":
-			h.Authority = hf.Value
-		case ":status":
-			h.HdrType = 1
-		case "te", "content-type":
-			// Standard gRPC headers; ignore for in-memory model.
-		case "grpc-timeout":
-			if d, perr := parseGrpcTimeout(hf.Value); perr == nil {
-				h.DeadlineUnixNano = uint64(time.Now().Add(d).UnixNano())
-			}
-		case "grpc-status":
-			isTrailers = true
-			if v, cerr := strconv.ParseUint(hf.Value, 10, 32); cerr == nil {
-				t.GRPCStatusCode = uint32(v)
-			}
-		case "grpc-message":
-			isTrailers = true
-			t.GRPCStatusMsg = hf.Value
-		default:
-			// User metadata.
-			val := append([]byte(nil), hf.Value...)
-			if isTrailers {
-				appendKV(&t.Metadata, hf.Name, val)
-			} else {
-				appendKV(&h.Metadata, hf.Name, val)
-			}
-		}
-	})
-	if _, err = dec.Write(b); err != nil {
+//
+// Uses the holder's pre-bound emit callback to avoid a per-call closure
+// allocation.
+func h2DecodeHeaders(holder *hpackDecoderHolder, b []byte) (h HeadersV1, t TrailersV1, isTrailers bool, err error) {
+	holder.decState.reset()
+	if _, err = holder.dec.Write(b); err != nil {
 		return HeadersV1{}, TrailersV1{}, false, err
 	}
-	if err = dec.Close(); err != nil {
+	if err = holder.dec.Close(); err != nil {
 		return HeadersV1{}, TrailersV1{}, false, err
 	}
-	h.Version = 1
-	t.Version = 1
-	return h, t, isTrailers, nil
+	return holder.decState.h, holder.decState.t, holder.decState.isTrailers, nil
 }
 
 func appendKV(metadata *[]KV, key string, val []byte) {
@@ -437,7 +485,6 @@ func extractPingOpaque(payload []byte) ([]byte, error) {
 // The returned mem.Buffer is heap-allocated (copy path); ZC for H2 DATA
 // is handled by readFrameViewH2.
 func readFrameH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolder) (FrameHeader, []byte, error) {
-	dec := holder.dec
 	for {
 		// First check if there's leftover data from a previous DATA
 		// frame that contained the start of the next LPM.
@@ -575,7 +622,7 @@ func readFrameH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolder) (
 		case H2FrameHEADERS:
 			// HPACK-decode and convert to Custom16 HeadersV1 / TrailersV1
 			// payload format the rest of the transport expects.
-			h, t, isTrailers, derr := h2DecodeHeaders(dec, payload)
+			h, t, isTrailers, derr := h2DecodeHeaders(holder, payload)
 			if derr != nil {
 				return FrameHeader{}, nil, derr
 			}
@@ -637,7 +684,6 @@ func readFrameH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolder) (
 //   - rx.IsSpeculativeZCEligible (ring large enough, payload large
 //     enough, at-most-one-ZC, < 75% full)
 func readFrameViewH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolder) (FrameHeader, mem.Buffer, error) {
-	dec := holder.dec
 	for {
 		// Drain any pending leftover from a previous DATA frame first.
 		// These bytes already lived in heap-allocated form (pendingFrame
@@ -790,7 +836,10 @@ func readFrameViewH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolde
 			continue
 
 		case H2FrameHEADERS:
-			payload := make([]byte, h2fh.Length)
+			// Materialize the H2 body into the holder's reusable scratch
+			// buffer. h2DecodeHeaders consumes it synchronously so it's
+			// safe to overwrite on the next frame's call to scratchBytes.
+			payload := holder.scratchBytes(int(h2fh.Length))
 			if h2fh.Length > 0 {
 				cn := copy(payload, pFirst)
 				if cn < int(h2fh.Length) && len(pSecond) > 0 {
@@ -798,7 +847,7 @@ func readFrameViewH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolde
 				}
 				commitPayload.Commit(int(h2fh.Length))
 			}
-			h, t, isTrailers, derr := h2DecodeHeaders(dec, payload)
+			h, t, isTrailers, derr := h2DecodeHeaders(holder, payload)
 			if derr != nil {
 				return FrameHeader{}, nil, derr
 			}
@@ -821,7 +870,7 @@ func readFrameViewH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolde
 			}, mem.Copy(out, mem.DefaultBufferPool()), nil
 
 		case H2FrameRSTSTREAM:
-			payload := make([]byte, h2fh.Length)
+			payload := holder.scratchBytes(int(h2fh.Length))
 			if h2fh.Length > 0 {
 				cn := copy(payload, pFirst)
 				if cn < int(h2fh.Length) && len(pSecond) > 0 {
@@ -837,7 +886,7 @@ func readFrameViewH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolde
 			}, mem.Copy(payload, mem.DefaultBufferPool()), nil
 
 		case H2FrameGOAWAY, H2FramePING, H2FrameWINDOWUPDATE:
-			payload := make([]byte, h2fh.Length)
+			payload := holder.scratchBytes(int(h2fh.Length))
 			if h2fh.Length > 0 {
 				cn := copy(payload, pFirst)
 				if cn < int(h2fh.Length) && len(pSecond) > 0 {

@@ -90,7 +90,7 @@ func TestH2EncodeDecodeHeaders_Initial(t *testing.T) {
 	if len(payload) == 0 {
 		t.Fatal("empty HPACK payload")
 	}
-	got, _, isTrailers, err := h2DecodeHeaders(dec.dec, payload)
+	got, _, isTrailers, err := h2DecodeHeaders(dec, payload)
 	if err != nil {
 		t.Fatalf("h2DecodeHeaders: %v", err)
 	}
@@ -126,7 +126,7 @@ func TestH2EncodeDecodeHeaders_Trailers(t *testing.T) {
 		},
 	}
 	payload := h2EncodeTrailers(enc.enc, enc.scratch, src)
-	_, got, isTrailers, err := h2DecodeHeaders(dec.dec, payload)
+	_, got, isTrailers, err := h2DecodeHeaders(dec, payload)
 	if err != nil {
 		t.Fatalf("h2DecodeHeaders: %v", err)
 	}
@@ -152,7 +152,7 @@ func TestH2EncodeHeaders_Deadline(t *testing.T) {
 		DeadlineUnixNano: uint64(deadline),
 	}
 	payload := h2EncodeHeaders(enc.enc, enc.scratch, src)
-	got, _, _, err := h2DecodeHeaders(dec.dec, payload)
+	got, _, _, err := h2DecodeHeaders(dec, payload)
 	if err != nil {
 		t.Fatalf("h2DecodeHeaders: %v", err)
 	}
