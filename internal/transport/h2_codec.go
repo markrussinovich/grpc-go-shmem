@@ -760,6 +760,9 @@ func readFrameViewH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolde
 				continue
 			}
 
+			acc := holder.getLpmAccumulator(h2fh.StreamID)
+			payloadLen := int(h2fh.Length)
+
 			// === ZC fast path ===
 			//
 			// Conditions:
@@ -771,10 +774,8 @@ func readFrameViewH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolde
 			//
 			// The body bytes returned to the caller include the gRPC LPM
 			// 5-byte prefix, matching Custom16 readFrameView.
-			acc := holder.getLpmAccumulator(h2fh.StreamID)
 			if !acc.inProgress() && len(pSecond) == 0 && len(pFirst) >= 5 {
 				bodyLen := int(binary.BigEndian.Uint32(pFirst[1:5]))
-				payloadLen := int(h2fh.Length)
 				if 5+bodyLen == payloadLen && rx.IsSpeculativeZCEligible(payloadLen, true) {
 					// Arm the ZC anchor with the post-frame target, then
 					// don't call commitPayload.Commit — the deferred
@@ -800,10 +801,98 @@ func readFrameViewH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolde
 				}
 			}
 
-			// === Copy path ===
+			// === Single-frame copy fast path ===
 			//
-			// Materialize body to a heap buffer, commit, then run it
-			// through the lpmAccumulator. Same as readFrameH2's logic.
+			// Body fits entirely in this DATA frame and contains exactly
+			// one complete LPM (5+bodyLen == payloadLen). Copy directly
+			// to a pool buffer, bypassing the lpmAccumulator. Without
+			// this path, the accumulator allocates `make([]byte,
+			// payloadLen)` for the heap copy AND its own `acc.buf` then
+			// appends into it — two allocs + two memcpys per frame.
+			// Single mem.Copy gives us one alloc + one memcpy, matching
+			// Custom16 readFrameView's parity.
+			//
+			// Reads the 5-byte LPM header from the (possibly split) ring
+			// slice via a small stack array so the fast path applies
+			// even when the body wraps.
+			if !acc.inProgress() && len(pFirst)+len(pSecond) == payloadLen && payloadLen >= 5 {
+				var hdr [5]byte
+				n := copy(hdr[:], pFirst)
+				if n < 5 {
+					copy(hdr[n:], pSecond)
+				}
+				bodyLen := int(binary.BigEndian.Uint32(hdr[1:5]))
+				if 5+bodyLen == payloadLen {
+					var buf mem.Buffer
+					if len(pSecond) == 0 {
+						buf = mem.Copy(pFirst[:payloadLen], mem.DefaultBufferPool())
+					} else {
+						pool := mem.DefaultBufferPool()
+						poolBuf := pool.Get(payloadLen)
+						cn := copy(*poolBuf, pFirst)
+						copy((*poolBuf)[cn:], pSecond)
+						buf = mem.NewBuffer(poolBuf, pool)
+					}
+					commitPayload.Commit(payloadLen)
+					if h2fh.Flags&H2FlagEndStream != 0 {
+						holder.removeLpmAccumulator(h2fh.StreamID)
+					}
+					return FrameHeader{
+						Type:     FrameTypeMESSAGE,
+						StreamID: h2fh.StreamID,
+						Length:   uint32(payloadLen),
+					}, buf, nil
+				}
+			}
+
+			// === Multi-frame / multi-LPM path ===
+			//
+			// Body is a fragment of an in-progress LPM, or contains
+			// multiple LPMs. Two sub-paths:
+			//
+			//  1. Mid-chain fast path: accumulator already in progress
+			//     AND this entire DATA frame fits within the remaining
+			//     LPM bytes (no completion / new LPM mid-frame). Append
+			//     ring slices directly into acc.buf, avoiding the
+			//     intermediate `make([]byte, payloadLen) + copy`. This
+			//     halves the per-chunk memcpy budget for messages
+			//     chunked at cap/8 (e.g., 16 MiB body → 8/8/5 chunks).
+			//
+			//  2. Slow path: copy ring → heap, run accumulator (handles
+			//     LPM completion + leftover bytes that start a new LPM
+			//     in the same DATA frame).
+			//
+			// Both paths return the accumulator's heap buffer wrapped
+			// via mem.NewBuffer(&msg, nil) (no pool round-trip), saving
+			// one further mem.Copy that the prior code performed.
+			if acc.inProgress() && acc.expectedTotal-acc.pos >= payloadLen {
+				acc.buf = append(acc.buf, pFirst...)
+				if len(pSecond) > 0 {
+					acc.buf = append(acc.buf, pSecond...)
+				}
+				acc.pos += payloadLen
+				commitPayload.Commit(payloadLen)
+				if acc.pos != acc.expectedTotal {
+					if h2fh.Flags&H2FlagEndStream != 0 {
+						return FrameHeader{}, nil, errors.New("h2: END_STREAM with incomplete LPM in accumulator")
+					}
+					continue
+				}
+				msg := acc.buf
+				acc.headerBytesSeen = 0
+				acc.expectedTotal = 0
+				acc.pos = 0
+				acc.buf = nil
+				if h2fh.Flags&H2FlagEndStream != 0 {
+					holder.removeLpmAccumulator(h2fh.StreamID)
+				}
+				return FrameHeader{
+					Type:     FrameTypeMESSAGE,
+					StreamID: h2fh.StreamID,
+					Length:   uint32(len(msg)),
+				}, mem.NewBuffer(&msg, nil), nil
+			}
+
 			payload := make([]byte, h2fh.Length)
 			cn := copy(payload, pFirst)
 			if cn < int(h2fh.Length) && len(pSecond) > 0 {
@@ -822,12 +911,11 @@ func readFrameViewH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolde
 						holder.pendingFrame = leftover
 						holder.pendingStreamID = h2fh.StreamID
 					}
-					buf := mem.Copy(msg, mem.DefaultBufferPool())
 					return FrameHeader{
 						Type:     FrameTypeMESSAGE,
 						StreamID: h2fh.StreamID,
 						Length:   uint32(len(msg)),
-					}, buf, nil
+					}, mem.NewBuffer(&msg, nil), nil
 				}
 				break
 			}
@@ -837,18 +925,29 @@ func readFrameViewH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolde
 			continue
 
 		case H2FrameHEADERS:
-			// Materialize the H2 body into the holder's reusable scratch
-			// buffer. h2DecodeHeaders consumes it synchronously so it's
-			// safe to overwrite on the next frame's call to scratchBytes.
-			payload := holder.scratchBytes(int(h2fh.Length))
+			// Decode HPACK directly from ring memory when contiguous —
+			// hpack.Decoder.Write+Close consume the slice synchronously
+			// (the emit callback already deep-copies any retained bytes
+			// via `append([]byte(nil), hf.Value...)`), so no ring slice
+			// is held past Close. Skips one ring→scratch memcpy per
+			// HEADERS frame; HEADERS payloads can be sizeable when
+			// metadata is rich.
+			//
+			// Wrap-around case still uses scratch to consolidate.
+			var payload []byte
 			if h2fh.Length > 0 {
-				cn := copy(payload, pFirst)
-				if cn < int(h2fh.Length) && len(pSecond) > 0 {
+				if len(pSecond) == 0 {
+					payload = pFirst[:h2fh.Length]
+				} else {
+					payload = holder.scratchBytes(int(h2fh.Length))
+					cn := copy(payload, pFirst)
 					copy(payload[cn:], pSecond)
 				}
-				commitPayload.Commit(int(h2fh.Length))
 			}
 			h, t, isTrailers, derr := h2DecodeHeaders(holder, payload)
+			if commitPayload != nil {
+				commitPayload.Commit(int(h2fh.Length))
+			}
 			if derr != nil {
 				return FrameHeader{}, nil, derr
 			}
@@ -871,11 +970,18 @@ func readFrameViewH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolde
 			}, mem.Copy(out, mem.DefaultBufferPool()), nil
 
 		case H2FrameRSTSTREAM:
-			payload := holder.scratchBytes(int(h2fh.Length))
+			// mem.Copy directly from the ring when contiguous — saves
+			// the ring→scratch then scratch→pool double-copy that the
+			// previous code did via holder.scratchBytes().
+			var buf mem.Buffer
 			if h2fh.Length > 0 {
-				cn := copy(payload, pFirst)
-				if cn < int(h2fh.Length) && len(pSecond) > 0 {
+				if len(pSecond) == 0 {
+					buf = mem.Copy(pFirst[:h2fh.Length], mem.DefaultBufferPool())
+				} else {
+					payload := holder.scratchBytes(int(h2fh.Length))
+					cn := copy(payload, pFirst)
 					copy(payload[cn:], pSecond)
+					buf = mem.Copy(payload, mem.DefaultBufferPool())
 				}
 				commitPayload.Commit(int(h2fh.Length))
 			}
@@ -883,28 +989,35 @@ func readFrameViewH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolde
 			return FrameHeader{
 				Type:     FrameTypeCANCEL,
 				StreamID: h2fh.StreamID,
-				Length:   uint32(len(payload)),
-			}, mem.Copy(payload, mem.DefaultBufferPool()), nil
+				Length:   h2fh.Length,
+			}, buf, nil
 
 		case H2FrameGOAWAY, H2FramePING, H2FrameWINDOWUPDATE:
-			payload := holder.scratchBytes(int(h2fh.Length))
-			if h2fh.Length > 0 {
-				cn := copy(payload, pFirst)
-				if cn < int(h2fh.Length) && len(pSecond) > 0 {
-					copy(payload[cn:], pSecond)
-				}
-				commitPayload.Commit(int(h2fh.Length))
-			}
 			ft, fl, ok := translateH2ToCustom(h2fh.Type, h2fh.Flags)
 			if !ok {
+				if commitPayload != nil {
+					commitPayload.Commit(int(h2fh.Length))
+				}
 				continue
+			}
+			var buf mem.Buffer
+			if h2fh.Length > 0 {
+				if len(pSecond) == 0 {
+					buf = mem.Copy(pFirst[:h2fh.Length], mem.DefaultBufferPool())
+				} else {
+					payload := holder.scratchBytes(int(h2fh.Length))
+					cn := copy(payload, pFirst)
+					copy(payload[cn:], pSecond)
+					buf = mem.Copy(payload, mem.DefaultBufferPool())
+				}
+				commitPayload.Commit(int(h2fh.Length))
 			}
 			return FrameHeader{
 				Type:     ft,
 				StreamID: h2fh.StreamID,
-				Length:   uint32(len(payload)),
+				Length:   h2fh.Length,
 				Flags:    fl,
-			}, mem.Copy(payload, mem.DefaultBufferPool()), nil
+			}, buf, nil
 
 		default:
 			// Unknown frame type. Per RFC 7540 §4.1, ignore after consuming.
