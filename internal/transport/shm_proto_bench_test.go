@@ -340,6 +340,10 @@ func BenchmarkShmProtoUnaryCopyH2(b *testing.B) {
 // ---------------------------------------------------------------------------
 
 func benchStreaming(b *testing.B, msgCount, bodySize int, useZC bool) {
+	benchStreamingWire(b, msgCount, bodySize, useZC, WireFormatCustom16)
+}
+
+func benchStreamingWire(b *testing.B, msgCount, bodySize int, useZC bool, wire WireFormat) {
 	if testing.Short() && bodySize > 16*1024*1024 {
 		b.Skipf("skipping %s in short mode", sizeLabel(bodySize))
 	}
@@ -347,7 +351,7 @@ func benchStreaming(b *testing.B, msgCount, bodySize int, useZC bool) {
 	if useZC {
 		tag = "zc"
 	}
-	segName := fmt.Sprintf("bs-%s-%d-%d-%d", tag, msgCount, bodySize, time.Now().UnixNano())
+	segName := fmt.Sprintf("bs-%s-%s-%d-%d-%d", wire, tag, msgCount, bodySize, time.Now().UnixNano())
 	seg, err := CreateSegment(segName, benchRingSize, benchRingSize)
 	if err != nil {
 		b.Fatalf("CreateSegment: %v", err)
@@ -358,6 +362,10 @@ func benchStreaming(b *testing.B, msgCount, bodySize int, useZC bool) {
 	rxA := NewShmRingFromSegment(seg.A, seg.Mem)
 	txB := NewShmRingFromSegment(seg.B, seg.Mem)
 	rxB := NewShmRingFromSegment(seg.B, seg.Mem)
+	txA.SetWireFormat(wire)
+	rxA.SetWireFormat(wire)
+	txB.SetWireFormat(wire)
+	rxB.SetWireFormat(wire)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
@@ -439,11 +447,44 @@ func BenchmarkShmProtoStreamingCopy(b *testing.B) {
 	}
 }
 
+// BenchmarkShmProtoStreamingZCH2 / BenchmarkShmProtoStreamingCopyH2 mirror
+// the Custom16 variants on rings using the HTTP/2 wire format. Provides
+// side-by-side comparison so the H2 single-frame copy fast path and
+// multi-frame DATA mid-chain accumulator append optimizations can be
+// exercised under streaming workloads (writer pipelined ahead of reader).
+func BenchmarkShmProtoStreamingZCH2(b *testing.B) {
+	for _, n := range []int{10, 100, 1000} {
+		b.Run(fmt.Sprintf("1KB/msgs=%d", n), func(b *testing.B) { benchStreamingWire(b, n, 1024, true, WireFormatHTTP2) })
+	}
+	for _, size := range []int{64, 256, 1024, 4096, 16384, 64 * 1024, 256 * 1024, 1024 * 1024, 4 * 1024 * 1024, 16 * 1024 * 1024} {
+		b.Run(fmt.Sprintf("%s/msgs=100", sizeLabel(size)), func(b *testing.B) { benchStreamingWire(b, 100, size, true, WireFormatHTTP2) })
+	}
+	for _, size := range []int{64 * 1024 * 1024, 256 * 1024 * 1024} {
+		b.Run(fmt.Sprintf("%s/msgs=10", sizeLabel(size)), func(b *testing.B) { benchStreamingWire(b, 10, size, true, WireFormatHTTP2) })
+	}
+}
+
+func BenchmarkShmProtoStreamingCopyH2(b *testing.B) {
+	for _, n := range []int{10, 100, 1000} {
+		b.Run(fmt.Sprintf("1KB/msgs=%d", n), func(b *testing.B) { benchStreamingWire(b, n, 1024, false, WireFormatHTTP2) })
+	}
+	for _, size := range []int{64, 256, 1024, 4096, 16384, 64 * 1024, 256 * 1024, 1024 * 1024, 4 * 1024 * 1024, 16 * 1024 * 1024} {
+		b.Run(fmt.Sprintf("%s/msgs=100", sizeLabel(size)), func(b *testing.B) { benchStreamingWire(b, 100, size, false, WireFormatHTTP2) })
+	}
+	for _, size := range []int{64 * 1024 * 1024, 256 * 1024 * 1024} {
+		b.Run(fmt.Sprintf("%s/msgs=10", sizeLabel(size)), func(b *testing.B) { benchStreamingWire(b, 10, size, false, WireFormatHTTP2) })
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Bidi streaming benchmark (concurrent ping-pong like .NET StreamingCall)
 // ---------------------------------------------------------------------------
 
 func benchBidi(b *testing.B, bodySize int, useZC bool) {
+	benchBidiWire(b, bodySize, useZC, WireFormatCustom16)
+}
+
+func benchBidiWire(b *testing.B, bodySize int, useZC bool, wire WireFormat) {
 	if testing.Short() && bodySize > 16*1024*1024 {
 		b.Skipf("skipping %s in short mode", sizeLabel(bodySize))
 	}
@@ -451,7 +492,7 @@ func benchBidi(b *testing.B, bodySize int, useZC bool) {
 	if useZC {
 		tag = "zc"
 	}
-	segName := fmt.Sprintf("bb-%s-%d-%d", tag, bodySize, time.Now().UnixNano())
+	segName := fmt.Sprintf("bb-%s-%s-%d-%d", wire, tag, bodySize, time.Now().UnixNano())
 	seg, err := CreateSegment(segName, benchRingSize, benchRingSize)
 	if err != nil {
 		b.Fatalf("CreateSegment: %v", err)
@@ -462,6 +503,10 @@ func benchBidi(b *testing.B, bodySize int, useZC bool) {
 	rxA := NewShmRingFromSegment(seg.A, seg.Mem)
 	txB := NewShmRingFromSegment(seg.B, seg.Mem)
 	rxB := NewShmRingFromSegment(seg.B, seg.Mem)
+	txA.SetWireFormat(wire)
+	rxA.SetWireFormat(wire)
+	txB.SetWireFormat(wire)
+	rxB.SetWireFormat(wire)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
@@ -523,6 +568,22 @@ func BenchmarkShmProtoBidiZC(b *testing.B) {
 func BenchmarkShmProtoBidiCopy(b *testing.B) {
 	for _, size := range protoSizes() {
 		b.Run(sizeLabel(size), func(b *testing.B) { benchBidi(b, size, false) })
+	}
+}
+
+// BenchmarkShmProtoBidiZCH2 / BenchmarkShmProtoBidiCopyH2 mirror the
+// Custom16 variants on rings using the HTTP/2 wire format. Bidi pairs
+// the H2 read fast paths with concurrent writes in both directions and
+// is the closest microbench to a real gRPC unary RPC over H2.
+func BenchmarkShmProtoBidiZCH2(b *testing.B) {
+	for _, size := range protoSizes() {
+		b.Run(sizeLabel(size), func(b *testing.B) { benchBidiWire(b, size, true, WireFormatHTTP2) })
+	}
+}
+
+func BenchmarkShmProtoBidiCopyH2(b *testing.B) {
+	for _, size := range protoSizes() {
+		b.Run(sizeLabel(size), func(b *testing.B) { benchBidiWire(b, size, false, WireFormatHTTP2) })
 	}
 }
 
