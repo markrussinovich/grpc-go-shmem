@@ -25,6 +25,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -163,6 +164,43 @@ func (r *ShmRing) h2Decoder() *hpackDecoderHolder {
 	return r.h2Dec
 }
 
+// writeMetadataField HPACK-encodes one metadata key/value pair, applying
+// gRPC-over-HTTP/2 binary-metadata transport rules:
+//
+//   - Keys ending in "-bin" carry arbitrary byte values. The internal
+//     HeadersV1/TrailersV1 model holds the RAW bytes (correct for the SHM
+//     boundary). On the H2 wire those values MUST be base64-encoded per
+//     gRFC G2 / gRPC-over-HTTP/2 §"Binary headers". Stock gRPC peers
+//     (grpc-go's own HTTP/2 transport, grpc-java, grpc-c++) base64-decode
+//     such headers on receipt, and emitting raw bytes here would violate
+//     the spec and confuse anyone tracing the wire (Wireshark, gRPC tracing,
+//     debug proxies).
+//   - Custom16 wire is unaffected: it transports metadata as raw bytes
+//     end-to-end via encodeHeaders/encodeTrailers, never reaching this
+//     adapter.
+func writeMetadataField(enc *hpack.Encoder, name string, raw []byte) {
+	if strings.HasSuffix(name, binHdrSuffix) {
+		_ = enc.WriteField(hpack.HeaderField{Name: name, Value: encodeBinHeader(raw)})
+		return
+	}
+	_ = enc.WriteField(hpack.HeaderField{Name: name, Value: string(raw)})
+}
+
+// decodeMetadataValue materialises a metadata value from a decoded HPACK
+// header value, base64-decoding when name is a binary header. Tolerates
+// malformed base64 by returning the raw HPACK bytes; matches stock
+// grpc-go's lenient behaviour (a strict reject here would tear down the
+// connection on a single bad header).
+func decodeMetadataValue(name, hpackValue string) []byte {
+	if !strings.HasSuffix(name, binHdrSuffix) {
+		return []byte(hpackValue)
+	}
+	if b, err := decodeBinHeader(hpackValue); err == nil {
+		return b
+	}
+	return []byte(hpackValue)
+}
+
 // h2EncodeHeaders converts an in-memory HeadersV1 into HPACK-encoded bytes
 // suitable for an H2 HEADERS frame payload. The encoder argument carries
 // the per-ring dynamic table state.
@@ -193,7 +231,7 @@ func h2EncodeHeaders(enc *hpack.Encoder, scratch *bytes.Buffer, h HeadersV1) []b
 	}
 	for _, kv := range h.Metadata {
 		for _, v := range kv.Values {
-			_ = enc.WriteField(hpack.HeaderField{Name: kv.Key, Value: string(v)})
+			writeMetadataField(enc, kv.Key, v)
 		}
 	}
 	return scratch.Bytes()
@@ -209,7 +247,7 @@ func h2EncodeTrailers(enc *hpack.Encoder, scratch *bytes.Buffer, t TrailersV1) [
 	}
 	for _, kv := range t.Metadata {
 		for _, v := range kv.Values {
-			_ = enc.WriteField(hpack.HeaderField{Name: kv.Key, Value: string(v)})
+			writeMetadataField(enc, kv.Key, v)
 		}
 	}
 	return scratch.Bytes()
@@ -263,8 +301,13 @@ func (s *h2DecodeState) emit(hf hpack.HeaderField) {
 		s.isTrailers = true
 		s.t.GRPCStatusMsg = hf.Value
 	default:
-		// User metadata.
-		val := append([]byte(nil), hf.Value...)
+		// User metadata. Apply -bin base64 decode at the HPACK boundary
+		// per gRPC-over-HTTP/2 binary-headers rules (mirror of
+		// writeMetadataField). decodeMetadataValue returns the
+		// caller-owned []byte; the emit callback's closure already
+		// guarantees independence from the HPACK input slice (the
+		// hpack package's decodeString deep-copies via string(u.b)).
+		val := decodeMetadataValue(hf.Name, hf.Value)
 		if s.isTrailers {
 			appendKV(&s.t.Metadata, hf.Name, val)
 		} else {

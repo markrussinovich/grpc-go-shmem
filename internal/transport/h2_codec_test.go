@@ -25,7 +25,27 @@ import (
 	"fmt"
 	"testing"
 	"time"
+
+	"golang.org/x/net/http2/hpack"
 )
+
+// decodeHpackToFields is a test helper that runs a fresh HPACK decoder
+// over a single HEADERS frame payload, returning all emitted fields. Used
+// to inspect on-wire values without relying on our internal decoder
+// (which deliberately strips/synthesizes pseudo-headers).
+func decodeHpackToFields(b []byte) ([]hpack.HeaderField, error) {
+	var fields []hpack.HeaderField
+	d := hpack.NewDecoder(4096, func(f hpack.HeaderField) {
+		fields = append(fields, f)
+	})
+	if _, err := d.Write(b); err != nil {
+		return nil, err
+	}
+	if err := d.Close(); err != nil {
+		return nil, err
+	}
+	return fields, nil
+}
 
 func TestH2FrameHeader_RoundTrip(t *testing.T) {
 	cases := []H2FrameHeader{
@@ -405,5 +425,186 @@ func TestConnectResponse_LegacyDefault(t *testing.T) {
 	}
 	if got.selectedWire != WireFormatCustom16 {
 		t.Errorf("legacy decode: got %v want C16", got.selectedWire)
+	}
+}
+
+// TestH2BinaryMetadata_HeaderRoundTrip verifies that arbitrary byte values
+// passed in HeadersV1.Metadata for keys with the "-bin" suffix survive an
+// H2 wire encode→decode cycle as raw bytes — i.e. that the HPACK adapter
+// applies base64 at the wire boundary per gRPC-over-HTTP/2 binary-headers
+// rules. Non-binary metadata must NOT be base64-decoded even when its
+// plain-text value coincidentally looks like base64 (e.g., "YWJj").
+func TestH2BinaryMetadata_HeaderRoundTrip(t *testing.T) {
+	segName := fmt.Sprintf("h2bin-%d", time.Now().UnixNano())
+	defer RemoveSegment(segName)
+	seg, err := CreateSegment(segName, 1<<20, 1<<20)
+	if err != nil {
+		t.Fatalf("CreateSegment: %v", err)
+	}
+	defer seg.Close()
+
+	tx := NewShmRingFromSegment(seg.A, seg.Mem)
+	rx := NewShmRingFromSegment(seg.A, seg.Mem)
+	tx.SetWireFormat(WireFormatHTTP2)
+	rx.SetWireFormat(WireFormatHTTP2)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// 0x00..0xFF non-text bytes: would crash a UTF-8 reader and would
+	// not survive verbatim transport on a real H2 peer that expects
+	// base64. Tests the round-trip of arbitrary byte content.
+	binValue := []byte{0x00, 0x01, 0x7F, 0x80, 0xFE, 0xFF}
+	// "YWJj" is base64("abc"). A buggy decoder that always base64-
+	// decodes regardless of suffix would turn this into "abc"; a
+	// correct decoder leaves it as the literal string "YWJj".
+	textLikeBase64 := []byte("YWJj")
+
+	hdrPayload := encodeHeaders(HeadersV1{
+		Version:   1,
+		HdrType:   0,
+		Method:    "/svc/Bin",
+		Authority: "test",
+		Metadata: []KV{
+			{Key: "x-binary-bin", Values: [][]byte{binValue}},
+			{Key: "x-text", Values: [][]byte{textLikeBase64}},
+		},
+	})
+	if err := writeFrame(ctx, tx, FrameHeader{
+		Type:     FrameTypeHEADERS,
+		StreamID: 1,
+		Flags:    HeadersFlagINITIAL,
+	}, hdrPayload); err != nil {
+		t.Fatalf("writeFrame: %v", err)
+	}
+
+	_, got, err := readFrame(ctx, rx)
+	if err != nil {
+		t.Fatalf("readFrame: %v", err)
+	}
+	decoded, err := decodeHeaders(got)
+	if err != nil {
+		t.Fatalf("decodeHeaders: %v", err)
+	}
+
+	var gotBin, gotText []byte
+	for _, kv := range decoded.Metadata {
+		switch kv.Key {
+		case "x-binary-bin":
+			if len(kv.Values) != 1 {
+				t.Fatalf("x-binary-bin: got %d values, want 1", len(kv.Values))
+			}
+			gotBin = kv.Values[0]
+		case "x-text":
+			if len(kv.Values) != 1 {
+				t.Fatalf("x-text: got %d values, want 1", len(kv.Values))
+			}
+			gotText = kv.Values[0]
+		}
+	}
+	if !bytes.Equal(gotBin, binValue) {
+		t.Errorf("binary metadata round-trip: got %x want %x", gotBin, binValue)
+	}
+	if !bytes.Equal(gotText, textLikeBase64) {
+		t.Errorf("text metadata accidentally base64-decoded: got %q want %q",
+			string(gotText), string(textLikeBase64))
+	}
+}
+
+// TestH2BinaryMetadata_TrailerRoundTrip exercises the trailers path,
+// which is the primary user of -bin metadata in practice (gRPC carries
+// rich error details via grpc-status-details-bin).
+func TestH2BinaryMetadata_TrailerRoundTrip(t *testing.T) {
+	segName := fmt.Sprintf("h2bintr-%d", time.Now().UnixNano())
+	defer RemoveSegment(segName)
+	seg, err := CreateSegment(segName, 1<<20, 1<<20)
+	if err != nil {
+		t.Fatalf("CreateSegment: %v", err)
+	}
+	defer seg.Close()
+
+	tx := NewShmRingFromSegment(seg.A, seg.Mem)
+	rx := NewShmRingFromSegment(seg.A, seg.Mem)
+	tx.SetWireFormat(WireFormatHTTP2)
+	rx.SetWireFormat(WireFormatHTTP2)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	statusDetails := []byte{0x08, 0x05, 0x12, 0x07, 't', 'e', 's', 't', 'i', 'n', 'g'}
+	tlrPayload := encodeTrailers(TrailersV1{
+		Version:        1,
+		GRPCStatusCode: 13, // Internal
+		GRPCStatusMsg:  "boom",
+		Metadata: []KV{
+			{Key: "grpc-status-details-bin", Values: [][]byte{statusDetails}},
+		},
+	})
+	if err := writeFrame(ctx, tx, FrameHeader{
+		Type:     FrameTypeTRAILERS,
+		StreamID: 5,
+		Flags:    TrailersFlagEndStream,
+	}, tlrPayload); err != nil {
+		t.Fatalf("writeFrame: %v", err)
+	}
+
+	fh, got, err := readFrame(ctx, rx)
+	if err != nil {
+		t.Fatalf("readFrame: %v", err)
+	}
+	if fh.Type != FrameTypeTRAILERS {
+		t.Fatalf("type: got %d want TRAILERS", fh.Type)
+	}
+	dec, err := decodeTrailers(got)
+	if err != nil {
+		t.Fatalf("decodeTrailers: %v", err)
+	}
+	if dec.GRPCStatusCode != 13 || dec.GRPCStatusMsg != "boom" {
+		t.Errorf("status: got code=%d msg=%q", dec.GRPCStatusCode, dec.GRPCStatusMsg)
+	}
+	var found []byte
+	for _, kv := range dec.Metadata {
+		if kv.Key == "grpc-status-details-bin" {
+			found = kv.Values[0]
+		}
+	}
+	if !bytes.Equal(found, statusDetails) {
+		t.Errorf("status-details-bin round-trip: got %x want %x", found, statusDetails)
+	}
+}
+
+// TestH2BinaryMetadata_WireFormatIsBase64 inspects the on-wire HPACK
+// payload to confirm the value emitted for a "-bin" header is the
+// standard base64 representation, not the raw bytes. This is what a
+// stock grpc-go / grpc-java / grpc-c++ peer would see; the tests above
+// only verify self-interop.
+func TestH2BinaryMetadata_WireFormatIsBase64(t *testing.T) {
+	enc := newHpackEncoderHolder()
+	raw := []byte{0xDE, 0xAD, 0xBE, 0xEF}
+	out := h2EncodeHeaders(enc.enc, enc.scratch, HeadersV1{
+		Version: 1,
+		HdrType: 0,
+		Method:  "/svc/M",
+		Metadata: []KV{
+			{Key: "x-bin", Values: [][]byte{raw}},
+		},
+	})
+	// Decode with a fresh hpack decoder (independent dynamic table) and
+	// inspect the literal value. encodeBinHeader uses raw-std (no padding);
+	// "DEADBEEF" → "3q2+7w".
+	hf, err := decodeHpackToFields(out)
+	if err != nil {
+		t.Fatalf("decode hpack: %v", err)
+	}
+	var seen string
+	for _, f := range hf {
+		if f.Name == "x-bin" {
+			seen = f.Value
+		}
+	}
+	want := encodeBinHeader(raw) // "3q2+7w"
+	if seen != want {
+		t.Errorf("on-wire x-bin value: got %q want %q (raw bytes would be %q)",
+			seen, want, string(raw))
 	}
 }
