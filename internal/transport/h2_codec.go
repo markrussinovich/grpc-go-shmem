@@ -374,6 +374,68 @@ func parseGrpcTimeout(s string) (time.Duration, error) {
 	}
 }
 
+// validateH2ControlFrame checks the per-RFC 7540 invariants of the
+// control-frame types the codec understands (RST_STREAM, SETTINGS, PING,
+// GOAWAY, WINDOW_UPDATE). Returns a non-nil error when the frame is
+// malformed; the caller is responsible for ensuring the malformed
+// payload bytes are committed to keep the ring read pointer in sync
+// before propagating the error up.
+//
+// Validations enforced:
+//
+//   - RST_STREAM (§6.4): payload length MUST be exactly 4; stream id
+//     MUST be non-zero. Length-tampered RST_STREAM in particular could
+//     otherwise silently change call state on the receiver, since we
+//     map it to internal Cancel.
+//   - SETTINGS (§6.5): stream id MUST be 0; non-ACK payload length MUST
+//     be a multiple of 6; ACK payload length MUST be 0.
+//   - PING (§6.7): stream id MUST be 0; payload length MUST be exactly 8.
+//   - GOAWAY (§6.8): stream id MUST be 0; payload length MUST be at
+//     least 8 (last-stream-id + error-code, debug data optional).
+//   - WINDOW_UPDATE (§6.9.1): payload length MUST be exactly 4. The
+//     increment-must-be-non-zero check is enforced after payload read.
+//
+// Conformance with stock gRPC peers (grpc-go's HTTP/2 transport,
+// grpc-java, grpc-c++) requires rejecting these forms; silently
+// accepting them masks peer bugs at integration time.
+func validateH2ControlFrame(h2fh H2FrameHeader) error {
+	switch h2fh.Type {
+	case H2FrameRSTSTREAM:
+		if h2fh.Length != 4 || h2fh.StreamID == 0 {
+			return fmt.Errorf("h2 RST_STREAM malformed (streamID=%d, length=%d; require streamID != 0 && length == 4)",
+				h2fh.StreamID, h2fh.Length)
+		}
+	case H2FrameSETTINGS:
+		if h2fh.StreamID != 0 {
+			return fmt.Errorf("h2 SETTINGS frame must have streamID=0 (got %d)", h2fh.StreamID)
+		}
+		if h2fh.Flags&H2FlagAck != 0 {
+			if h2fh.Length != 0 {
+				return fmt.Errorf("h2 SETTINGS ACK must have empty payload (got length=%d)", h2fh.Length)
+			}
+		} else if h2fh.Length%6 != 0 {
+			return fmt.Errorf("h2 SETTINGS payload length %d is not a multiple of 6", h2fh.Length)
+		}
+	case H2FramePING:
+		if h2fh.StreamID != 0 || h2fh.Length != 8 {
+			return fmt.Errorf("h2 PING malformed (streamID=%d, length=%d; require streamID == 0 && length == 8)",
+				h2fh.StreamID, h2fh.Length)
+		}
+	case H2FrameGOAWAY:
+		if h2fh.StreamID != 0 || h2fh.Length < 8 {
+			return fmt.Errorf("h2 GOAWAY malformed (streamID=%d, length=%d; require streamID == 0 && length >= 8)",
+				h2fh.StreamID, h2fh.Length)
+		}
+	case H2FrameWINDOWUPDATE:
+		if h2fh.Length != 4 {
+			return fmt.Errorf("h2 WINDOW_UPDATE payload length %d != 4", h2fh.Length)
+		}
+		// Increment-must-be-non-zero is enforced separately by the
+		// caller after reading the 4-byte payload.
+	}
+	return nil
+}
+
 // translateCustomToH2 maps an in-memory FrameHeader (Custom16 model) to the
 // equivalent H2 frame type and flags. The caller is responsible for any
 // payload transformation (HPACK for HEADERS/TRAILERS, etc.).
@@ -592,6 +654,13 @@ func readFrameH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolder) (
 			commitPayload.Commit(int(h2fh.Length))
 		}
 
+		// RFC 7540 §6.x control-frame validation. Payload is already
+		// drained above; surfacing the error here leaves the ring read
+		// pointer in sync.
+		if verr := validateH2ControlFrame(h2fh); verr != nil {
+			return FrameHeader{}, nil, verr
+		}
+
 		// Translate H2 → Custom16 frame model.
 		switch h2fh.Type {
 		case H2FrameSETTINGS, H2FramePRIORITY, H2FramePUSHPROMISE:
@@ -696,6 +765,15 @@ func readFrameH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolder) (
 				Length:   uint32(len(payload)),
 			}, payload, nil
 		case H2FrameGOAWAY, H2FramePING, H2FrameWINDOWUPDATE:
+			if h2fh.Type == H2FrameWINDOWUPDATE {
+				// RFC 7540 §6.9.1: increment MUST be non-zero. The
+				// 4-byte payload validation above (length == 4) guarantees
+				// the slice has the bytes to read.
+				inc := binary.BigEndian.Uint32(payload) & 0x7FFFFFFF
+				if inc == 0 {
+					return FrameHeader{}, nil, errors.New("h2 WINDOW_UPDATE increment must be non-zero")
+				}
+			}
 			ft, fl, ok := translateH2ToCustom(h2fh.Type, h2fh.Flags)
 			if !ok {
 				continue
@@ -784,6 +862,17 @@ func readFrameViewH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolde
 			if err != nil {
 				return FrameHeader{}, nil, err
 			}
+		}
+
+		// RFC 7540 §6.x control-frame validation. We must commit any
+		// reserved payload bytes before propagating the error so the
+		// ring read pointer stays in sync with the cross-process
+		// writer's view.
+		if verr := validateH2ControlFrame(h2fh); verr != nil {
+			if commitPayload != nil {
+				commitPayload.Commit(int(h2fh.Length))
+			}
+			return FrameHeader{}, nil, verr
 		}
 
 		switch h2fh.Type {
@@ -1042,6 +1131,20 @@ func readFrameViewH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolde
 					commitPayload.Commit(int(h2fh.Length))
 				}
 				continue
+			}
+			// RFC 7540 §6.9.1: WINDOW_UPDATE increment MUST be non-zero.
+			// validateH2ControlFrame already enforced length == 4.
+			if h2fh.Type == H2FrameWINDOWUPDATE {
+				var hdr [4]byte
+				cn := copy(hdr[:], pFirst)
+				if cn < 4 && len(pSecond) > 0 {
+					copy(hdr[cn:], pSecond)
+				}
+				inc := binary.BigEndian.Uint32(hdr[:]) & 0x7FFFFFFF
+				if inc == 0 {
+					commitPayload.Commit(int(h2fh.Length))
+					return FrameHeader{}, nil, errors.New("h2 WINDOW_UPDATE increment must be non-zero")
+				}
 			}
 			var buf mem.Buffer
 			if h2fh.Length > 0 {

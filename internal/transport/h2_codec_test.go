@@ -608,3 +608,236 @@ func TestH2BinaryMetadata_WireFormatIsBase64(t *testing.T) {
 			seen, want, string(raw))
 	}
 }
+
+// ---------------------------------------------------------------------------
+// H2 control-frame validation tests (RFC 7540 §6.x).
+//
+// Each malformed-frame test follows a uniform pattern:
+//
+//  1. inject a hand-crafted malformed H2 frame into the ring,
+//  2. assert readFrame returns an error,
+//  3. write a normal MESSAGE frame on the same ring,
+//  4. assert that MESSAGE reads back intact — proves the ring read
+//     index advanced past the malformed payload (i.e. the codec
+//     drained the bytes before throwing, no stuck reader).
+// ---------------------------------------------------------------------------
+
+// injectH2Frame writes a raw H2 frame (header + payload) into the ring
+// directly, bypassing the encoder's own validation. Used to simulate a
+// peer that sends a frame our codec considers malformed.
+func injectH2Frame(t *testing.T, ctx context.Context, tx *ShmRing,
+	frameType H2FrameType, flags byte, streamID uint32, payload []byte) {
+	t.Helper()
+	var hdr [h2FrameHeaderSize]byte
+	encodeH2FrameHeaderTo(&hdr, H2FrameHeader{
+		Length:   uint32(len(payload)),
+		Type:     frameType,
+		Flags:    flags,
+		StreamID: streamID,
+	})
+	res, err := tx.ReserveWrite(ctx, h2FrameHeaderSize+len(payload))
+	if err != nil {
+		t.Fatalf("ReserveWrite: %v", err)
+	}
+	// The injection bypass intentionally writes raw bytes — wrap-around
+	// handling mirrors writeH2Single's pattern.
+	if len(res.First) >= h2FrameHeaderSize {
+		copy(res.First[:h2FrameHeaderSize], hdr[:])
+		bodyInFirst := len(res.First) - h2FrameHeaderSize
+		if bodyInFirst > len(payload) {
+			bodyInFirst = len(payload)
+		}
+		copy(res.First[h2FrameHeaderSize:h2FrameHeaderSize+bodyInFirst], payload[:bodyInFirst])
+		if len(res.Second) > 0 && bodyInFirst < len(payload) {
+			copy(res.Second, payload[bodyInFirst:])
+		}
+	} else {
+		copy(res.First, hdr[:len(res.First)])
+		remHdr := h2FrameHeaderSize - len(res.First)
+		copy(res.Second[:remHdr], hdr[len(res.First):])
+		bodyDest := res.Second[remHdr:]
+		copy(bodyDest, payload)
+	}
+	if err := res.Commit(h2FrameHeaderSize + len(payload)); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+}
+
+// writeNormalMessageH2 writes a small MESSAGE frame on tx using the
+// production encoder; used as the post-recovery probe in malformed-frame
+// tests.
+func writeNormalMessageH2(t *testing.T, ctx context.Context, tx *ShmRing, body []byte) {
+	t.Helper()
+	payload := make([]byte, 5+len(body))
+	payload[0] = 0
+	binary.BigEndian.PutUint32(payload[1:5], uint32(len(body)))
+	copy(payload[5:], body)
+	if err := writeFrame(ctx, tx, FrameHeader{
+		Type:     FrameTypeMESSAGE,
+		StreamID: 7,
+	}, payload); err != nil {
+		t.Fatalf("post-recovery writeFrame: %v", err)
+	}
+}
+
+// readNormalMessageH2 reads exactly one MESSAGE frame and verifies its
+// body matches `want`; used as the post-recovery probe.
+func readNormalMessageH2(t *testing.T, ctx context.Context, rx *ShmRing, want []byte) {
+	t.Helper()
+	fh, got, err := readFrame(ctx, rx)
+	if err != nil {
+		t.Fatalf("post-recovery readFrame: %v", err)
+	}
+	if fh.Type != FrameTypeMESSAGE {
+		t.Fatalf("post-recovery type: got %d want MESSAGE", fh.Type)
+	}
+	// Body bytes start after the 5-byte LPM prefix.
+	if len(got) < 5 || !bytes.Equal(got[5:], want) {
+		t.Errorf("post-recovery body: got %q want %q", got[5:], want)
+	}
+}
+
+func newH2RingPair(t *testing.T) (tx, rx *ShmRing, ctx context.Context, cancel context.CancelFunc, segName string) {
+	t.Helper()
+	segName = fmt.Sprintf("h2valid-%d-%d", time.Now().UnixNano(), GoroutineID())
+	seg, err := CreateSegment(segName, 1<<20, 1<<20)
+	if err != nil {
+		t.Fatalf("CreateSegment: %v", err)
+	}
+	tx = NewShmRingFromSegment(seg.A, seg.Mem)
+	rx = NewShmRingFromSegment(seg.A, seg.Mem)
+	tx.SetWireFormat(WireFormatHTTP2)
+	rx.SetWireFormat(WireFormatHTTP2)
+	ctx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
+	t.Cleanup(func() {
+		cancel()
+		seg.Close()
+		RemoveSegment(segName)
+	})
+	return
+}
+
+// GoroutineID returns a coarse identifier used to disambiguate segment
+// names in parallel test runs. (We don't need a real goroutine ID.)
+func GoroutineID() int64 {
+	return time.Now().UnixNano() & 0xFFFF
+}
+
+func TestH2Validate_RstStreamWrongLength(t *testing.T) {
+	tx, rx, ctx, _, _ := newH2RingPair(t)
+	// streamID=1 but length=8 instead of 4.
+	injectH2Frame(t, ctx, tx, H2FrameRSTSTREAM, 0, 1, make([]byte, 8))
+	writeNormalMessageH2(t, ctx, tx, []byte("ok"))
+	if _, _, err := readFrame(ctx, rx); err == nil {
+		t.Fatal("expected error on malformed RST_STREAM length")
+	}
+	readNormalMessageH2(t, ctx, rx, []byte("ok"))
+}
+
+func TestH2Validate_RstStreamZeroStreamID(t *testing.T) {
+	tx, rx, ctx, _, _ := newH2RingPair(t)
+	// length=4 but streamID=0.
+	injectH2Frame(t, ctx, tx, H2FrameRSTSTREAM, 0, 0, make([]byte, 4))
+	writeNormalMessageH2(t, ctx, tx, []byte("ok"))
+	if _, _, err := readFrame(ctx, rx); err == nil {
+		t.Fatal("expected error on RST_STREAM streamID=0")
+	}
+	readNormalMessageH2(t, ctx, rx, []byte("ok"))
+}
+
+func TestH2Validate_SettingsNonZeroStreamID(t *testing.T) {
+	tx, rx, ctx, _, _ := newH2RingPair(t)
+	injectH2Frame(t, ctx, tx, H2FrameSETTINGS, 0, 5, nil)
+	writeNormalMessageH2(t, ctx, tx, []byte("ok"))
+	if _, _, err := readFrame(ctx, rx); err == nil {
+		t.Fatal("expected error on SETTINGS streamID != 0")
+	}
+	readNormalMessageH2(t, ctx, rx, []byte("ok"))
+}
+
+func TestH2Validate_SettingsBadLength(t *testing.T) {
+	tx, rx, ctx, _, _ := newH2RingPair(t)
+	// non-ACK SETTINGS with length not a multiple of 6.
+	injectH2Frame(t, ctx, tx, H2FrameSETTINGS, 0, 0, make([]byte, 7))
+	writeNormalMessageH2(t, ctx, tx, []byte("ok"))
+	if _, _, err := readFrame(ctx, rx); err == nil {
+		t.Fatal("expected error on SETTINGS length not multiple of 6")
+	}
+	readNormalMessageH2(t, ctx, rx, []byte("ok"))
+}
+
+func TestH2Validate_SettingsAckWithPayload(t *testing.T) {
+	tx, rx, ctx, _, _ := newH2RingPair(t)
+	// ACK flag set but non-empty payload.
+	injectH2Frame(t, ctx, tx, H2FrameSETTINGS, H2FlagAck, 0, make([]byte, 6))
+	writeNormalMessageH2(t, ctx, tx, []byte("ok"))
+	if _, _, err := readFrame(ctx, rx); err == nil {
+		t.Fatal("expected error on SETTINGS ACK with non-empty payload")
+	}
+	readNormalMessageH2(t, ctx, rx, []byte("ok"))
+}
+
+func TestH2Validate_PingWrongLength(t *testing.T) {
+	tx, rx, ctx, _, _ := newH2RingPair(t)
+	injectH2Frame(t, ctx, tx, H2FramePING, 0, 0, make([]byte, 4)) // need 8
+	writeNormalMessageH2(t, ctx, tx, []byte("ok"))
+	if _, _, err := readFrame(ctx, rx); err == nil {
+		t.Fatal("expected error on PING length != 8")
+	}
+	readNormalMessageH2(t, ctx, rx, []byte("ok"))
+}
+
+func TestH2Validate_PingNonZeroStreamID(t *testing.T) {
+	tx, rx, ctx, _, _ := newH2RingPair(t)
+	injectH2Frame(t, ctx, tx, H2FramePING, 0, 1, make([]byte, 8))
+	writeNormalMessageH2(t, ctx, tx, []byte("ok"))
+	if _, _, err := readFrame(ctx, rx); err == nil {
+		t.Fatal("expected error on PING streamID != 0")
+	}
+	readNormalMessageH2(t, ctx, rx, []byte("ok"))
+}
+
+func TestH2Validate_GoAwayShortPayload(t *testing.T) {
+	tx, rx, ctx, _, _ := newH2RingPair(t)
+	// length < 8 (last-stream-id + error-code).
+	injectH2Frame(t, ctx, tx, H2FrameGOAWAY, 0, 0, make([]byte, 4))
+	writeNormalMessageH2(t, ctx, tx, []byte("ok"))
+	if _, _, err := readFrame(ctx, rx); err == nil {
+		t.Fatal("expected error on GOAWAY length < 8")
+	}
+	readNormalMessageH2(t, ctx, rx, []byte("ok"))
+}
+
+func TestH2Validate_GoAwayNonZeroStreamID(t *testing.T) {
+	tx, rx, ctx, _, _ := newH2RingPair(t)
+	injectH2Frame(t, ctx, tx, H2FrameGOAWAY, 0, 9, make([]byte, 8))
+	writeNormalMessageH2(t, ctx, tx, []byte("ok"))
+	if _, _, err := readFrame(ctx, rx); err == nil {
+		t.Fatal("expected error on GOAWAY streamID != 0")
+	}
+	readNormalMessageH2(t, ctx, rx, []byte("ok"))
+}
+
+func TestH2Validate_WindowUpdateWrongLength(t *testing.T) {
+	tx, rx, ctx, _, _ := newH2RingPair(t)
+	injectH2Frame(t, ctx, tx, H2FrameWINDOWUPDATE, 0, 1, make([]byte, 3))
+	writeNormalMessageH2(t, ctx, tx, []byte("ok"))
+	if _, _, err := readFrame(ctx, rx); err == nil {
+		t.Fatal("expected error on WINDOW_UPDATE length != 4")
+	}
+	readNormalMessageH2(t, ctx, rx, []byte("ok"))
+}
+
+func TestH2Validate_WindowUpdateZeroIncrement(t *testing.T) {
+	tx, rx, ctx, _, _ := newH2RingPair(t)
+	// length=4, increment=0 (stream-error PROTOCOL_ERROR per RFC 7540
+	// §6.9.1: "A receiver MUST treat the receipt of a WINDOW_UPDATE
+	// frame with an flow-control window increment of 0 as a stream
+	// error or connection error of type PROTOCOL_ERROR".
+	injectH2Frame(t, ctx, tx, H2FrameWINDOWUPDATE, 0, 1, []byte{0, 0, 0, 0})
+	writeNormalMessageH2(t, ctx, tx, []byte("ok"))
+	if _, _, err := readFrame(ctx, rx); err == nil {
+		t.Fatal("expected error on WINDOW_UPDATE increment=0")
+	}
+	readNormalMessageH2(t, ctx, rx, []byte("ok"))
+}
