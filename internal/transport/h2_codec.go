@@ -374,6 +374,111 @@ func parseGrpcTimeout(s string) (time.Duration, error) {
 	}
 }
 
+// h2MaxHeaderListSize bounds the cumulative HPACK block size accepted
+// across a HEADERS + CONTINUATION sequence. A malicious peer streaming
+// gigabytes of HEADERS would otherwise OOM the receiver before any
+// upper-layer rate limiter triggers. 8 MiB is well above the largest
+// realistic gRPC HEADERS block (rich grpc-status-details-bin trailers
+// in error responses are typically a few KiB).
+const h2MaxHeaderListSize = 8 * 1024 * 1024
+
+// readH2HeadersWithContinuations assembles a complete HPACK header block
+// for a HEADERS frame whose first fragment did not carry END_HEADERS.
+// Reads subsequent H2 frames from rx and copies their payloads into a
+// pooled buffer until END_HEADERS is observed.
+//
+// firstPayload is the (already drained from the ring) body of the
+// initial HEADERS frame. The returned slice owns its own memory; the
+// caller is free to retain or pass it to the HPACK decoder. Stays nil
+// on error.
+//
+// Validation enforced inside the loop:
+//
+//   - the only legal frame type until END_HEADERS is CONTINUATION
+//     (RFC 7540 §6.10: any other type is PROTOCOL_ERROR; a peer cannot
+//     legally interleave DATA, RST_STREAM, etc. between HEADERS and
+//     trailing CONTINUATION);
+//   - streamID MUST match the originating HEADERS streamID;
+//   - cumulative payload bounded by h2MaxHeaderListSize.
+//
+// Each CONTINUATION frame's payload is fully drained (committed) before
+// any error is propagated, so the ring read pointer stays in sync with
+// the cross-process writer's view.
+func readH2HeadersWithContinuations(
+	ctx context.Context, rx *ShmRing, headersStreamID uint32, firstPayload []byte,
+) ([]byte, error) {
+	if len(firstPayload) > h2MaxHeaderListSize {
+		return nil, fmt.Errorf("h2 HEADERS first fragment %d bytes exceeds %d",
+			len(firstPayload), h2MaxHeaderListSize)
+	}
+	// Start with a buffer sized to a typical 2-3 fragment case while
+	// allowing growth up to the cap.
+	initialCap := len(firstPayload) * 2
+	if initialCap < 1024 {
+		initialCap = 1024
+	}
+	if initialCap > h2MaxHeaderListSize {
+		initialCap = h2MaxHeaderListSize
+	}
+	assembled := make([]byte, 0, initialCap)
+	assembled = append(assembled, firstPayload...)
+
+	for {
+		// Read the next 9-byte H2 frame header.
+		first, second, commitHdr, err := rx.ReadSlices(ctx, h2FrameHeaderSize)
+		if err != nil {
+			return nil, err
+		}
+		var hb [h2FrameHeaderSize]byte
+		n := copy(hb[:], first)
+		if n < h2FrameHeaderSize && len(second) > 0 {
+			n += copy(hb[n:], second)
+		}
+		commitHdr.Commit(h2FrameHeaderSize)
+		if n != h2FrameHeaderSize {
+			return nil, errors.New("h2: short CONTINUATION frame header")
+		}
+		fh, err := decodeH2FrameHeader(hb[:])
+		if err != nil {
+			return nil, err
+		}
+
+		// Drain the frame payload into a scratch buffer regardless of
+		// what we do with it — this keeps the ring read pointer in
+		// sync if validation rejects the frame.
+		var payload []byte
+		if fh.Length > 0 {
+			pFirst, pSecond, commitPayload, perr := rx.ReadSlices(ctx, int(fh.Length))
+			if perr != nil {
+				return nil, perr
+			}
+			payload = make([]byte, fh.Length)
+			cn := copy(payload, pFirst)
+			if cn < int(fh.Length) && len(pSecond) > 0 {
+				copy(payload[cn:], pSecond)
+			}
+			commitPayload.Commit(int(fh.Length))
+		}
+
+		if fh.Type != H2FrameCONTINUATION {
+			return nil, fmt.Errorf("h2 frame type %s interleaved between HEADERS and CONTINUATION (RFC 7540 §6.10)", fh.Type)
+		}
+		if fh.StreamID != headersStreamID {
+			return nil, fmt.Errorf("h2 CONTINUATION streamID %d does not match originating HEADERS streamID %d",
+				fh.StreamID, headersStreamID)
+		}
+		if int64(len(assembled))+int64(len(payload)) > h2MaxHeaderListSize {
+			return nil, fmt.Errorf("h2 HEADERS+CONTINUATION cumulative payload exceeds %d bytes",
+				h2MaxHeaderListSize)
+		}
+		assembled = append(assembled, payload...)
+
+		if fh.Flags&H2FlagEndHeaders != 0 {
+			return assembled, nil
+		}
+	}
+}
+
 // validateH2ControlFrame checks the per-RFC 7540 invariants of the
 // control-frame types the codec understands (RST_STREAM, SETTINGS, PING,
 // GOAWAY, WINDOW_UPDATE). Returns a non-nil error when the frame is
@@ -666,6 +771,13 @@ func readFrameH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolder) (
 		case H2FrameSETTINGS, H2FramePRIORITY, H2FramePUSHPROMISE:
 			// Skipped at this layer.
 			continue
+		case H2FrameCONTINUATION:
+			// CONTINUATION reaching the top-level switch is a stray
+			// fragment outside any HEADERS sequence — RFC 7540 §6.10
+			// requires this to be treated as PROTOCOL_ERROR. The
+			// in-sequence case is handled inside readH2HeadersWithContinuations
+			// where the per-stream HEADERS state is tracked.
+			return FrameHeader{}, nil, errors.New("h2 CONTINUATION frame received outside a HEADERS sequence (RFC 7540 §6.10)")
 		case H2FrameDATA:
 			// Empty DATA + END_STREAM = HALFCLOSE.
 			if len(payload) == 0 {
@@ -734,7 +846,21 @@ func readFrameH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolder) (
 		case H2FrameHEADERS:
 			// HPACK-decode and convert to Custom16 HeadersV1 / TrailersV1
 			// payload format the rest of the transport expects.
-			h, t, isTrailers, derr := h2DecodeHeaders(holder, payload)
+			//
+			// If END_HEADERS is missing, assemble the full HPACK block
+			// from subsequent CONTINUATION frames before decoding (RFC
+			// 7540 §6.10). The single-fragment fast path (END_HEADERS
+			// already set) is the overwhelmingly common case in gRPC;
+			// the slow path triggers only when a peer's HEADERS payload
+			// exceeds SETTINGS_MAX_FRAME_SIZE.
+			hpackBlock := payload
+			if h2fh.Flags&H2FlagEndHeaders == 0 {
+				hpackBlock, err = readH2HeadersWithContinuations(ctx, rx, h2fh.StreamID, payload)
+				if err != nil {
+					return FrameHeader{}, nil, err
+				}
+			}
+			h, t, isTrailers, derr := h2DecodeHeaders(holder, hpackBlock)
 			if derr != nil {
 				return FrameHeader{}, nil, derr
 			}
@@ -881,6 +1007,14 @@ func readFrameViewH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolde
 				commitPayload.Commit(int(h2fh.Length))
 			}
 			continue
+		case H2FrameCONTINUATION:
+			// Stray CONTINUATION outside a HEADERS sequence — RFC 7540
+			// §6.10: PROTOCOL_ERROR. In-sequence CONTINUATION is
+			// consumed inside readH2HeadersWithContinuations.
+			if commitPayload != nil {
+				commitPayload.Commit(int(h2fh.Length))
+			}
+			return FrameHeader{}, nil, errors.New("h2 CONTINUATION frame received outside a HEADERS sequence (RFC 7540 §6.10)")
 
 		case H2FrameDATA:
 			if h2fh.Length == 0 {
@@ -1066,6 +1200,11 @@ func readFrameViewH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolde
 			// metadata is rich.
 			//
 			// Wrap-around case still uses scratch to consolidate.
+			//
+			// END_HEADERS missing → assemble a heap-backed HPACK block
+			// across CONTINUATION frames (RFC 7540 §6.10) before
+			// decoding. Slow path; common case is END_HEADERS already
+			// set on the first fragment.
 			var payload []byte
 			if h2fh.Length > 0 {
 				if len(pSecond) == 0 {
@@ -1075,6 +1214,23 @@ func readFrameViewH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolde
 					cn := copy(payload, pFirst)
 					copy(payload[cn:], pSecond)
 				}
+			}
+			if h2fh.Flags&H2FlagEndHeaders == 0 {
+				// Materialize first fragment (we may have aliased ring
+				// memory) before draining; commit the first fragment
+				// payload, then read CONTINUATION frames.
+				firstCopy := append([]byte(nil), payload...)
+				if commitPayload != nil {
+					commitPayload.Commit(int(h2fh.Length))
+				}
+				// Mark commitPayload nil so the post-decode commit
+				// below is skipped.
+				commitPayload = nil
+				assembled, aerr := readH2HeadersWithContinuations(ctx, rx, h2fh.StreamID, firstCopy)
+				if aerr != nil {
+					return FrameHeader{}, nil, aerr
+				}
+				payload = assembled
 			}
 			h, t, isTrailers, derr := h2DecodeHeaders(holder, payload)
 			if commitPayload != nil {

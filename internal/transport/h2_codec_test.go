@@ -841,3 +841,127 @@ func TestH2Validate_WindowUpdateZeroIncrement(t *testing.T) {
 	}
 	readNormalMessageH2(t, ctx, rx, []byte("ok"))
 }
+
+// ---------------------------------------------------------------------------
+// CONTINUATION frame tests (RFC 7540 §6.10).
+// ---------------------------------------------------------------------------
+
+// hpackEncodeForTest deterministically encodes a list of HeaderFields to
+// HPACK bytes with a fresh encoder (no shared dynamic-table state with
+// any production decoder under test).
+func hpackEncodeForTest(t *testing.T, fields ...hpack.HeaderField) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	enc := hpack.NewEncoder(&buf)
+	for _, f := range fields {
+		if err := enc.WriteField(f); err != nil {
+			t.Fatalf("WriteField %v: %v", f, err)
+		}
+	}
+	return buf.Bytes()
+}
+
+// TestH2Continuation_TwoFragments_RoundTrip splits a single HPACK header
+// block into two halves and emits them as HEADERS (no END_HEADERS) +
+// CONTINUATION (END_HEADERS). The reader must reassemble the block and
+// produce the same HeadersV1 we'd see from a single-fragment HEADERS.
+func TestH2Continuation_TwoFragments_RoundTrip(t *testing.T) {
+	tx, rx, ctx, _, _ := newH2RingPair(t)
+	hpackBlock := hpackEncodeForTest(t,
+		hpack.HeaderField{Name: ":method", Value: "POST"},
+		hpack.HeaderField{Name: ":scheme", Value: "http"},
+		hpack.HeaderField{Name: ":path", Value: "/svc/MyMethod"},
+		hpack.HeaderField{Name: ":authority", Value: "example"},
+		hpack.HeaderField{Name: "te", Value: "trailers"},
+		hpack.HeaderField{Name: "content-type", Value: "application/grpc"},
+		hpack.HeaderField{Name: "x-custom", Value: "v"},
+	)
+	// Split roughly in half (must split at any byte; HPACK is a byte
+	// stream, the split point need not be on a field boundary).
+	half := len(hpackBlock) / 2
+	if half == 0 {
+		t.Fatalf("hpack block too small: %d", len(hpackBlock))
+	}
+	// First fragment: HEADERS, no END_HEADERS.
+	injectH2Frame(t, ctx, tx, H2FrameHEADERS, 0, 1, hpackBlock[:half])
+	// Second fragment: CONTINUATION, END_HEADERS set.
+	injectH2Frame(t, ctx, tx, H2FrameCONTINUATION, H2FlagEndHeaders, 1, hpackBlock[half:])
+
+	fh, payload, err := readFrame(ctx, rx)
+	if err != nil {
+		t.Fatalf("readFrame: %v", err)
+	}
+	if fh.Type != FrameTypeHEADERS {
+		t.Fatalf("type: got %d want HEADERS", fh.Type)
+	}
+	hv, derr := decodeHeaders(payload)
+	if derr != nil {
+		t.Fatalf("decodeHeaders: %v", derr)
+	}
+	if hv.Method != "/svc/MyMethod" {
+		t.Errorf("method: got %q want /svc/MyMethod", hv.Method)
+	}
+	if hv.Authority != "example" {
+		t.Errorf("authority: got %q want example", hv.Authority)
+	}
+	var seen string
+	for _, kv := range hv.Metadata {
+		if kv.Key == "x-custom" && len(kv.Values) > 0 {
+			seen = string(kv.Values[0])
+		}
+	}
+	if seen != "v" {
+		t.Errorf("x-custom: got %q want v", seen)
+	}
+}
+
+// TestH2Continuation_StreamIDMismatch verifies that a CONTINUATION
+// fragment whose stream id differs from the originating HEADERS is
+// rejected as PROTOCOL_ERROR (RFC 7540 §6.10).
+func TestH2Continuation_StreamIDMismatch(t *testing.T) {
+	tx, rx, ctx, _, _ := newH2RingPair(t)
+	hpackBlock := hpackEncodeForTest(t,
+		hpack.HeaderField{Name: ":method", Value: "POST"},
+		hpack.HeaderField{Name: ":path", Value: "/x"},
+	)
+	half := len(hpackBlock) / 2
+	injectH2Frame(t, ctx, tx, H2FrameHEADERS, 0, 1, hpackBlock[:half])
+	// CONTINUATION on a different stream id.
+	injectH2Frame(t, ctx, tx, H2FrameCONTINUATION, H2FlagEndHeaders, 99, hpackBlock[half:])
+
+	if _, _, err := readFrame(ctx, rx); err == nil {
+		t.Fatal("expected error on CONTINUATION streamID mismatch")
+	}
+}
+
+// TestH2Continuation_NonContinuationInterleaved verifies that a frame of
+// any type other than CONTINUATION arriving while a HEADERS sequence is
+// open is rejected (RFC 7540 §6.10). gRPC peers cannot legally
+// interleave DATA, RST_STREAM, etc. between HEADERS and trailing
+// CONTINUATION.
+func TestH2Continuation_NonContinuationInterleaved(t *testing.T) {
+	tx, rx, ctx, _, _ := newH2RingPair(t)
+	hpackBlock := hpackEncodeForTest(t,
+		hpack.HeaderField{Name: ":method", Value: "POST"},
+		hpack.HeaderField{Name: ":path", Value: "/x"},
+	)
+	half := len(hpackBlock) / 2
+	injectH2Frame(t, ctx, tx, H2FrameHEADERS, 0, 1, hpackBlock[:half])
+	// DATA frame interleaved (would be valid on its own but illegal
+	// here while HEADERS is open).
+	injectH2Frame(t, ctx, tx, H2FrameDATA, 0, 1, []byte{0x00, 0x00, 0x00, 0x00, 0x00})
+	if _, _, err := readFrame(ctx, rx); err == nil {
+		t.Fatal("expected error on DATA frame interleaved between HEADERS and CONTINUATION")
+	}
+}
+
+// TestH2Continuation_StrayContinuation verifies that a CONTINUATION
+// frame appearing outside any HEADERS sequence is rejected.
+func TestH2Continuation_StrayContinuation(t *testing.T) {
+	tx, rx, ctx, _, _ := newH2RingPair(t)
+	injectH2Frame(t, ctx, tx, H2FrameCONTINUATION, H2FlagEndHeaders, 1,
+		hpackEncodeForTest(t, hpack.HeaderField{Name: "x", Value: "y"}))
+	if _, _, err := readFrame(ctx, rx); err == nil {
+		t.Fatal("expected error on stray CONTINUATION outside a HEADERS sequence")
+	}
+}
