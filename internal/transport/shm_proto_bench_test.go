@@ -75,6 +75,16 @@ func sizeLabel(n int) string {
 // ---------------------------------------------------------------------------
 // Write helpers — reuse production code paths
 // ---------------------------------------------------------------------------
+//
+// Default flags=0 means "complete logical message; more messages may
+// follow" — neither MessageFlagMORE (chunk-level "more chunks of THIS
+// message") nor MessageFlagEndStream (H2-only "this is the last
+// message I'll send; half-close after"). This exercises the new
+// MORE-vs-EndStream split correctly on every iteration: H2 emits
+// END_STREAM only when EndStream is set, not as a side-effect of the
+// last DATA frame in a burst. Tests that want to exercise the
+// EndStream path explicitly should use writeProto*ToRing directly
+// with the desired flags rather than these bench-oriented helpers.
 
 // writeZC calls writeProtoToRing (shared with transport.writeProto).
 // Falls back to copy path if ZC can't fit contiguously.
@@ -84,19 +94,30 @@ func writeZC(ctx context.Context, tx *ShmRing, id uint32, msg proto.Message) err
 		return err
 	}
 	if !ok {
-		return writeProtoCopyToRing(ctx, tx, id, msg)
+		return writeProtoCopyToRing(ctx, tx, id, msg, 0)
 	}
 	return nil
 }
 
 // writeCopy calls writeProtoCopyToRing (shared with transport.write path).
 func writeCopy(ctx context.Context, tx *ShmRing, id uint32, msg proto.Message) error {
-	return writeProtoCopyToRing(ctx, tx, id, msg)
+	return writeProtoCopyToRing(ctx, tx, id, msg, 0)
 }
 
 // ---------------------------------------------------------------------------
 // Read helpers — reuse production code paths
 // ---------------------------------------------------------------------------
+//
+// The bench readers drive message-completion off the LPM 5-byte
+// length prefix (consumed/total bytes) rather than the per-frame
+// MessageFlagMORE bit. This decouples bench correctness from the
+// codec's MORE-vs-EndStream signalling: a single H2 DATA carrying
+// one complete LPM with no END_STREAM still surfaces as
+// MessageFlagMORE-set in the new semantics (MORE=1 means "more
+// frames follow on this stream"), but the message is logically
+// complete when assembled bytes equal 5+payloadLen. Driving the
+// loop off the LPM length is also closer to production
+// MaterializeToBuffer semantics.
 
 // readZC calls readFrameView (zero-copy SliceBuffer) + direct Unmarshal.
 // For single-frame messages: proto.Unmarshal reads directly from ring (true ZC).
@@ -117,30 +138,26 @@ func readZC(ctx context.Context, rx *ShmRing, msg proto.Message) error {
 	}
 
 	data := buf.ReadOnlyData()
-	if fh.Flags&MessageFlagMORE == 0 {
-		// Single frame — unmarshal directly from ring (zero-copy)
-		if len(data) < 5 {
-			buf.Free()
-			return fmt.Errorf("short payload %d", len(data))
-		}
-		payloadLen := int(binary.BigEndian.Uint32(data[1:5]))
-		actualPayload := len(data) - 5
-		if payloadLen != actualPayload {
-			buf.Free()
-			return fmt.Errorf("CORRUPTION: grpcLen=%d actual=%d fhLen=%d",
-				payloadLen, actualPayload, fh.Length)
-		}
+	if len(data) < 5 {
+		buf.Free()
+		return fmt.Errorf("short payload %d", len(data))
+	}
+	payloadLen := int(binary.BigEndian.Uint32(data[1:5]))
+	actualPayload := len(data) - 5
+	if payloadLen == actualPayload {
+		// Single-frame complete message — unmarshal directly from ring.
 		err = proto.Unmarshal(data[5:], msg)
 		buf.Free()
 		return err
 	}
+	if actualPayload > payloadLen {
+		buf.Free()
+		return fmt.Errorf("CORRUPTION: grpcLen=%d actual=%d fhLen=%d",
+			payloadLen, actualPayload, fh.Length)
+	}
 
 	// Multi-chunk: pre-allocate from gRPC length prefix in first chunk.
-	var assembled []byte
-	if len(data) >= 5 {
-		totalPayload := int(binary.BigEndian.Uint32(data[1:5]))
-		assembled = make([]byte, 0, 5+totalPayload)
-	}
+	assembled := make([]byte, 0, 5+payloadLen)
 	assembled = append(assembled, data...)
 	buf.Free()
 
@@ -150,7 +167,7 @@ func readZC(ctx context.Context, rx *ShmRing, msg proto.Message) error {
 	// state machine and freeze header.ReadIdx forever (the open ZC
 	// anchor would never be released because the codec never observes
 	// the final chunk).
-	for {
+	for len(assembled) < 5+payloadLen {
 		fh2, buf2, err := readFrameView(ctx, rx)
 		if err != nil {
 			return err
@@ -165,63 +182,45 @@ func readZC(ctx context.Context, rx *ShmRing, msg proto.Message) error {
 			assembled = append(assembled, buf2.ReadOnlyData()...)
 			buf2.Free()
 		}
-		if fh2.Flags&MessageFlagMORE == 0 {
-			break
-		}
-	}
-	if len(assembled) < 5 {
-		return fmt.Errorf("short assembled %d", len(assembled))
 	}
 	return proto.Unmarshal(assembled[5:], msg)
 }
 
 // readCopy calls readFrame (always copies) + Unmarshal. Handles chunks.
 func readCopy(ctx context.Context, rx *ShmRing, msg proto.Message) error {
-	var assembled []byte
-	for {
-		fh, payload, err := readFrame(ctx, rx)
+	fh, payload, err := readFrame(ctx, rx)
+	if err != nil {
+		return err
+	}
+	if fh.Type != FrameTypeMESSAGE {
+		return fmt.Errorf("unexpected frame type %d", fh.Type)
+	}
+	if len(payload) < 5 {
+		return fmt.Errorf("short payload %d", len(payload))
+	}
+	payloadLen := int(binary.BigEndian.Uint32(payload[1:5]))
+	actualPayload := len(payload) - 5
+	if payloadLen == actualPayload {
+		// Single-frame complete message.
+		return proto.Unmarshal(payload[5:], msg)
+	}
+	if actualPayload > payloadLen {
+		return fmt.Errorf("CORRUPTION: grpcLen=%d actual=%d", payloadLen, actualPayload)
+	}
+
+	// Multi-chunk: pre-allocate from gRPC length prefix in first chunk.
+	// Matches production MaterializeToBuffer(pool.Get(totalLength)).
+	assembled := make([]byte, 0, 5+payloadLen)
+	assembled = append(assembled, payload...)
+	for len(assembled) < 5+payloadLen {
+		fh3, payload3, err := readFrame(ctx, rx)
 		if err != nil {
 			return err
 		}
-		if fh.Type != FrameTypeMESSAGE {
-			return fmt.Errorf("unexpected frame type %d", fh.Type)
+		if fh3.Type != FrameTypeMESSAGE {
+			return fmt.Errorf("unexpected frame type %d", fh3.Type)
 		}
-		if assembled == nil && fh.Flags&MessageFlagMORE == 0 {
-			// Single frame
-			if len(payload) < 5 {
-				return fmt.Errorf("short payload %d", len(payload))
-			}
-			return proto.Unmarshal(payload[5:], msg)
-		}
-		// Multi-chunk: pre-allocate from gRPC length prefix in first chunk.
-		// Matches production MaterializeToBuffer(pool.Get(totalLength)).
-		if assembled == nil && len(payload) >= 5 {
-			totalPayload := int(binary.BigEndian.Uint32(payload[1:5]))
-			assembled = make([]byte, 0, 5+totalPayload)
-		}
-		assembled = append(assembled, payload...)
-		if fh.Flags&MessageFlagMORE == 0 {
-			break
-		}
-		// Subsequent chunks: read directly into assembled to avoid
-		// per-chunk temp allocation (matches production CopyTo).
-		for {
-			fh3, payload3, err := readFrame(ctx, rx)
-			if err != nil {
-				return err
-			}
-			if fh3.Type != FrameTypeMESSAGE {
-				return fmt.Errorf("unexpected frame type %d", fh3.Type)
-			}
-			assembled = append(assembled, payload3...)
-			if fh3.Flags&MessageFlagMORE == 0 {
-				break
-			}
-		}
-		break
-	}
-	if len(assembled) < 5 {
-		return fmt.Errorf("short assembled %d", len(assembled))
+		assembled = append(assembled, payload3...)
 	}
 	return proto.Unmarshal(assembled[5:], msg)
 }

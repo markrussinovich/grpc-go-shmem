@@ -62,14 +62,6 @@ type lpmAccumulator struct {
 	buf             []byte  // accumulated frame, len == pos, cap >= expectedTotal
 }
 
-// reset clears accumulator state for reuse on the next message.
-func (a *lpmAccumulator) reset() {
-	a.headerBytesSeen = 0
-	a.expectedTotal = 0
-	a.pos = 0
-	a.buf = nil
-}
-
 // inProgress reports whether the accumulator is mid-message.
 func (a *lpmAccumulator) inProgress() bool {
 	return a.headerBytesSeen > 0 || a.pos > 0
@@ -103,13 +95,37 @@ func (a *lpmAccumulator) feed(data []byte, maxBody int) (msg []byte, leftover []
 
 		bodyLen := int(binary.BigEndian.Uint32(a.headerBuf[1:5]))
 		if bodyLen < 0 {
+			// Reset header-parse state so a subsequent feed call (in
+			// principle: caller treats this as connection-fatal, but
+			// defense-in-depth) doesn't silently mis-parse on stale
+			// state.
+			a.headerBytesSeen = 0
 			return nil, nil, errors.New("h2 LPM: negative body length")
 		}
 		if maxBody > 0 && bodyLen > maxBody {
+			a.headerBytesSeen = 0
 			return nil, nil, fmt.Errorf("h2 LPM: body length %d exceeds max %d", bodyLen, maxBody)
 		}
 		a.expectedTotal = 5 + bodyLen
-		a.buf = make([]byte, 0, a.expectedTotal)
+		// Allocate incrementally rather than to the full declared
+		// expectedTotal: a peer-controlled tiny DATA frame that
+		// declares hundreds of MiB in the LPM header would otherwise
+		// force an immediate huge allocation before any per-RPC
+		// receive limit can reject it. Append below grows the slice
+		// amortised-O(N) on actual received bytes; the cap above
+		// (maxBody) provides a hard upper bound on declared size, but
+		// we never trust it for preallocation.
+		//
+		// Initial cap is min(8 KiB, expectedTotal) — enough to absorb
+		// the small-message hot path without a second growth, while
+		// keeping the worst-case (511 MiB declared, 5 byte body sent)
+		// allocation bounded by what was actually received.
+		const initialBufHint = 8 * 1024
+		initialCap := a.expectedTotal
+		if initialCap > initialBufHint {
+			initialCap = initialBufHint
+		}
+		a.buf = make([]byte, 0, initialCap)
 		a.buf = append(a.buf, a.headerBuf[:]...)
 		a.pos = 5
 	}

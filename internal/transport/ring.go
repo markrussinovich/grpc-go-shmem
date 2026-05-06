@@ -444,10 +444,7 @@ func (r *ShmRing) IsSpeculativeZCEligible(payloadLength int, contiguous bool) bo
 	// Back-pressure auto-degrade.
 	hdr := r.header()
 	used := hdr.WriteIndex() - hdr.ReadIndex()
-	if used*4 > r.capacity*3 {
-		return false
-	}
-	return true
+	return used*4 <= r.capacity*3
 }
 
 // ===== Multi-frame chain ZC (Custom16 MORE-chunked messages) =====

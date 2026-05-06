@@ -63,6 +63,19 @@ const (
 
 	// MESSAGE flags
 	MessageFlagMORE = uint8(0x01)
+	// MessageFlagEndStream signals to the writer that this MESSAGE
+	// terminates the stream from THIS peer's send direction. Set by
+	// the client transport on the last logical request message of a
+	// client-streaming or unary RPC; never set by the server (server
+	// ends its send direction with a TRAILERS frame). The H2 codec's
+	// writeProtoToRingH2 maps this to H2's END_STREAM flag on the
+	// emitted DATA frame; the H2 reader maps the same DATA's
+	// END_STREAM back to MessageFlagMORE = 0 (clearing MORE) on the
+	// surfaced MESSAGE so ShmServerTransport.handleMessage's MORE=0
+	// EOF logic fires correctly. Custom16 codec ignores this flag —
+	// MORE=0 alone is sufficient there because Custom16 has no
+	// HTTP/2-level END_STREAM concept.
+	MessageFlagEndStream = uint8(0x02)
 
 	// TRAILERS flags
 	TrailersFlagEndStream = uint8(0x01)

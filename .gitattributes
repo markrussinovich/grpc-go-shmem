@@ -1,0 +1,12 @@
+# Treat binary asset types as binary so tools like `git grep` skip them.
+# Without this, scripts/vet.sh's trailing-whitespace check (`git grep
+# '[[:blank:]]$'`) flags bytes inside PNG/JPEG payloads that happen to
+# match its regex.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.zip binary
+*.gz binary

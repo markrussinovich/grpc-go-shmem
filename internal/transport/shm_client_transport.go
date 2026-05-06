@@ -1213,11 +1213,23 @@ func (t *ShmClientTransport) writeProto(s *ClientStream, msg any, opts *WriteOpt
 		return false, err
 	}
 
-	// Set MessageFlagMORE if this is not the last message in the stream.
-	// The server's handleMessage uses MORE=0 to detect client half-close.
+	// Set frame flags based on the caller's "last message" signal:
+	//
+	//   - MessageFlagMORE: Custom16-only. The server's handleMessage
+	//     uses MORE=0 on incoming MESSAGE to detect client half-close.
+	//   - MessageFlagEndStream: H2-only. writeProtoToRingH2 maps this
+	//     to H2's END_STREAM bit on the emitted DATA frame; the
+	//     server-side H2 reader translates END_STREAM back to MORE=0
+	//     so the same handleMessage MORE=0 EOF logic fires.
+	//
+	// Set both flags coherently so the H2 and Custom16 codepaths each
+	// see the right signal regardless of which wire format the ring
+	// is using.
 	var frameFlags uint8
 	if opts != nil && !opts.Last {
 		frameFlags = MessageFlagMORE
+	} else {
+		frameFlags = MessageFlagEndStream
 	}
 
 	// Acquire the frame writer's inline mutex to serialize with writeLoop.
@@ -1322,7 +1334,10 @@ func (t *ShmClientTransport) write(s *ClientStream, hdr []byte, data mem.BufferS
 		shmDebugf("[DEBUG] ShmClientTransport.write: send quota acquired")
 	}
 
-	// Write MESSAGE frame. MessageFlagMORE indicates more data will follow.
+	// Write MESSAGE frame. See ringWriteProto for the rationale on
+	// the MORE / EndStream flag pair (Custom16 uses MORE=0 to signal
+	// half-close; H2 needs END_STREAM on wire which writeFrameH2
+	// derives from MessageFlagEndStream).
 	fh := FrameHeader{
 		StreamID: s.id,
 		Type:     FrameTypeMESSAGE,
@@ -1330,6 +1345,8 @@ func (t *ShmClientTransport) write(s *ClientStream, hdr []byte, data mem.BufferS
 	}
 	if opts != nil && !opts.Last {
 		fh.Flags = MessageFlagMORE
+	} else {
+		fh.Flags = MessageFlagEndStream
 	}
 
 	if shmDebugEnabled {

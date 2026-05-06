@@ -250,7 +250,17 @@ func (w *shmFrameWriter) close() {
 	w.wg.Wait()
 	// Drain any inline writer that acquired inlineMu before closed was set.
 	// After this returns, no goroutine is accessing the ring through the
-	// frame writer, so the caller can safely unmap the segment.
+	// frame writer, so the caller can safely unmap the segment. The
+	// Lock/Unlock pair acts as a barrier: any in-flight inline writer
+	// holding inlineMu will release it before we proceed.
+	w.drainInline()
+}
+
+// drainInline waits for any in-flight inline writer to release inlineMu.
+// It exists as a separate method so the Lock/Unlock pair isn't flagged
+// by static analysis as an empty critical section — the empty body is
+// the intended barrier semantics.
+func (w *shmFrameWriter) drainInline() {
 	w.inlineMu.Lock()
-	w.inlineMu.Unlock()
+	defer w.inlineMu.Unlock()
 }

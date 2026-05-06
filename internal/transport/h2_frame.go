@@ -71,7 +71,7 @@ const (
 	// PING flags (Ack shared with SETTINGS)
 )
 
-// HTTP/2 error codes (RFC 7540 §7).
+// H2ErrorCode is an HTTP/2 error code as defined in RFC 7540 §7.
 type H2ErrorCode uint32
 
 // HTTP/2 error code constants.

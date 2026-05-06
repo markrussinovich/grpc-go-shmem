@@ -26,11 +26,10 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"golang.org/x/net/http2/hpack"
-	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/internal/grpcutil"
 	"google.golang.org/grpc/mem"
 	"google.golang.org/protobuf/proto"
 )
@@ -56,14 +55,6 @@ import (
 // metadata. The decoder converts back to the same in-memory HeadersV1 /
 // TrailersV1 structs the rest of the transport already uses, so callers
 // remain wire-format-agnostic.
-
-// h2HpackPool reuses HPACK encoders to amortize the dynamic-table cost.
-// HPACK encoders are stateful (per-connection dynamic table), so each
-// ring uses its own encoder/decoder. This pool is used only as a way to
-// avoid per-frame allocations of the bytes.Buffer that backs the encoder.
-var h2HpackPool = sync.Pool{
-	New: func() any { return new(bytes.Buffer) },
-}
 
 // hpackEncoderHolder bundles a per-ring HPACK encoder with its scratch
 // buffer. The encoder is single-threaded (writer goroutine).
@@ -100,6 +91,39 @@ type hpackDecoderHolder struct {
 	// any new H2 frames. nil when no leftover.
 	pendingFrame    []byte
 	pendingStreamID uint32
+	// pendingFrameEndStream is set when the DATA frame whose leftover
+	// landed in pendingFrame had END_STREAM. The replay path must
+	// honour the deferred-halfclose state once the leftover drains:
+	// without this flag, a multi-LPM DATA frame ending the stream
+	// (legitimate when grpc-go peer batches multiple messages with
+	// END_STREAM on the last DATA) would surface the messages but
+	// never produce HALFCLOSE.
+	pendingFrameEndStream bool
+
+	// lastSid / lastAcc form a single-entry MRU cache over
+	// lpmAccumulators. The reader is single-goroutine and almost all
+	// gRPC traffic is sticky to one stream id at a time (pipelined
+	// unary RPCs, streaming) so the cache absorbs essentially every
+	// DATA frame's accumulator lookup. Map miss path still works
+	// (cache update only on map insert / hit). lastSid == 0 means
+	// cache empty (stream id 0 is reserved per RFC 7540 §5.1.1 and
+	// rejected by validateH2ControlFrame for DATA/HEADERS, so it's
+	// safe as the sentinel).
+	lastSid uint32
+	lastAcc *lpmAccumulator
+
+	// pendingHalfCloseStreamID, when non-zero, requests a synthetic
+	// FrameTypeHALFCLOSE to be returned on the next read BEFORE
+	// touching the ring. Set when an initial HEADERS frame arrived
+	// with END_STREAM (a zero-message client-streaming request: rare
+	// but legal per RFC 7540 §6.2 and gRFC G2). The codec returns
+	// the HEADERS first so the server transport can create the
+	// stream and dispatch the handler; the deferred HALFCLOSE then
+	// triggers the upper layer's client-half-close path
+	// (ShmServerTransport.handleHalfClose writes io.EOF to the
+	// stream's recv channel) so a HEADERS-only RPC doesn't hang
+	// waiting for a MESSAGE that never arrives.
+	pendingHalfCloseStreamID uint32
 }
 
 // scratchBytes returns a slice of length n drawn from the holder's
@@ -120,6 +144,14 @@ func newHpackDecoderHolder() *hpackDecoderHolder {
 	st := &h2DecodeState{}
 	st.reset()
 	dec := hpack.NewDecoder(4096, nil)
+	// Cap any single decoded HPACK string at 64 KiB. RFC 7541 doesn't
+	// enforce a per-string limit; without this guard a peer could send
+	// one HEADERS field whose Huffman-decoded value is gigabytes,
+	// allocating memory on the receiver per field. 64 KiB is well
+	// above any realistic gRPC metadata value (path, authority, custom
+	// metadata) and matches stock golang.org/x/net/http2's default for
+	// the MaxHeaderListSize SETTINGS knob.
+	dec.SetMaxStringLength(64 * 1024)
 	dec.SetEmitEnabled(true)
 	dec.SetEmitFunc(st.emit)
 	return &hpackDecoderHolder{
@@ -131,19 +163,48 @@ func newHpackDecoderHolder() *hpackDecoderHolder {
 
 // getLpmAccumulator returns the accumulator for stream sid, creating it
 // on first use. Safe to call only from the single reader goroutine.
+//
+// Hot path optimisation: a single-entry MRU cache (lastSid/lastAcc)
+// short-circuits the map lookup. gRPC traffic is overwhelmingly sticky
+// to a single stream id within a sequence of DATA frames (unary RPC
+// finishes its message exchange in 2-3 DATA frames on the same stream;
+// streaming sends many DATA frames in a row on one stream). The
+// reader is single-goroutine so the cache is race-free without
+// locking.
 func (h *hpackDecoderHolder) getLpmAccumulator(sid uint32) *lpmAccumulator {
+	if sid == h.lastSid && h.lastAcc != nil {
+		return h.lastAcc
+	}
 	if a, ok := h.lpmAccumulators[sid]; ok {
+		h.lastSid = sid
+		h.lastAcc = a
 		return a
 	}
 	a := &lpmAccumulator{}
 	h.lpmAccumulators[sid] = a
+	h.lastSid = sid
+	h.lastAcc = a
 	return a
 }
 
 // removeLpmAccumulator drops the accumulator for stream sid (called on
 // stream close: TRAILERS, RST_STREAM, or HEADERS-with-END_STREAM).
+// Invalidates the MRU cache when the removed sid matches AND clears
+// any in-flight pendingFrame state for that sid — without the latter,
+// a peer that sends DATA[partial-lpm]+RST_STREAM would leave the
+// pendingFrame slice from the dead stream queued; the next read would
+// replay it against a freshly-recreated accumulator on the same sid.
 func (h *hpackDecoderHolder) removeLpmAccumulator(sid uint32) {
 	delete(h.lpmAccumulators, sid)
+	if h.lastSid == sid {
+		h.lastSid = 0
+		h.lastAcc = nil
+	}
+	if h.pendingStreamID == sid {
+		h.pendingFrame = nil
+		h.pendingStreamID = 0
+		h.pendingFrameEndStream = false
+	}
 }
 
 // h2Encoder lazily initializes and returns the HPACK encoder for this
@@ -178,12 +239,19 @@ func (r *ShmRing) h2Decoder() *hpackDecoderHolder {
 //   - Custom16 wire is unaffected: it transports metadata as raw bytes
 //     end-to-end via encodeHeaders/encodeTrailers, never reaching this
 //     adapter.
+//   - HPACK header names MUST be lowercase (RFC 7540 §8.1.2). This is a
+//     hard requirement for real H2 peer interop — receivers that follow
+//     the spec strictly will reject any uppercase byte in the field name
+//     with PROTOCOL_ERROR. We lowercase here so callers can use whatever
+//     case suits them. The lowercase form is also what makes the "-bin"
+//     suffix detection match keys like "X-Custom-Bin".
 func writeMetadataField(enc *hpack.Encoder, name string, raw []byte) {
-	if strings.HasSuffix(name, binHdrSuffix) {
-		_ = enc.WriteField(hpack.HeaderField{Name: name, Value: encodeBinHeader(raw)})
+	lower := strings.ToLower(name)
+	if strings.HasSuffix(lower, binHdrSuffix) {
+		_ = enc.WriteField(hpack.HeaderField{Name: lower, Value: encodeBinHeader(raw)})
 		return
 	}
-	_ = enc.WriteField(hpack.HeaderField{Name: name, Value: string(raw)})
+	_ = enc.WriteField(hpack.HeaderField{Name: lower, Value: string(raw)})
 }
 
 // decodeMetadataValue materialises a metadata value from a decoded HPACK
@@ -191,14 +259,39 @@ func writeMetadataField(enc *hpack.Encoder, name string, raw []byte) {
 // malformed base64 by returning the raw HPACK bytes; matches stock
 // grpc-go's lenient behaviour (a strict reject here would tear down the
 // connection on a single bad header).
+//
+// Case-insensitive on the suffix check so a non-conformant peer that
+// sends an uppercase "-Bin" still gets binary semantics. Conformant
+// gRPC peers always send lowercase per RFC 7540 §8.1.2 so the lowercase
+// fast path covers the overwhelmingly common case.
 func decodeMetadataValue(name, hpackValue string) []byte {
-	if !strings.HasSuffix(name, binHdrSuffix) {
+	if !hasBinHeaderSuffix(name) {
 		return []byte(hpackValue)
 	}
 	if b, err := decodeBinHeader(hpackValue); err == nil {
 		return b
 	}
 	return []byte(hpackValue)
+}
+
+// hasBinHeaderSuffix is a case-insensitive equivalent of
+// strings.HasSuffix(name, binHdrSuffix). Avoids allocating a lowercased
+// copy of name when the suffix doesn't match anyway.
+func hasBinHeaderSuffix(name string) bool {
+	if len(name) < len(binHdrSuffix) {
+		return false
+	}
+	tail := name[len(name)-len(binHdrSuffix):]
+	for i := 0; i < len(binHdrSuffix); i++ {
+		c := tail[i]
+		if c >= 'A' && c <= 'Z' {
+			c += 'a' - 'A'
+		}
+		if c != binHdrSuffix[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // h2EncodeHeaders converts an in-memory HeadersV1 into HPACK-encoded bytes
@@ -221,8 +314,13 @@ func h2EncodeHeaders(enc *hpack.Encoder, scratch *bytes.Buffer, h HeadersV1) []b
 			if ns < 0 {
 				ns = 0
 			}
-			// gRPC encodes timeout as `<value><unit>`. Use nanoseconds for precision.
-			_ = enc.WriteField(hpack.HeaderField{Name: "grpc-timeout", Value: strconv.FormatInt(ns, 10) + "n"})
+			// gRPC encodes timeout as `<value><unit>`. The value MUST
+			// fit in 8 ASCII digits per gRFC G2 / gRPC-over-HTTP/2
+			// "Timeout"; grpcutil.EncodeDuration picks the largest unit
+			// that satisfies that constraint (e.g. 5s -> "5S", not
+			// "5000000000n", which strict peers reject as 10 digits).
+			_ = enc.WriteField(hpack.HeaderField{Name: "grpc-timeout",
+				Value: grpcutil.EncodeDuration(time.Duration(ns))})
 		}
 	} else {
 		// Server-initial.
@@ -243,7 +341,12 @@ func h2EncodeTrailers(enc *hpack.Encoder, scratch *bytes.Buffer, t TrailersV1) [
 	scratch.Reset()
 	_ = enc.WriteField(hpack.HeaderField{Name: "grpc-status", Value: strconv.FormatUint(uint64(t.GRPCStatusCode), 10)})
 	if t.GRPCStatusMsg != "" {
-		_ = enc.WriteField(hpack.HeaderField{Name: "grpc-message", Value: t.GRPCStatusMsg})
+		// gRPC-over-HTTP/2 requires grpc-message to be percent-encoded
+		// (gRFC G2 / 'Status & status-message'): only printable ASCII
+		// 0x20-0x7E except '%' is allowed verbatim; all other bytes
+		// must be %-escaped. encodeGrpcMessage handles the fast path
+		// (no escape needed) without allocation.
+		_ = enc.WriteField(hpack.HeaderField{Name: "grpc-message", Value: encodeGrpcMessage(t.GRPCStatusMsg)})
 	}
 	for _, kv := range t.Metadata {
 		for _, v := range kv.Values {
@@ -289,7 +392,7 @@ func (s *h2DecodeState) emit(hf hpack.HeaderField) {
 	case "te", "content-type":
 		// Standard gRPC headers; ignore for in-memory model.
 	case "grpc-timeout":
-		if d, perr := parseGrpcTimeout(hf.Value); perr == nil {
+		if d, perr := decodeTimeout(hf.Value); perr == nil {
 			s.h.DeadlineUnixNano = uint64(time.Now().Add(d).UnixNano())
 		}
 	case "grpc-status":
@@ -299,7 +402,9 @@ func (s *h2DecodeState) emit(hf hpack.HeaderField) {
 		}
 	case "grpc-message":
 		s.isTrailers = true
-		s.t.GRPCStatusMsg = hf.Value
+		// Reverse of encodeGrpcMessage. decodeGrpcMessage tolerates
+		// malformed escapes by returning the input unchanged.
+		s.t.GRPCStatusMsg = decodeGrpcMessage(hf.Value)
 	default:
 		// User metadata. Apply -bin base64 decode at the HPACK boundary
 		// per gRPC-over-HTTP/2 binary-headers rules (mirror of
@@ -346,34 +451,6 @@ func appendKV(metadata *[]KV, key string, val []byte) {
 	*metadata = append(*metadata, KV{Key: key, Values: [][]byte{val}})
 }
 
-// parseGrpcTimeout parses gRPC's `<value><unit>` timeout encoding.
-func parseGrpcTimeout(s string) (time.Duration, error) {
-	if len(s) < 2 {
-		return 0, errors.New("grpc-timeout too short")
-	}
-	unit := s[len(s)-1]
-	num, err := strconv.ParseInt(s[:len(s)-1], 10, 64)
-	if err != nil {
-		return 0, err
-	}
-	switch unit {
-	case 'n':
-		return time.Duration(num) * time.Nanosecond, nil
-	case 'u':
-		return time.Duration(num) * time.Microsecond, nil
-	case 'm':
-		return time.Duration(num) * time.Millisecond, nil
-	case 'S':
-		return time.Duration(num) * time.Second, nil
-	case 'M':
-		return time.Duration(num) * time.Minute, nil
-	case 'H':
-		return time.Duration(num) * time.Hour, nil
-	default:
-		return 0, fmt.Errorf("unknown grpc-timeout unit %q", unit)
-	}
-}
-
 // h2MaxHeaderListSize bounds the cumulative HPACK block size accepted
 // across a HEADERS + CONTINUATION sequence. A malicious peer streaming
 // gigabytes of HEADERS would otherwise OOM the receiver before any
@@ -381,6 +458,32 @@ func parseGrpcTimeout(s string) (time.Duration, error) {
 // realistic gRPC HEADERS block (rich grpc-status-details-bin trailers
 // in error responses are typically a few KiB).
 const h2MaxHeaderListSize = 8 * 1024 * 1024
+
+// h2MaxLPMBodyBytes bounds the LPM body length the codec is willing to
+// allocate for in a single gRPC message reassembled from H2 DATA
+// frames. Without this cap a peer could send a tiny DATA frame whose
+// 5-byte LPM header declares a multi-gigabyte body, and the
+// accumulator would attempt make([]byte, 0, declared) before any
+// upper-layer MaxRecvMsgSize check has a chance to reject it. The cap
+// is a transport-level DoS bound; per-stream limits set by
+// grpc.MaxCallRecvMsgSize / grpc.MaxRecvMsgSize still apply
+// independently and may further restrict acceptable sizes.
+//
+// 512 MiB is set well above the largest body benchmarked by the proto
+// suite (256 MiB user payload, which serialises to ~256 MiB + 6 bytes
+// after protobuf wrapping). Any peer requiring more than this should
+// stream rather than send a single unary message.
+const h2MaxLPMBodyBytes = 512 * 1024 * 1024
+
+// h2MaxContinuationFrames bounds the number of CONTINUATION frames a
+// peer may emit while assembling one logical HEADERS block. Defends
+// against a peer that streams an unbounded number of zero-length
+// CONTINUATION frames — the cumulative-byte cap above never trips
+// because the payload contributes nothing, but each iteration still
+// consumes 9 bytes of ring header and CPU. Picked well above what any
+// real gRPC peer would emit (with SETTINGS_MAX_FRAME_SIZE = 16 MiB-1
+// the absolute maximum is one CONTINUATION).
+const h2MaxContinuationFrames = 256
 
 // readH2HeadersWithContinuations assembles a complete HPACK header block
 // for a HEADERS frame whose first fragment did not carry END_HEADERS.
@@ -423,7 +526,13 @@ func readH2HeadersWithContinuations(
 	assembled := make([]byte, 0, initialCap)
 	assembled = append(assembled, firstPayload...)
 
+	frameCount := 0
 	for {
+		frameCount++
+		if frameCount > h2MaxContinuationFrames {
+			return nil, fmt.Errorf("h2 HEADERS+CONTINUATION exceeded %d frames (DoS guard)",
+				h2MaxContinuationFrames)
+		}
 		// Read the next 9-byte H2 frame header.
 		first, second, commitHdr, err := rx.ReadSlices(ctx, h2FrameHeaderSize)
 		if err != nil {
@@ -479,15 +588,83 @@ func readH2HeadersWithContinuations(
 	}
 }
 
+// stripDataPadding removes the PADDED flag's prefix/suffix from a DATA
+// frame body per RFC 7540 §6.1. When PADDED is not set, returns the
+// input unchanged. When PADDED is set, the first byte is the pad
+// length, followed by the actual data, followed by `pad length` zero
+// bytes; we trim both ends and return only the payload.
+//
+// Returns an error if the pad length exceeds the available bytes
+// (FRAME_SIZE_ERROR per RFC).
+//
+// gRPC peers do not normally send PADDED DATA, but a standards-
+// compliant H2 sender (Kestrel, nginx, envoy) may legally do so when
+// it satisfies an upper-layer alignment or DoS-mitigation policy.
+func stripDataPadding(payload []byte, flags byte) ([]byte, error) {
+	if flags&H2FlagPadded == 0 {
+		return payload, nil
+	}
+	if len(payload) < 1 {
+		return nil, errors.New("h2 DATA PADDED with empty payload (RFC 7540 §6.1 FRAME_SIZE_ERROR)")
+	}
+	padLen := int(payload[0])
+	if 1+padLen > len(payload) {
+		return nil, fmt.Errorf("h2 DATA pad length %d exceeds available payload %d (RFC 7540 §6.1)",
+			padLen, len(payload)-1)
+	}
+	return payload[1 : len(payload)-padLen], nil
+}
+
+// stripHeadersPaddingAndPriority removes the PADDED flag's pad-length
+// prefix + trailing padding and the PRIORITY flag's 5-byte priority
+// prefix from a HEADERS frame body per RFC 7540 §6.2. Returns the
+// HPACK fragment slice. The PRIORITY weight/dependency information is
+// dropped — gRPC does not surface it (and RFC 9113 deprecates it).
+//
+// Errors on malformed lengths (FRAME_SIZE_ERROR per RFC).
+func stripHeadersPaddingAndPriority(payload []byte, flags byte) ([]byte, error) {
+	if flags&(H2FlagPadded|H2FlagPriority) == 0 {
+		return payload, nil
+	}
+	out := payload
+	padLen := 0
+	if flags&H2FlagPadded != 0 {
+		if len(out) < 1 {
+			return nil, errors.New("h2 HEADERS PADDED with empty payload (RFC 7540 §6.2 FRAME_SIZE_ERROR)")
+		}
+		padLen = int(out[0])
+		out = out[1:]
+	}
+	if flags&H2FlagPriority != 0 {
+		// 5-byte stream-dependency + weight prefix.
+		if len(out) < 5 {
+			return nil, errors.New("h2 HEADERS PRIORITY prefix shorter than 5 bytes (RFC 7540 §6.2 FRAME_SIZE_ERROR)")
+		}
+		out = out[5:]
+	}
+	if padLen > len(out) {
+		return nil, fmt.Errorf("h2 HEADERS pad length %d exceeds remaining payload %d (RFC 7540 §6.2)",
+			padLen, len(out))
+	}
+	return out[:len(out)-padLen], nil
+}
+
 // validateH2ControlFrame checks the per-RFC 7540 invariants of the
 // control-frame types the codec understands (RST_STREAM, SETTINGS, PING,
-// GOAWAY, WINDOW_UPDATE). Returns a non-nil error when the frame is
-// malformed; the caller is responsible for ensuring the malformed
-// payload bytes are committed to keep the ring read pointer in sync
-// before propagating the error up.
+// GOAWAY, WINDOW_UPDATE, plus stream-id checks for DATA/HEADERS).
+// Returns a non-nil error when the frame is malformed; the caller is
+// responsible for ensuring the malformed payload bytes are committed to
+// keep the ring read pointer in sync before propagating the error up.
 //
 // Validations enforced:
 //
+//   - DATA (§6.1): stream id MUST be non-zero. Receiving DATA on stream 0
+//     is a connection error of type PROTOCOL_ERROR; silently accepting
+//     it would let a buggy/malicious peer inject DATA into our stream-0
+//     dispatch slot which the upper layer treats as connection-control.
+//   - HEADERS (§6.2): stream id MUST be non-zero. Same reasoning as DATA;
+//     additionally combines badly with our CONTINUATION assembly logic,
+//     which would otherwise key the assembly state on streamID 0.
 //   - RST_STREAM (§6.4): payload length MUST be exactly 4; stream id
 //     MUST be non-zero. Length-tampered RST_STREAM in particular could
 //     otherwise silently change call state on the receiver, since we
@@ -505,6 +682,14 @@ func readH2HeadersWithContinuations(
 // accepting them masks peer bugs at integration time.
 func validateH2ControlFrame(h2fh H2FrameHeader) error {
 	switch h2fh.Type {
+	case H2FrameDATA:
+		if h2fh.StreamID == 0 {
+			return errors.New("h2 DATA frame must have streamID != 0 (RFC 7540 §6.1)")
+		}
+	case H2FrameHEADERS:
+		if h2fh.StreamID == 0 {
+			return errors.New("h2 HEADERS frame must have streamID != 0 (RFC 7540 §6.2)")
+		}
 	case H2FrameRSTSTREAM:
 		if h2fh.Length != 4 || h2fh.StreamID == 0 {
 			return fmt.Errorf("h2 RST_STREAM malformed (streamID=%d, length=%d; require streamID != 0 && length == 4)",
@@ -547,9 +732,16 @@ func validateH2ControlFrame(h2fh H2FrameHeader) error {
 func translateCustomToH2(fh FrameHeader) (H2FrameType, byte) {
 	switch fh.Type {
 	case FrameTypeMESSAGE:
-		// MORE flag means "more chunks follow" — not END_STREAM.
-		// Otherwise still not END_STREAM (server uses TRAILERS to end).
-		return H2FrameDATA, 0
+		// END_STREAM is set on the wire only when the caller signalled
+		// MessageFlagEndStream (logical "this is the last message
+		// from MY send direction"). Set by the client transport on
+		// its last request message; never set by the server. See
+		// MessageFlagEndStream's docstring in frame.go.
+		var f byte
+		if fh.Flags&MessageFlagEndStream != 0 {
+			f = H2FlagEndStream
+		}
+		return H2FrameDATA, f
 	case FrameTypeHEADERS:
 		return H2FrameHEADERS, H2FlagEndHeaders
 	case FrameTypeTRAILERS:
@@ -637,45 +829,6 @@ func goawayPayloadH2(custom []byte) []byte {
 	return out
 }
 
-// windowUpdatePayload encodes a WINDOW_UPDATE payload (4-byte increment).
-func windowUpdatePayload(increment uint32) []byte {
-	var b [4]byte
-	binary.BigEndian.PutUint32(b[:], increment&0x7FFFFFFF)
-	return b[:]
-}
-
-// statusCodeToH2Err maps a gRPC status code to an H2 error code for
-// RST_STREAM. Most cancellations use Cancel; flow-control violations use
-// FlowControlError.
-func statusCodeToH2Err(c codes.Code) H2ErrorCode {
-	switch c {
-	case codes.Canceled:
-		return H2ErrCancel
-	case codes.ResourceExhausted:
-		return H2ErrFlowControlError
-	case codes.Unavailable:
-		return H2ErrRefusedStream
-	default:
-		return H2ErrInternalError
-	}
-}
-
-// pingPayloadH2 encodes a PING payload (8 bytes opaque).
-// gRPC SHM uses the first 8 bytes of the legacy Custom16 payload.
-func pingPayloadH2(opaque []byte) []byte {
-	var b [8]byte
-	copy(b[:], opaque)
-	return b[:]
-}
-
-// extractPingOpaque pulls the 8-byte opaque PING payload (RFC 7540 §6.7).
-func extractPingOpaque(payload []byte) ([]byte, error) {
-	if len(payload) != 8 {
-		return nil, fmt.Errorf("h2 PING payload must be 8 bytes, got %d", len(payload))
-	}
-	return payload, nil
-}
-
 // readFrameH2 reads one logical SHM frame from a ring whose wire format is
 // HTTP/2. Multi-frame H2 payloads (CONTINUATION, fragmented HEADERS) and
 // chunked DATA are coalesced into a single FrameHeader+payload return.
@@ -696,31 +849,70 @@ func extractPingOpaque(payload []byte) ([]byte, error) {
 // is handled by readFrameViewH2.
 func readFrameH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolder) (FrameHeader, []byte, error) {
 	for {
+		// Synthetic HALFCLOSE: an earlier read returned an initial
+		// HEADERS that carried END_STREAM (zero-message client
+		// stream). Surface the deferred half-close before touching
+		// the ring so the upper-layer state machine sees HEADERS
+		// then HALFCLOSE in the right order.
+		if holder.pendingHalfCloseStreamID != 0 {
+			sid := holder.pendingHalfCloseStreamID
+			holder.pendingHalfCloseStreamID = 0
+			holder.removeLpmAccumulator(sid)
+			return FrameHeader{
+				Type: FrameTypeHALFCLOSE, StreamID: sid, Length: 0,
+			}, nil, nil
+		}
+
 		// First check if there's leftover data from a previous DATA
 		// frame that contained the start of the next LPM.
 		if len(holder.pendingFrame) > 0 {
 			sid := holder.pendingStreamID
 			data := holder.pendingFrame
+			endStream := holder.pendingFrameEndStream
 			holder.pendingFrame = nil
+			holder.pendingFrameEndStream = false
 			acc := holder.getLpmAccumulator(sid)
-			msg, leftover, ferr := acc.feed(data, 0)
+			msg, leftover, ferr := acc.feed(data, h2MaxLPMBodyBytes)
 			if ferr != nil {
 				return FrameHeader{}, nil, ferr
 			}
 			if len(leftover) > 0 {
+				// Carry END_STREAM forward to the next replay so a
+				// multi-LPM DATA frame ending the stream emits MORE=0
+				// after the LAST LPM, not after the first.
 				holder.pendingFrame = leftover
 				holder.pendingStreamID = sid
+				holder.pendingFrameEndStream = endStream
 			}
 			if msg != nil {
+				// Set MessageFlagMORE based on END_STREAM + leftover:
+				// MORE=1 when more messages follow (either more LPMs
+				// queued OR more frames coming), MORE=0 only on the
+				// last LPM of the END_STREAM-bearing DATA frame.
+				// ShmServerTransport.handleMessage uses MORE=0 to
+				// detect client half-close.
+				msgFlags := MessageFlagMORE
+				if endStream && len(leftover) == 0 {
+					msgFlags = 0
+					holder.removeLpmAccumulator(sid)
+				}
 				return FrameHeader{
 					Type:     FrameTypeMESSAGE,
 					StreamID: sid,
 					Length:   uint32(len(msg)),
-					Flags:    0,
+					Flags:    msgFlags,
 				}, msg, nil
 			}
-			// Accumulator still in-progress (only header consumed); fall
-			// through to read the next H2 DATA frame.
+			// Accumulator still in-progress (only header consumed): if
+			// the source DATA frame had END_STREAM AND the current
+			// feed produced no message AND there's still bytes left to
+			// arrive (acc.inProgress, no leftover, no msg), the peer
+			// truncated the LPM mid-message — connection-fatal per
+			// gRPC framing.
+			if endStream && len(leftover) == 0 && acc.inProgress() {
+				return FrameHeader{}, nil, errors.New("h2: END_STREAM with incomplete LPM in pendingFrame replay")
+			}
+			// Otherwise fall through to read the next H2 DATA frame.
 		}
 
 		// Read 9-byte H2 frame header.
@@ -779,9 +971,39 @@ func readFrameH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolder) (
 			// where the per-stream HEADERS state is tracked.
 			return FrameHeader{}, nil, errors.New("h2 CONTINUATION frame received outside a HEADERS sequence (RFC 7540 §6.10)")
 		case H2FrameDATA:
+			// RFC 7540 §6.1: PADDED DATA carries a 1-byte pad-length
+			// prefix and trailing padding. Strip both before LPM parse.
+			// gRPC peers don't normally pad, but a standards-compliant
+			// H2 sender legally may.
+			//
+			// PADDED with Length=0 is illegal — the mandatory pad-
+			// length prefix can't fit (FRAME_SIZE_ERROR per §6.1).
+			// stripDataPadding's len < 1 guard catches this.
+			if h2fh.Flags&H2FlagPadded != 0 {
+				stripped, serr := stripDataPadding(payload, h2fh.Flags)
+				if serr != nil {
+					return FrameHeader{}, nil, serr
+				}
+				payload = stripped
+			}
 			// Empty DATA + END_STREAM = HALFCLOSE.
 			if len(payload) == 0 {
 				if h2fh.Flags&H2FlagEndStream != 0 {
+					// If the per-stream accumulator is mid-message,
+					// END_STREAM here truncates the LPM. Per gRPC
+					// framing this is a connection-fatal protocol
+					// error; silently dropping the partial bytes
+					// would corrupt the application's view of the
+					// stream.
+					if acc, ok := holder.lpmAccumulators[h2fh.StreamID]; ok && acc.inProgress() {
+						holder.removeLpmAccumulator(h2fh.StreamID)
+						return FrameHeader{}, nil, errors.New("h2: END_STREAM on empty DATA with incomplete LPM in accumulator")
+					}
+					// Drop any per-stream accumulator so a long-lived
+					// connection doesn't leak map entries when streams
+					// end via empty-DATA+END_STREAM (the canonical
+					// shape our own writer emits via translateCustomToH2).
+					holder.removeLpmAccumulator(h2fh.StreamID)
 					return FrameHeader{
 						Type: FrameTypeHALFCLOSE, StreamID: h2fh.StreamID, Length: 0,
 					}, nil, nil
@@ -796,17 +1018,23 @@ func readFrameH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolder) (
 			if !acc.inProgress() && len(payload) >= 5 {
 				bodyLen := int(binary.BigEndian.Uint32(payload[1:5]))
 				if 5+bodyLen == len(payload) {
-					// Stream-end on this DATA frame implies the next
-					// HEADERS/TRAILERS will arrive; clean accumulator
-					// state preemptively so a stale entry can't grow.
+					// Set MORE flag based on END_STREAM:
+					// MORE=0 signals client half-close on the server
+					// transport (handleMessage uses MORE=0 to write
+					// io.EOF); peer-set END_STREAM on a DATA carrying
+					// exactly one complete LPM is the canonical
+					// "last message" shape from grpc-go HTTP/2,
+					// grpc-java, grpc-c++.
+					msgFlags := MessageFlagMORE
 					if h2fh.Flags&H2FlagEndStream != 0 {
+						msgFlags = 0
 						holder.removeLpmAccumulator(h2fh.StreamID)
 					}
 					return FrameHeader{
 						Type:     FrameTypeMESSAGE,
 						StreamID: h2fh.StreamID,
 						Length:   uint32(len(payload)),
-						Flags:    0,
+						Flags:    msgFlags,
 					}, payload, nil
 				}
 			}
@@ -814,23 +1042,34 @@ func readFrameH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolder) (
 			// Multi-frame / multi-message path: feed the accumulator.
 			data := payload
 			for len(data) > 0 {
-				msg, leftover, ferr := acc.feed(data, 0)
+				msg, leftover, ferr := acc.feed(data, h2MaxLPMBodyBytes)
 				if ferr != nil {
 					return FrameHeader{}, nil, ferr
 				}
 				if msg != nil {
 					// Stash any leftover (start of next LPM in the same
 					// DATA frame) for the next iteration of the outer
-					// readFrameH2 loop.
+					// readFrameH2 loop. Carry END_STREAM forward to the
+					// replay path so a multi-LPM DATA frame ending the
+					// stream emits MORE=0 after the LAST LPM, not the
+					// first one.
+					msgFlags := MessageFlagMORE
 					if len(leftover) > 0 {
 						holder.pendingFrame = leftover
 						holder.pendingStreamID = h2fh.StreamID
+						holder.pendingFrameEndStream = h2fh.Flags&H2FlagEndStream != 0
+					} else if h2fh.Flags&H2FlagEndStream != 0 {
+						// Last LPM of the END_STREAM-bearing DATA
+						// frame: signal client half-close to the
+						// upper transport via MORE=0.
+						msgFlags = 0
+						holder.removeLpmAccumulator(h2fh.StreamID)
 					}
 					return FrameHeader{
 						Type:     FrameTypeMESSAGE,
 						StreamID: h2fh.StreamID,
 						Length:   uint32(len(msg)),
-						Flags:    0,
+						Flags:    msgFlags,
 					}, msg, nil
 				}
 				// feed consumed all of data into the accumulator without
@@ -847,15 +1086,32 @@ func readFrameH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolder) (
 			// HPACK-decode and convert to Custom16 HeadersV1 / TrailersV1
 			// payload format the rest of the transport expects.
 			//
+			// RFC 7540 §6.2: PADDED and PRIORITY flags add a 1-byte
+			// pad-length prefix and a 5-byte priority prefix to the
+			// HEADERS body before the HPACK fragment, plus trailing
+			// padding bytes. Strip these before HPACK decode. gRPC
+			// peers don't typically set these flags, but
+			// standards-compliant senders may, and the H2 spec requires
+			// receivers to handle them.
+			//
 			// If END_HEADERS is missing, assemble the full HPACK block
 			// from subsequent CONTINUATION frames before decoding (RFC
 			// 7540 §6.10). The single-fragment fast path (END_HEADERS
 			// already set) is the overwhelmingly common case in gRPC;
 			// the slow path triggers only when a peer's HEADERS payload
-			// exceeds SETTINGS_MAX_FRAME_SIZE.
+			// exceeds SETTINGS_MAX_FRAME_SIZE. Padding/priority is
+			// only carried on the FIRST fragment so we strip it here
+			// before passing to the CONTINUATION assembler.
 			hpackBlock := payload
+			if h2fh.Flags&(H2FlagPadded|H2FlagPriority) != 0 {
+				stripped, serr := stripHeadersPaddingAndPriority(hpackBlock, h2fh.Flags)
+				if serr != nil {
+					return FrameHeader{}, nil, serr
+				}
+				hpackBlock = stripped
+			}
 			if h2fh.Flags&H2FlagEndHeaders == 0 {
-				hpackBlock, err = readH2HeadersWithContinuations(ctx, rx, h2fh.StreamID, payload)
+				hpackBlock, err = readH2HeadersWithContinuations(ctx, rx, h2fh.StreamID, hpackBlock)
 				if err != nil {
 					return FrameHeader{}, nil, err
 				}
@@ -865,7 +1121,15 @@ func readFrameH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolder) (
 				return FrameHeader{}, nil, derr
 			}
 			if isTrailers {
-				// Stream is ending — drop accumulator state.
+				// TRAILERS ends the stream. If the per-stream
+				// accumulator is mid-message the request body was
+				// truncated mid-LPM; surface a connection-fatal
+				// error rather than silently dropping the partial
+				// bytes.
+				if acc, ok := holder.lpmAccumulators[h2fh.StreamID]; ok && acc.inProgress() {
+					holder.removeLpmAccumulator(h2fh.StreamID)
+					return FrameHeader{}, nil, errors.New("h2: TRAILERS with incomplete LPM in accumulator")
+				}
 				holder.removeLpmAccumulator(h2fh.StreamID)
 				out := encodeTrailers(t)
 				return FrameHeader{
@@ -876,6 +1140,15 @@ func readFrameH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolder) (
 				}, out, nil
 			}
 			out := encodeHeaders(h)
+			// Initial HEADERS may carry END_STREAM (zero-message
+			// client stream). Defer a synthetic HALFCLOSE so the
+			// next read fires the upper-layer client-half-close
+			// path; otherwise the stream would be created by
+			// ShmServerTransport.handleHeaders and then hang
+			// waiting for a MESSAGE that never arrives.
+			if h2fh.Flags&H2FlagEndStream != 0 {
+				holder.pendingHalfCloseStreamID = h2fh.StreamID
+			}
 			return FrameHeader{
 				Type:     FrameTypeHEADERS,
 				StreamID: h2fh.StreamID,
@@ -932,29 +1205,56 @@ func readFrameH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolder) (
 //     enough, at-most-one-ZC, < 75% full)
 func readFrameViewH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolder) (FrameHeader, mem.Buffer, error) {
 	for {
+		// Synthetic HALFCLOSE deferred from an earlier HEADERS+
+		// END_STREAM read. See readFrameH2's matching block.
+		if holder.pendingHalfCloseStreamID != 0 {
+			sid := holder.pendingHalfCloseStreamID
+			holder.pendingHalfCloseStreamID = 0
+			holder.removeLpmAccumulator(sid)
+			return FrameHeader{
+				Type: FrameTypeHALFCLOSE, StreamID: sid,
+			}, nil, nil
+		}
+
 		// Drain any pending leftover from a previous DATA frame first.
 		// These bytes already lived in heap-allocated form (pendingFrame
 		// is a copy, not a ring slice), so ZC isn't applicable here.
 		if len(holder.pendingFrame) > 0 {
 			sid := holder.pendingStreamID
 			data := holder.pendingFrame
+			endStream := holder.pendingFrameEndStream
 			holder.pendingFrame = nil
+			holder.pendingFrameEndStream = false
 			acc := holder.getLpmAccumulator(sid)
-			msg, leftover, ferr := acc.feed(data, 0)
+			msg, leftover, ferr := acc.feed(data, h2MaxLPMBodyBytes)
 			if ferr != nil {
 				return FrameHeader{}, nil, ferr
 			}
 			if len(leftover) > 0 {
 				holder.pendingFrame = leftover
 				holder.pendingStreamID = sid
+				holder.pendingFrameEndStream = endStream
 			}
 			if msg != nil {
-				buf := mem.Copy(msg, mem.DefaultBufferPool())
+				// MORE flag: see readFrameH2's matching block.
+				msgFlags := MessageFlagMORE
+				if endStream && len(leftover) == 0 {
+					msgFlags = 0
+					holder.removeLpmAccumulator(sid)
+				}
+				// acc.buf is already a heap-owned slice of the exact
+				// LPM size; wrap directly via mem.NewBuffer(&msg, nil)
+				// (no-op Free) instead of pool.Get + memcpy.
 				return FrameHeader{
 					Type:     FrameTypeMESSAGE,
 					StreamID: sid,
 					Length:   uint32(len(msg)),
-				}, buf, nil
+					Flags:    msgFlags,
+				}, mem.NewBuffer(&msg, nil), nil
+			}
+			// Truncated LPM at end of stream: connection-fatal.
+			if endStream && len(leftover) == 0 && acc.inProgress() {
+				return FrameHeader{}, nil, errors.New("h2: END_STREAM with incomplete LPM in pendingFrame replay")
 			}
 		}
 
@@ -1017,8 +1317,24 @@ func readFrameViewH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolde
 			return FrameHeader{}, nil, errors.New("h2 CONTINUATION frame received outside a HEADERS sequence (RFC 7540 §6.10)")
 
 		case H2FrameDATA:
+			// PADDED with Length=0 is illegal: the mandatory 1-byte
+			// pad-length prefix can't fit. Per RFC 7540 §6.1
+			// FRAME_SIZE_ERROR. Check this BEFORE the empty-DATA
+			// HALFCLOSE shortcut below — otherwise a malformed
+			// PADDED|END_STREAM frame would surface as a valid
+			// half-close.
+			if h2fh.Flags&H2FlagPadded != 0 && h2fh.Length == 0 {
+				return FrameHeader{}, nil, errors.New("h2 DATA PADDED with empty payload (RFC 7540 §6.1 FRAME_SIZE_ERROR)")
+			}
 			if h2fh.Length == 0 {
 				if h2fh.Flags&H2FlagEndStream != 0 {
+					if acc, ok := holder.lpmAccumulators[h2fh.StreamID]; ok && acc.inProgress() {
+						holder.removeLpmAccumulator(h2fh.StreamID)
+						return FrameHeader{}, nil, errors.New("h2: END_STREAM on empty DATA with incomplete LPM in accumulator")
+					}
+					// Drop any per-stream accumulator (see matching
+					// branch in readFrameH2).
+					holder.removeLpmAccumulator(h2fh.StreamID)
 					return FrameHeader{
 						Type: FrameTypeHALFCLOSE, StreamID: h2fh.StreamID,
 					}, nil, nil
@@ -1029,135 +1345,168 @@ func readFrameViewH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolde
 			acc := holder.getLpmAccumulator(h2fh.StreamID)
 			payloadLen := int(h2fh.Length)
 
-			// === ZC fast path ===
-			//
-			// Conditions:
-			//   - accumulator empty (no in-progress chain)
-			//   - body contiguous (no ring wrap)
-			//   - body fully contains exactly one LPM
-			//   - rx.IsSpeculativeZCEligible (large enough ring/payload,
-			//     at-most-one-ZC, not under back-pressure)
-			//
-			// The body bytes returned to the caller include the gRPC LPM
-			// 5-byte prefix, matching Custom16 readFrameView.
-			if !acc.inProgress() && len(pSecond) == 0 && len(pFirst) >= 5 {
-				bodyLen := int(binary.BigEndian.Uint32(pFirst[1:5]))
-				if 5+bodyLen == payloadLen && rx.IsSpeculativeZCEligible(payloadLen, true) {
-					// Arm the ZC anchor with the post-frame target, then
-					// don't call commitPayload.Commit — the deferred
-					// target already accounts for these bytes.
-					baseIdx := commitPayload.commitReadIdx
-					rx.BeginSingleFrameZcCommit(baseIdx, payloadLen)
-					rx.AddChainZcInFlight()
+			// PADDED DATA frames carry a 1-byte pad-length prefix and
+			// trailing padding (RFC 7540 §6.1). The ZC / single-frame
+			// fast paths below assume the ring slice IS the LPM body;
+			// with padding present the LPM length match and ring-slice
+			// bounds would be wrong. When PADDED is set, fall through
+			// directly to the heap-copy multi-frame path which applies
+			// stripDataPadding after copy. gRPC peers don't send
+			// PADDED in practice, so the fast-path skip costs nothing
+			// in the common case.
+			isPadded := h2fh.Flags&H2FlagPadded != 0
+			if !isPadded {
 
-					// Pre-emptively clean accumulator state if END_STREAM
-					// arrives on this DATA frame.
-					if h2fh.Flags&H2FlagEndStream != 0 {
-						holder.removeLpmAccumulator(h2fh.StreamID)
+				// === ZC fast path ===
+				//
+				// Conditions:
+				//   - accumulator empty (no in-progress chain)
+				//   - body contiguous (no ring wrap)
+				//   - body fully contains exactly one LPM
+				//   - rx.IsSpeculativeZCEligible (large enough ring/payload,
+				//     at-most-one-ZC, not under back-pressure)
+				//
+				// The body bytes returned to the caller include the gRPC LPM
+				// 5-byte prefix, matching Custom16 readFrameView.
+				if !acc.inProgress() && len(pSecond) == 0 && len(pFirst) >= 5 {
+					bodyLen := int(binary.BigEndian.Uint32(pFirst[1:5]))
+					if 5+bodyLen == payloadLen && rx.IsSpeculativeZCEligible(payloadLen, true) {
+						// Arm the ZC anchor with the post-frame target, then
+						// don't call commitPayload.Commit — the deferred
+						// target already accounts for these bytes.
+						baseIdx := commitPayload.commitReadIdx
+						rx.BeginSingleFrameZcCommit(baseIdx, payloadLen)
+						rx.AddChainZcInFlight()
+
+						// Set MORE flag based on END_STREAM. MORE=0
+						// signals client half-close to the server
+						// transport (ShmServerTransport.handleMessage
+						// uses MORE=0 to write io.EOF). Required for
+						// cross-impl interop with grpc-go HTTP/2,
+						// grpc-java, grpc-c++ which set END_STREAM on
+						// the last DATA frame carrying body bytes.
+						msgFlags := MessageFlagMORE
+						if h2fh.Flags&H2FlagEndStream != 0 {
+							msgFlags = 0
+							holder.removeLpmAccumulator(h2fh.StreamID)
+						}
+
+						ringSlice := pFirst[:payloadLen:payloadLen]
+						pool := &zcChainReleasePool{ring: rx}
+						buf := mem.NewBuffer(&ringSlice, pool)
+						return FrameHeader{
+							Type:     FrameTypeMESSAGE,
+							StreamID: h2fh.StreamID,
+							Length:   uint32(payloadLen),
+							Flags:    msgFlags,
+						}, buf, nil
 					}
-
-					ringSlice := pFirst[:payloadLen:payloadLen]
-					pool := &zcChainReleasePool{ring: rx}
-					buf := mem.NewBuffer(&ringSlice, pool)
-					return FrameHeader{
-						Type:     FrameTypeMESSAGE,
-						StreamID: h2fh.StreamID,
-						Length:   uint32(payloadLen),
-					}, buf, nil
 				}
-			}
 
-			// === Single-frame copy fast path ===
-			//
-			// Body fits entirely in this DATA frame and contains exactly
-			// one complete LPM (5+bodyLen == payloadLen). Copy directly
-			// to a pool buffer, bypassing the lpmAccumulator. Without
-			// this path, the accumulator allocates `make([]byte,
-			// payloadLen)` for the heap copy AND its own `acc.buf` then
-			// appends into it — two allocs + two memcpys per frame.
-			// Single mem.Copy gives us one alloc + one memcpy, matching
-			// Custom16 readFrameView's parity.
-			//
-			// Reads the 5-byte LPM header from the (possibly split) ring
-			// slice via a small stack array so the fast path applies
-			// even when the body wraps.
-			if !acc.inProgress() && len(pFirst)+len(pSecond) == payloadLen && payloadLen >= 5 {
-				var hdr [5]byte
-				n := copy(hdr[:], pFirst)
-				if n < 5 {
-					copy(hdr[n:], pSecond)
-				}
-				bodyLen := int(binary.BigEndian.Uint32(hdr[1:5]))
-				if 5+bodyLen == payloadLen {
-					var buf mem.Buffer
-					if len(pSecond) == 0 {
-						buf = mem.Copy(pFirst[:payloadLen], mem.DefaultBufferPool())
-					} else {
-						pool := mem.DefaultBufferPool()
-						poolBuf := pool.Get(payloadLen)
-						cn := copy(*poolBuf, pFirst)
-						copy((*poolBuf)[cn:], pSecond)
-						buf = mem.NewBuffer(poolBuf, pool)
+				// === Single-frame copy fast path ===
+				//
+				// Body fits entirely in this DATA frame and contains exactly
+				// one complete LPM (5+bodyLen == payloadLen). Copy directly
+				// to a pool buffer, bypassing the lpmAccumulator. Without
+				// this path, the accumulator allocates `make([]byte,
+				// payloadLen)` for the heap copy AND its own `acc.buf` then
+				// appends into it — two allocs + two memcpys per frame.
+				// Single mem.Copy gives us one alloc + one memcpy, matching
+				// Custom16 readFrameView's parity.
+				//
+				// Reads the 5-byte LPM header from the (possibly split) ring
+				// slice via a small stack array so the fast path applies
+				// even when the body wraps.
+				if !acc.inProgress() && len(pFirst)+len(pSecond) == payloadLen && payloadLen >= 5 {
+					var hdr [5]byte
+					n := copy(hdr[:], pFirst)
+					if n < 5 {
+						copy(hdr[n:], pSecond)
 					}
+					bodyLen := int(binary.BigEndian.Uint32(hdr[1:5]))
+					if 5+bodyLen == payloadLen {
+						var buf mem.Buffer
+						if len(pSecond) == 0 {
+							buf = mem.Copy(pFirst[:payloadLen], mem.DefaultBufferPool())
+						} else {
+							pool := mem.DefaultBufferPool()
+							poolBuf := pool.Get(payloadLen)
+							cn := copy(*poolBuf, pFirst)
+							copy((*poolBuf)[cn:], pSecond)
+							buf = mem.NewBuffer(poolBuf, pool)
+						}
+						commitPayload.Commit(payloadLen)
+						// MORE flag based on END_STREAM (see ZC fast
+						// path above).
+						msgFlags := MessageFlagMORE
+						if h2fh.Flags&H2FlagEndStream != 0 {
+							msgFlags = 0
+							holder.removeLpmAccumulator(h2fh.StreamID)
+						}
+						return FrameHeader{
+							Type:     FrameTypeMESSAGE,
+							StreamID: h2fh.StreamID,
+							Length:   uint32(payloadLen),
+							Flags:    msgFlags,
+						}, buf, nil
+					}
+				}
+
+				// === Multi-frame / multi-LPM path ===
+				//
+				// Body is a fragment of an in-progress LPM, or contains
+				// multiple LPMs. Two sub-paths:
+				//
+				//  1. Mid-chain fast path: accumulator already in progress
+				//     AND this entire DATA frame fits within the remaining
+				//     LPM bytes (no completion / new LPM mid-frame). Append
+				//     ring slices directly into acc.buf, avoiding the
+				//     intermediate `make([]byte, payloadLen) + copy`. This
+				//     halves the per-chunk memcpy budget for messages
+				//     chunked at cap/8 (e.g., 16 MiB body → 8/8/5 chunks).
+				//
+				//  2. Slow path: copy ring → heap, run accumulator (handles
+				//     LPM completion + leftover bytes that start a new LPM
+				//     in the same DATA frame).
+				//
+				// Both paths return the accumulator's heap buffer wrapped
+				// via mem.NewBuffer(&msg, nil) (no pool round-trip), saving
+				// one further mem.Copy that the prior code performed.
+				if acc.inProgress() && acc.expectedTotal-acc.pos >= payloadLen {
+					acc.buf = append(acc.buf, pFirst...)
+					if len(pSecond) > 0 {
+						acc.buf = append(acc.buf, pSecond...)
+					}
+					acc.pos += payloadLen
 					commitPayload.Commit(payloadLen)
+					if acc.pos != acc.expectedTotal {
+						if h2fh.Flags&H2FlagEndStream != 0 {
+							return FrameHeader{}, nil, errors.New("h2: END_STREAM with incomplete LPM in accumulator")
+						}
+						continue
+					}
+					msg := acc.buf
+					acc.headerBytesSeen = 0
+					acc.expectedTotal = 0
+					acc.pos = 0
+					acc.buf = nil
+					// Mid-chain accumulator complete: this chunk fully
+					// finished the in-progress LPM AND fit within
+					// remaining bytes (no leftover possible by
+					// definition). Set MORE flag based on END_STREAM.
+					msgFlags := MessageFlagMORE
 					if h2fh.Flags&H2FlagEndStream != 0 {
+						msgFlags = 0
 						holder.removeLpmAccumulator(h2fh.StreamID)
 					}
 					return FrameHeader{
 						Type:     FrameTypeMESSAGE,
 						StreamID: h2fh.StreamID,
-						Length:   uint32(payloadLen),
-					}, buf, nil
+						Length:   uint32(len(msg)),
+						Flags:    msgFlags,
+					}, mem.NewBuffer(&msg, nil), nil
 				}
-			}
-
-			// === Multi-frame / multi-LPM path ===
-			//
-			// Body is a fragment of an in-progress LPM, or contains
-			// multiple LPMs. Two sub-paths:
-			//
-			//  1. Mid-chain fast path: accumulator already in progress
-			//     AND this entire DATA frame fits within the remaining
-			//     LPM bytes (no completion / new LPM mid-frame). Append
-			//     ring slices directly into acc.buf, avoiding the
-			//     intermediate `make([]byte, payloadLen) + copy`. This
-			//     halves the per-chunk memcpy budget for messages
-			//     chunked at cap/8 (e.g., 16 MiB body → 8/8/5 chunks).
-			//
-			//  2. Slow path: copy ring → heap, run accumulator (handles
-			//     LPM completion + leftover bytes that start a new LPM
-			//     in the same DATA frame).
-			//
-			// Both paths return the accumulator's heap buffer wrapped
-			// via mem.NewBuffer(&msg, nil) (no pool round-trip), saving
-			// one further mem.Copy that the prior code performed.
-			if acc.inProgress() && acc.expectedTotal-acc.pos >= payloadLen {
-				acc.buf = append(acc.buf, pFirst...)
-				if len(pSecond) > 0 {
-					acc.buf = append(acc.buf, pSecond...)
-				}
-				acc.pos += payloadLen
-				commitPayload.Commit(payloadLen)
-				if acc.pos != acc.expectedTotal {
-					if h2fh.Flags&H2FlagEndStream != 0 {
-						return FrameHeader{}, nil, errors.New("h2: END_STREAM with incomplete LPM in accumulator")
-					}
-					continue
-				}
-				msg := acc.buf
-				acc.headerBytesSeen = 0
-				acc.expectedTotal = 0
-				acc.pos = 0
-				acc.buf = nil
-				if h2fh.Flags&H2FlagEndStream != 0 {
-					holder.removeLpmAccumulator(h2fh.StreamID)
-				}
-				return FrameHeader{
-					Type:     FrameTypeMESSAGE,
-					StreamID: h2fh.StreamID,
-					Length:   uint32(len(msg)),
-				}, mem.NewBuffer(&msg, nil), nil
-			}
+			} // end isPadded fast-path skip
 
 			payload := make([]byte, h2fh.Length)
 			cn := copy(payload, pFirst)
@@ -1166,21 +1515,37 @@ func readFrameViewH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolde
 			}
 			commitPayload.Commit(int(h2fh.Length))
 
+			// RFC 7540 §6.1: PADDED DATA. Strip after commit so the
+			// ring read pointer is in sync; data slice is heap-owned.
+			if h2fh.Flags&H2FlagPadded != 0 {
+				stripped, serr := stripDataPadding(payload, h2fh.Flags)
+				if serr != nil {
+					return FrameHeader{}, nil, serr
+				}
+				payload = stripped
+			}
+
 			data := payload
 			for len(data) > 0 {
-				msg, leftover, ferr := acc.feed(data, 0)
+				msg, leftover, ferr := acc.feed(data, h2MaxLPMBodyBytes)
 				if ferr != nil {
 					return FrameHeader{}, nil, ferr
 				}
 				if msg != nil {
+					msgFlags := MessageFlagMORE
 					if len(leftover) > 0 {
 						holder.pendingFrame = leftover
 						holder.pendingStreamID = h2fh.StreamID
+						holder.pendingFrameEndStream = h2fh.Flags&H2FlagEndStream != 0
+					} else if h2fh.Flags&H2FlagEndStream != 0 {
+						msgFlags = 0
+						holder.removeLpmAccumulator(h2fh.StreamID)
 					}
 					return FrameHeader{
 						Type:     FrameTypeMESSAGE,
 						StreamID: h2fh.StreamID,
 						Length:   uint32(len(msg)),
+						Flags:    msgFlags,
 					}, mem.NewBuffer(&msg, nil), nil
 				}
 				break
@@ -1215,6 +1580,18 @@ func readFrameViewH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolde
 					copy(payload[cn:], pSecond)
 				}
 			}
+			// RFC 7540 §6.2: PADDED / PRIORITY flags add prefix bytes
+			// and trailing padding. Strip before HPACK decode.
+			if h2fh.Flags&(H2FlagPadded|H2FlagPriority) != 0 {
+				stripped, serr := stripHeadersPaddingAndPriority(payload, h2fh.Flags)
+				if serr != nil {
+					if commitPayload != nil {
+						commitPayload.Commit(int(h2fh.Length))
+					}
+					return FrameHeader{}, nil, serr
+				}
+				payload = stripped
+			}
 			if h2fh.Flags&H2FlagEndHeaders == 0 {
 				// Materialize first fragment (we may have aliased ring
 				// memory) before draining; commit the first fragment
@@ -1240,6 +1617,10 @@ func readFrameViewH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolde
 				return FrameHeader{}, nil, derr
 			}
 			if isTrailers {
+				if acc, ok := holder.lpmAccumulators[h2fh.StreamID]; ok && acc.inProgress() {
+					holder.removeLpmAccumulator(h2fh.StreamID)
+					return FrameHeader{}, nil, errors.New("h2: TRAILERS with incomplete LPM in accumulator")
+				}
 				holder.removeLpmAccumulator(h2fh.StreamID)
 				out := encodeTrailers(t)
 				return FrameHeader{
@@ -1250,6 +1631,12 @@ func readFrameViewH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolde
 				}, mem.Copy(out, mem.DefaultBufferPool()), nil
 			}
 			out := encodeHeaders(h)
+			// Initial HEADERS may carry END_STREAM (zero-message
+			// client stream). Defer a synthetic HALFCLOSE; see the
+			// matching block in readFrameH2.
+			if h2fh.Flags&H2FlagEndStream != 0 {
+				holder.pendingHalfCloseStreamID = h2fh.StreamID
+			}
 			return FrameHeader{
 				Type:     FrameTypeHEADERS,
 				StreamID: h2fh.StreamID,
@@ -1498,12 +1885,18 @@ func writeProtoToRingH2(ctx context.Context, tx *ShmRing, streamID uint32, msg p
 
 	// H2 DATA frame header (9 bytes).
 	var h2hdr [h2FrameHeaderSize]byte
-	// MORE flag → no END_STREAM. !MORE → still no END_STREAM (server
-	// uses TRAILERS to end). Same semantics as writeFrameH2 mapping.
+	// END_STREAM mirrors the caller's logical "last message in my
+	// send direction" signal. Only the client side sets
+	// MessageFlagEndStream (on the last request message of a
+	// client-streaming or unary RPC); the server ends its send
+	// direction with a TRAILERS frame, NOT END_STREAM on DATA.
+	// Setting END_STREAM on a server response DATA would tell the
+	// client peer "no more frames from this side" before the
+	// TRAILERS arrived — protocol violation and breaks
+	// server-streaming.
 	var h2flags byte
-	if flags&MessageFlagMORE == 0 {
-		// Final chunk for this message. END_STREAM stays 0 (TRAILERS ends).
-		h2flags = 0
+	if flags&MessageFlagEndStream != 0 {
+		h2flags = H2FlagEndStream
 	}
 	encodeH2FrameHeaderTo(&h2hdr, H2FrameHeader{
 		Length:   uint32(5 + pSize),

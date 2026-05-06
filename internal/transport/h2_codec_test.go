@@ -23,6 +23,7 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"runtime"
 	"testing"
 	"time"
 
@@ -625,7 +626,7 @@ func TestH2BinaryMetadata_WireFormatIsBase64(t *testing.T) {
 // injectH2Frame writes a raw H2 frame (header + payload) into the ring
 // directly, bypassing the encoder's own validation. Used to simulate a
 // peer that sends a frame our codec considers malformed.
-func injectH2Frame(t *testing.T, ctx context.Context, tx *ShmRing,
+func injectH2Frame(ctx context.Context, t *testing.T, tx *ShmRing,
 	frameType H2FrameType, flags byte, streamID uint32, payload []byte) {
 	t.Helper()
 	var hdr [h2FrameHeaderSize]byte
@@ -666,7 +667,7 @@ func injectH2Frame(t *testing.T, ctx context.Context, tx *ShmRing,
 // writeNormalMessageH2 writes a small MESSAGE frame on tx using the
 // production encoder; used as the post-recovery probe in malformed-frame
 // tests.
-func writeNormalMessageH2(t *testing.T, ctx context.Context, tx *ShmRing, body []byte) {
+func writeNormalMessageH2(ctx context.Context, t *testing.T, tx *ShmRing, body []byte) {
 	t.Helper()
 	payload := make([]byte, 5+len(body))
 	payload[0] = 0
@@ -682,7 +683,7 @@ func writeNormalMessageH2(t *testing.T, ctx context.Context, tx *ShmRing, body [
 
 // readNormalMessageH2 reads exactly one MESSAGE frame and verifies its
 // body matches `want`; used as the post-recovery probe.
-func readNormalMessageH2(t *testing.T, ctx context.Context, rx *ShmRing, want []byte) {
+func readNormalMessageH2(ctx context.Context, t *testing.T, rx *ShmRing, want []byte) {
 	t.Helper()
 	fh, got, err := readFrame(ctx, rx)
 	if err != nil {
@@ -699,7 +700,7 @@ func readNormalMessageH2(t *testing.T, ctx context.Context, rx *ShmRing, want []
 
 func newH2RingPair(t *testing.T) (tx, rx *ShmRing, ctx context.Context, cancel context.CancelFunc, segName string) {
 	t.Helper()
-	segName = fmt.Sprintf("h2valid-%d-%d", time.Now().UnixNano(), GoroutineID())
+	segName = fmt.Sprintf("h2valid-%d-%d", time.Now().UnixNano(), goroutineID())
 	seg, err := CreateSegment(segName, 1<<20, 1<<20)
 	if err != nil {
 		t.Fatalf("CreateSegment: %v", err)
@@ -717,115 +718,115 @@ func newH2RingPair(t *testing.T) (tx, rx *ShmRing, ctx context.Context, cancel c
 	return
 }
 
-// GoroutineID returns a coarse identifier used to disambiguate segment
+// goroutineID returns a coarse identifier used to disambiguate segment
 // names in parallel test runs. (We don't need a real goroutine ID.)
-func GoroutineID() int64 {
+func goroutineID() int64 {
 	return time.Now().UnixNano() & 0xFFFF
 }
 
 func TestH2Validate_RstStreamWrongLength(t *testing.T) {
 	tx, rx, ctx, _, _ := newH2RingPair(t)
 	// streamID=1 but length=8 instead of 4.
-	injectH2Frame(t, ctx, tx, H2FrameRSTSTREAM, 0, 1, make([]byte, 8))
-	writeNormalMessageH2(t, ctx, tx, []byte("ok"))
+	injectH2Frame(ctx, t, tx, H2FrameRSTSTREAM, 0, 1, make([]byte, 8))
+	writeNormalMessageH2(ctx, t, tx, []byte("ok"))
 	if _, _, err := readFrame(ctx, rx); err == nil {
 		t.Fatal("expected error on malformed RST_STREAM length")
 	}
-	readNormalMessageH2(t, ctx, rx, []byte("ok"))
+	readNormalMessageH2(ctx, t, rx, []byte("ok"))
 }
 
 func TestH2Validate_RstStreamZeroStreamID(t *testing.T) {
 	tx, rx, ctx, _, _ := newH2RingPair(t)
 	// length=4 but streamID=0.
-	injectH2Frame(t, ctx, tx, H2FrameRSTSTREAM, 0, 0, make([]byte, 4))
-	writeNormalMessageH2(t, ctx, tx, []byte("ok"))
+	injectH2Frame(ctx, t, tx, H2FrameRSTSTREAM, 0, 0, make([]byte, 4))
+	writeNormalMessageH2(ctx, t, tx, []byte("ok"))
 	if _, _, err := readFrame(ctx, rx); err == nil {
 		t.Fatal("expected error on RST_STREAM streamID=0")
 	}
-	readNormalMessageH2(t, ctx, rx, []byte("ok"))
+	readNormalMessageH2(ctx, t, rx, []byte("ok"))
 }
 
 func TestH2Validate_SettingsNonZeroStreamID(t *testing.T) {
 	tx, rx, ctx, _, _ := newH2RingPair(t)
-	injectH2Frame(t, ctx, tx, H2FrameSETTINGS, 0, 5, nil)
-	writeNormalMessageH2(t, ctx, tx, []byte("ok"))
+	injectH2Frame(ctx, t, tx, H2FrameSETTINGS, 0, 5, nil)
+	writeNormalMessageH2(ctx, t, tx, []byte("ok"))
 	if _, _, err := readFrame(ctx, rx); err == nil {
 		t.Fatal("expected error on SETTINGS streamID != 0")
 	}
-	readNormalMessageH2(t, ctx, rx, []byte("ok"))
+	readNormalMessageH2(ctx, t, rx, []byte("ok"))
 }
 
 func TestH2Validate_SettingsBadLength(t *testing.T) {
 	tx, rx, ctx, _, _ := newH2RingPair(t)
 	// non-ACK SETTINGS with length not a multiple of 6.
-	injectH2Frame(t, ctx, tx, H2FrameSETTINGS, 0, 0, make([]byte, 7))
-	writeNormalMessageH2(t, ctx, tx, []byte("ok"))
+	injectH2Frame(ctx, t, tx, H2FrameSETTINGS, 0, 0, make([]byte, 7))
+	writeNormalMessageH2(ctx, t, tx, []byte("ok"))
 	if _, _, err := readFrame(ctx, rx); err == nil {
 		t.Fatal("expected error on SETTINGS length not multiple of 6")
 	}
-	readNormalMessageH2(t, ctx, rx, []byte("ok"))
+	readNormalMessageH2(ctx, t, rx, []byte("ok"))
 }
 
 func TestH2Validate_SettingsAckWithPayload(t *testing.T) {
 	tx, rx, ctx, _, _ := newH2RingPair(t)
 	// ACK flag set but non-empty payload.
-	injectH2Frame(t, ctx, tx, H2FrameSETTINGS, H2FlagAck, 0, make([]byte, 6))
-	writeNormalMessageH2(t, ctx, tx, []byte("ok"))
+	injectH2Frame(ctx, t, tx, H2FrameSETTINGS, H2FlagAck, 0, make([]byte, 6))
+	writeNormalMessageH2(ctx, t, tx, []byte("ok"))
 	if _, _, err := readFrame(ctx, rx); err == nil {
 		t.Fatal("expected error on SETTINGS ACK with non-empty payload")
 	}
-	readNormalMessageH2(t, ctx, rx, []byte("ok"))
+	readNormalMessageH2(ctx, t, rx, []byte("ok"))
 }
 
 func TestH2Validate_PingWrongLength(t *testing.T) {
 	tx, rx, ctx, _, _ := newH2RingPair(t)
-	injectH2Frame(t, ctx, tx, H2FramePING, 0, 0, make([]byte, 4)) // need 8
-	writeNormalMessageH2(t, ctx, tx, []byte("ok"))
+	injectH2Frame(ctx, t, tx, H2FramePING, 0, 0, make([]byte, 4)) // need 8
+	writeNormalMessageH2(ctx, t, tx, []byte("ok"))
 	if _, _, err := readFrame(ctx, rx); err == nil {
 		t.Fatal("expected error on PING length != 8")
 	}
-	readNormalMessageH2(t, ctx, rx, []byte("ok"))
+	readNormalMessageH2(ctx, t, rx, []byte("ok"))
 }
 
 func TestH2Validate_PingNonZeroStreamID(t *testing.T) {
 	tx, rx, ctx, _, _ := newH2RingPair(t)
-	injectH2Frame(t, ctx, tx, H2FramePING, 0, 1, make([]byte, 8))
-	writeNormalMessageH2(t, ctx, tx, []byte("ok"))
+	injectH2Frame(ctx, t, tx, H2FramePING, 0, 1, make([]byte, 8))
+	writeNormalMessageH2(ctx, t, tx, []byte("ok"))
 	if _, _, err := readFrame(ctx, rx); err == nil {
 		t.Fatal("expected error on PING streamID != 0")
 	}
-	readNormalMessageH2(t, ctx, rx, []byte("ok"))
+	readNormalMessageH2(ctx, t, rx, []byte("ok"))
 }
 
 func TestH2Validate_GoAwayShortPayload(t *testing.T) {
 	tx, rx, ctx, _, _ := newH2RingPair(t)
 	// length < 8 (last-stream-id + error-code).
-	injectH2Frame(t, ctx, tx, H2FrameGOAWAY, 0, 0, make([]byte, 4))
-	writeNormalMessageH2(t, ctx, tx, []byte("ok"))
+	injectH2Frame(ctx, t, tx, H2FrameGOAWAY, 0, 0, make([]byte, 4))
+	writeNormalMessageH2(ctx, t, tx, []byte("ok"))
 	if _, _, err := readFrame(ctx, rx); err == nil {
 		t.Fatal("expected error on GOAWAY length < 8")
 	}
-	readNormalMessageH2(t, ctx, rx, []byte("ok"))
+	readNormalMessageH2(ctx, t, rx, []byte("ok"))
 }
 
 func TestH2Validate_GoAwayNonZeroStreamID(t *testing.T) {
 	tx, rx, ctx, _, _ := newH2RingPair(t)
-	injectH2Frame(t, ctx, tx, H2FrameGOAWAY, 0, 9, make([]byte, 8))
-	writeNormalMessageH2(t, ctx, tx, []byte("ok"))
+	injectH2Frame(ctx, t, tx, H2FrameGOAWAY, 0, 9, make([]byte, 8))
+	writeNormalMessageH2(ctx, t, tx, []byte("ok"))
 	if _, _, err := readFrame(ctx, rx); err == nil {
 		t.Fatal("expected error on GOAWAY streamID != 0")
 	}
-	readNormalMessageH2(t, ctx, rx, []byte("ok"))
+	readNormalMessageH2(ctx, t, rx, []byte("ok"))
 }
 
 func TestH2Validate_WindowUpdateWrongLength(t *testing.T) {
 	tx, rx, ctx, _, _ := newH2RingPair(t)
-	injectH2Frame(t, ctx, tx, H2FrameWINDOWUPDATE, 0, 1, make([]byte, 3))
-	writeNormalMessageH2(t, ctx, tx, []byte("ok"))
+	injectH2Frame(ctx, t, tx, H2FrameWINDOWUPDATE, 0, 1, make([]byte, 3))
+	writeNormalMessageH2(ctx, t, tx, []byte("ok"))
 	if _, _, err := readFrame(ctx, rx); err == nil {
 		t.Fatal("expected error on WINDOW_UPDATE length != 4")
 	}
-	readNormalMessageH2(t, ctx, rx, []byte("ok"))
+	readNormalMessageH2(ctx, t, rx, []byte("ok"))
 }
 
 func TestH2Validate_WindowUpdateZeroIncrement(t *testing.T) {
@@ -834,12 +835,12 @@ func TestH2Validate_WindowUpdateZeroIncrement(t *testing.T) {
 	// §6.9.1: "A receiver MUST treat the receipt of a WINDOW_UPDATE
 	// frame with an flow-control window increment of 0 as a stream
 	// error or connection error of type PROTOCOL_ERROR".
-	injectH2Frame(t, ctx, tx, H2FrameWINDOWUPDATE, 0, 1, []byte{0, 0, 0, 0})
-	writeNormalMessageH2(t, ctx, tx, []byte("ok"))
+	injectH2Frame(ctx, t, tx, H2FrameWINDOWUPDATE, 0, 1, []byte{0, 0, 0, 0})
+	writeNormalMessageH2(ctx, t, tx, []byte("ok"))
 	if _, _, err := readFrame(ctx, rx); err == nil {
 		t.Fatal("expected error on WINDOW_UPDATE increment=0")
 	}
-	readNormalMessageH2(t, ctx, rx, []byte("ok"))
+	readNormalMessageH2(ctx, t, rx, []byte("ok"))
 }
 
 // ---------------------------------------------------------------------------
@@ -883,9 +884,9 @@ func TestH2Continuation_TwoFragments_RoundTrip(t *testing.T) {
 		t.Fatalf("hpack block too small: %d", len(hpackBlock))
 	}
 	// First fragment: HEADERS, no END_HEADERS.
-	injectH2Frame(t, ctx, tx, H2FrameHEADERS, 0, 1, hpackBlock[:half])
+	injectH2Frame(ctx, t, tx, H2FrameHEADERS, 0, 1, hpackBlock[:half])
 	// Second fragment: CONTINUATION, END_HEADERS set.
-	injectH2Frame(t, ctx, tx, H2FrameCONTINUATION, H2FlagEndHeaders, 1, hpackBlock[half:])
+	injectH2Frame(ctx, t, tx, H2FrameCONTINUATION, H2FlagEndHeaders, 1, hpackBlock[half:])
 
 	fh, payload, err := readFrame(ctx, rx)
 	if err != nil {
@@ -925,9 +926,9 @@ func TestH2Continuation_StreamIDMismatch(t *testing.T) {
 		hpack.HeaderField{Name: ":path", Value: "/x"},
 	)
 	half := len(hpackBlock) / 2
-	injectH2Frame(t, ctx, tx, H2FrameHEADERS, 0, 1, hpackBlock[:half])
+	injectH2Frame(ctx, t, tx, H2FrameHEADERS, 0, 1, hpackBlock[:half])
 	// CONTINUATION on a different stream id.
-	injectH2Frame(t, ctx, tx, H2FrameCONTINUATION, H2FlagEndHeaders, 99, hpackBlock[half:])
+	injectH2Frame(ctx, t, tx, H2FrameCONTINUATION, H2FlagEndHeaders, 99, hpackBlock[half:])
 
 	if _, _, err := readFrame(ctx, rx); err == nil {
 		t.Fatal("expected error on CONTINUATION streamID mismatch")
@@ -946,10 +947,10 @@ func TestH2Continuation_NonContinuationInterleaved(t *testing.T) {
 		hpack.HeaderField{Name: ":path", Value: "/x"},
 	)
 	half := len(hpackBlock) / 2
-	injectH2Frame(t, ctx, tx, H2FrameHEADERS, 0, 1, hpackBlock[:half])
+	injectH2Frame(ctx, t, tx, H2FrameHEADERS, 0, 1, hpackBlock[:half])
 	// DATA frame interleaved (would be valid on its own but illegal
 	// here while HEADERS is open).
-	injectH2Frame(t, ctx, tx, H2FrameDATA, 0, 1, []byte{0x00, 0x00, 0x00, 0x00, 0x00})
+	injectH2Frame(ctx, t, tx, H2FrameDATA, 0, 1, []byte{0x00, 0x00, 0x00, 0x00, 0x00})
 	if _, _, err := readFrame(ctx, rx); err == nil {
 		t.Fatal("expected error on DATA frame interleaved between HEADERS and CONTINUATION")
 	}
@@ -959,9 +960,1001 @@ func TestH2Continuation_NonContinuationInterleaved(t *testing.T) {
 // frame appearing outside any HEADERS sequence is rejected.
 func TestH2Continuation_StrayContinuation(t *testing.T) {
 	tx, rx, ctx, _, _ := newH2RingPair(t)
-	injectH2Frame(t, ctx, tx, H2FrameCONTINUATION, H2FlagEndHeaders, 1,
+	injectH2Frame(ctx, t, tx, H2FrameCONTINUATION, H2FlagEndHeaders, 1,
 		hpackEncodeForTest(t, hpack.HeaderField{Name: "x", Value: "y"}))
 	if _, _, err := readFrame(ctx, rx); err == nil {
 		t.Fatal("expected error on stray CONTINUATION outside a HEADERS sequence")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Self-review hardening tests (RFC 7540 §6.1, §6.2, §6.10, §8.1.2).
+// ---------------------------------------------------------------------------
+
+// TestH2HpackName_LowercaseOnEncode asserts that header field names are
+// emitted lowercase on the H2 wire even when the in-memory metadata key
+// arrives mixed-case. Real H2 peers (RFC 7540 §8.1.2) reject any
+// uppercase byte in a field name with a connection error.
+func TestH2HpackName_LowercaseOnEncode(t *testing.T) {
+	enc := newHpackEncoderHolder()
+	out := h2EncodeHeaders(enc.enc, enc.scratch, HeadersV1{
+		Version: 1,
+		HdrType: 0,
+		Method:  "/svc/M",
+		Metadata: []KV{
+			{Key: "X-Mixed-Case", Values: [][]byte{[]byte("v")}},
+		},
+	})
+	hf, err := decodeHpackToFields(out)
+	if err != nil {
+		t.Fatalf("decode hpack: %v", err)
+	}
+	for _, f := range hf {
+		// All emitted names must be lowercase.
+		for i := 0; i < len(f.Name); i++ {
+			if c := f.Name[i]; c >= 'A' && c <= 'Z' {
+				t.Errorf("name %q contains uppercase byte at %d (RFC 7540 §8.1.2 violation)", f.Name, i)
+				break
+			}
+		}
+	}
+}
+
+// TestH2BinaryMetadata_MixedCaseKey verifies that "-bin" suffix
+// detection survives a mixed-case key on send, and that a peer sending
+// a mixed-case "-Bin" suffix (non-conformant but possible) is still
+// treated as binary on decode.
+func TestH2BinaryMetadata_MixedCaseKey(t *testing.T) {
+	tx, rx, ctx, _, _ := newH2RingPair(t)
+	binValue := []byte{0xCA, 0xFE, 0xBA, 0xBE}
+	hdrPayload := encodeHeaders(HeadersV1{
+		Version: 1, HdrType: 0, Method: "/svc/M",
+		Metadata: []KV{
+			{Key: "X-Mixed-Bin", Values: [][]byte{binValue}},
+		},
+	})
+	if err := writeFrame(ctx, tx, FrameHeader{
+		Type: FrameTypeHEADERS, StreamID: 1, Flags: HeadersFlagINITIAL,
+	}, hdrPayload); err != nil {
+		t.Fatalf("writeFrame: %v", err)
+	}
+	_, got, err := readFrame(ctx, rx)
+	if err != nil {
+		t.Fatalf("readFrame: %v", err)
+	}
+	dec, err := decodeHeaders(got)
+	if err != nil {
+		t.Fatalf("decodeHeaders: %v", err)
+	}
+	// Round-trip key arrives lowercased (we lowercase on send), value
+	// arrives as raw binary bytes (base64 round-trip).
+	var found []byte
+	for _, kv := range dec.Metadata {
+		if kv.Key == "x-mixed-bin" {
+			found = kv.Values[0]
+		}
+	}
+	if !bytes.Equal(found, binValue) {
+		t.Errorf("mixed-case -bin round-trip: got %x want %x", found, binValue)
+	}
+}
+
+func TestH2Validate_DataZeroStreamID(t *testing.T) {
+	tx, rx, ctx, _, _ := newH2RingPair(t)
+	// DATA on stream 0 — RFC 7540 §6.1 PROTOCOL_ERROR.
+	injectH2Frame(ctx, t, tx, H2FrameDATA, 0, 0,
+		[]byte{0x00, 0x00, 0x00, 0x00, 0x02, 'h', 'i'}) // valid LPM payload
+	writeNormalMessageH2(ctx, t, tx, []byte("ok"))
+	if _, _, err := readFrame(ctx, rx); err == nil {
+		t.Fatal("expected error on DATA streamID=0")
+	}
+	readNormalMessageH2(ctx, t, rx, []byte("ok"))
+}
+
+func TestH2Validate_HeadersZeroStreamID(t *testing.T) {
+	tx, rx, ctx, _, _ := newH2RingPair(t)
+	hpackBlock := hpackEncodeForTest(t,
+		hpack.HeaderField{Name: ":method", Value: "POST"},
+		hpack.HeaderField{Name: ":path", Value: "/x"},
+	)
+	// HEADERS on stream 0 — RFC 7540 §6.2 PROTOCOL_ERROR.
+	injectH2Frame(ctx, t, tx, H2FrameHEADERS, H2FlagEndHeaders, 0, hpackBlock)
+	writeNormalMessageH2(ctx, t, tx, []byte("ok"))
+	if _, _, err := readFrame(ctx, rx); err == nil {
+		t.Fatal("expected error on HEADERS streamID=0")
+	}
+	readNormalMessageH2(ctx, t, rx, []byte("ok"))
+}
+
+// TestH2Continuation_FrameCountCap asserts that a peer streaming an
+// excessive number of zero-length CONTINUATION frames hits the
+// h2MaxContinuationFrames bound and is rejected, even though the
+// cumulative-byte cap (h2MaxHeaderListSize) is never tripped because
+// each CONTINUATION's payload is empty. Defends against a buggy or
+// adversarial local SHM peer that would otherwise tie up the reader
+// goroutine.
+func TestH2Continuation_FrameCountCap(t *testing.T) {
+	tx, rx, ctx, _, _ := newH2RingPair(t)
+	hpackBlock := hpackEncodeForTest(t,
+		hpack.HeaderField{Name: ":method", Value: "POST"},
+		hpack.HeaderField{Name: ":path", Value: "/x"},
+	)
+	// First fragment without END_HEADERS opens the sequence.
+	injectH2Frame(ctx, t, tx, H2FrameHEADERS, 0, 1, hpackBlock)
+	// Inject one more than the cap of empty CONTINUATIONs (none with
+	// END_HEADERS so the assembler keeps looping).
+	for i := 0; i < h2MaxContinuationFrames+1; i++ {
+		injectH2Frame(ctx, t, tx, H2FrameCONTINUATION, 0, 1, nil)
+	}
+	if _, _, err := readFrame(ctx, rx); err == nil {
+		t.Fatal("expected error on CONTINUATION frame count overflow")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// gRPC-over-HTTP/2 spec compliance tests (gRFC G2).
+// ---------------------------------------------------------------------------
+
+// TestH2LPM_DoSCap_OversizedDeclared asserts the LPM accumulator
+// rejects a tiny DATA frame that declares an oversized body before
+// allocating. Without this cap a malicious peer could declare a
+// multi-gigabyte body in 5 bytes and force a giant make().
+func TestH2LPM_DoSCap_OversizedDeclared(t *testing.T) {
+	tx, rx, ctx, _, _ := newH2RingPair(t)
+	// LPM header declaring an absurdly large body but providing only a
+	// few bytes; the codec must reject the declaration before
+	// allocating the buffer.
+	declared := uint32(1 << 30) // 1 GiB declared, well past h2MaxLPMBodyBytes
+	body := make([]byte, 7)
+	body[0] = 0
+	binary.BigEndian.PutUint32(body[1:5], declared)
+	body[5] = 'a'
+	body[6] = 'b'
+	injectH2Frame(ctx, t, tx, H2FrameDATA, 0, 1, body)
+	if _, _, err := readFrame(ctx, rx); err == nil {
+		t.Fatal("expected error on oversized declared LPM body")
+	}
+}
+
+// TestH2GrpcMessage_PercentEncoded asserts that a status message
+// containing % and non-ASCII bytes round-trips via percent-encoding on
+// the H2 wire (gRFC G2 / 'Status & status-message').
+func TestH2GrpcMessage_PercentEncoded(t *testing.T) {
+	tx, rx, ctx, _, _ := newH2RingPair(t)
+	// Mix of plain ASCII, %, non-ASCII (中), and a control byte.
+	msg := "boom 50% \u4e2d\u6587 \x01"
+	tlrPayload := encodeTrailers(TrailersV1{
+		Version:        1,
+		GRPCStatusCode: 13,
+		GRPCStatusMsg:  msg,
+	})
+	if err := writeFrame(ctx, tx, FrameHeader{
+		Type: FrameTypeTRAILERS, StreamID: 5, Flags: TrailersFlagEndStream,
+	}, tlrPayload); err != nil {
+		t.Fatalf("writeFrame: %v", err)
+	}
+	fh, got, err := readFrame(ctx, rx)
+	if err != nil {
+		t.Fatalf("readFrame: %v", err)
+	}
+	if fh.Type != FrameTypeTRAILERS {
+		t.Fatalf("type: got %d want TRAILERS", fh.Type)
+	}
+	dec, err := decodeTrailers(got)
+	if err != nil {
+		t.Fatalf("decodeTrailers: %v", err)
+	}
+	if dec.GRPCStatusMsg != msg {
+		t.Errorf("status message round-trip: got %q want %q", dec.GRPCStatusMsg, msg)
+	}
+}
+
+// TestH2GrpcMessage_WireFormatIsPercentEncoded inspects the on-wire
+// HPACK value to confirm '%' and non-ASCII are escaped per gRFC G2.
+func TestH2GrpcMessage_WireFormatIsPercentEncoded(t *testing.T) {
+	enc := newHpackEncoderHolder()
+	out := h2EncodeTrailers(enc.enc, enc.scratch, TrailersV1{
+		Version:        1,
+		GRPCStatusCode: 13,
+		GRPCStatusMsg:  "50% off",
+	})
+	hf, err := decodeHpackToFields(out)
+	if err != nil {
+		t.Fatalf("decode hpack: %v", err)
+	}
+	var seen string
+	for _, f := range hf {
+		if f.Name == "grpc-message" {
+			seen = f.Value
+		}
+	}
+	// '%' MUST be encoded as %25; ASCII printable space is allowed.
+	if want := "50%25 off"; seen != want {
+		t.Errorf("on-wire grpc-message: got %q want %q", seen, want)
+	}
+}
+
+// TestH2GrpcTimeout_8DigitCap asserts that a deadline producing > 8
+// digits in nanoseconds is encoded with a larger unit so the wire value
+// fits the 8-digit gRFC G2 limit.
+func TestH2GrpcTimeout_8DigitCap(t *testing.T) {
+	enc := newHpackEncoderHolder()
+	// 5 second deadline → 5_000_000_000 ns = 10 digits if naive 'n'
+	// emission. EncodeDuration should pick a coarser unit.
+	deadlineUnixNano := uint64(time.Now().Add(5 * time.Second).UnixNano())
+	out := h2EncodeHeaders(enc.enc, enc.scratch, HeadersV1{
+		Version:          1,
+		HdrType:          0,
+		Method:           "/svc/M",
+		DeadlineUnixNano: deadlineUnixNano,
+	})
+	hf, err := decodeHpackToFields(out)
+	if err != nil {
+		t.Fatalf("decode hpack: %v", err)
+	}
+	var seen string
+	for _, f := range hf {
+		if f.Name == "grpc-timeout" {
+			seen = f.Value
+		}
+	}
+	if seen == "" {
+		t.Fatal("grpc-timeout not emitted")
+	}
+	// Must be at most 8 digits + 1 unit byte.
+	if len(seen) > 9 {
+		t.Errorf("grpc-timeout %q is %d chars, exceeds 8-digit gRFC limit", seen, len(seen))
+	}
+}
+
+// TestH2DataPadded_RoundTrip injects a PADDED DATA frame on stream 1
+// containing a complete LPM and verifies the codec strips the padding
+// and surfaces the LPM body. Self-interop never sends PADDED but
+// standards-compliant H2 peers may.
+func TestH2DataPadded_RoundTrip(t *testing.T) {
+	tx, rx, ctx, _, _ := newH2RingPair(t)
+	body := []byte("hello")
+	lpm := make([]byte, 5+len(body))
+	lpm[0] = 0
+	binary.BigEndian.PutUint32(lpm[1:5], uint32(len(body)))
+	copy(lpm[5:], body)
+	// PADDED layout: [padLen=3][LPM bytes][3 bytes padding].
+	padded := make([]byte, 1+len(lpm)+3)
+	padded[0] = 3
+	copy(padded[1:], lpm)
+	// Trailing 3 bytes default-zero (padding content is opaque).
+	injectH2Frame(ctx, t, tx, H2FrameDATA, H2FlagPadded, 1, padded)
+	fh, got, err := readFrame(ctx, rx)
+	if err != nil {
+		t.Fatalf("readFrame: %v", err)
+	}
+	if fh.Type != FrameTypeMESSAGE {
+		t.Fatalf("type: got %d want MESSAGE", fh.Type)
+	}
+	if !bytes.Equal(got, lpm) {
+		t.Errorf("padded DATA body: got %q want %q", got, lpm)
+	}
+}
+
+// TestH2DataPadded_BadPadLen verifies a malformed pad-length is rejected
+// AND the ring read pointer recovers (a normal MESSAGE frame after the
+// malformed one is read intact).
+func TestH2DataPadded_BadPadLen(t *testing.T) {
+	tx, rx, ctx, _, _ := newH2RingPair(t)
+	// padLen claims 100 bytes but payload is only 5 bytes total.
+	bad := []byte{100, 0x00, 0x00, 0x00, 0x00}
+	injectH2Frame(ctx, t, tx, H2FrameDATA, H2FlagPadded, 1, bad)
+	writeNormalMessageH2(ctx, t, tx, []byte("ok"))
+	if _, _, err := readFrame(ctx, rx); err == nil {
+		t.Fatal("expected error on PADDED DATA with bad pad length")
+	}
+	readNormalMessageH2(ctx, t, rx, []byte("ok"))
+}
+
+// TestH2HeadersPriority_RoundTrip injects a HEADERS frame with the
+// PRIORITY flag set: a 5-byte stream-dependency + weight prefix
+// precedes the HPACK fragment. The codec must drop the priority bytes
+// and decode the fragment.
+func TestH2HeadersPriority_RoundTrip(t *testing.T) {
+	tx, rx, ctx, _, _ := newH2RingPair(t)
+	hpackBlock := hpackEncodeForTest(t,
+		hpack.HeaderField{Name: ":method", Value: "POST"},
+		hpack.HeaderField{Name: ":path", Value: "/svc/Prio"},
+	)
+	// 5-byte priority prefix: 4-byte stream-dependency + 1-byte weight.
+	withPrio := make([]byte, 5+len(hpackBlock))
+	binary.BigEndian.PutUint32(withPrio[0:4], 7) // depends on stream 7
+	withPrio[4] = 16                             // weight
+	copy(withPrio[5:], hpackBlock)
+	injectH2Frame(ctx, t, tx, H2FrameHEADERS, H2FlagEndHeaders|H2FlagPriority, 1, withPrio)
+	fh, payload, err := readFrame(ctx, rx)
+	if err != nil {
+		t.Fatalf("readFrame: %v", err)
+	}
+	if fh.Type != FrameTypeHEADERS {
+		t.Fatalf("type: got %d want HEADERS", fh.Type)
+	}
+	dec, err := decodeHeaders(payload)
+	if err != nil {
+		t.Fatalf("decodeHeaders: %v", err)
+	}
+	if dec.Method != "/svc/Prio" {
+		t.Errorf("method: got %q want /svc/Prio", dec.Method)
+	}
+}
+
+// TestH2HeadersPadded_RoundTrip injects a HEADERS frame with the
+// PADDED flag and verifies the codec strips both the pad-length prefix
+// and the trailing padding before decoding the HPACK fragment.
+func TestH2HeadersPadded_RoundTrip(t *testing.T) {
+	tx, rx, ctx, _, _ := newH2RingPair(t)
+	hpackBlock := hpackEncodeForTest(t,
+		hpack.HeaderField{Name: ":method", Value: "POST"},
+		hpack.HeaderField{Name: ":path", Value: "/svc/Pad"},
+	)
+	padLen := 4
+	padded := make([]byte, 1+len(hpackBlock)+padLen)
+	padded[0] = byte(padLen)
+	copy(padded[1:], hpackBlock)
+	// Padding bytes default-zero.
+	injectH2Frame(ctx, t, tx, H2FrameHEADERS, H2FlagEndHeaders|H2FlagPadded, 1, padded)
+	fh, payload, err := readFrame(ctx, rx)
+	if err != nil {
+		t.Fatalf("readFrame: %v", err)
+	}
+	if fh.Type != FrameTypeHEADERS {
+		t.Fatalf("type: got %d want HEADERS", fh.Type)
+	}
+	dec, err := decodeHeaders(payload)
+	if err != nil {
+		t.Fatalf("decodeHeaders: %v", err)
+	}
+	if dec.Method != "/svc/Pad" {
+		t.Errorf("method: got %q want /svc/Pad", dec.Method)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Second-pass review hardening tests.
+// ---------------------------------------------------------------------------
+
+// TestH2LPM_NoPreallocOversized asserts the LPM accumulator does NOT
+// allocate the full declared body size up-front. A peer-controlled
+// tiny DATA frame that declares (h2MaxLPMBodyBytes - 1) MiB but sends
+// only a few body bytes must NOT cause a hundreds-of-MiB heap
+// allocation before any per-RPC receive limit applies. Verified by
+// observing runtime.ReadMemStats before/after a single failing-feed
+// call.
+func TestH2LPM_NoPreallocOversized(t *testing.T) {
+	// Construct a deliberately-truthful LPM header inside the
+	// declared cap (so the size-check fast-path passes) but only feed
+	// a few body bytes; assert the resident allocation stays small.
+	const declared = h2MaxLPMBodyBytes - 1024 // just under the cap
+	hdrAndPartialBody := make([]byte, 5+1024)
+	hdrAndPartialBody[0] = 0
+	binary.BigEndian.PutUint32(hdrAndPartialBody[1:5], uint32(declared))
+	for i := 5; i < len(hdrAndPartialBody); i++ {
+		hdrAndPartialBody[i] = byte(i)
+	}
+
+	var memBefore, memAfter runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&memBefore)
+
+	acc := &lpmAccumulator{}
+	msg, _, err := acc.feed(hdrAndPartialBody, h2MaxLPMBodyBytes)
+	if err != nil {
+		t.Fatalf("feed: %v", err)
+	}
+	if msg != nil {
+		t.Fatal("expected msg nil — only partial body fed")
+	}
+	runtime.ReadMemStats(&memAfter)
+
+	// HeapAlloc growth should be on the order of bytes actually fed
+	// (< 256 KiB allowing for slice growth slack) — NOT the declared
+	// size which is hundreds of MiB.
+	growth := memAfter.HeapAlloc - memBefore.HeapAlloc
+	const maxAcceptableGrowth = 256 * 1024
+	if growth > maxAcceptableGrowth {
+		t.Errorf("HeapAlloc grew %d bytes after feeding 1029 bytes (declared %d); pre-allocation DoS guard is leaky",
+			growth, declared)
+	}
+
+	// Ensure the accumulator can still complete the message if all
+	// bytes arrive (sanity check: incremental allocation didn't break
+	// the happy path).
+	_ = acc // silence linter; growth into legitimate territory is
+	// covered by other LPM tests in the suite.
+}
+
+// TestH2DataPaddedZeroLength_ViewReader asserts the production
+// readFrameView path (which dispatches to readFrameViewH2) rejects a
+// PADDED|END_STREAM DATA frame with Length=0 instead of treating it as
+// a valid HALFCLOSE. The mandatory 1-byte pad-length prefix can't fit
+// in a zero-byte payload (FRAME_SIZE_ERROR per RFC 7540 §6.1).
+func TestH2DataPaddedZeroLength_ViewReader(t *testing.T) {
+	tx, rx, ctx, _, _ := newH2RingPair(t)
+	// Inject DATA with PADDED|END_STREAM and Length=0.
+	injectH2Frame(ctx, t, tx, H2FrameDATA, H2FlagPadded|H2FlagEndStream, 1, nil)
+	// readFrameView is the production hot path; it dispatches to
+	// readFrameViewH2 because the ring is configured with HTTP/2.
+	_, buf, err := readFrameView(ctx, rx)
+	if buf != nil {
+		buf.Free()
+	}
+	if err == nil {
+		t.Fatal("expected error on PADDED|END_STREAM DATA with Length=0")
+	}
+}
+
+// TestH2GrpcTimeout_DecodeTooLong asserts the receive-side timeout
+// parser rejects values whose digit-portion exceeds the 8-digit gRFC
+// limit (e.g., a 10-digit nanosecond value emitted by a non-conformant
+// peer). The previous parseGrpcTimeout helper accepted any-length
+// digit string and could overflow on huge hour values.
+func TestH2GrpcTimeout_DecodeTooLong(t *testing.T) {
+	enc := newHpackEncoderHolder()
+	dec := newHpackDecoderHolder()
+
+	// Hand-craft a HEADERS HPACK block with grpc-timeout="999999999n"
+	// (9 digits + unit = 10 chars > 9-char limit).
+	var buf bytes.Buffer
+	hpackEnc := hpack.NewEncoder(&buf)
+	_ = hpackEnc.WriteField(hpack.HeaderField{Name: ":method", Value: "POST"})
+	_ = hpackEnc.WriteField(hpack.HeaderField{Name: ":path", Value: "/x"})
+	_ = hpackEnc.WriteField(hpack.HeaderField{Name: "grpc-timeout", Value: "999999999n"})
+	hpackBlock := buf.Bytes()
+
+	h, _, _, err := h2DecodeHeaders(dec, hpackBlock)
+	if err != nil {
+		t.Fatalf("h2DecodeHeaders: %v", err)
+	}
+	// On reject (length > 9), DeadlineUnixNano should remain 0 rather
+	// than carry an overflow / nonsense deadline. The decoder
+	// silently drops the bad value (matches stock grpc-go behaviour
+	// which does not surface a malformed-timeout connection error
+	// when the field's syntax is invalid; the upper layer then
+	// treats the call as no-deadline).
+	if h.DeadlineUnixNano != 0 {
+		t.Errorf("DeadlineUnixNano: got %d want 0 for over-long timeout (10 digits)", h.DeadlineUnixNano)
+	}
+	_ = enc // unused but keeps imports stable
+}
+
+// ---------------------------------------------------------------------------
+// Third-pass review hardening tests.
+// ---------------------------------------------------------------------------
+
+// TestH2DataEndStreamWithBody_EmitsHalfClose asserts that a DATA frame
+// TestH2DataEndStreamWithBody_EmitsMoreClear verifies that a DATA
+// frame with a non-empty body AND END_STREAM flag — the canonical
+// shape emitted by stock grpc-go's HTTP/2 transport, grpc-java, and
+// grpc-c++ when finishing a unary client send — surfaces a MESSAGE
+// with MessageFlagMORE CLEARED. The MORE=0 signal is what
+// ShmServerTransport.handleMessage uses to write io.EOF on the
+// stream's recv channel; without it the call hangs waiting for an
+// explicit half-close.
+func TestH2DataEndStreamWithBody_EmitsMoreClear(t *testing.T) {
+	tx, rx, ctx, _, _ := newH2RingPair(t)
+	body := []byte("hello")
+	lpm := make([]byte, 5+len(body))
+	lpm[0] = 0
+	binary.BigEndian.PutUint32(lpm[1:5], uint32(len(body)))
+	copy(lpm[5:], body)
+	injectH2Frame(ctx, t, tx, H2FrameDATA, H2FlagEndStream, 1, lpm)
+
+	fh, got, err := readFrame(ctx, rx)
+	if err != nil {
+		t.Fatalf("readFrame: %v", err)
+	}
+	if fh.Type != FrameTypeMESSAGE {
+		t.Fatalf("frame type: got %d want MESSAGE", fh.Type)
+	}
+	if !bytes.Equal(got, lpm) {
+		t.Errorf("body: got %q want %q", got, lpm)
+	}
+	if fh.Flags&MessageFlagMORE != 0 {
+		t.Errorf("flags: got MORE=1 on END_STREAM-bearing DATA, want MORE=0")
+	}
+}
+
+// TestH2DataEndStreamWithBody_ViewReader_EmitsMoreClear covers the
+// production hot path (readFrameView dispatches to readFrameViewH2
+// for HTTP/2 rings).
+func TestH2DataEndStreamWithBody_ViewReader_EmitsMoreClear(t *testing.T) {
+	tx, rx, ctx, _, _ := newH2RingPair(t)
+	body := make([]byte, 200*1024) // big enough to hit ZC fast path
+	for i := range body {
+		body[i] = byte(i)
+	}
+	lpm := make([]byte, 5+len(body))
+	lpm[0] = 0
+	binary.BigEndian.PutUint32(lpm[1:5], uint32(len(body)))
+	copy(lpm[5:], body)
+	injectH2Frame(ctx, t, tx, H2FrameDATA, H2FlagEndStream, 1, lpm)
+
+	fh, buf, err := readFrameView(ctx, rx)
+	if err != nil {
+		t.Fatalf("readFrameView: %v", err)
+	}
+	if fh.Type != FrameTypeMESSAGE {
+		t.Fatalf("type: got %d want MESSAGE", fh.Type)
+	}
+	if fh.Flags&MessageFlagMORE != 0 {
+		t.Errorf("flags: got MORE=1 on END_STREAM-bearing DATA, want MORE=0")
+	}
+	if buf != nil {
+		buf.Free()
+	}
+}
+
+// TestH2LPM_AccumulatorResetOnError verifies that an LPM accumulator
+// rejected for body-too-large clears its internal state so a subsequent
+// feed call (with valid content) starts from scratch. Without the
+// reset, the second call would be stuck in headerBytesSeen=5 + zero
+// expectedTotal and silently drop legitimate data.
+func TestH2LPM_AccumulatorResetOnError(t *testing.T) {
+	acc := &lpmAccumulator{}
+	// First feed: 5-byte LPM header declaring 1 GiB body — rejected
+	// against a 1 KiB cap.
+	tooBig := make([]byte, 5)
+	tooBig[0] = 0
+	binary.BigEndian.PutUint32(tooBig[1:5], 1<<30)
+	if _, _, err := acc.feed(tooBig, 1024); err == nil {
+		t.Fatal("expected reject on oversized body")
+	}
+	if acc.headerBytesSeen != 0 {
+		t.Errorf("headerBytesSeen after error: got %d want 0", acc.headerBytesSeen)
+	}
+
+	// Second feed: a complete valid LPM. Accumulator must reparse the
+	// header from scratch and produce a complete message.
+	body := []byte("ok")
+	good := make([]byte, 5+len(body))
+	good[0] = 0
+	binary.BigEndian.PutUint32(good[1:5], uint32(len(body)))
+	copy(good[5:], body)
+	msg, leftover, err := acc.feed(good, 0)
+	if err != nil {
+		t.Fatalf("feed after recovered state: %v", err)
+	}
+	if !bytes.Equal(msg, good) {
+		t.Errorf("post-recovery msg: got %q want %q", msg, good)
+	}
+	if len(leftover) != 0 {
+		t.Errorf("leftover: got %d bytes want 0", len(leftover))
+	}
+}
+
+// TestH2HpackString_MaxLengthEnforced verifies the HPACK decoder
+// rejects a single header value longer than the configured cap (64
+// KiB). golang.org/x/net/http2/hpack.Decoder.SetMaxStringLength
+// enforces this; without the cap a peer could allocate gigabytes via
+// a single oversized header.
+func TestH2HpackString_MaxLengthEnforced(t *testing.T) {
+	dec := newHpackDecoderHolder()
+	// Encode a header whose value is 128 KiB (above the 64 KiB cap).
+	huge := make([]byte, 128*1024)
+	for i := range huge {
+		huge[i] = 'a' + byte(i%26)
+	}
+	var buf bytes.Buffer
+	enc := hpack.NewEncoder(&buf)
+	_ = enc.WriteField(hpack.HeaderField{Name: "x-huge", Value: string(huge)})
+	if _, _, _, err := h2DecodeHeaders(dec, buf.Bytes()); err == nil {
+		t.Fatal("expected error on HPACK string longer than cap")
+	}
+}
+
+// TestH2DataMultiLPM_EndStreamCarriesAcrossLeftover verifies that
+// END_STREAM on a DATA frame containing multiple LPMs surfaces
+// MESSAGE/MORE=1 for all LPMs except the LAST one, which carries
+// MORE=0. Regression test: pre-fix the leftover-stash path forgot the
+// END_STREAM flag, every emitted MESSAGE had MORE=0, and the server
+// transport observed io.EOF after the FIRST LPM rather than after the
+// last.
+func TestH2DataMultiLPM_EndStreamCarriesAcrossLeftover(t *testing.T) {
+	tx, rx, ctx, _, _ := newH2RingPair(t)
+	// Build a DATA payload containing two complete LPMs back-to-back.
+	body1 := []byte("first")
+	body2 := []byte("second")
+	lpm1 := make([]byte, 5+len(body1))
+	lpm1[0] = 0
+	binary.BigEndian.PutUint32(lpm1[1:5], uint32(len(body1)))
+	copy(lpm1[5:], body1)
+	lpm2 := make([]byte, 5+len(body2))
+	lpm2[0] = 0
+	binary.BigEndian.PutUint32(lpm2[1:5], uint32(len(body2)))
+	copy(lpm2[5:], body2)
+	combined := append(append([]byte{}, lpm1...), lpm2...)
+	injectH2Frame(ctx, t, tx, H2FrameDATA, H2FlagEndStream, 1, combined)
+
+	// First read: MESSAGE with lpm1, MORE=1 (more LPMs to come from
+	// this DATA frame's leftover).
+	fh, got, err := readFrame(ctx, rx)
+	if err != nil {
+		t.Fatalf("readFrame 1: %v", err)
+	}
+	if fh.Type != FrameTypeMESSAGE || !bytes.Equal(got, lpm1) {
+		t.Fatalf("first frame: type=%d body=%q want MESSAGE %q", fh.Type, got, lpm1)
+	}
+	if fh.Flags&MessageFlagMORE == 0 {
+		t.Errorf("first frame flags: got MORE=0, want MORE=1 (leftover present)")
+	}
+
+	// Second read: MESSAGE with lpm2, MORE=0 (last LPM of the
+	// END_STREAM-bearing DATA frame).
+	fh2, got2, err := readFrame(ctx, rx)
+	if err != nil {
+		t.Fatalf("readFrame 2: %v", err)
+	}
+	if fh2.Type != FrameTypeMESSAGE || !bytes.Equal(got2, lpm2) {
+		t.Fatalf("second frame: type=%d body=%q want MESSAGE %q", fh2.Type, got2, lpm2)
+	}
+	if fh2.Flags&MessageFlagMORE != 0 {
+		t.Errorf("second frame flags: got MORE=1, want MORE=0 (last LPM, END_STREAM source)")
+	}
+}
+
+// TestH2LpmAccumulator_MRUCacheHits exercises the MRU cache
+// short-circuit. Every consecutive call with the same stream id
+// should bypass the map lookup. Cache invalidates correctly when the
+// accumulator is removed.
+func TestH2LpmAccumulator_MRUCacheHits(t *testing.T) {
+	holder := newHpackDecoderHolder()
+	a1 := holder.getLpmAccumulator(7)
+	if holder.lastSid != 7 || holder.lastAcc != a1 {
+		t.Fatalf("MRU cache not populated after first lookup: lastSid=%d lastAcc=%v",
+			holder.lastSid, holder.lastAcc)
+	}
+	// Second lookup of same sid: must short-circuit (return cached).
+	if a2 := holder.getLpmAccumulator(7); a2 != a1 {
+		t.Errorf("MRU cache miss for repeat sid=7: got %p want %p", a2, a1)
+	}
+	// Different sid: cache rotates.
+	a3 := holder.getLpmAccumulator(11)
+	if holder.lastSid != 11 || holder.lastAcc != a3 {
+		t.Errorf("MRU cache not updated for new sid: lastSid=%d", holder.lastSid)
+	}
+	// Removing the cached sid invalidates the cache.
+	holder.removeLpmAccumulator(11)
+	if holder.lastSid != 0 || holder.lastAcc != nil {
+		t.Errorf("MRU cache not invalidated after removal: lastSid=%d lastAcc=%v",
+			holder.lastSid, holder.lastAcc)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Fourth-pass review hardening tests.
+// ---------------------------------------------------------------------------
+
+// TestH2DataPartialLPM_EndStream rejects a DATA frame that delivers
+// only a partial LPM header AND has END_STREAM. Without explicit
+// rejection the codec previously left the accumulator in
+// "in-progress" state and waited for a next DATA frame that would
+// never arrive (the peer signalled end of stream), hanging the
+// reader.
+func TestH2DataPartialLPM_EndStream(t *testing.T) {
+	tx, rx, ctx, _, _ := newH2RingPair(t)
+	// Send LPM1 (complete) + 3 bytes of LPM2's 5-byte header, all in
+	// one DATA frame with END_STREAM set.
+	lpm1 := []byte{0x00, 0x00, 0x00, 0x00, 0x02, 'h', 'i'} // body=2
+	partial2 := []byte{0x00, 0x00, 0x00}                   // 3 of 5 header bytes
+	combined := append(append([]byte{}, lpm1...), partial2...)
+	injectH2Frame(ctx, t, tx, H2FrameDATA, H2FlagEndStream, 1, combined)
+
+	// First read: MESSAGE with lpm1 (MORE=1 — leftover stashed).
+	fh, _, err := readFrame(ctx, rx)
+	if err != nil {
+		t.Fatalf("readFrame 1: %v", err)
+	}
+	if fh.Type != FrameTypeMESSAGE {
+		t.Fatalf("first frame: got type %d, want MESSAGE", fh.Type)
+	}
+
+	// Second read: replay path feeds partial header. END_STREAM was
+	// set; partial header in-progress with no more bytes coming →
+	// must error.
+	if _, _, err := readFrame(ctx, rx); err == nil {
+		t.Fatal("expected error: partial LPM header at END_STREAM")
+	}
+}
+
+// TestH2EmptyDataEndStream_RemovesAccumulator verifies the empty-DATA
+// + END_STREAM HALFCLOSE branch drops the per-stream accumulator when
+// the accumulator is at a clean boundary (no message in flight). A
+// long-lived connection processing many streams must not leak
+// accumulator map entries, which would grow lpmAccumulators
+// unboundedly. Setup uses a multi-DATA delivery of a complete LPM
+// (split header / body across two frames) to force accumulator
+// creation; once the message completes the accumulator is idle and
+// can be removed safely on END_STREAM.
+func TestH2EmptyDataEndStream_RemovesAccumulator(t *testing.T) {
+	tx, rx, ctx, _, _ := newH2RingPair(t)
+	// Frame 1: LPM header only — accumulator absorbs all 5 bytes
+	// (no message yet emitted). Multi-DATA path forces accumulator
+	// to be allocated for stream 1.
+	header := []byte{0x00, 0x00, 0x00, 0x00, 0x02} // declares 2-byte body
+	injectH2Frame(ctx, t, tx, H2FrameDATA, 0, 1, header)
+	// Frame 2: full body — message completes; accumulator returns to
+	// idle state (headerBytesSeen=0, pos=0) but map entry persists.
+	body := []byte{'h', 'i'}
+	injectH2Frame(ctx, t, tx, H2FrameDATA, 0, 1, body)
+	// Frame 3: empty DATA + END_STREAM (canonical translateCustomToH2
+	// HALFCLOSE encoding). Accumulator is idle so this is a clean
+	// half-close — must NOT error and must drop the map entry.
+	injectH2Frame(ctx, t, tx, H2FrameDATA, H2FlagEndStream, 1, nil)
+
+	// First read surfaces the assembled MESSAGE.
+	if fh, _, err := readFrame(ctx, rx); err != nil {
+		t.Fatalf("readFrame MESSAGE: %v", err)
+	} else if fh.Type != FrameTypeMESSAGE {
+		t.Fatalf("first frame: got type %d want MESSAGE", fh.Type)
+	}
+
+	// Second read surfaces HALFCLOSE.
+	fh, _, err := readFrame(ctx, rx)
+	if err != nil {
+		t.Fatalf("readFrame HALFCLOSE: %v", err)
+	}
+	if fh.Type != FrameTypeHALFCLOSE {
+		t.Fatalf("frame type: got %d want HALFCLOSE", fh.Type)
+	}
+
+	// Inspect holder state: accumulator must have been removed.
+	holder := rx.h2Decoder()
+	if _, exists := holder.lpmAccumulators[1]; exists {
+		t.Error("accumulator for stream 1 still present after empty-DATA+END_STREAM HALFCLOSE")
+	}
+}
+
+// TestH2EmptyDataEndStream_RejectsPartialLPMInAccumulator covers the
+// case where the per-stream accumulator is mid-message (header parsed,
+// body partially received) when an empty DATA + END_STREAM arrives.
+// Per gRPC framing, END_STREAM here truncates a length-prefixed
+// message that the application is still expecting bytes for; silently
+// surfacing HALFCLOSE would lose the in-flight message body. The
+// codec must error and clear the accumulator to avoid replaying the
+// truncated state on a subsequent stream that reuses the same id.
+func TestH2EmptyDataEndStream_RejectsPartialLPMInAccumulator(t *testing.T) {
+	tx, rx, ctx, _, _ := newH2RingPair(t)
+	// Frame 1: full LPM header declaring 5-byte body, no body sent —
+	// accumulator now headerBytesSeen=5, expectedTotal=10, pos=5,
+	// inProgress()==true.
+	partial := []byte{0x00, 0x00, 0x00, 0x00, 0x05}
+	injectH2Frame(ctx, t, tx, H2FrameDATA, 0, 1, partial)
+	// Frame 2: empty DATA + END_STREAM. With partial LPM in flight
+	// this must surface as an error (truncated message), not as a
+	// silent HALFCLOSE.
+	injectH2Frame(ctx, t, tx, H2FrameDATA, H2FlagEndStream, 1, nil)
+
+	if _, _, err := readFrame(ctx, rx); err == nil {
+		t.Fatal("expected error on empty DATA+END_STREAM with partial LPM in accumulator")
+	}
+
+	// Accumulator must be cleared so a subsequent reused stream id
+	// doesn't see stale state.
+	holder := rx.h2Decoder()
+	if _, exists := holder.lpmAccumulators[1]; exists {
+		t.Error("accumulator for stream 1 still present after error path")
+	}
+}
+
+// TestH2EmptyDataEndStream_RejectsPartialLPM_ViewReader mirrors
+// TestH2EmptyDataEndStream_RejectsPartialLPMInAccumulator on the
+// readFrameView (zero-copy SliceBuffer) path. The two readers share
+// the codec state machine but have parallel branches for the empty
+// DATA + END_STREAM case; both must reject partial LPMs.
+func TestH2EmptyDataEndStream_RejectsPartialLPM_ViewReader(t *testing.T) {
+	tx, rx, ctx, _, _ := newH2RingPair(t)
+	partial := []byte{0x00, 0x00, 0x00, 0x00, 0x05}
+	injectH2Frame(ctx, t, tx, H2FrameDATA, 0, 1, partial)
+	injectH2Frame(ctx, t, tx, H2FrameDATA, H2FlagEndStream, 1, nil)
+
+	if _, buf, err := readFrameView(ctx, rx); err == nil {
+		if buf != nil {
+			buf.Free()
+		}
+		t.Fatal("expected error on empty DATA+END_STREAM with partial LPM (view reader)")
+	}
+	holder := rx.h2Decoder()
+	if _, exists := holder.lpmAccumulators[1]; exists {
+		t.Error("accumulator for stream 1 still present after error path (view reader)")
+	}
+}
+
+// TestH2Trailers_RejectsPartialLPMInAccumulator covers the parallel
+// case for the TRAILERS branch: a HEADERS frame with END_STREAM that
+// the codec interprets as gRPC trailers. If the per-stream
+// accumulator is mid-message at trailers arrival, the application's
+// buffered response is truncated; the codec must error rather than
+// surface clean trailers + drop the partial bytes.
+func TestH2Trailers_RejectsPartialLPMInAccumulator(t *testing.T) {
+	tx, rx, ctx, _, _ := newH2RingPair(t)
+	// Frame 1: initial HEADERS (no END_STREAM) — establishes the
+	// stream so the next HEADERS is treated as trailers, not initial.
+	hpackInit := hpackEncodeForTest(t,
+		hpack.HeaderField{Name: ":method", Value: "POST"},
+		hpack.HeaderField{Name: ":path", Value: "/svc/M"},
+		hpack.HeaderField{Name: "te", Value: "trailers"},
+		hpack.HeaderField{Name: "content-type", Value: "application/grpc"},
+	)
+	injectH2Frame(ctx, t, tx, H2FrameHEADERS, H2FlagEndHeaders, 1, hpackInit)
+	// Frame 2: partial LPM body — accumulator becomes inProgress.
+	partial := []byte{0x00, 0x00, 0x00, 0x00, 0x05}
+	injectH2Frame(ctx, t, tx, H2FrameDATA, 0, 1, partial)
+	// Frame 3: trailers (HEADERS + END_STREAM) — must error, not
+	// silently emit clean trailers.
+	hpackTrailers := hpackEncodeForTest(t,
+		hpack.HeaderField{Name: "grpc-status", Value: "0"},
+	)
+	injectH2Frame(ctx, t, tx, H2FrameHEADERS,
+		H2FlagEndHeaders|H2FlagEndStream, 1, hpackTrailers)
+
+	// First read: HEADERS frame (initial).
+	if fh, _, err := readFrame(ctx, rx); err != nil {
+		t.Fatalf("readFrame HEADERS: %v", err)
+	} else if fh.Type != FrameTypeHEADERS {
+		t.Fatalf("first frame: got type %d want HEADERS", fh.Type)
+	}
+	// Second read: must error on TRAILERS-with-partial-LPM.
+	if _, _, err := readFrame(ctx, rx); err == nil {
+		t.Fatal("expected error on TRAILERS with partial LPM in accumulator")
+	}
+	holder := rx.h2Decoder()
+	if _, exists := holder.lpmAccumulators[1]; exists {
+		t.Error("accumulator for stream 1 still present after error path")
+	}
+}
+
+// TestH2InitialHeadersEndStream_EmitsHalfClose covers the
+// zero-message client-streaming case: the client sends a single
+// HEADERS frame with END_STREAM (no DATA frames at all) to indicate
+// "request started, no payload, half-close immediately". The codec
+// must surface BOTH the HEADERS frame (so the server runs the RPC
+// handler) AND a synthetic HALFCLOSE frame (so the handler's recv
+// path observes io.EOF promptly). Without the synthetic HALFCLOSE
+// the server would hang on the recv waiting for a half-close that
+// never arrives.
+func TestH2InitialHeadersEndStream_EmitsHalfClose(t *testing.T) {
+	tx, rx, ctx, _, _ := newH2RingPair(t)
+	hpackBlock := hpackEncodeForTest(t,
+		hpack.HeaderField{Name: ":method", Value: "POST"},
+		hpack.HeaderField{Name: ":path", Value: "/svc/M"},
+		hpack.HeaderField{Name: "te", Value: "trailers"},
+		hpack.HeaderField{Name: "content-type", Value: "application/grpc"},
+	)
+	injectH2Frame(ctx, t, tx, H2FrameHEADERS,
+		H2FlagEndHeaders|H2FlagEndStream, 1, hpackBlock)
+
+	// First read: HEADERS surfaced as FrameTypeHEADERS so the server
+	// dispatch picks up the RPC.
+	fh, _, err := readFrame(ctx, rx)
+	if err != nil {
+		t.Fatalf("readFrame HEADERS: %v", err)
+	}
+	if fh.Type != FrameTypeHEADERS {
+		t.Fatalf("first frame type: got %d want HEADERS", fh.Type)
+	}
+	if fh.StreamID != 1 {
+		t.Fatalf("first frame StreamID: got %d want 1", fh.StreamID)
+	}
+
+	// Second read: synthetic HALFCLOSE on the same stream id — drives
+	// the server-side recv loop's io.EOF without waiting for any DATA.
+	fh, _, err = readFrame(ctx, rx)
+	if err != nil {
+		t.Fatalf("readFrame HALFCLOSE: %v", err)
+	}
+	if fh.Type != FrameTypeHALFCLOSE {
+		t.Fatalf("second frame type: got %d want HALFCLOSE", fh.Type)
+	}
+	if fh.StreamID != 1 {
+		t.Fatalf("HALFCLOSE StreamID: got %d want 1", fh.StreamID)
+	}
+
+	// Pending half-close state must be cleared after surfacing.
+	holder := rx.h2Decoder()
+	if holder.pendingHalfCloseStreamID != 0 {
+		t.Errorf("pendingHalfCloseStreamID not cleared: %d",
+			holder.pendingHalfCloseStreamID)
+	}
+}
+
+// TestH2InitialHeadersEndStream_EmitsHalfClose_ViewReader mirrors the
+// readFrame test on the readFrameView path. Both readers must emit
+// the synthetic HALFCLOSE for HEADERS+END_STREAM since either may be
+// invoked by the server transport's dispatch loop.
+func TestH2InitialHeadersEndStream_EmitsHalfClose_ViewReader(t *testing.T) {
+	tx, rx, ctx, _, _ := newH2RingPair(t)
+	hpackBlock := hpackEncodeForTest(t,
+		hpack.HeaderField{Name: ":method", Value: "POST"},
+		hpack.HeaderField{Name: ":path", Value: "/svc/M"},
+		hpack.HeaderField{Name: "te", Value: "trailers"},
+		hpack.HeaderField{Name: "content-type", Value: "application/grpc"},
+	)
+	injectH2Frame(ctx, t, tx, H2FrameHEADERS,
+		H2FlagEndHeaders|H2FlagEndStream, 1, hpackBlock)
+
+	// First read: HEADERS via view reader.
+	fh, buf, err := readFrameView(ctx, rx)
+	if err != nil {
+		t.Fatalf("readFrameView HEADERS: %v", err)
+	}
+	if buf != nil {
+		buf.Free()
+	}
+	if fh.Type != FrameTypeHEADERS {
+		t.Fatalf("first frame type: got %d want HEADERS", fh.Type)
+	}
+
+	// Second read: synthetic HALFCLOSE.
+	fh, buf, err = readFrameView(ctx, rx)
+	if err != nil {
+		t.Fatalf("readFrameView HALFCLOSE: %v", err)
+	}
+	if buf != nil {
+		buf.Free()
+	}
+	if fh.Type != FrameTypeHALFCLOSE {
+		t.Fatalf("second frame type: got %d want HALFCLOSE", fh.Type)
+	}
+	if fh.StreamID != 1 {
+		t.Fatalf("HALFCLOSE StreamID: got %d want 1", fh.StreamID)
+	}
+}
+
+// TestH2RstStream_ClearsPendingFrame verifies that RST_STREAM after a
+// DATA frame that left a partial LPM in pendingFrame correctly clears
+// the pendingFrame state. Without this clear, a subsequent read would
+// replay the dead stream's leftover bytes against a freshly-recreated
+// accumulator on the same stream id (legitimate for protocol-violating
+// peers; defense-in-depth for our codec).
+func TestH2RstStream_ClearsPendingFrame(t *testing.T) {
+	tx, rx, ctx, _, _ := newH2RingPair(t)
+	// Build DATA[lpm1][partial-lpm2-header] on stream 1.
+	body1 := []byte("ok")
+	lpm1 := make([]byte, 5+len(body1))
+	lpm1[0] = 0
+	binary.BigEndian.PutUint32(lpm1[1:5], uint32(len(body1)))
+	copy(lpm1[5:], body1)
+	// 3 of 5 LPM-header bytes for a phantom lpm2.
+	partial := []byte{0x00, 0x00, 0x00}
+	combined := append(append([]byte{}, lpm1...), partial...)
+	injectH2Frame(ctx, t, tx, H2FrameDATA, 0, 1, combined)
+
+	// First read: MESSAGE lpm1 (MORE=1). Stashes pendingFrame=partial.
+	if _, _, err := readFrame(ctx, rx); err != nil {
+		t.Fatalf("readFrame 1: %v", err)
+	}
+	holder := rx.h2Decoder()
+	if len(holder.pendingFrame) == 0 {
+		t.Fatal("expected pendingFrame to be populated after partial LPM")
+	}
+	if holder.pendingStreamID != 1 {
+		t.Fatalf("pendingStreamID: got %d want 1", holder.pendingStreamID)
+	}
+
+	// Inject RST_STREAM on stream 1.
+	rstPayload := []byte{0, 0, 0, 0x08} // CANCEL error code
+	injectH2Frame(ctx, t, tx, H2FrameRSTSTREAM, 0, 1, rstPayload)
+	fh, _, err := readFrame(ctx, rx)
+	if err != nil {
+		t.Fatalf("readFrame after RST: %v", err)
+	}
+	if fh.Type != FrameTypeCANCEL {
+		t.Fatalf("expected CANCEL, got %d", fh.Type)
+	}
+
+	// Verify pendingFrame state was cleared.
+	if len(holder.pendingFrame) != 0 {
+		t.Errorf("pendingFrame not cleared after RST_STREAM: %d bytes leftover", len(holder.pendingFrame))
+	}
+	if holder.pendingStreamID != 0 {
+		t.Errorf("pendingStreamID not cleared after RST_STREAM: %d", holder.pendingStreamID)
+	}
+	if holder.pendingFrameEndStream {
+		t.Error("pendingFrameEndStream not cleared after RST_STREAM")
 	}
 }

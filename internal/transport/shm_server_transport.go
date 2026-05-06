@@ -520,6 +520,15 @@ func (t *ShmServerTransport) processIncomingData(ctx context.Context) {
 			} else {
 				t.handleMessage(fh.StreamID, fh.Flags, payload)
 			}
+		case FrameTypeHALFCLOSE:
+			// Client signalled it is done sending. Custom16 writer
+			// emits this as a separate frame; the H2 codec emits it
+			// after an initial HEADERS frame whose source H2 frame
+			// carried END_STREAM (zero-message client-streaming
+			// request). Without this case, such a stream would hang
+			// waiting for a MESSAGE that never arrives.
+			t.handleHalfClose(fh.StreamID)
+			release()
 		case FrameTypeTRAILERS:
 			t.handleTrailers(fh.StreamID, payload)
 			release()
@@ -705,6 +714,29 @@ func (t *ShmServerTransport) handleHeaders(ctx context.Context, streamID uint32,
 
 // handleMessage processes a MESSAGE frame.
 // For client->server, the final MESSAGE is indicated by MessageFlagMORE being unset.
+// handleHalfClose surfaces a client half-close on streamID without
+// any associated message payload. Used when the codec needs to
+// signal "client done sending" out-of-band — currently only when an
+// initial HEADERS frame carried H2's END_STREAM flag (zero-message
+// client-streaming request, RFC 7540 §6.2 + gRFC G2). The normal
+// path, where MORE=0 on the last MESSAGE drives EOF, is handled in
+// handleMessage and is unaffected.
+func (t *ShmServerTransport) handleHalfClose(streamID uint32) {
+	var s *ServerStream
+	if c := t.cachedStream.Load(); c != nil && c.streamID == streamID {
+		s = c.stream
+	} else {
+		t.mu.RLock()
+		var exists bool
+		s, exists = t.streams[streamID]
+		t.mu.RUnlock()
+		if !exists {
+			return
+		}
+	}
+	s.write(recvMsg{err: io.EOF})
+}
+
 func (t *ShmServerTransport) handleMessage(streamID uint32, flags uint8, payload []byte) {
 	// Fast path: if we have a cached single stream, skip map lookup + RLock.
 	var s *ServerStream
@@ -1174,7 +1206,7 @@ func (t *ShmServerTransport) maybeWriteHeader(s *ServerStream) error {
 //
 // Only handles contiguous (non-wrap-around) writes. Wrap-around, non-proto
 // messages, and oversized messages fall back.
-func (t *ShmServerTransport) writeProto(s *ServerStream, msg any, opts *WriteOptions) (bool, error) {
+func (t *ShmServerTransport) writeProto(s *ServerStream, msg any, _ *WriteOptions) (bool, error) {
 	pm, ok := msg.(protoMessage)
 	if !ok {
 		return false, nil
