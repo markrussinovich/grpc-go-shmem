@@ -22,6 +22,7 @@ package transport
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"io"
 	"log"
@@ -232,12 +233,20 @@ func (s *ShmStreamingServer) runStreamSender(stream *streamingServerStream) {
 			if !ok {
 				return
 			}
-			// Send message frame
+			// Send message frame. H2 codec on the receive side requires
+			// the MESSAGE body to be gRPC LPM-prefixed (1-byte compressed
+			// flag + 4-byte big-endian length + body). The user-facing
+			// SendMsg / RecvMsg API operates on raw payload bytes, so we
+			// wrap on send and strip on receive (dispatchMessage).
+			wrapped := make([]byte, 5+len(msg))
+			wrapped[0] = 0 // not compressed
+			binary.BigEndian.PutUint32(wrapped[1:5], uint32(len(msg)))
+			copy(wrapped[5:], msg)
 			fh := FrameHeader{
 				StreamID: stream.id,
 				Type:     FrameTypeMESSAGE,
 			}
-			if err := s.writeFrameSafe(stream.ctx, fh, msg); err != nil {
+			if err := s.writeFrameSafe(stream.ctx, fh, wrapped); err != nil {
 				log.Printf("StreamingServer: failed to send message on stream %d: %v", stream.id, err)
 				stream.closeWithError(err)
 				return
@@ -262,8 +271,15 @@ func (s *ShmStreamingServer) dispatchMessage(id uint32, p []byte) {
 		log.Printf("StreamingServer: no stream found for id %d", id)
 		return
 	}
+	// Strip the gRPC LPM 5-byte prefix added by the sender. See the
+	// matching stripLPMHeader in streaming_client.go.
+	body, ok := stripLPMHeader(p)
+	if !ok {
+		log.Printf("StreamingServer: dropping malformed MESSAGE on stream %d (len=%d)", id, len(p))
+		return
+	}
 	// Make a copy since the payload buffer may be reused
-	msg := append([]byte(nil), p...)
+	msg := append([]byte(nil), body...)
 	select {
 	case stream.msgCh <- msg:
 		return

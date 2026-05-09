@@ -22,6 +22,7 @@ package transport
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"log"
 	"sync"
@@ -194,6 +195,10 @@ func (c *ShmUnaryClient) dispatchMessage(id uint32, p []byte) {
 	if s == nil {
 		return
 	}
+	// Callers (this test-only unary client) operate on the full LPM-
+	// prefixed MESSAGE body — the same bytes the producer constructed
+	// (compressed flag + length + body). The H2 codec preserves these
+	// bytes verbatim on the wire, so we hand the payload through as-is.
 	select {
 	case s.msgCh <- append([]byte(nil), p...):
 	default:
@@ -357,9 +362,22 @@ func (c *ShmUnaryClient) UnaryCall(ctx context.Context, method, authority string
 		return HeadersV1{}, nil, TrailersV1{}, err
 	}
 	log.Printf("Client: HEADERS sent successfully for stream %d", id)
-	// Send MESSAGE (single frame for unary)
+	// Send MESSAGE (single frame for unary). The caller is responsible
+	// for constructing a gRPC LPM-prefixed body (1-byte compressed flag
+	// + 4-byte big-endian length + body) — all callers in this test
+	// package already do so. We pass the bytes through verbatim; the
+	// H2 codec on the receive side hands the same bytes back to
+	// dispatchMessage.
+	//
+	// Set MessageFlagEndStream so the H2 codec emits the H2
+	// END_STREAM flag on the DATA frame. On the receive side this
+	// becomes MORE=0 on the surfaced MESSAGE FrameHeader, signalling
+	// "this is the only / last request frame" to a peer that breaks
+	// its receive loop on MORE=0. Without this, single-frame unary
+	// requests look identical to "more frames will follow" and
+	// servers loop forever waiting for the next frame.
 	log.Printf("Client: about to send MESSAGE frame for stream %d", id)
-	if err := writeFrame(ctx, c.tx, FrameHeader{StreamID: id, Type: FrameTypeMESSAGE}, payload); err != nil {
+	if err := writeFrame(ctx, c.tx, FrameHeader{StreamID: id, Type: FrameTypeMESSAGE, Flags: MessageFlagEndStream}, payload); err != nil {
 		c.writeMu.Unlock()
 		log.Printf("Client: MESSAGE write failed for stream %d: %v", id, err)
 		close(done)
@@ -411,4 +429,26 @@ func (c *ShmUnaryClient) UnaryCall(ctx context.Context, method, authority string
 			haveTr = true
 		}
 	}
+}
+
+// stripLPMHeader removes the 5-byte gRPC length-prefixed-message header
+// from a MESSAGE frame body. Returns the body bytes and true on success;
+// returns (nil, false) if p is too short or the declared length does not
+// match the actual body length.
+//
+// Used by the test-only ShmUnaryClient / ShmStreamingClient /
+// ShmStreamingServer helpers in this package to unwrap MESSAGE bodies on
+// receipt. The H2 codec preserves the gRPC LPM 5-byte prefix when it
+// reassembles a MESSAGE frame, so test helpers that operate on raw
+// user-level payload bytes must strip the prefix before passing data
+// to the test.
+func stripLPMHeader(p []byte) ([]byte, bool) {
+	if len(p) < 5 {
+		return nil, false
+	}
+	declared := binary.BigEndian.Uint32(p[1:5])
+	if int(declared) != len(p)-5 {
+		return nil, false
+	}
+	return p[5:], true
 }

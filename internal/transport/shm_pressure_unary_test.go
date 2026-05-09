@@ -22,6 +22,7 @@ package transport
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"runtime"
 	"testing"
@@ -49,10 +50,11 @@ func TestUnary_BackpressureAndBlocking(t *testing.T) {
 	const total = 48 * 1024
 	payload := make([]byte, 5+total)
 	payload[0] = 0
-	payload[1] = byte(total & 0xFF)
-	payload[2] = byte((total >> 8) & 0xFF)
-	payload[3] = byte((total >> 16) & 0xFF)
-	payload[4] = byte((total >> 24) & 0xFF)
+	// gRPC LPM length is big-endian per the H2 wire format. (The test
+	// previously used little-endian which happened to round-trip for
+	// values where the low bytes had the data; H2 codec validation
+	// strictly requires big-endian.)
+	binary.BigEndian.PutUint32(payload[1:5], total)
 	for i := 0; i < total; i++ {
 		payload[5+i] = byte(i % 251)
 	}

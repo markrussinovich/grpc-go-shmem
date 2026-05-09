@@ -226,18 +226,11 @@ func warmUpGRPC(b *testing.B, client testgrpc.BenchmarkServiceClient) {
 	}
 }
 
-// benchStream performs per-iteration stream creation and one round-trip.
-// A fresh stream is created each iteration because the SHM transport cannot
-// safely reuse a stream across Go benchmark ramp-up rounds (the first round's
-// stream cleanup corrupts the connection state for subsequent rounds).
-// This pattern measures stream-creation + one round-trip latency, which is
-// representative of typical short-lived streaming RPCs.
 // benchStream performs streaming ping-pong Send/Recv for b.N iterations on a
-// single persistent stream. The stream uses context.Background so it survives
-// across Go benchmark ramp-up rounds without triggering SHM transport connection
-// teardown. The stream is abandoned (not CloseSend'd) when the function returns;
-// this is safe because the server handler will see io.EOF when the client
-// eventually closes the connection (at env.close time).
+// single persistent stream. This measures per-message latency on an already-
+// established stream rather than per-stream setup cost. The stream is closed
+// at function exit; the server handler returns when it sees io.EOF on its
+// receive side.
 func benchStream(b *testing.B, client testgrpc.BenchmarkServiceClient, size int) {
 	req := &testpb.SimpleRequest{
 		ResponseType: testpb.PayloadType_COMPRESSABLE,
@@ -245,29 +238,42 @@ func benchStream(b *testing.B, client testgrpc.BenchmarkServiceClient, size int)
 		Payload:      benchmark.NewPayload(testpb.PayloadType_COMPRESSABLE, size),
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	stream, err := client.StreamingCall(ctx)
+	if err != nil {
+		b.Fatalf("StreamingCall: %v", err)
+	}
+
+	// Warm up the stream so the first measured iteration doesn't include
+	// per-stream setup cost.
+	if err := stream.Send(req); err != nil {
+		b.Fatalf("warm-up Send: %v", err)
+	}
+	if _, err := stream.Recv(); err != nil {
+		b.Fatalf("warm-up Recv: %v", err)
+	}
+
 	b.SetBytes(int64(size))
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		stream, err := client.StreamingCall(context.Background())
-		if err != nil {
-			b.Fatalf("StreamingCall: %v", err)
-		}
 		if err := stream.Send(req); err != nil {
 			b.Fatalf("Send: %v", err)
 		}
 		if _, err := stream.Recv(); err != nil {
 			b.Fatalf("Recv: %v", err)
 		}
-		// CloseSend signals the server handler to exit (it will see io.EOF
-		// from RecvMsg). A brief pause lets the SHM transport process the
-		// half-close and server trailers before the next iteration creates
-		// a new stream on the same connection. Without this, the transport
-		// may corrupt state across stream boundaries.
-		stream.CloseSend()
-		time.Sleep(time.Millisecond)
 	}
 	b.StopTimer()
+
+	// Close the stream cleanly so the next benchmark size starts fresh.
+	_ = stream.CloseSend()
+	for {
+		if _, err := stream.Recv(); err != nil {
+			break
+		}
+	}
 }
 
 // benchUnary performs individual UnaryCall RPCs for b.N iterations.
@@ -298,9 +304,12 @@ var benchStreamSizes = []int{64, 256, 1024, 4096, 16384, 65536, 262144, 1048576}
 // Unary payload sizes (64 B to 4 KiB) — small payloads where per-call overhead dominates.
 var benchUnarySizes = []int{64, 256, 1024, 4096}
 
-// Large payload sizes (1 MiB to 16 MiB).
-// NOTE: Payloads approaching the ring buffer size (64 MiB) may corrupt data
-// during gRPC frame reassembly over SHM. Cap at 16 MiB for reliable results.
+// Large payload sizes (1 MiB to 256 MiB). H2 chunking on the SHM
+// transport splits messages whose total wire size exceeds ring
+// capacity into multiple DATA frames, so a 256 MiB payload on a
+// 64 MiB ring is well-formed and round-trips correctly. The
+// historical 16 MiB cap was a workaround for the legacy Custom16
+// MORE-flag chunking path which no longer exists.
 var benchLargeSizes = []struct {
 	bytes int
 	label string
@@ -308,6 +317,8 @@ var benchLargeSizes = []struct {
 	{1 * 1024 * 1024, "1MB"},
 	{4 * 1024 * 1024, "4MB"},
 	{16 * 1024 * 1024, "16MB"},
+	{64 * 1024 * 1024, "64MB"},
+	{256 * 1024 * 1024, "256MB"},
 }
 
 // =============================================================================

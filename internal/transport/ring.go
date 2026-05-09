@@ -112,24 +112,13 @@ type ShmRing struct {
 	// cost of multiple frame writes.
 	batchDepth uint32
 
-	// wire is the on-ring frame encoding negotiated during the CONNECT
-	// handshake. Both ends of a ring use the same wire format. Set once
-	// after construction (via SetWireFormat) and never mutated again.
-	//
-	// Accessed via atomic.LoadUint32 / atomic.StoreUint32 because
-	// SetWireFormat may be called by the dialer goroutine after the
-	// transport's reader/writer goroutines have already started (they
-	// receive the ring before the negotiation completes). The race
-	// detector flagged a benign data race here; using atomic primitives
-	// makes it explicit and provides release/acquire ordering so a
-	// reader that observes wire==Http2 also sees any other state that
-	// was published before SetWireFormat returned.
-	wire uint32
-
-	// h2Enc / h2Dec are the per-ring HPACK encoder/decoder state, used
-	// only when wire == WireFormatHTTP2. The encoder is single-threaded
-	// (writer goroutine via inlineMu); the decoder is single-threaded
-	// (reader goroutine in processIncomingData).
+	// h2Enc / h2Dec are the per-ring HPACK encoder/decoder state used by
+	// the HTTP/2 wire codec for data-plane traffic. The encoder is
+	// single-threaded (writer goroutine via inlineMu); the decoder is
+	// single-threaded (reader goroutine in processIncomingData). Lazily
+	// initialised by h2Encoder() / h2Decoder() on first use; control
+	// rings (which never carry data-plane gRPC frames) never allocate
+	// these.
 	h2Enc *hpackEncoderHolder
 	h2Dec *hpackDecoderHolder
 
@@ -396,7 +385,7 @@ func (r *ShmRing) publishTarget(hdr *RingHeader, target uint64) {
 }
 
 // IsSpeculativeZCEligible is the centralised speculative-ZC eligibility
-// check, applied identically by every wire-format reader (Custom16 + H2).
+// check, applied identically by every reader.
 // Single source of truth for the heuristic so the two code paths cannot
 // drift.
 //
@@ -447,34 +436,20 @@ func (r *ShmRing) IsSpeculativeZCEligible(payloadLength int, contiguous bool) bo
 	return used*4 <= r.capacity*3
 }
 
-// ===== Multi-frame chain ZC (Custom16 MORE-chunked messages) =====
+// ===== Multi-frame chain ZC =====
 //
-// Custom16 supports a per-message MORE flag that lets a single logical
-// gRPC message span multiple frames. When chunking, the writer emits
-// MESSAGE frames with MORE=1 followed by a final MESSAGE with MORE=0.
-//
-// Chain ZC: when the FIRST chunk arrives, the codec peeks the LPM
-// length to compute totalMsg. If totalMsg ≤ ChainZcBudget (cap/2) AND
-// the regular IsSpeculativeZCEligible passes, the chain enters ZC
-// mode: every chunk in the chain returns its body as a ring-backed
-// mem.Buffer; the consumer aggregates them via mem.BufferSlice. The
-// anchor opens on the first chunk via BeginZcReservation; per-chunk
-// Commit is deferred via zcInFlight bookkeeping; the anchor closes
-// when the final !MORE chunk's buffer is freed (the consumer's last
-// Buffer.Free triggers EndZcReservation).
-//
-// Why no tail-ZC? The savings would be at most ChainZcBudget worth of
-// memcpy on the codec→pool boundary, but the upper-layer protobuf
-// parser already needs a contiguous buffer for messages spanning
-// multiple segments. Keeping the codec simple — single mode decision
-// per message — is worth more than the marginal gain.
-//
-// Why cap/2 budget? Under sustained back-to-back streaming, the
-// writer must have ≥ cap/2 of headroom to begin emitting the next
-// message while the consumer is still parsing the current one.
-// A larger budget (e.g., cap - 64 KiB) works for unary but deadlocks
-// streaming: holding nearly the whole ring leaves no room for the
-// writer to progress on the next message.
+// Reserved infrastructure for zero-copy reads of logical messages
+// that span multiple ring frames. Currently NOT REACHABLE under the
+// H2 wire format because the H2 codec's lpmAccumulator reassembles
+// multi-DATA-frame LPMs into a heap buffer before surfacing the
+// MESSAGE to the upper layer; only single-frame messages traverse
+// the deferred-publish ZC path. The runtime hooks (chainOpen /
+// IsZcChainActive / IsChainOpen / ChainZcBudget) remain in place
+// for two reasons: (1) EndZcReservation's chainOpen check is
+// load-bearing for the anchor-close ordering, and (2) future work
+// may extend the H2 codec to surface chunk-by-chunk DATA frames as
+// distinct MESSAGE frames carrying MessageFlagMORE, which would
+// re-activate this path.
 
 // ChainZcBudget is the maximum totalMsg (5-byte LPM header + body)
 // that may enter chain-ZC mode. cap/2 ensures the writer always has
@@ -609,24 +584,6 @@ func NewShmRingFromSegment(ringView *ringView, mem []byte) *ShmRing {
 // On Linux, this is a no-op since futex works natively across mappings.
 func (r *ShmRing) SetEvents(events *RingEvents) {
 	r.events = events
-}
-
-// SetWireFormat configures the on-ring frame encoding. Must be called
-// after the CONNECT handshake completes; safe to call after the
-// transport's reader/writer goroutines have started because the field
-// is accessed via atomic primitives.
-//
-// Atomic store provides a release barrier: any goroutine that observes
-// wire == Http2 (via WireFormat()) is guaranteed to see all state
-// published by SetWireFormat's caller before this call.
-func (r *ShmRing) SetWireFormat(w WireFormat) {
-	atomic.StoreUint32(&r.wire, uint32(w))
-}
-
-// WireFormat returns the on-ring frame encoding for this ring. Acquire
-// load to pair with SetWireFormat's release store.
-func (r *ShmRing) WireFormat() WireFormat {
-	return WireFormat(atomic.LoadUint32(&r.wire))
 }
 
 // header returns a pointer to the RingHeader in shared memory

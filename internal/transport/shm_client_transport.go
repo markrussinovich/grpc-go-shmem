@@ -246,7 +246,12 @@ func (t *ShmClientTransport) sendWindowUpdate(streamID uint32, delta uint32) {
 	t.sendQuotaMu.Unlock()
 
 	buf := make([]byte, 4)
-	binary.LittleEndian.PutUint32(buf, delta)
+	// RFC 7540 §6.9.1: WINDOW_UPDATE Window Size Increment is a 31-bit
+	// big-endian unsigned integer. Match the spec so the codec's
+	// validate-non-zero check (which reads BigEndian) sees the
+	// correct value, and so an external HTTP/2 peer parsing this
+	// frame interprets the increment correctly.
+	binary.BigEndian.PutUint32(buf, delta)
 	_ = t.frameWriter.enqueue(frameEntry{
 		ctx:     context.Background(),
 		fh:      FrameHeader{Type: FrameTypeWindowUpdate, StreamID: streamID},
@@ -507,7 +512,9 @@ func (t *ShmClientTransport) processIncomingData(ctx context.Context) {
 			continue
 		case FrameTypeWindowUpdate:
 			if len(payload) >= 4 {
-				delta := binary.LittleEndian.Uint32(payload[:4])
+				// RFC 7540 §6.9.1: increment is big-endian. Senders
+				// (sendWindowUpdate above) write BigEndian so this matches.
+				delta := binary.BigEndian.Uint32(payload[:4])
 				t.addSendQuota(fh.StreamID, delta)
 			}
 			release()
@@ -1196,8 +1203,8 @@ func (t *ShmClientTransport) writeProto(s *ClientStream, msg any, opts *WriteOpt
 	}
 
 	pSize := protoSize(pm)
-	ringSize := frameHeaderSize + 5 + pSize // total bytes in ring (header + gRPC LPM + proto)
-	quotaSize := 5 + pSize                  // flow-control size (matches receiver WINDOW_UPDATE accounting)
+	ringSize := h2FrameHeaderSize + 5 + pSize // total bytes in ring (H2 header + gRPC LPM + proto)
+	quotaSize := 5 + pSize                    // flow-control size (matches receiver WINDOW_UPDATE accounting)
 
 	// Skip ZC if the message is too large for a single frame.
 	// Must check before acquiring flow control quota to avoid double-acquire
@@ -1207,7 +1214,7 @@ func (t *ShmClientTransport) writeProto(s *ClientStream, msg any, opts *WriteOpt
 	}
 
 	// Flow control: account only the gRPC payload (5-byte LPM header + proto
-	// body). The 16-byte ring frame header is a transport-level concern and
+	// body). The 9-byte H2 frame header is a transport-level concern and
 	// is NOT included in WINDOW_UPDATE accounting on the receive side.
 	if err := t.acquireSendQuota(s.ctx, s.id, quotaSize); err != nil {
 		return false, err
@@ -1215,16 +1222,14 @@ func (t *ShmClientTransport) writeProto(s *ClientStream, msg any, opts *WriteOpt
 
 	// Set frame flags based on the caller's "last message" signal:
 	//
-	//   - MessageFlagMORE: Custom16-only. The server's handleMessage
-	//     uses MORE=0 on incoming MESSAGE to detect client half-close.
-	//   - MessageFlagEndStream: H2-only. writeProtoToRingH2 maps this
-	//     to H2's END_STREAM bit on the emitted DATA frame; the
+	//   - MessageFlagMORE: signals "more frames follow on this stream".
+	//     The server's handleMessage uses MORE=0 on incoming MESSAGE
+	//     to detect client half-close.
+	//   - MessageFlagEndStream: signals "this is the last message I
+	//     will send on this stream". writeProtoToRingH2 maps this to
+	//     H2's END_STREAM bit on the emitted DATA frame; the
 	//     server-side H2 reader translates END_STREAM back to MORE=0
 	//     so the same handleMessage MORE=0 EOF logic fires.
-	//
-	// Set both flags coherently so the H2 and Custom16 codepaths each
-	// see the right signal regardless of which wire format the ring
-	// is using.
 	var frameFlags uint8
 	if opts != nil && !opts.Last {
 		frameFlags = MessageFlagMORE
@@ -1335,9 +1340,9 @@ func (t *ShmClientTransport) write(s *ClientStream, hdr []byte, data mem.BufferS
 	}
 
 	// Write MESSAGE frame. See ringWriteProto for the rationale on
-	// the MORE / EndStream flag pair (Custom16 uses MORE=0 to signal
-	// half-close; H2 needs END_STREAM on wire which writeFrameH2
-	// derives from MessageFlagEndStream).
+	// the MORE / EndStream flag pair (MORE=0 signals half-close;
+	// writeFrameH2 derives the on-wire END_STREAM bit from
+	// MessageFlagEndStream).
 	fh := FrameHeader{
 		StreamID: s.id,
 		Type:     FrameTypeMESSAGE,

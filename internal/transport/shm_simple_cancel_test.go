@@ -22,6 +22,7 @@ package transport
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"log"
 	"testing"
@@ -100,11 +101,9 @@ func TestSimpleCancellation(t *testing.T) {
 
 	client := NewShmUnaryClient(seg)
 	payload := make([]byte, 5+3)
-	payload[0] = 0
-	payload[1] = 3
-	payload[2] = 0
-	payload[3] = 0
-	payload[4] = 0
+	payload[0] = 0 // not compressed
+	// gRPC LPM length is big-endian (H2 wire format).
+	binary.BigEndian.PutUint32(payload[1:5], 3)
 	copy(payload[5:], []byte("abc"))
 
 	// Use a simple cancellable context WITHOUT timeout
