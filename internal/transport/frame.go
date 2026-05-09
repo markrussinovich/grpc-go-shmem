@@ -63,6 +63,19 @@ const (
 
 	// MESSAGE flags
 	MessageFlagMORE = uint8(0x01)
+	// MessageFlagEndStream signals to the writer that this MESSAGE
+	// terminates the stream from THIS peer's send direction. Set by
+	// the client transport on the last logical request message of a
+	// client-streaming or unary RPC; never set by the server (server
+	// ends its send direction with a TRAILERS frame). The H2 codec's
+	// writeProtoToRingH2 maps this to H2's END_STREAM flag on the
+	// emitted DATA frame; the H2 reader maps the same DATA's
+	// END_STREAM back to MessageFlagMORE = 0 (clearing MORE) on the
+	// surfaced MESSAGE so ShmServerTransport.handleMessage's MORE=0
+	// EOF logic fires correctly. Custom16 codec ignores this flag —
+	// MORE=0 alone is sufficient there because Custom16 has no
+	// HTTP/2-level END_STREAM concept.
+	MessageFlagEndStream = uint8(0x02)
 
 	// TRAILERS flags
 	TrailersFlagEndStream = uint8(0x01)
@@ -370,6 +383,12 @@ func decodeTrailers(b []byte) (TrailersV1, error) {
 // necessary and never spins. Headers may straddle wraps; ReserveFrameHeader
 // can return split slices which are both written.
 func writeFrame(ctx context.Context, tx *ShmRing, fh FrameHeader, payload []byte) error {
+	// Dispatch to the H2 codec when the ring is configured for HTTP/2.
+	if tx.WireFormat() == WireFormatHTTP2 {
+		holder := tx.h2Encoder()
+		return writeFrameH2(ctx, tx, fh, payload, holder.enc, holder.scratch)
+	}
+
 	// Fill header fields consistently and set reserved to zero
 	fh.Length = uint32(len(payload))
 	fh.Reserved = 0
@@ -424,6 +443,20 @@ func writeFrame(ctx context.Context, tx *ShmRing, fh FrameHeader, payload []byte
 // header prefix plus a BufferSlice. It avoids building an intermediate
 // contiguous payload, reducing allocations and copies on the hot path.
 func writeFrameBuffers(ctx context.Context, tx *ShmRing, fh FrameHeader, hdr []byte, payload mem.BufferSlice) error {
+	if tx.WireFormat() == WireFormatHTTP2 {
+		// Materialize hdr + payload into a contiguous buffer for the H2 codec.
+		// The H2 codec further translates HEADERS/TRAILERS into HPACK; for
+		// MESSAGE frames the bytes are written directly as DATA.
+		dataLen := payload.Len()
+		buf := make([]byte, len(hdr)+dataLen)
+		copy(buf, hdr)
+		off := len(hdr)
+		for _, b := range payload {
+			off += copy(buf[off:], b.ReadOnlyData())
+		}
+		holder := tx.h2Encoder()
+		return writeFrameH2(ctx, tx, fh, buf, holder.enc, holder.scratch)
+	}
 	dataLen := payload.Len()
 	payloadLen := len(hdr) + dataLen
 	fh.Length = uint32(payloadLen)
@@ -497,6 +530,12 @@ func writeFrameBuffers(ctx context.Context, tx *ShmRing, fh FrameHeader, hdr []b
 // zero, it defaults to ringCapacity - frameHeaderSize - safetyMargin. A sensible
 // default is 32KB or (capacity/2) whichever is smaller.
 func writeFrameBuffersChunked(ctx context.Context, tx *ShmRing, fh FrameHeader, hdr []byte, data mem.BufferSlice, maxFramePayload int) error {
+	if tx.WireFormat() == WireFormatHTTP2 {
+		// H2 path doesn't currently chunk: H2's max frame size is 16MB which
+		// is sufficient for almost all gRPC messages. For larger messages,
+		// future work is to emit multiple H2 DATA frames with END_STREAM=0.
+		return writeFrameBuffers(ctx, tx, fh, hdr, data)
+	}
 	payloadLen := len(hdr) + data.Len()
 
 	// Calculate effective max payload if not specified.
@@ -661,6 +700,9 @@ func writeFrameChunkFromCursor(ctx context.Context, tx *ShmRing, fh FrameHeader,
 // readFrame reads one non-PAD frame (skipping any PAD frames). It blocks if
 // necessary and never spins.
 func readFrame(ctx context.Context, rx *ShmRing) (FrameHeader, []byte, error) {
+	if rx.WireFormat() == WireFormatHTTP2 {
+		return readFrameH2(ctx, rx, rx.h2Decoder())
+	}
 	for {
 		// Read exactly the header size, but allow it to straddle the wrap
 		first, second, commit, err := rx.ReadSlices(ctx, frameHeaderSize)
@@ -721,6 +763,9 @@ func readFrame(ctx context.Context, rx *ShmRing) (FrameHeader, []byte, error) {
 // microseconds while filling 64MB takes milliseconds, this is safe for
 // all practical workloads.
 func readFrameView(ctx context.Context, rx *ShmRing) (FrameHeader, mem.Buffer, error) {
+	if rx.WireFormat() == WireFormatHTTP2 {
+		return readFrameViewH2(ctx, rx, rx.h2Decoder())
+	}
 	for {
 		first, second, commitHeader, err := rx.ReadSlices(ctx, frameHeaderSize)
 		if err != nil {
@@ -775,14 +820,13 @@ func readFrameView(ctx context.Context, rx *ShmRing) (FrameHeader, mem.Buffer, e
 
 		// Zero-copy for contiguous single-frame MESSAGE payloads only.
 		//
-		// Multi-frame chunks (MORE flag set) always use the copy path because:
-		// 1. The caller must reassemble chunks into a contiguous buffer anyway,
-		//    so speculative ZC provides no copy savings.
-		// 2. Speculative reservation reduces writer pipeline depth (from 3
-		//    chunks to ~1), hurting throughput for large payloads.
-		// This matches the C# implementation which only uses speculative ZC
-		// for single-frame final messages (!isMore).
-		var buf mem.Buffer
+		// Multi-frame chunks (MORE flag set) always use the copy path:
+		// the caller must reassemble chunks into a contiguous buffer
+		// anyway, so speculative ZC provides no copy savings, and the
+		// deferred-publish protocol holds header.ReadIdx across the
+		// chain which would stall the writer for chains larger than
+		// cap/2. Matches grpc-dotnet-shm's chain-zc-only-for-cap/2 rule
+		// (which we don't yet implement on the Go side).
 		isMore := fh.Flags&MessageFlagMORE != 0
 
 		// When MORE flag is set, boost the reader's spin cutoff so the
@@ -794,39 +838,157 @@ func readFrameView(ctx context.Context, rx *ShmRing) (FrameHeader, mem.Buffer, e
 		if isMore {
 			atomic.StoreUint32(&rx.dataSpinCutoff, spinMoreBoost)
 		}
-		if len(pSecond) == 0 && fh.Type == FrameTypeMESSAGE && !isMore && !mem.IsBelowBufferPoolingThreshold(payloadLen) {
-			// Zero-copy: wrap ring slice directly. The speculative
-			// reservation prevents the writer from overwriting this
-			// memory before the caller frees the buffer.
+
+		// Speculative zero-copy decision tree for MESSAGE frames:
+		//
+		// Single-frame (!isMore) message:
+		//   * ZC if eligible (no chain in flight, large enough payload,
+		//     contiguous, ring not under back-pressure). Uses the fused
+		//     single-frame anchor for one Begin+Commit step.
+		//
+		// Multi-frame chain:
+		//   * First chunk (isMore && !chainOpen && !chainCopyMode):
+		//     peek the LPM length; if totalMsg ≤ ChainZcBudget AND
+		//     IsSpeculativeZCEligible passes, open a chain anchor.
+		//     Otherwise enter chainCopyMode for the rest of the message.
+		//   * Continuation chunk in ZC mode (isMore && chainOpen):
+		//     emit body as ring-backed buffer, deferred Commit, no new
+		//     anchor.
+		//   * Final chunk in ZC mode (!isMore && chainOpen):
+		//     emit ring-backed buffer, close the chain marker; the
+		//     consumer's last Buffer.Free triggers EndZcReservation.
+		//   * Any chunk in chainCopyMode: copy.
+		if fh.Type == FrameTypeMESSAGE && len(pSecond) == 0 {
+			// === Single-frame (no MORE) ===
+			if !isMore && !rx.IsZcChainActive() && !rx.ChainCopyMode() &&
+				rx.IsSpeculativeZCEligible(payloadLen, true) {
+				baseIdx := commitPayload.commitReadIdx
+				rx.BeginSingleFrameZcCommit(baseIdx, payloadLen)
+				rx.AddChainZcInFlight()
+				ringSlice := pFirst[:payloadLen:payloadLen]
+				pool := &zcChainReleasePool{ring: rx}
+				buf := mem.NewBuffer(&ringSlice, pool)
+				return fh, buf, nil
+			}
+
+			// === Multi-frame chain start ===
+			if isMore && !rx.IsZcChainActive() && !rx.ChainCopyMode() {
+				// Peek LPM length to decide ZC vs copy for the chain.
+				// LPM = 5 bytes: 1-byte compressed flag + 4-byte big-
+				// endian length. Total message bytes = 5 + lpmBodyLen.
+				if payloadLen >= 5 && rx.IsSpeculativeZCEligible(payloadLen, true) {
+					lpmBodyLen := int64(binary.BigEndian.Uint32(pFirst[1:5]))
+					totalMsg := int64(5) + lpmBodyLen
+					if totalMsg > 0 && totalMsg <= rx.ChainZcBudget() {
+						// Open chain anchor.
+						baseIdx := commitPayload.commitReadIdx
+						rx.BeginZcReservation(baseIdx)
+						rx.OpenZcChain()
+						rx.AddChainZcInFlight()
+						commitPayload.Commit(payloadLen)
+						ringSlice := pFirst[:payloadLen:payloadLen]
+						pool := &zcChainReleasePool{ring: rx}
+						buf := mem.NewBuffer(&ringSlice, pool)
+						return fh, buf, nil
+					}
+				}
+				// Reject: enter copy mode for the rest of the message.
+				rx.SetChainCopyMode(true)
+			}
+
+			// === Multi-frame chain continuation in ZC mode ===
 			//
-			// IMPORTANT: payloadLen must exceed the buffer pooling
-			// threshold (1024). For smaller payloads, mem.NewBuffer
-			// returns SliceBuffer with no-op Free(), which would leak
-			// speculativeReserved bytes indefinitely → ring deadlock.
-			totalBytes := int64(frameHeaderSize + payloadLen)
-			rxHdr := rx.header()
-			rxHdr.AddSpeculativeReserved(totalBytes)
-			commitPayload.Commit(payloadLen)
-			// Wrap the ring slice in a buffer with a release pool.
-			// Three-index slice sets cap=len to prevent accidental out-of-bounds.
-			ringSlice := pFirst[:payloadLen:payloadLen]
-			pool := &speculativeReleasePool{ring: rx, reserved: totalBytes}
-			buf = mem.NewBuffer(&ringSlice, pool)
-		} else if len(pSecond) == 0 {
-			// Contiguous MORE chunk or non-MESSAGE: copy to pooled buffer.
-			// Using DefaultBufferPool avoids repeated make()+memclr for
-			// same-sized chunks — the pool returns a reused buffer that
-			// doesn't need zeroing. Saves ~10% CPU for large payloads.
-			commitPayload.Commit(payloadLen)
+			// Gate on IsChainOpen (codec-side chain marker), NOT
+			// IsZcChainActive (which includes single-frame holds where
+			// no chain is in progress). A single-frame ZC buffer being
+			// held while a subsequent unrelated message arrives must
+			// NOT enter chain continuation; that subsequent message
+			// goes through the regular copy path and its commit is
+			// deferred via the zcActive=1 branch in ReadCommit.Commit.
+			if rx.IsChainOpen() && !rx.ChainCopyMode() {
+				// Tiny continuation chunks (typically the residual tail
+				// after a clean (cap/8)-aligned split, e.g. a 5-byte
+				// last chunk for a 16 MiB body chunked at 8 MiB) cannot
+				// safely use the ring-backed ZC path: mem.NewBuffer
+				// returns a no-op SliceBuffer when cap(data) is below
+				// the buffer-pooling threshold (1 KiB), and a no-op
+				// Buffer.Free never invokes our pool's Put — so
+				// zcInFlight would never decrement, EndZcReservation
+				// would never fire, and header.ReadIdx would freeze
+				// (deadlocking the writer).
+				//
+				// Copy these tiny chunks to a heap buffer instead. The
+				// deferred Commit is still issued (zcActive=1 routes it
+				// into zcDeferredTarget) so the chain's accumulated
+				// target advances correctly; we simply skip
+				// AddChainZcInFlight for this chunk because no ring
+				// memory is held past return. CloseZcChain (called for
+				// the final chunk) then either fires EndZcReservation
+				// itself (if all earlier ZC chunks were already freed)
+				// or yields to a later Buffer.Free which will.
+				if mem.IsBelowBufferPoolingThreshold(payloadLen) {
+					copied := make([]byte, payloadLen)
+					copy(copied, pFirst[:payloadLen])
+					commitPayload.Commit(payloadLen)
+					if !isMore {
+						rx.CloseZcChain()
+						rx.SetChainCopyMode(false)
+					}
+					return fh, mem.SliceBuffer(copied), nil
+				}
+
+				// Anchor already open. Just hand back ring slice; the
+				// chain anchor's deferred-publish handles the read
+				// index. AddChainZcInFlight + deferred Commit on this
+				// chunk's bytes accumulate into zcDeferredTarget.
+				rx.AddChainZcInFlight()
+				commitPayload.Commit(payloadLen)
+				if !isMore {
+					// Final chunk — close chain marker. The consumer's
+					// last Buffer.Free triggers EndZcReservation.
+					rx.CloseZcChain()
+					rx.SetChainCopyMode(false)
+				}
+				ringSlice := pFirst[:payloadLen:payloadLen]
+				pool := &zcChainReleasePool{ring: rx}
+				buf := mem.NewBuffer(&ringSlice, pool)
+				return fh, buf, nil
+			}
+		}
+
+		// Copy paths: copy data BEFORE Commit. Commit frees ring space
+		// for the writer; without copying first, the writer could
+		// overwrite the data between Commit and Copy.
+		//
+		// Chain bookkeeping: zcInFlight ONLY tracks ring-backed ZC
+		// buffers, not copy buffers. But chainOpen MUST be cleared on
+		// the final !MORE chunk regardless of which path it took, so
+		// the consumer's eventual Free of the chain's ZC buffers can
+		// fire EndZcReservation. If the final chunk happens to be in
+		// the copy path (wrap, mid-chain rejection, etc.), we close
+		// the chain marker here.
+		var buf mem.Buffer
+		if len(pSecond) == 0 {
 			buf = mem.Copy(pFirst[:payloadLen], mem.DefaultBufferPool())
-		} else {
-			// Wrap-around case: copy both parts to pooled buffer.
 			commitPayload.Commit(payloadLen)
+		} else {
+			// Wrap-around: copy both parts to pooled buffer.
 			pool := mem.DefaultBufferPool()
 			poolBuf := pool.Get(payloadLen)
 			copied := copy(*poolBuf, pFirst)
 			copy((*poolBuf)[copied:], pSecond)
 			buf = mem.NewBuffer(poolBuf, pool)
+			commitPayload.Commit(payloadLen)
+		}
+		// Final chunk of a multi-frame message — close any chain state
+		// so the consumer's last ZC buffer Free triggers EndZc.
+		if fh.Type == FrameTypeMESSAGE && !isMore {
+			if rx.IsChainOpen() {
+				rx.CloseZcChain()
+			}
+			if rx.ChainCopyMode() {
+				rx.SetChainCopyMode(false)
+			}
 		}
 		return fh, buf, nil
 	}

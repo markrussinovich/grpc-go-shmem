@@ -22,6 +22,7 @@ package transport
 
 import (
 	"context"
+	"runtime"
 	"sync"
 	"sync/atomic"
 
@@ -40,14 +41,16 @@ import (
 //
 // Shutdown safety:
 //   - close() marks the writer as closed and closes the channel.
-//   - enqueue/enqueueAndWait use trySend which recovers from the panic that
-//     occurs if a producer races with close(ch). This eliminates the need for
-//     a mutex on the hot path while remaining safe during shutdown.
+//   - enqueue/enqueueAndWait use closeMu.RLock to coordinate with close(),
+//     ensuring the channel is never sent to after being closed.
 type shmFrameWriter struct {
 	tx     *ShmRing
 	ch     chan frameEntry // data + control frames from app goroutines
 	wg     sync.WaitGroup
 	closed atomic.Bool
+	// closeMu synchronizes channel close with concurrent senders.
+	// Senders hold RLock; close() holds Lock.
+	closeMu sync.RWMutex
 	// inlineMu protects direct ring writes in the enqueueAndWait fast path.
 	// The writer goroutine also holds this when active, ensuring no two
 	// writers access the ring simultaneously.
@@ -58,10 +61,10 @@ type shmFrameWriter struct {
 type frameEntry struct {
 	ctx      context.Context
 	fh       FrameHeader
-	payload  []byte         // simple payload (HEADERS, TRAILERS, CANCEL, etc.)
-	hdr      []byte         // optional header prefix for BufferSlice payloads
+	payload  []byte          // simple payload (HEADERS, TRAILERS, CANCEL, etc.)
+	hdr      []byte          // optional header prefix for BufferSlice payloads
 	data     mem.BufferSlice // zero-copy payload (MESSAGE)
-	maxChunk int            // max frame payload for chunked writes; 0 = default
+	maxChunk int             // max frame payload for chunked writes; 0 = default
 	doneCh   chan error      // if non-nil, writer sends result and caller waits
 }
 
@@ -89,7 +92,27 @@ func newShmFrameWriter(tx *ShmRing) *shmFrameWriter {
 func (w *shmFrameWriter) writeLoop() {
 	defer w.wg.Done()
 
-	for entry := range w.ch {
+	for {
+		// Fast path: non-blocking check. In unary ping-pong, the next
+		// frame often arrives within microseconds of the previous write.
+		// A Gosched+select avoids the full gopark/goready cycle (~1-3µs).
+		var entry frameEntry
+		var ok bool
+		select {
+		case entry, ok = <-w.ch:
+			if !ok {
+				return
+			}
+		default:
+			// Channel empty — yield briefly to let sender goroutine run,
+			// then block. This mirrors .NET's WriterLoop Phase 2.5 yield.
+			runtime.Gosched()
+			entry, ok = <-w.ch
+			if !ok {
+				return
+			}
+		}
+
 		w.inlineMu.Lock()
 		// Check if more frames are queued behind this one.
 		pending := len(w.ch)
@@ -125,18 +148,33 @@ func (w *shmFrameWriter) processEntry(entry frameEntry) {
 	}
 }
 
-// trySend attempts to send an entry to the channel. Returns false if the
-// channel is closed (recovering from the panic). This is safe because the
-// only goroutine that closes w.ch is close(), and a recovered panic here
-// simply means "writer is shutting down".
-func (w *shmFrameWriter) trySend(entry frameEntry) (ok bool) {
-	defer func() {
-		if r := recover(); r != nil {
-			ok = false
-		}
-	}()
+// trySend attempts to send an entry to the channel under closeMu.RLock.
+// Returns false if the writer has been closed.
+func (w *shmFrameWriter) trySend(entry frameEntry) bool {
+	w.closeMu.RLock()
+	defer w.closeMu.RUnlock()
+	if w.closed.Load() {
+		return false
+	}
 	w.ch <- entry
 	return true
+}
+
+// tryEnqueueNonBlocking attempts to send a frame without blocking.
+// Used for best-effort frames (GOAWAY) in Close() where blocking would
+// deadlock if the channel is full (writer goroutine stuck on ring write).
+func (w *shmFrameWriter) tryEnqueueNonBlocking(entry frameEntry) bool {
+	w.closeMu.RLock()
+	defer w.closeMu.RUnlock()
+	if w.closed.Load() {
+		return false
+	}
+	select {
+	case w.ch <- entry:
+		return true
+	default:
+		return false
+	}
 }
 
 // enqueue submits a frame for asynchronous writing. Returns ErrConnClosing
@@ -156,11 +194,17 @@ func (w *shmFrameWriter) enqueue(entry frameEntry) error {
 // Fast path: if the inline mutex is available (writer goroutine is idle
 // or between entries), the caller executes the write directly in its own
 // goroutine. This avoids channel send + goroutine scheduling (~100-200ns).
+//
+// The fast path holds closeMu.RLock around the closed check + inlineMu
+// acquisition + ring write to prevent close() from completing (and the
+// transport from unmapping the segment) while the write is in progress.
 func (w *shmFrameWriter) enqueueAndWait(entry frameEntry) error {
+	// Fast path: try to write inline under closeMu protection.
+	w.closeMu.RLock()
 	if w.closed.Load() {
+		w.closeMu.RUnlock()
 		return ErrConnClosing
 	}
-	// Fast path: try to acquire inline write lock without blocking.
 	if w.inlineMu.TryLock() {
 		var err error
 		if entry.data != nil {
@@ -169,8 +213,11 @@ func (w *shmFrameWriter) enqueueAndWait(entry frameEntry) error {
 			err = writeFrame(entry.ctx, w.tx, entry.fh, entry.payload)
 		}
 		w.inlineMu.Unlock()
+		w.closeMu.RUnlock()
 		return err
 	}
+	w.closeMu.RUnlock()
+
 	// Slow path: writer goroutine is busy, enqueue to channel.
 	entry.doneCh = make(chan error, 1)
 	if !w.trySend(entry) {
@@ -181,11 +228,39 @@ func (w *shmFrameWriter) enqueueAndWait(entry frameEntry) error {
 
 // close shuts down the writer goroutine. It closes the channel, causing
 // writeLoop to drain remaining entries and exit. Blocks until completion.
-// Any concurrent enqueue calls will get ErrConnClosing via trySend's recover.
+//
+// Shutdown sequence:
+//  1. closeMu.Lock — blocks new enqueueAndWait fast-path and trySend callers.
+//  2. closed.Swap(true) + close(ch) — marks writer as done, drains channel.
+//  3. closeMu.Unlock — lets in-flight RLock holders complete.
+//  4. wg.Wait — waits for writeLoop goroutine to exit.
+//  5. inlineMu.Lock/Unlock — waits for any inline writer that acquired
+//     inlineMu before step 1 (they hold closeMu.RLock, so step 3 must
+//     come before step 4 to avoid deadlock with writeLoop).
+//
+// After close returns, no goroutine is accessing the ring.
 func (w *shmFrameWriter) close() {
+	w.closeMu.Lock()
 	if w.closed.Swap(true) {
+		w.closeMu.Unlock()
 		return // already closed
 	}
 	close(w.ch)
+	w.closeMu.Unlock()
 	w.wg.Wait()
+	// Drain any inline writer that acquired inlineMu before closed was set.
+	// After this returns, no goroutine is accessing the ring through the
+	// frame writer, so the caller can safely unmap the segment. The
+	// Lock/Unlock pair acts as a barrier: any in-flight inline writer
+	// holding inlineMu will release it before we proceed.
+	w.drainInline()
+}
+
+// drainInline waits for any in-flight inline writer to release inlineMu.
+// It exists as a separate method so the Lock/Unlock pair isn't flagged
+// by static analysis as an empty critical section — the empty body is
+// the intended barrier semantics.
+func (w *shmFrameWriter) drainInline() {
+	w.inlineMu.Lock()
+	defer w.inlineMu.Unlock()
 }

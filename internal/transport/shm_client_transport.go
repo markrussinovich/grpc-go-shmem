@@ -42,6 +42,13 @@ import (
 	"google.golang.org/grpc/status"
 )
 
+// clientStreamCache holds a cached stream pointer and its ID for lock-free
+// lookup in the frame dispatch hot path. Loaded/stored atomically.
+type clientStreamCache struct {
+	stream   *ClientStream
+	streamID uint32
+}
+
 // ShmClientTransport implements the gRPC ClientTransport interface
 // for shared memory communication.
 type ShmClientTransport struct {
@@ -73,17 +80,15 @@ type ShmClientTransport struct {
 	mu          sync.RWMutex
 
 	// Stream management
-	streams         map[uint32]*ClientStream
+	streams  map[uint32]*ClientStream
 	streamID uint32 // next stream ID to assign
 
 	// cachedStream caches the only active stream for single-stream connections,
 	// allowing frame dispatch to skip the map lookup + RLock.
 	//
-	// Read without t.mu in handleMessage/handleMessageBuffer (hot path).
-	// Written under t.mu in updateStreamCache. This is an intentional
-	// benign race: a stale read falls through to the locked map lookup.
-	cachedStream   *ClientStream
-	cachedStreamID uint32
+	// Loaded atomically without t.mu in the frame dispatch hot path.
+	// Stored atomically under t.mu when the stream set changes.
+	cachedStream atomic.Pointer[clientStreamCache]
 
 	// singleStreamMode is negotiated via the CONNECT frame. When true,
 	// the client requested single-stream optimizations and the transport
@@ -105,10 +110,9 @@ type ShmClientTransport struct {
 	// BDP estimation and dynamic flow control (RFC A73 Phase 5)
 	bdpEst            *shmBDPEstimator
 	initialWindowSize int32
-	streamScheduler   *StreamScheduler
 
 	// WindowUpdate batching: accumulate deltas and flush when threshold exceeded.
-	pendingConnWU   uint32 // accumulated connection-level WindowUpdate delta
+	pendingConnWU   uint32            // accumulated connection-level WindowUpdate delta
 	pendingStreamWU map[uint32]uint32 // accumulated per-stream WindowUpdate deltas
 
 	// Error handling
@@ -317,17 +321,17 @@ func NewShmClientTransport(segment *Segment, localAddr, remoteAddr net.Addr) (*S
 	}
 
 	t := &ShmClientTransport{
-		segment:               segment,
-		clientToServer:        clientToServer,
-		serverToClient:        serverToClient,
-		segmentName:           segName,
-		readEvents:            readEvents,
-		writeEvents:           writeEvents,
-		localAddr:             localAddr,
-		remoteAddr:            remoteAddr,
-		ctx:                   ctx,
-		cancel:                cancel,
-		streams:               make(map[uint32]*ClientStream),
+		segment:        segment,
+		clientToServer: clientToServer,
+		serverToClient: serverToClient,
+		segmentName:    segName,
+		readEvents:     readEvents,
+		writeEvents:    writeEvents,
+		localAddr:      localAddr,
+		remoteAddr:     remoteAddr,
+		ctx:            ctx,
+		cancel:         cancel,
+		streams:        make(map[uint32]*ClientStream),
 
 		streamSendQuota:       make(map[uint32]int64),
 		streamInFlow:          make(map[uint32]*inFlow),
@@ -353,7 +357,6 @@ func NewShmClientTransport(segment *Segment, localAddr, remoteAddr net.Addr) (*S
 	// local memory has near-zero RTT and high bandwidth.
 	t.initialWindowSize = shmInitialWindowSize
 	t.bdpEst = newShmBDPEstimator(uint32(shmInitialWindowSize), t.updateFlowControl)
-	t.streamScheduler = NewStreamScheduler()
 
 	max := segment.H.MaxStreams()
 	if max == 0 {
@@ -413,9 +416,13 @@ func (t *ShmClientTransport) GetAuthInfo() credentials.AuthInfo {
 
 // processIncomingData reads data from the server->client ring and processes gRPC frames
 func (t *ShmClientTransport) processIncomingData(ctx context.Context) {
-	shmDebugf("[DEBUG] ShmClientTransport.processIncomingData: STARTED")
+	if shmDebugEnabled {
+		shmDebugf("[DEBUG] ShmClientTransport.processIncomingData: STARTED")
+	}
 	defer func() {
-		shmDebugf("[DEBUG] ShmClientTransport.processIncomingData: EXITING")
+		if shmDebugEnabled {
+			shmDebugf("[DEBUG] ShmClientTransport.processIncomingData: EXITING")
+		}
 		if !t.closed.Load() {
 			go t.Close(errors.New("incoming data processing ended"))
 		}
@@ -423,14 +430,20 @@ func (t *ShmClientTransport) processIncomingData(ctx context.Context) {
 
 	for {
 		if t.closed.Load() {
-			shmDebugf("[DEBUG] ShmClientTransport.processIncomingData: transport closed, exiting")
+			if shmDebugEnabled {
+				shmDebugf("[DEBUG] ShmClientTransport.processIncomingData: transport closed, exiting")
+			}
 			return
 		}
-		shmDebugf("[DEBUG] ShmClientTransport.processIncomingData: waiting for frame from server...")
+		if shmDebugEnabled {
+			shmDebugf("[DEBUG] ShmClientTransport.processIncomingData: waiting for frame from server...")
+		}
 		// Event-driven: block on next frame from rx ring.
 		fh, payloadBuf, err := readFrameView(ctx, t.serverToClient)
 		if err != nil {
-			shmDebugf("[DEBUG] ShmClientTransport.processIncomingData: readFrame error: %v", err)
+			if shmDebugEnabled {
+				shmDebugf("[DEBUG] ShmClientTransport.processIncomingData: readFrame error: %v", err)
+			}
 			if errors.Is(err, io.EOF) {
 				return
 			}
@@ -442,7 +455,9 @@ func (t *ShmClientTransport) processIncomingData(ctx context.Context) {
 			}
 			continue
 		}
-		shmDebugf("[DEBUG] ShmClientTransport.processIncomingData: received frame type=%d, streamID=%d, length=%d", fh.Type, fh.StreamID, fh.Length)
+		if shmDebugEnabled {
+			shmDebugf("[DEBUG] ShmClientTransport.processIncomingData: received frame type=%d, streamID=%d, length=%d", fh.Type, fh.StreamID, fh.Length)
+		}
 
 		// Update last read timestamp for keepalive tracking.
 		atomic.StoreInt64(&t.lastRead, time.Now().UnixNano())
@@ -501,8 +516,10 @@ func (t *ShmClientTransport) processIncomingData(ctx context.Context) {
 
 		// Dispatch frame to appropriate stream.
 		// Fast path: if we have a cached single stream, skip map lookup + RLock.
-		stream := t.cachedStream
-		if stream == nil || t.cachedStreamID != fh.StreamID {
+		var stream *ClientStream
+		if c := t.cachedStream.Load(); c != nil && c.streamID == fh.StreamID {
+			stream = c.stream
+		} else {
 			t.mu.RLock()
 			var ok bool
 			stream, ok = t.streams[fh.StreamID]
@@ -557,7 +574,9 @@ func (t *ShmClientTransport) processIncomingData(ctx context.Context) {
 
 		case FrameTypeMESSAGE:
 			// Server sent a message. Apply inbound flow control before delivering.
-			shmDebugf("[DEBUG] ShmClientTransport: MESSAGE handler entered for stream %d, payload size=%d", fh.StreamID, len(payload))
+			if shmDebugEnabled {
+				shmDebugf("[DEBUG] ShmClientTransport: MESSAGE handler entered for stream %d, payload size=%d", fh.StreamID, len(payload))
+			}
 			sz := uint32(len(payload))
 
 			// BDP estimation: track bytes received and trigger BDP ping if needed
@@ -570,7 +589,9 @@ func (t *ShmClientTransport) processIncomingData(ctx context.Context) {
 				t.sendWindowUpdate(0, wu)
 			}
 			if err := stream.fc.onData(sz); err != nil {
-				shmDebugf("[DEBUG] ShmClientTransport: MESSAGE flow control error: %v", err)
+				if shmDebugEnabled {
+					shmDebugf("[DEBUG] ShmClientTransport: MESSAGE flow control error: %v", err)
+				}
 				release()
 				t.closeStream(stream, err, true, http2.ErrCodeFlowControl, status.New(codes.Internal, err.Error()), nil, false)
 				continue
@@ -587,16 +608,22 @@ func (t *ShmClientTransport) processIncomingData(ctx context.Context) {
 
 			// Transfer ownership of the ring-backed buffer to the stream for zero-copy delivery.
 			if payloadBuf != nil {
-				shmDebugf("[DEBUG] ShmClientTransport: MESSAGE delivering payloadBuf (len=%d) to stream %d", payloadBuf.Len(), fh.StreamID)
+				if shmDebugEnabled {
+					shmDebugf("[DEBUG] ShmClientTransport: MESSAGE delivering payloadBuf (len=%d) to stream %d", payloadBuf.Len(), fh.StreamID)
+				}
 				payloadTransferred = true
 				stream.write(recvMsg{buffer: payloadBuf})
 				payloadBuf = nil
 			} else {
-				shmDebugf("[DEBUG] ShmClientTransport: MESSAGE delivering copied payload (len=%d) to stream %d", len(payload), fh.StreamID)
+				if shmDebugEnabled {
+					shmDebugf("[DEBUG] ShmClientTransport: MESSAGE delivering copied payload (len=%d) to stream %d", len(payload), fh.StreamID)
+				}
 				buf := mem.Copy(payload, mem.DefaultBufferPool())
 				stream.write(recvMsg{buffer: buf})
 			}
-			shmDebugf("[DEBUG] ShmClientTransport: MESSAGE delivered to stream %d", fh.StreamID)
+			if shmDebugEnabled {
+				shmDebugf("[DEBUG] ShmClientTransport: MESSAGE delivered to stream %d", fh.StreamID)
+			}
 
 		case FrameTypePING:
 			// Respond with PONG carrying the same opaque data.
@@ -677,18 +704,15 @@ func (t *ShmClientTransport) Close(err error) {
 		t.notifyQuotaChangeLocked()
 		t.sendQuotaMu.Unlock()
 
-		// Best-effort GOAWAY before tearing down rings. Uses non-blocking
-		// send to avoid deadlock if the writer queue is full.
+		// Best-effort GOAWAY before tearing down rings.
+		// Non-blocking: if the channel is full (writer stuck on ring write),
+		// skip GOAWAY to avoid deadlocking Close.
 		if t.clientToServer != nil && !segClosed {
-			select {
-			case t.frameWriter.ch <- frameEntry{
+			t.frameWriter.tryEnqueueNonBlocking(frameEntry{
 				ctx:     context.Background(),
 				fh:      FrameHeader{Type: FrameTypeGOAWAY, Flags: GoAwayFlagIMMEDIATE},
 				payload: []byte("client closing"),
-			}:
-			default:
-				// Queue full, skip GOAWAY — ring is about to close anyway.
-			}
+			})
 		}
 
 		// Cancel context to stop background reader goroutine and keepalive.
@@ -879,10 +903,9 @@ func (t *ShmClientTransport) NewStream(ctx context.Context, callHdr *CallHdr) (*
 		t.streams[streamID] = s
 		// Update single-stream cache.
 		if len(t.streams) == 1 {
-			t.cachedStream = s
-			t.cachedStreamID = streamID
+			t.cachedStream.Store(&clientStreamCache{stream: s, streamID: streamID})
 		} else {
-			t.cachedStream = nil
+			t.cachedStream.Store(nil)
 		}
 		t.sendQuotaMu.Lock()
 		t.streamSendQuota[streamID] = int64(maxWindowSize)
@@ -900,13 +923,6 @@ func (t *ShmClientTransport) NewStream(ctx context.Context, callHdr *CallHdr) (*
 			t.kpDormancyCond.Signal()
 		}
 
-		// Add stream to scheduler with default priority
-		if t.streamScheduler != nil {
-			t.streamScheduler.AddStream(StreamPriority{
-				StreamID: streamID,
-				Weight:   16, // Default HTTP/2 weight
-			})
-		}
 		t.mu.Unlock()
 
 		break
@@ -979,9 +995,6 @@ func (t *ShmClientTransport) NewStream(ctx context.Context, callHdr *CallHdr) (*
 	}); err != nil {
 		t.mu.Lock()
 		delete(t.streams, streamID)
-		if t.streamScheduler != nil {
-			t.streamScheduler.RemoveStream(streamID)
-		}
 		t.streamQuota++
 		if t.streamQuota > 0 && t.waitingStreams > 0 {
 			select {
@@ -1113,15 +1126,11 @@ func (t *ShmClientTransport) closeStream(s *ClientStream, err error, rst bool, _
 	// Update single-stream cache.
 	if len(t.streams) == 1 {
 		for id, cs := range t.streams {
-			t.cachedStream = cs
-			t.cachedStreamID = id
+			t.cachedStream.Store(&clientStreamCache{stream: cs, streamID: id})
 			break
 		}
 	} else {
-		t.cachedStream = nil
-	}
-	if t.streamScheduler != nil {
-		t.streamScheduler.RemoveStream(s.id)
+		t.cachedStream.Store(nil)
 	}
 	t.sendQuotaMu.Lock()
 	delete(t.streamSendQuota, s.id)
@@ -1187,57 +1196,89 @@ func (t *ShmClientTransport) writeProto(s *ClientStream, msg any, opts *WriteOpt
 	}
 
 	pSize := protoSize(pm)
-	totalSize := frameHeaderSize + 5 + pSize
+	ringSize := frameHeaderSize + 5 + pSize // total bytes in ring (header + gRPC LPM + proto)
+	quotaSize := 5 + pSize                  // flow-control size (matches receiver WINDOW_UPDATE accounting)
 
 	// Skip ZC if the message is too large for a single frame.
 	// Must check before acquiring flow control quota to avoid double-acquire
 	// when the caller falls back to the standard write path.
-	if uint64(totalSize) > t.clientToServer.Capacity()/3 {
+	if uint64(ringSize) > t.clientToServer.Capacity()/3 {
 		return false, nil
 	}
 
-	// Flow control
-	if err := t.acquireSendQuota(s.ctx, s.id, totalSize); err != nil {
+	// Flow control: account only the gRPC payload (5-byte LPM header + proto
+	// body). The 16-byte ring frame header is a transport-level concern and
+	// is NOT included in WINDOW_UPDATE accounting on the receive side.
+	if err := t.acquireSendQuota(s.ctx, s.id, quotaSize); err != nil {
 		return false, err
 	}
 
-	// Set MessageFlagMORE if this is not the last message in the stream.
-	// The server's handleMessage uses MORE=0 to detect client half-close.
+	// Set frame flags based on the caller's "last message" signal:
+	//
+	//   - MessageFlagMORE: Custom16-only. The server's handleMessage
+	//     uses MORE=0 on incoming MESSAGE to detect client half-close.
+	//   - MessageFlagEndStream: H2-only. writeProtoToRingH2 maps this
+	//     to H2's END_STREAM bit on the emitted DATA frame; the
+	//     server-side H2 reader translates END_STREAM back to MORE=0
+	//     so the same handleMessage MORE=0 EOF logic fires.
+	//
+	// Set both flags coherently so the H2 and Custom16 codepaths each
+	// see the right signal regardless of which wire format the ring
+	// is using.
 	var frameFlags uint8
 	if opts != nil && !opts.Last {
 		frameFlags = MessageFlagMORE
+	} else {
+		frameFlags = MessageFlagEndStream
 	}
 
 	// Acquire the frame writer's inline mutex to serialize with writeLoop.
 	// writeProtoToRing writes directly to the ring, bypassing the frame
 	// writer channel. Without this lock, concurrent control frame writes
 	// (PING, WINDOW_UPDATE, etc.) would violate the SPSC ring invariant.
+	//
+	// closeMu.RLock prevents close() from completing (and the transport
+	// from unmapping the segment) while we're writing to the ring.
+	t.frameWriter.closeMu.RLock()
+	if t.frameWriter.closed.Load() {
+		t.frameWriter.closeMu.RUnlock()
+		return true, ErrConnClosing
+	}
 	if !t.frameWriter.inlineMu.TryLock() {
+		t.frameWriter.closeMu.RUnlock()
 		// Writer goroutine is busy — release quota and let caller fall back
 		// to the standard write path (which goes through enqueueAndWait).
 		t.sendQuotaMu.Lock()
-		t.connSendQuota += int64(totalSize)
-		t.streamSendQuota[s.id] += int64(totalSize)
+		t.connSendQuota += int64(quotaSize)
+		if _, ok := t.streamSendQuota[s.id]; ok {
+			t.streamSendQuota[s.id] += int64(quotaSize)
+		}
+		t.notifyQuotaChangeLocked()
 		t.sendQuotaMu.Unlock()
 		return false, nil
 	}
 	ok2, err := writeProtoToRing(s.ctx, t.clientToServer, s.id, pm, pSize, frameFlags)
 	t.frameWriter.inlineMu.Unlock()
-	if !ok2 && err == nil {
-		// ZC failed (e.g., insufficient contiguous space). Release the quota
-		// so the fallback standard write path can re-acquire without leak.
+	t.frameWriter.closeMu.RUnlock()
+	if !ok2 {
+		// ZC didn't handle the write (insufficient contiguous space, or
+		// an error from ReserveWrite/marshal). Release quota so the
+		// fallback standard write path can re-acquire without leak.
 		t.sendQuotaMu.Lock()
-		t.connSendQuota += int64(totalSize)
-		t.streamSendQuota[s.id] += int64(totalSize)
+		t.connSendQuota += int64(quotaSize)
+		if _, ok := t.streamSendQuota[s.id]; ok {
+			t.streamSendQuota[s.id] += int64(quotaSize)
+		}
+		t.notifyQuotaChangeLocked()
 		t.sendQuotaMu.Unlock()
-		return false, nil
+		return false, err
 	}
 	if err != nil {
-		return false, err
+		return true, err
 	}
 
 	// ZC succeeded — transition stream state if this is the last message.
-	if opts.Last {
+	if opts != nil && opts.Last {
 		if !s.compareAndSwapState(streamActive, streamWriteDone) {
 			// Race: stream was closed concurrently. Data is already written
 			// to the ring which is harmless (reader will process it).
@@ -1250,36 +1291,53 @@ func (t *ShmClientTransport) writeProto(s *ClientStream, msg any, opts *WriteOpt
 // write writes data to the stream via the shared memory transport.
 // This is called by ClientStream.Write() to send data.
 func (t *ShmClientTransport) write(s *ClientStream, hdr []byte, data mem.BufferSlice, opts *WriteOptions) error {
-	shmDebugf("[DEBUG] ShmClientTransport.write: stream=%d, hdr_len=%d, data_bytes=%d, ring=%p", s.id, len(hdr), data.Len(), t.clientToServer)
+	if shmDebugEnabled {
+		shmDebugf("[DEBUG] ShmClientTransport.write: stream=%d, hdr_len=%d, data_bytes=%d, ring=%p", s.id, len(hdr), data.Len(), t.clientToServer)
+	}
 	// Check if transport is closed
 	if t.closed.Load() {
-		shmDebugf("[DEBUG] ShmClientTransport.write: transport closed")
+		if shmDebugEnabled {
+			shmDebugf("[DEBUG] ShmClientTransport.write: transport closed")
+		}
 		return ErrConnClosing
 	}
 
 	// Check stream state
-	if opts.Last {
+	if opts != nil && opts.Last {
 		// Last message - transition to write done state
 		if !s.compareAndSwapState(streamActive, streamWriteDone) {
-			shmDebugf("[DEBUG] ShmClientTransport.write: stream done (Last=true)")
+			if shmDebugEnabled {
+				shmDebugf("[DEBUG] ShmClientTransport.write: stream done (Last=true)")
+			}
 			return errStreamDone
 		}
 	} else if s.getState() != streamActive {
-		shmDebugf("[DEBUG] ShmClientTransport.write: stream not active")
+		if shmDebugEnabled {
+			shmDebugf("[DEBUG] ShmClientTransport.write: stream not active")
+		}
 		return errStreamDone
 	}
 
 	payloadLen := len(hdr) + data.Len()
 
 	// Enforce outbound flow control: wait for available send window.
-	shmDebugf("[DEBUG] ShmClientTransport.write: acquiring send quota for %d bytes", payloadLen)
+	if shmDebugEnabled {
+		shmDebugf("[DEBUG] ShmClientTransport.write: acquiring send quota for %d bytes", payloadLen)
+	}
 	if err := t.acquireSendQuota(s.ctx, s.id, payloadLen); err != nil {
-		shmDebugf("[DEBUG] ShmClientTransport.write: acquireSendQuota failed: %v", err)
+		if shmDebugEnabled {
+			shmDebugf("[DEBUG] ShmClientTransport.write: acquireSendQuota failed: %v", err)
+		}
 		return err
 	}
-	shmDebugf("[DEBUG] ShmClientTransport.write: send quota acquired")
+	if shmDebugEnabled {
+		shmDebugf("[DEBUG] ShmClientTransport.write: send quota acquired")
+	}
 
-	// Write MESSAGE frame. MessageFlagMORE indicates more data will follow.
+	// Write MESSAGE frame. See ringWriteProto for the rationale on
+	// the MORE / EndStream flag pair (Custom16 uses MORE=0 to signal
+	// half-close; H2 needs END_STREAM on wire which writeFrameH2
+	// derives from MessageFlagEndStream).
 	fh := FrameHeader{
 		StreamID: s.id,
 		Type:     FrameTypeMESSAGE,
@@ -1287,9 +1345,13 @@ func (t *ShmClientTransport) write(s *ClientStream, hdr []byte, data mem.BufferS
 	}
 	if opts != nil && !opts.Last {
 		fh.Flags = MessageFlagMORE
+	} else {
+		fh.Flags = MessageFlagEndStream
 	}
 
-	shmDebugf("[DEBUG] ShmClientTransport.write: writing frame to ring")
+	if shmDebugEnabled {
+		shmDebugf("[DEBUG] ShmClientTransport.write: writing frame to ring")
+	}
 	if err := t.frameWriter.enqueueAndWait(frameEntry{
 		ctx:      s.ctx,
 		fh:       fh,
@@ -1297,10 +1359,14 @@ func (t *ShmClientTransport) write(s *ClientStream, hdr []byte, data mem.BufferS
 		data:     data,
 		maxChunk: 0,
 	}); err != nil {
-		shmDebugf("[ERROR] ShmClientTransport.write: frame write failed: %v", err)
+		if shmDebugEnabled {
+			shmDebugf("[ERROR] ShmClientTransport.write: frame write failed: %v", err)
+		}
 		return err
 	}
-	shmDebugf("[DEBUG] ShmClientTransport.write: frame written successfully")
+	if shmDebugEnabled {
+		shmDebugf("[DEBUG] ShmClientTransport.write: frame written successfully")
+	}
 
 	return nil
 }

@@ -165,7 +165,6 @@ func TestRing_SpaceLimited_WaitsOnSpace(t *testing.T) {
 	}
 
 	prevSpace := hdr.SpaceSequence()
-	prevContig := hdr.ContigSequence()
 
 	// Consume 16 bytes; since ring was full, this must increment spaceSeq exactly once
 	first, second, commit, err := ring.ReadSlices(testCtx, 16)
@@ -188,7 +187,7 @@ func TestRing_SpaceLimited_WaitsOnSpace(t *testing.T) {
 	if hdr.SpaceSequence() != prevSpace+1 {
 		t.Fatalf("spaceSeq should increment once on full→not-full; got=%d want=%d", hdr.SpaceSequence(), prevSpace+1)
 	}
-	if hdr.ContigSequence() == prevContig {
-		t.Fatalf("contigSeq should increment on read commit")
-	}
+	// ContigSequence only increments when ContigWaiters > 0.
+	// In this test the writer waited on space (full ring), not
+	// contiguous space, so contigSeq may or may not increment.
 }

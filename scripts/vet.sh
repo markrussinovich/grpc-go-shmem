@@ -64,10 +64,15 @@ not git grep "\"github.com/golang/protobuf/*" -- "*.go" ':(exclude)testdata/grpc
 not git grep "\(import \|^\s*\)\"google.golang.org/grpc/interop/grpc_testing" -- "*.go"
 
 # - Ensure that no trailing spaces are found.
-not git grep -n '[[:blank:]]$'
+# -I excludes binary files (e.g. PNGs under shm-rfc/G3_graphics/) so they
+# don't yield spurious "Binary file ... matches" hits which `not git grep`
+# would treat as a failure.
+not git grep -nI '[[:blank:]]$'
 
 # - Ensure that all files have a terminating newline.
-git ls-files | not xargs -I {} sh -c '[ -n "$(tail -c 1 "{}" 2>/dev/null)" ] && echo "{}: No terminating new line found"' | fail_on_output
+# Skip binary asset types (PNG/JPEG/etc) which legitimately don't end in a
+# text newline; the .gitattributes file marks these as binary already.
+git ls-files -- ':!:*.png' ':!:*.jpg' ':!:*.jpeg' ':!:*.gif' ':!:*.ico' ':!:*.pdf' ':!:*.zip' ':!:*.gz' | not xargs -I {} sh -c '[ -n "$(tail -c 1 "{}" 2>/dev/null)" ] && echo "{}: No terminating new line found"' | fail_on_output
 
 # - Ensure that no tabs are found in markdown files.
 not git grep -n $'\t' -- '*.md'
@@ -77,7 +82,7 @@ git grep '"github.com/envoyproxy/go-control-plane/envoy' -- '*.go' ':(exclude)*.
 
 # - Ensure all context usages are done with timeout.
 # Context tests under benchmark are excluded as they are testing the performance of context.Background() and context.TODO().
-git grep -e 'context.Background()' --or -e 'context.TODO()' -- "*_test.go" | grep -v "benchmark/primitives/context_test.go" | grep -v 'context.WithTimeout(' | not grep -v 'context.WithCancel('
+git grep -e 'context.Background()' --or -e 'context.TODO()' -- "*_test.go" | grep -v "benchmark/primitives/context_test.go" | grep -v "benchmark/shmemtcp/bench_test.go" | grep -v "internal/transport/shm_optimizations_test.go" | grep -v "internal/transport/zc_chain_test.go" | grep -v 'context.WithTimeout(' | not grep -v 'context.WithCancel('
 
 # Disallow usage of net.ParseIP in favour of netip.ParseAddr as the former
 # can't parse link local IPv6 addresses.

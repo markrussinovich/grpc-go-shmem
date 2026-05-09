@@ -25,6 +25,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"runtime"
 	"sync/atomic"
 	"time"
 	"unsafe"
@@ -110,6 +111,71 @@ type ShmRing struct {
 	// EndBatch call performs a single increment + signal, amortizing the
 	// cost of multiple frame writes.
 	batchDepth uint32
+
+	// wire is the on-ring frame encoding negotiated during the CONNECT
+	// handshake. Both ends of a ring use the same wire format. Set once
+	// after construction (via SetWireFormat) and never mutated again.
+	//
+	// Accessed via atomic.LoadUint32 / atomic.StoreUint32 because
+	// SetWireFormat may be called by the dialer goroutine after the
+	// transport's reader/writer goroutines have already started (they
+	// receive the ring before the negotiation completes). The race
+	// detector flagged a benign data race here; using atomic primitives
+	// makes it explicit and provides release/acquire ordering so a
+	// reader that observes wire==Http2 also sees any other state that
+	// was published before SetWireFormat returned.
+	wire uint32
+
+	// h2Enc / h2Dec are the per-ring HPACK encoder/decoder state, used
+	// only when wire == WireFormatHTTP2. The encoder is single-threaded
+	// (writer goroutine via inlineMu); the decoder is single-threaded
+	// (reader goroutine in processIncomingData).
+	h2Enc *hpackEncoderHolder
+	h2Dec *hpackDecoderHolder
+
+	// ===== Position-aware speculative ZC protection =====
+	//
+	// Problem: SpeculativeReservedBytes is a count, not a position; it
+	// cannot tell the writer WHERE the held bytes are. If a non-ZC frame
+	// commits AFTER a ZC frame, header.ReadIdx advances past the ZC
+	// region's tail, and the writer's available-space formula allows
+	// wrapping onto still-held bytes.
+	//
+	// Solution (ported from grpc-dotnet-shm): don't advance the SHARED
+	// header.ReadIdx while a ZC frame is in flight. Reader keeps its
+	// progress in zcDeferredTarget; on ZC release the deferred value is
+	// published to header.ReadIdx in one shot. Cross-process writer
+	// reads header.ReadIdx normally and is correct without knowing
+	// anything about ZC.
+	//
+	// Invariants enforced by callers:
+	//   - At most ONE ZC in flight per ring (gated by IsSpeculativeZCEligible).
+	//   - BeginZcReservation/EndZcReservation are paired exactly once per ZC.
+	//   - The reader-side processIncomingData loop is single-threaded;
+	//     ReadCommit.Commit is only called from that thread or from
+	//     EndZcReservation (consumer side).
+	//
+	// Accessed via atomic.LoadUint32 / atomic.StoreUint32 with explicit
+	// fencing rather than the sync/atomic.Bool wrapper to make the
+	// release/acquire ordering explicit at every site.
+	zcActive         uint32 // 1 while a speculative-ZC anchor is held
+	zcDeferredTarget uint64 // furthest absolute idx wanting commit while zcActive
+	// zcInFlight tracks the number of ZC buffers held by the consumer
+	// for the current chain. Decremented by zcReleasePool.Put on each
+	// buffer Free. When it reaches 0 AND the codec has closed the chain
+	// (chainOpen=false), EndZcReservation fires.
+	zcInFlight int64
+	// chainOpen tracks codec-side chain state: 1 between the codec
+	// emitting the first chunk of a multi-frame message and the final
+	// (!MORE) chunk. zcReleasePool.Put gates EndZcReservation on
+	// (zcInFlight == 0 && chainOpen == 0) so a partial chain can
+	// never publish ReadIdx mid-message.
+	chainOpen uint32
+	// chainCopyMode tracks the codec-side per-message decision: the
+	// codec rejected chain ZC for the in-progress multi-frame message
+	// and will copy all remaining chunks. Cleared on the message's
+	// final (!MORE) chunk so the next message starts fresh.
+	chainCopyMode uint32
 }
 
 // ReadCommit holds the state needed to commit a read operation.
@@ -123,6 +189,23 @@ type ReadCommit struct {
 // Commit advances the shared read index to free space for the writer.
 // consumed must not exceed maxBytes.
 // Safe to call after the ring is closed - silently does nothing.
+//
+// While a speculative-ZC anchor is held (BeginZcReservation called and not
+// yet matched by EndZcReservation), Commit defers the shared-memory write
+// and instead bumps the local zcDeferredTarget. EndZcReservation publishes
+// the accumulated target in one shot. This ensures the cross-process
+// writer never sees a header.ReadIdx that points inside a still-held ZC
+// region.
+//
+// CRITICAL: Use ADDITIVE accumulation here (target += consumed), not the
+// absolute (baseCommitReadIdx + consumed) formula used in the non-deferred
+// branch. While zcActive is true, header.ReadIdx is FROZEN at the ZC
+// frame's start, so every subsequent ReadSlices captures the STALE
+// header.ReadIdx as its commitReadIdx. A naive (staleBase + perFrameBytes)
+// formula yields a value at most ~one frame past baseZc — far behind the
+// actual cumulative consumed position once several frames have been
+// parsed. The reader thread is single-threaded so additive accumulation
+// is race-free on the local field.
 func (rc *ReadCommit) Commit(consumed int) {
 	if consumed < 0 || consumed > rc.maxBytes {
 		return // Invalid consumption, ignore
@@ -137,10 +220,32 @@ func (rc *ReadCommit) Commit(consumed int) {
 		return
 	}
 
+	// ZC-active path: defer the shared-memory write; advance
+	// zcDeferredTarget by the bytes the caller is committing. Reader is
+	// single-threaded so the additive accumulation is race-free on the
+	// local field. EndZcReservation reads this and publishes in one shot.
+	if atomic.LoadUint32(&rc.ring.zcActive) != 0 {
+		atomic.AddUint64(&rc.ring.zcDeferredTarget, uint64(consumed))
+		return
+	}
+
 	hdr := rc.ring.header()
 
-	// Advance shared read index (release-publish) - frees space for writer
-	hdr.SetReadIndex(rc.commitReadIdx + uint64(consumed))
+	newRI := rc.commitReadIdx + uint64(consumed)
+	// Advance shared read index (release-publish) - frees space for writer.
+	// CAS loop ensures ReadIdx only moves forward — a concurrent
+	// EndZcReservation publish must not be regressed by a deferred
+	// Commit that captured an earlier baseCommitReadIdx.
+	for {
+		current := hdr.ReadIndex()
+		if newRI <= current {
+			// Already past this point — nothing to do.
+			break
+		}
+		if hdr.CompareAndSwapReadIndex(current, newRI) {
+			break
+		}
+	}
 
 	// Contiguity: only bump and signal when a writer is actually waiting.
 	// Skipping the atomic increment when no waiters exist saves ~1-2% overhead.
@@ -156,38 +261,312 @@ func (rc *ReadCommit) Commit(consumed int) {
 	}
 }
 
-// speculativeReleasePool implements mem.BufferPool. When the buffer is freed,
-// Put decrements the ring's speculativeReserved counter and wakes blocked
-// writers. The buffer data (ring memory) is not actually pooled.
-type speculativeReleasePool struct {
-	ring     *ShmRing
-	reserved int64
+// ===== Speculative ZC deferred-publish protocol (ported from grpc-dotnet-shm) =====
+//
+// Single source of truth: ZC safety is achieved on the READER side by
+// deferring header.ReadIdx advancement while a ZC frame is in flight. The
+// writer's plain `used = writeIdx - readIdx` formula is automatically
+// correct — no shared-memory ZC field, no protocol change.
+//
+// Invariants enforced by callers:
+//   - At most ONE ZC in flight per ring (gated by IsSpeculativeZCEligible).
+//   - BeginZcReservation/EndZcReservation are paired exactly once per ZC.
+//   - The reader-side processIncomingData loop is single-threaded;
+//     ReadCommit.Commit is only called from that thread or from
+//     EndZcReservation (consumer side).
+
+// BeginZcReservation begins a speculative-zero-copy reservation. Subsequent
+// ReadCommit.Commit calls on this ring will be deferred (do not touch the
+// shared header.ReadIdx) until EndZcReservation is called.
+//
+// baseIdx is the absolute read index at which the ZC frame starts. The ZC
+// frame's own Commit (called right after BeginZcReservation) bumps the
+// deferred target by the frame size.
+//
+// Pair every call with EndZcReservation via the buffer's Free() callback.
+//
+// Ordering: write the target FIRST, then set zcActive. The atomic store
+// on zcActive provides a release barrier so any reader-thread Commit that
+// observes zcActive=true (acquire load) will see the initialised target,
+// never a leftover stale value from the previous ZC cycle.
+func (r *ShmRing) BeginZcReservation(baseIdx uint64) {
+	atomic.StoreUint64(&r.zcDeferredTarget, baseIdx)
+	atomic.StoreUint32(&r.zcActive, 1)
 }
 
-func (p *speculativeReleasePool) Get(n int) *[]byte {
-	buf := make([]byte, n)
-	return &buf
+// BeginSingleFrameZcCommit is the single-frame fast path: fuses
+// BeginZcReservation + the frame's own deferred Commit bump into one
+// atomic sequence. The reader thread is single-threaded so no other
+// Commit can race between Begin and the frame's own deferred bump; we
+// therefore set zcDeferredTarget directly to its post-frame value
+// instead of doing the standard
+//
+//	(write base) → (read base) → (write base+totalBytes)
+//
+// triple-step. Saves 1 Load and 1 Store per single-frame ZC compared to
+// the two-call sequence.
+//
+// Only safe when:
+//   - This is a SINGLE-frame ZC anchor (no chain follows). Multi-frame
+//     chains must use the separate BeginZcReservation + per-frame Commit
+//     sequence so that intervening non-chain frames committed during the
+//     chain hold are also captured into zcDeferredTarget.
+//   - At-most-one-ZC FIFO invariant holds (caller already verified
+//     IsSpeculativeZCEligible).
+func (r *ShmRing) BeginSingleFrameZcCommit(baseIdx uint64, totalBytes int) {
+	atomic.StoreUint64(&r.zcDeferredTarget, baseIdx+uint64(totalBytes))
+	atomic.StoreUint32(&r.zcActive, 1)
 }
 
-func (p *speculativeReleasePool) Put(_ *[]byte) {
-	if p.ring == nil {
+// EndZcReservation ends the in-flight ZC reservation: publishes the
+// deferred read index to the shared header.ReadIdx, releasing all bytes
+// consumed during the ZC hold (the ZC frame itself plus any non-ZC
+// frames that were committed-deferred while ZC was active).
+//
+// CRITICAL ordering: PUBLISH header.ReadIdx FIRST, then clear zcActive.
+// The reverse order has a window where a concurrent reader-thread Commit
+// observes zcActive=false but header.ReadIdx is still at the ZC start
+// (we haven't published yet); the reader then takes the immediate-
+// publish branch with a STALE commitReadIdx (= ZC start) and CASes
+// header.ReadIdx to a value INSIDE the still-held ZC region. The cross-
+// process writer then sees those bytes as free, wraps onto them, and
+// corrupts the in-flight payload.
+//
+// After clearing zcActive, a small race window remains where the reader
+// bumped zcDeferredTarget with zcActive=true still observed but our
+// publish happened with the older snapshot. We catch that by re-reading
+// and re-publishing. Once zcActive is false, no further bumps can occur
+// (reader's Commit goes to the CAS path), so a single refresh suffices.
+func (r *ShmRing) EndZcReservation() {
+	if atomic.LoadUint32(&r.closed) != 0 {
+		// Ring closed; do not touch shared memory which may be unmapped.
+		atomic.StoreUint32(&r.zcActive, 0)
 		return
 	}
-	if atomic.LoadUint32(&p.ring.closed) != 0 {
-		return
-	}
-	hdr := p.ring.header()
-	hdr.AddSpeculativeReserved(-p.reserved)
+	hdr := r.header()
+	target := atomic.LoadUint64(&r.zcDeferredTarget)
 
-	// Wake any writers waiting for space, since freeing speculative bytes
-	// effectively increases the writer's available space.
-	if hdr.SpaceWaiters() > 0 {
-		hdr.IncrementSpaceSequence()
-		p.ring.signalSpace(&hdr.spaceSeq)
+	// Phase 1: publish target while zcActive is still true. Any concurrent
+	// reader-thread Commit still sees zcActive=true and stays on the
+	// deferred path, which only bumps zcDeferredTarget — never touches
+	// header.ReadIdx. So our CAS here is uncontended on the reader-thread
+	// side; only cross-process EndZcReservation-on-the-other-side could
+	// compete (impossible: ZC is per-direction).
+	r.publishTarget(hdr, target)
+
+	// Phase 2: drop the active flag. From this point the reader thread
+	// will route future Commit calls through the CAS path. A frame whose
+	// commitReadIdx was captured before our publish has newReadIdx <=
+	// target and is a no-op (CAS sees current >= newReadIdx).
+	atomic.StoreUint32(&r.zcActive, 0)
+
+	// Phase 3: catch the small window where the reader bumped
+	// zcDeferredTarget after our LoadUint64(target) above but before
+	// StoreUint32(zcActive=0). Such a bump would have been routed to the
+	// deferred path (reader saw zcActive=true) and is therefore NOT
+	// reflected in header.ReadIdx yet. Publish it now.
+	refreshed := atomic.LoadUint64(&r.zcDeferredTarget)
+	if refreshed > target {
+		r.publishTarget(hdr, refreshed)
 	}
+
+	// Wake the writer if it was waiting on space.
 	if hdr.ContigWaiters() > 0 {
 		hdr.IncrementContigSequence()
-		p.ring.signalContig(&hdr.contigSeq)
+		r.signalContig(&hdr.contigSeq)
+	}
+	if hdr.SpaceWaiters() > 0 {
+		hdr.IncrementSpaceSequence()
+		r.signalSpace(&hdr.spaceSeq)
+	}
+}
+
+// publishTarget CAS-loops header.ReadIdx forward to target, never
+// regressing it.
+func (r *ShmRing) publishTarget(hdr *RingHeader, target uint64) {
+	for {
+		current := hdr.ReadIndex()
+		if target <= current {
+			return
+		}
+		if hdr.CompareAndSwapReadIndex(current, target) {
+			return
+		}
+	}
+}
+
+// IsSpeculativeZCEligible is the centralised speculative-ZC eligibility
+// check, applied identically by every wire-format reader (Custom16 + H2).
+// Single source of truth for the heuristic so the two code paths cannot
+// drift.
+//
+// payloadLength is the byte length of the candidate frame payload
+// (excluding wire headers). contiguous is true iff the payload reservation
+// is contiguous (no ring wrap).
+//
+// Heuristic (mirrors grpc-dotnet-shm):
+//
+//   - Adaptive minimum payload threshold: 64 KiB on rings ≥ 1 MiB
+//     (large enough that a 64 KiB ZC hold leaves >> 90% of the ring
+//     free for the writer); progressively smaller on smaller rings
+//     so ZC stays useful for the dominant message size; never below
+//     4 KiB where memcpy is faster than ZC bookkeeping.
+//   - Disabled entirely on rings below 1 MiB: a single 64 KiB ZC hold
+//     would freeze 25% of a 256 KiB ring and stall the writer.
+//   - Back-pressure self-disable: if the ring is already > 75% full
+//     (used×4 > cap×3), taking ZC would risk stalling the writer.
+//   - At-most-one-ZC: zcActive==0 enforces a single ZC payload in
+//     flight per ring. The deferred-publish protocol assumes a single
+//     producer of bumps to zcDeferredTarget; multiple concurrent ZC
+//     frames would require multi-producer ordering not yet implemented.
+func (r *ShmRing) IsSpeculativeZCEligible(payloadLength int, contiguous bool) bool {
+	if !contiguous {
+		return false
+	}
+	const minRingForZC = uint64(1) << 20 // 1 MiB
+	if r.capacity < minRingForZC {
+		return false
+	}
+	// Adaptive minimum: min(64 KiB, cap/16), floored at 4 KiB.
+	adaptiveMin := uint64(64 * 1024)
+	if r.capacity/16 < adaptiveMin {
+		adaptiveMin = r.capacity / 16
+	}
+	if adaptiveMin < 4*1024 {
+		adaptiveMin = 4 * 1024
+	}
+	if uint64(payloadLength) < adaptiveMin {
+		return false
+	}
+	if atomic.LoadUint32(&r.zcActive) != 0 {
+		return false
+	}
+	// Back-pressure auto-degrade.
+	hdr := r.header()
+	used := hdr.WriteIndex() - hdr.ReadIndex()
+	return used*4 <= r.capacity*3
+}
+
+// ===== Multi-frame chain ZC (Custom16 MORE-chunked messages) =====
+//
+// Custom16 supports a per-message MORE flag that lets a single logical
+// gRPC message span multiple frames. When chunking, the writer emits
+// MESSAGE frames with MORE=1 followed by a final MESSAGE with MORE=0.
+//
+// Chain ZC: when the FIRST chunk arrives, the codec peeks the LPM
+// length to compute totalMsg. If totalMsg ≤ ChainZcBudget (cap/2) AND
+// the regular IsSpeculativeZCEligible passes, the chain enters ZC
+// mode: every chunk in the chain returns its body as a ring-backed
+// mem.Buffer; the consumer aggregates them via mem.BufferSlice. The
+// anchor opens on the first chunk via BeginZcReservation; per-chunk
+// Commit is deferred via zcInFlight bookkeeping; the anchor closes
+// when the final !MORE chunk's buffer is freed (the consumer's last
+// Buffer.Free triggers EndZcReservation).
+//
+// Why no tail-ZC? The savings would be at most ChainZcBudget worth of
+// memcpy on the codec→pool boundary, but the upper-layer protobuf
+// parser already needs a contiguous buffer for messages spanning
+// multiple segments. Keeping the codec simple — single mode decision
+// per message — is worth more than the marginal gain.
+//
+// Why cap/2 budget? Under sustained back-to-back streaming, the
+// writer must have ≥ cap/2 of headroom to begin emitting the next
+// message while the consumer is still parsing the current one.
+// A larger budget (e.g., cap - 64 KiB) works for unary but deadlocks
+// streaming: holding nearly the whole ring leaves no room for the
+// writer to progress on the next message.
+
+// ChainZcBudget is the maximum totalMsg (5-byte LPM header + body)
+// that may enter chain-ZC mode. cap/2 ensures the writer always has
+// at least cap/2 of headroom for the next message.
+func (r *ShmRing) ChainZcBudget() int64 {
+	return int64(r.capacity / 2)
+}
+
+// IsZcChainActive reports whether a speculative-ZC anchor is held
+// (zcActive==1). Used by the codec to decide whether a continuation
+// chunk should ride the existing anchor or open a new one.
+func (r *ShmRing) IsZcChainActive() bool {
+	return atomic.LoadUint32(&r.zcActive) != 0
+}
+
+// IsChainOpen reports whether the codec is mid-multi-frame-message
+// (between the first MORE chunk and the final !MORE chunk).
+func (r *ShmRing) IsChainOpen() bool {
+	return atomic.LoadUint32(&r.chainOpen) != 0
+}
+
+// OpenZcChain marks the codec as inside a multi-frame ZC chain.
+// Called when emitting the first chunk of a chain that opted into ZC.
+// Must be paired with CloseZcChain on the message's final chunk.
+func (r *ShmRing) OpenZcChain() {
+	atomic.StoreUint32(&r.chainOpen, 1)
+}
+
+// CloseZcChain marks the codec as finished with a multi-frame ZC
+// chain. The consumer's eventual Buffer.Free of the chain's buffers
+// then triggers EndZcReservation when zcInFlight reaches 0.
+//
+// Race fixup: if the LAST in-flight ZC chunk was already freed BEFORE
+// this call (zcInFlight==0 at close time), ReleaseChainZcBuffer would
+// have observed IsChainOpen()==true and skipped EndZcReservation.
+// Symmetrically, if the chain's final chunk falls back to the copy
+// path (e.g., the payload straddles a wrap boundary so the chain ZC
+// fast-path's len(pSecond)==0 guard rejects it), no AddChainZcInFlight
+// is performed for that chunk, so zcInFlight has already been driven
+// to 0 by the previous chunk's buf.Free. In either case nothing else
+// will fire EndZcReservation, header.ReadIdx stays frozen at the
+// chain start, and the writer eventually fills the ring and
+// deadlocks. We must fire it here.
+//
+// Idempotency: EndZcReservation is gated by atomic.StoreUint32 of
+// zcActive=0. If a concurrent ReleaseChainZcBuffer races us and fires
+// first, our LoadUint32(zcActive) returns 0 and we skip — no double
+// publish. If we win the race, ReleaseChainZcBuffer's later check
+// observes zcInFlight==0 && !IsChainOpen() but zcActive==0 means
+// EndZcReservation's CAS-on-header.ReadIdx is a forward-only no-op.
+func (r *ShmRing) CloseZcChain() {
+	atomic.StoreUint32(&r.chainOpen, 0)
+	// Ordering: chainOpen must be cleared BEFORE we check zcInFlight.
+	// If a concurrent ReleaseChainZcBuffer reads zcInFlight==0 it then
+	// loads chainOpen — by the time it does, our store above is
+	// visible (atomic store has release semantics) so it observes
+	// chainOpen==0 and fires EndZcReservation itself.
+	if atomic.LoadInt64(&r.zcInFlight) == 0 && atomic.LoadUint32(&r.zcActive) != 0 {
+		r.EndZcReservation()
+	}
+}
+
+// SetChainCopyMode marks the codec as committed to copy-mode for the
+// in-progress multi-frame message. Cleared on the message's final
+// chunk so the next message starts fresh.
+func (r *ShmRing) SetChainCopyMode(v bool) {
+	if v {
+		atomic.StoreUint32(&r.chainCopyMode, 1)
+	} else {
+		atomic.StoreUint32(&r.chainCopyMode, 0)
+	}
+}
+
+// ChainCopyMode reports whether the codec is in copy-mode for the
+// in-progress multi-frame message.
+func (r *ShmRing) ChainCopyMode() bool {
+	return atomic.LoadUint32(&r.chainCopyMode) != 0
+}
+
+// AddChainZcInFlight increments the count of ZC buffers held by the
+// consumer for the active chain. Called by the codec for each chunk
+// emitted as a ring-backed buffer.
+func (r *ShmRing) AddChainZcInFlight() {
+	atomic.AddInt64(&r.zcInFlight, 1)
+}
+
+// ReleaseChainZcBuffer decrements the in-flight count and, when the
+// count reaches 0 AND the chain is closed, fires EndZcReservation.
+// Called by zcReleasePool.Put on each Buffer.Free.
+func (r *ShmRing) ReleaseChainZcBuffer() {
+	if atomic.AddInt64(&r.zcInFlight, -1) == 0 && !r.IsChainOpen() {
+		r.EndZcReservation()
 	}
 }
 
@@ -232,9 +611,34 @@ func (r *ShmRing) SetEvents(events *RingEvents) {
 	r.events = events
 }
 
+// SetWireFormat configures the on-ring frame encoding. Must be called
+// after the CONNECT handshake completes; safe to call after the
+// transport's reader/writer goroutines have started because the field
+// is accessed via atomic primitives.
+//
+// Atomic store provides a release barrier: any goroutine that observes
+// wire == Http2 (via WireFormat()) is guaranteed to see all state
+// published by SetWireFormat's caller before this call.
+func (r *ShmRing) SetWireFormat(w WireFormat) {
+	atomic.StoreUint32(&r.wire, uint32(w))
+}
+
+// WireFormat returns the on-ring frame encoding for this ring. Acquire
+// load to pair with SetWireFormat's release store.
+func (r *ShmRing) WireFormat() WireFormat {
+	return WireFormat(atomic.LoadUint32(&r.wire))
+}
+
 // header returns a pointer to the RingHeader in shared memory
 func (r *ShmRing) header() *RingHeader {
 	return (*RingHeader)(unsafe.Pointer(uintptr(unsafe.Pointer(&r.mem[0])) + r.hdrOff))
+}
+
+// isRingClosed returns true if the ring's local closed flag is set.
+// Cheap atomic load used by deferred-Free callbacks to avoid use-after-
+// unmap when the segment is torn down between buffer creation and Free.
+func isRingClosed(r *ShmRing) bool {
+	return atomic.LoadUint32(&r.closed) != 0
 }
 
 // dataPtr returns a pointer to the data area in shared memory
@@ -447,16 +851,7 @@ func (r *ShmRing) WriteBlocking(data []byte) error {
 		// Re-check under the same loop to avoid missed wake.
 		writeIdx = hdr.WriteIndex()
 		readIdx = hdr.ReadIndex()
-		usedBefore = writeIdx - readIdx
-		available = r.capacity - usedBefore
-		specReserved = hdr.SpeculativeReserved()
-		if specReserved > 0 {
-			sr := uint64(specReserved)
-			if sr > available {
-				sr = available
-			}
-			available -= sr
-		}
+		available = r.effectiveSpace(writeIdx, readIdx)
 		if available == 0 {
 			// Full: spin-wait then wait on spaceSeq (full→not-full)
 			// Phase 1: Spin-wait before falling back to futex
@@ -465,7 +860,7 @@ func (r *ShmRing) WriteBlocking(data []byte) error {
 			for spin := uint32(0); spin < spinLimit; spin++ {
 				writeIdx = hdr.WriteIndex()
 				readIdx = hdr.ReadIndex()
-				if (r.capacity - (writeIdx - readIdx)) >= uint64(len(data)) {
+				if r.effectiveSpace(writeIdx, readIdx) >= uint64(len(data)) {
 					// Space available! Update adaptive cutoff
 					if spin > 0 {
 						target := min(spinIterationsMax, spin*2)
@@ -492,7 +887,7 @@ func (r *ShmRing) WriteBlocking(data []byte) error {
 			// Re-check condition to avoid missed wake
 			writeIdx = hdr.WriteIndex()
 			readIdx = hdr.ReadIndex()
-			if (r.capacity - (writeIdx - readIdx)) >= uint64(len(data)) {
+			if r.effectiveSpace(writeIdx, readIdx) >= uint64(len(data)) {
 				hdr.DecSpaceWaiters()
 				continue
 			}
@@ -511,7 +906,7 @@ func (r *ShmRing) WriteBlocking(data []byte) error {
 		for spin := uint32(0); spin < spinLimit; spin++ {
 			writeIdx = hdr.WriteIndex()
 			readIdx = hdr.ReadIndex()
-			if (r.capacity - (writeIdx - readIdx)) >= uint64(len(data)) {
+			if r.effectiveSpace(writeIdx, readIdx) >= uint64(len(data)) {
 				if spin > 0 {
 					target := min(spinIterationsMax, spin*2)
 					newCutoff := (7*spinLimit + target) / 8
@@ -537,7 +932,7 @@ func (r *ShmRing) WriteBlocking(data []byte) error {
 		// Re-check prior to waiting
 		writeIdx = hdr.WriteIndex()
 		readIdx = hdr.ReadIndex()
-		if (r.capacity - (writeIdx - readIdx)) >= uint64(len(data)) {
+		if r.effectiveSpace(writeIdx, readIdx) >= uint64(len(data)) {
 			hdr.DecContigWaiters()
 			continue
 		}
@@ -659,11 +1054,12 @@ func (r *ShmRing) ReadBlocking(buf []byte) (int, error) {
 						newCutoff := (7*spinLimit + target) / 8
 						atomic.StoreUint32(&r.dataSpinCutoff, max(spinIterationsMin, newCutoff))
 					}
-					continue // Re-enter main loop to read data
+					break // Exit spin loop; outer loop will read data
 				}
-				// Check closure during spin
+				// Check closure during spin — break to let the outer
+				// loop's drain logic decide whether data should be read.
 				if hdr.Closed() {
-					return 0, io.EOF
+					break
 				}
 				// PAUSE instruction - yields to hyperthread, saves power
 				runtime_procyield(1)
@@ -684,10 +1080,11 @@ func (r *ShmRing) ReadBlocking(buf []byte) (int, error) {
 				continue
 			}
 			// Re-check closed flag to avoid missing a close that happened
-			// after our initial check but before we entered futexWait
+			// after our initial check but before we entered futexWait.
+			// If closed, re-enter the main loop which checks data-then-close.
 			if hdr.Closed() {
 				hdr.DecDataWaiters()
-				return 0, io.EOF
+				continue
 			}
 			if err := r.waitForData(&hdr.dataSeq, dataSeq, 0); err != nil {
 				// Spurious wake or other wake reasons - just continue the loop
@@ -746,6 +1143,22 @@ func (r *ShmRing) effectiveAvailable() uint64 {
 	used := writeIdx - readIdx
 	raw := r.capacity - used
 
+	specReserved := hdr.SpeculativeReserved()
+	if specReserved <= 0 {
+		return raw
+	}
+	sr := uint64(specReserved)
+	if sr > raw {
+		sr = raw
+	}
+	return raw - sr
+}
+
+// effectiveSpace returns the writable space given current indices,
+// deducting bytes speculatively reserved by zero-copy readers.
+func (r *ShmRing) effectiveSpace(writeIdx, readIdx uint64) uint64 {
+	raw := r.capacity - (writeIdx - readIdx)
+	hdr := r.header()
 	specReserved := hdr.SpeculativeReserved()
 	if specReserved <= 0 {
 		return raw
@@ -854,9 +1267,18 @@ func (r *ShmRing) WriteBlockingContext(ctx context.Context, data []byte) error {
 		writeIdx := hdr.WriteIndex()
 		readIdx := hdr.ReadIndex()
 
-		// Calculate available space using indices
+		// Calculate available space using indices, deducting bytes
+		// speculatively reserved by zero-copy readers.
 		usedBefore := writeIdx - readIdx
 		available := r.capacity - usedBefore
+		specReserved := hdr.SpeculativeReserved()
+		if specReserved > 0 {
+			sr := uint64(specReserved)
+			if sr > available {
+				sr = available
+			}
+			available -= sr
+		}
 
 		if uint64(len(data)) <= available {
 			// Space available - perform the write (same as original WriteBlocking)
@@ -914,8 +1336,7 @@ func (r *ShmRing) WriteBlockingContext(ctx context.Context, data []byte) error {
 			// Re-check and choose wait primitive
 			writeIdx = hdr.WriteIndex()
 			readIdx = hdr.ReadIndex()
-			usedBefore = writeIdx - readIdx
-			available = r.capacity - usedBefore
+			available = r.effectiveSpace(writeIdx, readIdx)
 			if uint64(len(data)) <= available {
 				continue
 			}
@@ -925,7 +1346,7 @@ func (r *ShmRing) WriteBlockingContext(ctx context.Context, data []byte) error {
 				// Re-check
 				writeIdx = hdr.WriteIndex()
 				readIdx = hdr.ReadIndex()
-				if (r.capacity - (writeIdx - readIdx)) >= uint64(len(data)) {
+				if r.effectiveSpace(writeIdx, readIdx) >= uint64(len(data)) {
 					hdr.DecSpaceWaiters()
 					continue
 				}
@@ -937,7 +1358,7 @@ func (r *ShmRing) WriteBlockingContext(ctx context.Context, data []byte) error {
 				// Re-check
 				writeIdx = hdr.WriteIndex()
 				readIdx = hdr.ReadIndex()
-				if (r.capacity - (writeIdx - readIdx)) >= uint64(len(data)) {
+				if r.effectiveSpace(writeIdx, readIdx) >= uint64(len(data)) {
 					hdr.DecContigWaiters()
 					continue
 				}
@@ -948,8 +1369,7 @@ func (r *ShmRing) WriteBlockingContext(ctx context.Context, data []byte) error {
 			// No timeout: same logic with infinite waits
 			writeIdx = hdr.WriteIndex()
 			readIdx = hdr.ReadIndex()
-			usedBefore = writeIdx - readIdx
-			available = r.capacity - usedBefore
+			available = r.effectiveSpace(writeIdx, readIdx)
 			if uint64(len(data)) <= available {
 				continue
 			}
@@ -959,7 +1379,7 @@ func (r *ShmRing) WriteBlockingContext(ctx context.Context, data []byte) error {
 				// Re-check
 				writeIdx = hdr.WriteIndex()
 				readIdx = hdr.ReadIndex()
-				if (r.capacity - (writeIdx - readIdx)) >= uint64(len(data)) {
+				if r.effectiveSpace(writeIdx, readIdx) >= uint64(len(data)) {
 					hdr.DecSpaceWaiters()
 					continue
 				}
@@ -971,7 +1391,7 @@ func (r *ShmRing) WriteBlockingContext(ctx context.Context, data []byte) error {
 				// Re-check
 				writeIdx = hdr.WriteIndex()
 				readIdx = hdr.ReadIndex()
-				if (r.capacity - (writeIdx - readIdx)) >= uint64(len(data)) {
+				if r.effectiveSpace(writeIdx, readIdx) >= uint64(len(data)) {
 					hdr.DecContigWaiters()
 					continue
 				}
@@ -1092,10 +1512,11 @@ func (r *ShmRing) ReadBlockingContext(ctx context.Context, buf []byte) (int, err
 		}
 
 		// Re-check closed flag after incrementing waiters to avoid missing
-		// a close that happened between our initial check and now
+		// a close that happened between our initial check and now.
+		// If closed, re-enter the main loop which checks data-then-close.
 		if hdr.Closed() {
 			hdr.DecDataWaiters()
-			return 0, io.EOF
+			continue
 		}
 
 		// Calculate timeout from context deadline
@@ -1321,6 +1742,9 @@ func (r *ShmRing) ReserveWrite(ctx context.Context, n int) (WriteReservation, er
 		spinCutoff := atomic.LoadUint32(&r.spaceSpinCutoff)
 		spinSuccess := false
 		for i := uint32(0); i < spinCutoff; i++ {
+			if atomic.LoadUint32(&r.closed) != 0 {
+				return WriteReservation{}, ErrRingClosed
+			}
 			runtime_procyield(1) // PAUSE instruction to reduce power/contention
 			writeIdx = hdr.WriteIndex()
 			readIdx = hdr.ReadIndex()
@@ -1363,7 +1787,7 @@ func (r *ShmRing) ReserveWrite(ctx context.Context, n int) (WriteReservation, er
 		// Spin failed - fall back to futex, choosing wait type based on fullness
 		writeIdx = hdr.WriteIndex()
 		readIdx = hdr.ReadIndex()
-		free := r.capacity - (writeIdx - readIdx)
+		free := r.effectiveSpace(writeIdx, readIdx)
 		if free == 0 {
 			hdr.IncSpaceWaiters()
 			exp := hdr.SpaceSequence()
@@ -1372,7 +1796,7 @@ func (r *ShmRing) ReserveWrite(ctx context.Context, n int) (WriteReservation, er
 			// Re-check
 			writeIdx = hdr.WriteIndex()
 			readIdx = hdr.ReadIndex()
-			if (r.capacity - (writeIdx - readIdx)) >= uint64(n) {
+			if r.effectiveSpace(writeIdx, readIdx) >= uint64(n) {
 				hdr.DecSpaceWaiters()
 				continue
 			}
@@ -1411,7 +1835,7 @@ func (r *ShmRing) ReserveWrite(ctx context.Context, n int) (WriteReservation, er
 		// Re-check
 		writeIdx = hdr.WriteIndex()
 		readIdx = hdr.ReadIndex()
-		if (r.capacity - (writeIdx - readIdx)) >= uint64(n) {
+		if r.effectiveSpace(writeIdx, readIdx) >= uint64(n) {
 			hdr.DecContigWaiters()
 			continue
 		}
@@ -1542,7 +1966,24 @@ func (r *ShmRing) ReadSlices(ctx context.Context, n int) (first, second []byte, 
 		spinCutoff := atomic.LoadUint32(&r.dataSpinCutoff)
 		spinSuccess := false
 		for i := uint32(0); i < spinCutoff; i++ {
-			runtime_procyield(1) // PAUSE instruction to reduce power/contention
+			// Mixed spin strategy: PAUSE for first phase, then Gosched
+			// to let writer goroutine run (critical for same-process
+			// unary ping-pong where reader and writer compete for CPU).
+			if i > 0 && i%100 == 0 {
+				// Check closed before AND after Gosched — the segment may
+				// be unmapped during Gosched, making hdr access unsafe.
+				// Break out of spin and let the outer loop's drain logic
+				// decide whether remaining data should be read.
+				if atomic.LoadUint32(&r.closed) != 0 {
+					break
+				}
+				runtime.Gosched()
+				if atomic.LoadUint32(&r.closed) != 0 {
+					break
+				}
+			} else {
+				runtime_procyield(1)
+			}
 			writeIdx = hdr.WriteIndex()
 			pendingIdx = atomic.LoadUint64(&r.pendingReadIdx)
 			if writeIdx-pendingIdx >= uint64(n) {

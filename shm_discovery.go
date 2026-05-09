@@ -23,6 +23,7 @@ package grpc
 import (
 	"context"
 	"net"
+	"net/netip"
 	"sync/atomic"
 
 	"google.golang.org/grpc/metadata"
@@ -63,12 +64,12 @@ const (
 //	go s.Serve(shmLis)   // SHM listener
 //	s.Serve(tcpLis)       // TCP listener
 func ShmDiscoveryServerInterceptors(shmCtlSegment string) (UnaryServerInterceptor, StreamServerInterceptor) {
-	unary := func(ctx context.Context, req any, info *UnaryServerInfo, handler UnaryHandler) (any, error) {
+	unary := func(ctx context.Context, req any, _ *UnaryServerInfo, handler UnaryHandler) (any, error) {
 		maybeSetShmCtl(ctx, shmCtlSegment)
 		return handler(ctx, req)
 	}
 
-	stream := func(srv any, ss ServerStream, info *StreamServerInfo, handler StreamHandler) error {
+	stream := func(srv any, ss ServerStream, _ *StreamServerInfo, handler StreamHandler) error {
 		maybeSetShmCtl(ss.Context(), shmCtlSegment)
 		return handler(srv, ss)
 	}
@@ -115,11 +116,11 @@ func isSameHostPeer(ctx context.Context) bool {
 	if err != nil {
 		return false
 	}
-	ip := net.ParseIP(host)
-	if ip == nil {
+	addr, err := netip.ParseAddr(host)
+	if err != nil {
 		return false
 	}
-	return ip.IsLoopback()
+	return addr.IsLoopback()
 }
 
 // ShmOfferContext returns a context with "shm-offer" metadata attached.

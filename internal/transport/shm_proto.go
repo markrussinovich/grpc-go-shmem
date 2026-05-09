@@ -54,6 +54,12 @@ func writeProtoToRing(ctx context.Context, tx *ShmRing, streamID uint32, msg pro
 	if pSize < 0 {
 		pSize = proto.Size(msg)
 	}
+
+	// Dispatch to the H2 ZC path when the ring is configured for HTTP/2.
+	if tx.WireFormat() == WireFormatHTTP2 {
+		return writeProtoToRingH2(ctx, tx, streamID, msg, pSize, flags)
+	}
+
 	total := frameHeaderSize + 5 + pSize
 
 	// Skip ZC for messages that will never fit in a single frame.
@@ -107,7 +113,15 @@ var marshalBufPool = sync.Pool{}
 // it to the ring via writeFrame. For large payloads that exceed half the ring
 // capacity, uses chunked writes with MORE flag so the reader can consume
 // pieces while the writer continues.
-func writeProtoCopyToRing(ctx context.Context, tx *ShmRing, streamID uint32, msg proto.Message) error {
+//
+// flags is propagated to the FINAL chunk's frame header — Custom16
+// MessageFlagMORE / MessageFlagEndStream both apply to the message as
+// a whole, so per-chunk MORE-bit-setting only affects intermediate
+// chunks (which always have MORE=1 to indicate more chunks of THIS
+// message follow). The H2 codec's writeFrameH2 inspects the final
+// frame's MessageFlagEndStream to decide whether to set H2 END_STREAM
+// on its outgoing DATA frame.
+func writeProtoCopyToRing(ctx context.Context, tx *ShmRing, streamID uint32, msg proto.Message, flags uint8) error {
 	pSize := proto.Size(msg)
 	needed := 5 + pSize
 
@@ -138,6 +152,7 @@ func writeProtoCopyToRing(ctx context.Context, tx *ShmRing, streamID uint32, msg
 	fh := FrameHeader{
 		Type:     FrameTypeMESSAGE,
 		StreamID: streamID,
+		Flags:    flags, // applied to single-frame and to last chunk
 	}
 
 	// For large payloads, chunk into pieces that fit in the ring.
@@ -169,6 +184,12 @@ func writeProtoCopyToRing(ctx context.Context, tx *ShmRing, streamID uint32, msg
 	// Chunked write with MORE flag.
 	// Per-chunk signals are needed so the reader consumes chunks and
 	// frees ring space for subsequent chunks (pipelining).
+	//
+	// Flag-handling: MessageFlagEndStream applies to the LOGICAL
+	// message as a whole; only the final chunk carries it. Intermediate
+	// chunks get MessageFlagMORE (chunk-level "more chunks of THIS
+	// message follow") and explicitly clear MessageFlagEndStream so
+	// the H2 codec doesn't emit END_STREAM on every chunk.
 	remaining := buf
 	for len(remaining) > 0 {
 		chunk := remaining
@@ -179,7 +200,7 @@ func writeProtoCopyToRing(ctx context.Context, tx *ShmRing, streamID uint32, msg
 
 		chunkFH := fh
 		if len(remaining) > 0 {
-			chunkFH.Flags |= MessageFlagMORE
+			chunkFH.Flags = (chunkFH.Flags &^ MessageFlagEndStream) | MessageFlagMORE
 		}
 		if err := writeFrame(ctx, tx, chunkFH, chunk); err != nil {
 			if needed > 64*1024 {
