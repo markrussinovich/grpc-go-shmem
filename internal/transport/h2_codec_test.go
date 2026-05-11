@@ -2173,6 +2173,17 @@ func TestWriteFrameBuffersVectoredMessage(t *testing.T) {
 			segments:  [][]byte{[]byte("eos!")},
 			endStream: true,
 		},
+		{
+			// Explicit MORE: gRPC streaming SendMsg with more
+			// messages to follow ΓÇö caller passes Flags=0 (no
+			// EndStream), which the H2 codec translates to no
+			// END_STREAM bit on the wire; the H2 reader surfaces
+			// the FrameHeader with MessageFlagMORE set so the
+			// upper layer continues reading.
+			name:     "more-no-end-stream",
+			hdr:      []byte{0, 0, 0, 0, 5},
+			segments: [][]byte{[]byte("more!")},
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -2232,9 +2243,27 @@ func TestWriteFrameBuffersVectoredMessage(t *testing.T) {
 
 // TestWriteFrameBuffersVectoredMessage_WrapStraddle stresses the
 // res.First / res.Second boundary by writing many small MESSAGE frames
-// until the ring write head wraps, then writing a final vectored
-// MESSAGE whose payload happens to straddle the wrap. Verifies that
-// the ringSegWriter correctly emits across the two-slice reservation.
+// until the ring write head crosses the wrap point, then writing a
+// final vectored MESSAGE whose payload is large enough to straddle the
+// wrap. Verifies that the ringSegWriter correctly emits across the
+// two-slice reservation.
+//
+// Sizing arithmetic (ringSize = 4096, smallFrame = 9 H2 hdr + 5 LPM
+// hdr + 4 body = 18 bytes, finalFrame = 9 + 5 + 333+444+555 = 1346
+// bytes): for the final write to straddle, we need writeIdx mod 4096
+// to lie in [4096-1346+1, 4096-1] = [2751, 4095]. With each warmup
+// iteration advancing writeIdx by exactly 18 bytes, ceil(2751/18) =
+// 153 iterations is the minimum that *could* land in the straddle
+// band. Anywhere from 153..227 iterations land somewhere in [2754,
+// 4086]. We use 200 to land squarely inside.
+//
+// The post-write assertion `len(res.Second) > 0` is not directly
+// observable from outside the codec, so we instead inspect
+// `tx.ContiguousWriteSpace()` immediately BEFORE the final write — it
+// returns the contiguous bytes remaining in res.First. If that is
+// less than finalFrame, the reservation MUST straddle. The test
+// fatally fails the wrap precondition before the actual write so a
+// regression in the warmup arithmetic is loud, not silent.
 func TestWriteFrameBuffersVectoredMessage_WrapStraddle(t *testing.T) {
 	const ringSize = 4096
 	segName := fmt.Sprintf("h2vwrap-%d", time.Now().UnixNano())
@@ -2250,12 +2279,12 @@ func TestWriteFrameBuffersVectoredMessage_WrapStraddle(t *testing.T) {
 	defer cancel()
 
 	// Repeatedly write+read a small MESSAGE to advance head/tail
-	// past at least one wrap. Each iteration moves the ring cursor by
-	// (9 H2 hdr + 5 LPM hdr + payload) bytes; we want the next write
-	// to straddle the wrap.
+	// past the wrap point. See the function-level comment for the
+	// 200-iteration choice.
 	smallBody := []byte("ping")
 	smallHdr := []byte{0, 0, 0, 0, byte(len(smallBody))}
-	for i := 0; i < 32; i++ {
+	const warmupIters = 200
+	for i := 0; i < warmupIters; i++ {
 		if err := writeFrameBuffers(ctx, tx,
 			FrameHeader{StreamID: uint32(i + 1), Type: FrameTypeMESSAGE},
 			smallHdr, mem.BufferSlice{mem.SliceBuffer(smallBody)},
@@ -2282,6 +2311,17 @@ func TestWriteFrameBuffersVectoredMessage_WrapStraddle(t *testing.T) {
 	totalBody := len(body0) + len(body1) + len(body2)
 	hdr := []byte{0, 0, 0, 0, 0}
 	binary.BigEndian.PutUint32(hdr[1:5], uint32(totalBody))
+	const finalFrameTotal = h2FrameHeaderSize + 5 + 333 + 444 + 555 // 1346
+
+	// Precondition: the next write must straddle the wrap. If
+	// ContiguousWriteSpace returns >= finalFrameTotal, res.Second
+	// will be empty and we'd be testing the non-straddle branch only
+	// — a silent regression of this test's stated purpose.
+	if contig := tx.ContiguousWriteSpace(); contig >= uint64(finalFrameTotal) {
+		t.Fatalf("test setup broken: ContiguousWriteSpace=%d >= finalFrameTotal=%d, "+
+			"final write will not straddle the wrap. Adjust warmupIters.",
+			contig, finalFrameTotal)
+	}
 
 	if err := writeFrameBuffers(ctx, tx,
 		FrameHeader{StreamID: 999, Type: FrameTypeMESSAGE},
@@ -2304,5 +2344,122 @@ func TestWriteFrameBuffersVectoredMessage_WrapStraddle(t *testing.T) {
 	want = append(want, body2...)
 	if !bytes.Equal(payload, want) {
 		t.Fatalf("wrap-straddle payload mismatch: len got=%d want=%d", len(payload), len(want))
+	}
+}
+
+// TestReadFrameViewH2_MultiLPMLeftoverNoAliasing is a regression test
+// for a data-corruption bug: when one H2 DATA frame body carries
+// multiple gRPC LPMs, readFrameViewH2 used to stash the leftover
+// (start of the next LPM) in holder.pendingFrame as a slice that
+// aliased ring memory. commitPayload.Commit(int(h2fh.Length)) ran
+// IMMEDIATELY before the leftover was stored, so the writer was free
+// to advance into the just-committed bytes — corrupting the second
+// LPM the next read would surface.
+//
+// The fix copies leftover to a heap-owned buffer before commit. This
+// test exercises the path by:
+//  1. Building a single DATA frame body containing TWO complete
+//     LPMs (so feedSplit returns msg=first LPM + leftover=second).
+//  2. Reading the first LPM via readFrameView (which commits the
+//     whole DATA payload to the ring read pointer).
+//  3. Writing many junk frames to drive the ring writer past the
+//     previous read position — overwriting the bytes that USED to
+//     back the leftover slice.
+//  4. Reading the second LPM via readFrameView. It should still
+//     decode to the original bytes; before the fix it would decode
+//     to junk (whatever the writer left in those ring slots).
+func TestReadFrameViewH2_MultiLPMLeftoverNoAliasing(t *testing.T) {
+	const ringSize = 4096
+	segName := fmt.Sprintf("h2multilpm-%d", time.Now().UnixNano())
+	defer RemoveSegment(segName)
+	seg, err := CreateSegment(segName, ringSize, ringSize)
+	if err != nil {
+		t.Fatalf("CreateSegment: %v", err)
+	}
+	defer seg.Close()
+	tx := NewShmRingFromSegment(seg.A, seg.Mem)
+	rx := NewShmRingFromSegment(seg.A, seg.Mem)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Build a DATA payload containing two LPMs:
+	//
+	//	LPM_A = [0][len(A)][bodyA]  bodyA = 0xAA × 100
+	//	LPM_B = [0][len(B)][bodyB]  bodyB = 0xBB × 200
+	const aLen, bLen = 100, 200
+	bodyA := bytes.Repeat([]byte{0xAA}, aLen)
+	bodyB := bytes.Repeat([]byte{0xBB}, bLen)
+	lpmA := append(buildLPMHeaderTest(aLen), bodyA...)
+	lpmB := append(buildLPMHeaderTest(bLen), bodyB...)
+	combined := append(append([]byte{}, lpmA...), lpmB...)
+
+	injectH2Frame(ctx, t, tx, H2FrameDATA, 0, 1, combined)
+
+	// Read 1: surfaces LPM_A; leftover (LPM_B bytes) gets stashed in
+	// holder.pendingFrame. Before the fix, that stash aliased ring
+	// memory which is about to be released.
+	fh1, buf1, err := readFrameView(ctx, rx)
+	if err != nil {
+		t.Fatalf("read 1: %v", err)
+	}
+	if fh1.Type != FrameTypeMESSAGE {
+		t.Fatalf("read 1 type: got %d want MESSAGE", fh1.Type)
+	}
+	dataA := append([]byte{}, buf1.ReadOnlyData()...) // snapshot
+	if buf1 != nil {
+		buf1.Free()
+	}
+	wantA := append(append([]byte{}, buildLPMHeaderTest(aLen)...), bodyA...)
+	if !bytes.Equal(dataA, wantA) {
+		t.Fatalf("read 1 payload mismatch")
+	}
+
+	// Stomp the ring without draining: inject junk DATA frames whose
+	// bytes will overwrite the ring slots where LPM_B *used* to
+	// live. We do NOT readFrameView these — pendingFrame is replayed
+	// FIRST on every readFrameView call (before any new ring read),
+	// so any read here would consume the pendingFrame and mask the
+	// bug. We just want the ring writer's bytes to land on top of
+	// the leftover slice's backing memory.
+	//
+	// Ring layout: ringSize = 4096. After read 1 commits, both
+	// readIdx and writeIdx are at 9 (H2 hdr) + 5+100+5+200 = 319,
+	// modular = 319. The leftover (LPM_B body) used to back ring
+	// positions [9+5+100 .. 9+5+100+5+200] = [114..319]. To
+	// overwrite those positions the writer must wrap past 4096 and
+	// re-enter [0..319]. From writeIdx=319, advancing by
+	// (4096-319) + 319 = 4096 bytes wraps back exactly to position
+	// 319 — covering ALL ring positions including [114..319]. Each
+	// junk DATA frame is 9 (H2 hdr) + 5 (LPM hdr) + 32 (body) = 46
+	// bytes. 89 junk frames advance writeIdx by 89*46 = 4094 — just
+	// shy of full ring (4096) so reservation does not block, but
+	// enough to land at position (319+4094) mod 4096 = 317,
+	// definitely past 319.
+	junkBody := bytes.Repeat([]byte{0xCC}, 32)
+	junkPayload := append(buildLPMHeaderTest(len(junkBody)), junkBody...)
+	for i := 0; i < 89; i++ {
+		injectH2Frame(ctx, t, tx, H2FrameDATA, 0, uint32(100+i), junkPayload)
+	}
+
+	// Read 2: should pull LPM_B from holder.pendingFrame (replayed
+	// before any new ring read). Pre-fix: pendingFrame aliases the
+	// just-overwritten ring memory and we get junk bytes. Post-fix:
+	// pendingFrame is a heap copy taken before commit and LPM_B is
+	// intact.
+	fh2, buf2, err := readFrameView(ctx, rx)
+	if err != nil {
+		t.Fatalf("read 2: %v", err)
+	}
+	if buf2 != nil {
+		defer buf2.Free()
+	}
+	if fh2.Type != FrameTypeMESSAGE {
+		t.Fatalf("read 2 type: got %d want MESSAGE", fh2.Type)
+	}
+	wantB := append(append([]byte{}, buildLPMHeaderTest(bLen)...), bodyB...)
+	if !bytes.Equal(buf2.ReadOnlyData(), wantB) {
+		t.Fatalf("read 2 payload mismatch:\n got %d bytes head=%x\nwant %d bytes head=%x",
+			len(buf2.ReadOnlyData()), buf2.ReadOnlyData()[:min(16, len(buf2.ReadOnlyData()))],
+			len(wantB), wantB[:min(16, len(wantB))])
 	}
 }

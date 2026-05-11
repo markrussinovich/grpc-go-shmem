@@ -1358,11 +1358,10 @@ func (t *ShmClientTransport) write(s *ClientStream, hdr []byte, data mem.BufferS
 		shmDebugf("[DEBUG] ShmClientTransport.write: writing frame to ring")
 	}
 	if err := t.frameWriter.enqueueAndWait(frameEntry{
-		ctx:      s.ctx,
-		fh:       fh,
-		hdr:      hdr,
-		data:     data,
-		maxChunk: 0,
+		ctx:  s.ctx,
+		fh:   fh,
+		hdr:  hdr,
+		data: data,
 	}); err != nil {
 		if shmDebugEnabled {
 			shmDebugf("[ERROR] ShmClientTransport.write: frame write failed: %v", err)

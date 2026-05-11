@@ -1147,6 +1147,16 @@ func readFrameH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolder) (
 				if err != nil {
 					return FrameHeader{}, nil, err
 				}
+			} else if len(hpackBlock) > h2MaxHeaderListSize {
+				// Single-fragment HEADERS: the multi-fragment path enforces
+				// this cap inside readH2HeadersWithContinuations, but a peer
+				// can also fit up to (2^24-1) bytes in a single HEADERS frame
+				// when END_HEADERS is set. Apply the same h2MaxHeaderListSize
+				// bound here so the DoS guard documented on that constant
+				// holds for both paths.
+				return FrameHeader{}, nil, fmt.Errorf(
+					"h2 HEADERS payload exceeds %d bytes (got %d)",
+					h2MaxHeaderListSize, len(hpackBlock))
 			}
 			h, t, isTrailers, derr := h2DecodeHeaders(holder, hpackBlock)
 			if derr != nil {
@@ -1562,6 +1572,17 @@ func readFrameViewH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolde
 			// upper end of the size range.
 			if h2fh.Flags&H2FlagPadded == 0 {
 				msg, leftover, ferr := acc.feedSplit(pFirst, pSecond, h2MaxLPMBodyBytes)
+				// leftover may alias ring memory (pFirst/pSecond) when
+				// feedSplit consumes only one source slice. Copying to a
+				// heap-owned buffer BEFORE Commit prevents the writer
+				// (cross-process or another goroutine on the same ring)
+				// from overwriting the bytes between this call and the
+				// next readFrameViewH2 invocation that replays them.
+				// Without this copy, a multi-LPM DATA frame can corrupt
+				// subsequent messages under ring reuse.
+				if len(leftover) > 0 {
+					leftover = append([]byte(nil), leftover...)
+				}
 				commitPayload.Commit(int(h2fh.Length))
 				if ferr != nil {
 					return FrameHeader{}, nil, ferr
@@ -1691,6 +1712,19 @@ func readFrameViewH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolde
 					return FrameHeader{}, nil, aerr
 				}
 				payload = assembled
+			} else if len(payload) > h2MaxHeaderListSize {
+				// Single-fragment HEADERS: the multi-fragment path
+				// enforces this cap inside readH2HeadersWithContinuations,
+				// but a peer can also fit up to (2^24-1) bytes in a single
+				// HEADERS frame when END_HEADERS is set. Apply the same
+				// h2MaxHeaderListSize bound here so the DoS guard
+				// documented on that constant holds for both paths.
+				if commitPayload != nil {
+					commitPayload.Commit(int(h2fh.Length))
+				}
+				return FrameHeader{}, nil, fmt.Errorf(
+					"h2 HEADERS payload exceeds %d bytes (got %d)",
+					h2MaxHeaderListSize, len(payload))
 			}
 			h, t, isTrailers, derr := h2DecodeHeaders(holder, payload)
 			if commitPayload != nil {
@@ -2005,6 +2039,14 @@ func writeFrameH2Message(
 			rw.write(seg)
 		}
 	}
+	if rw.err != nil {
+		// Invariant violation: release the reservation without
+		// publishing bytes (Commit(0) leaves writeIdx unchanged) so
+		// the writer state stays consistent and the caller's
+		// frameWriter.inlineMu unlock can run.
+		_ = res.Commit(0)
+		return rw.err
+	}
 	return res.Commit(total)
 }
 
@@ -2016,13 +2058,26 @@ func writeFrameH2Message(
 type ringSegWriter struct {
 	first, second []byte
 	off           int // total bytes written into the reservation so far
+	err           error
 }
 
-// write copies src into the reservation, advancing the cursor. The
-// caller must ensure the reservation has enough remaining capacity
+// write copies src into the reservation, advancing the cursor. On
+// invariant violation (sum of writes exceeds the reservation), records
+// an error and otherwise no-ops; the caller should inspect w.err
+// before Commit. The error path returns rather than panics so the
+// caller's deferred mutex unlocks (e.g., frameWriter.inlineMu) still
+// run; a panic mid-write would leave inlineMu held forever and freeze
+// the transport's writer goroutine. The caller is responsible for
+// ensuring the reservation has enough remaining capacity
 // (len(first) + len(second) - off ≥ len(src)); writeFrameH2Message
-// guarantees this by reserving the exact total up-front.
+// guarantees this by reserving the exact total up-front. The bounds
+// check costs one compare per write call on the cold path (≤ 3 calls
+// per MESSAGE: H2 hdr, LPM hdr, segments) so the overhead is
+// negligible.
 func (w *ringSegWriter) write(src []byte) {
+	if w.err != nil {
+		return
+	}
 	if w.off < len(w.first) {
 		n := copy(w.first[w.off:], src)
 		w.off += n
@@ -2032,6 +2087,19 @@ func (w *ringSegWriter) write(src []byte) {
 		}
 	}
 	pos := w.off - len(w.first)
+	if pos+len(src) > len(w.second) {
+		// Invariant violation: caller reserved fewer bytes than the
+		// sum of segment lengths it then tried to write. Always a bug
+		// in writeFrameH2Message (or any future caller); silently
+		// truncating would corrupt the ring's next frame. Record the
+		// error so writeFrameH2Message returns it to its caller; do
+		// NOT panic — that would leak the frameWriter.inlineMu lock
+		// the caller holds.
+		w.err = fmt.Errorf(
+			"ringSegWriter overflow: off=%d, src=%d, len(first)=%d, len(second)=%d",
+			w.off, len(src), len(w.first), len(w.second))
+		return
+	}
 	copy(w.second[pos:], src)
 	w.off += len(src)
 }

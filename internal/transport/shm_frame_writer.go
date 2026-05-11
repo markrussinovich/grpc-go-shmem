@@ -59,13 +59,12 @@ type shmFrameWriter struct {
 
 // frameEntry represents a single frame to be written to the ring.
 type frameEntry struct {
-	ctx      context.Context
-	fh       FrameHeader
-	payload  []byte          // simple payload (HEADERS, TRAILERS, CANCEL, etc.)
-	hdr      []byte          // optional header prefix for BufferSlice payloads
-	data     mem.BufferSlice // zero-copy payload (MESSAGE)
-	maxChunk int             // max frame payload for chunked writes; 0 = default
-	doneCh   chan error      // if non-nil, writer sends result and caller waits
+	ctx     context.Context
+	fh      FrameHeader
+	payload []byte          // simple payload (HEADERS, TRAILERS, CANCEL, etc.)
+	hdr     []byte          // optional header prefix for BufferSlice payloads
+	data    mem.BufferSlice // zero-copy payload (MESSAGE)
+	doneCh  chan error      // if non-nil, writer sends result and caller waits
 }
 
 const (
@@ -139,7 +138,7 @@ func (w *shmFrameWriter) writeLoop() {
 func (w *shmFrameWriter) processEntry(entry frameEntry) {
 	var err error
 	if entry.data != nil {
-		err = writeFrameBuffersChunked(entry.ctx, w.tx, entry.fh, entry.hdr, entry.data, entry.maxChunk)
+		err = writeFrameBuffers(entry.ctx, w.tx, entry.fh, entry.hdr, entry.data)
 	} else {
 		err = writeFrame(entry.ctx, w.tx, entry.fh, entry.payload)
 	}
@@ -208,7 +207,7 @@ func (w *shmFrameWriter) enqueueAndWait(entry frameEntry) error {
 	if w.inlineMu.TryLock() {
 		var err error
 		if entry.data != nil {
-			err = writeFrameBuffersChunked(entry.ctx, w.tx, entry.fh, entry.hdr, entry.data, entry.maxChunk)
+			err = writeFrameBuffers(entry.ctx, w.tx, entry.fh, entry.hdr, entry.data)
 		} else {
 			err = writeFrame(entry.ctx, w.tx, entry.fh, entry.payload)
 		}

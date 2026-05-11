@@ -432,17 +432,6 @@ func writeFrameBuffers(ctx context.Context, tx *ShmRing, fh FrameHeader, hdr []b
 	return writeFrame(ctx, tx, fh, buf)
 }
 
-// writeFrameBuffersChunked writes a MESSAGE whose payload (hdr + data)
-// may exceed the per-frame H2 size limit. The H2 codec handles its own
-// internal chunking via writeFrameH2DataChunked; this wrapper simply
-// materialises the buffer slice for the codec to consume. The
-// maxFramePayload parameter is accepted for compatibility with the
-// previous signature but is ignored — H2's max DATA frame size is
-// fixed at the protocol level.
-func writeFrameBuffersChunked(ctx context.Context, tx *ShmRing, fh FrameHeader, hdr []byte, data mem.BufferSlice, _ int) error {
-	return writeFrameBuffers(ctx, tx, fh, hdr, data)
-}
-
 // readFrame reads one logical SHM frame from a ring using the HTTP/2
 // wire codec. Multi-frame H2 payloads (CONTINUATION / fragmented
 // HEADERS / chunked DATA) are coalesced into a single

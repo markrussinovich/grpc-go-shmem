@@ -1312,11 +1312,10 @@ func (t *ShmServerTransport) write(s *ServerStream, hdr []byte, data mem.BufferS
 
 	// Write frame via the dedicated writer goroutine.
 	if err := t.frameWriter.enqueueAndWait(frameEntry{
-		ctx:      context.Background(),
-		fh:       fh,
-		hdr:      hdr,
-		data:     data,
-		maxChunk: 0,
+		ctx:  context.Background(),
+		fh:   fh,
+		hdr:  hdr,
+		data: data,
 	}); err != nil {
 		if shmDebugEnabled {
 			shmDebugf("[ERROR] ShmServerTransport.write: Failed to write frame: %v", err)
