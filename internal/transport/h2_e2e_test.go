@@ -32,10 +32,10 @@ import (
 	"google.golang.org/grpc/mem"
 )
 
-// TestH2NegotiatedDial verifies that when both client and server advertise
-// HTTP/2, the negotiated wire format is propagated to both sides' data rings
-// and a ping-pong RPC succeeds.
-func TestH2NegotiatedDial(t *testing.T) {
+// TestShmDial_E2E verifies a basic ping-pong RPC over the shared-memory
+// transport via the public dial / accept paths. The on-ring wire format
+// is HTTP/2 (the only supported format).
+func TestShmDial_E2E(t *testing.T) {
 	testCtx, testCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer testCancel()
 
@@ -46,7 +46,6 @@ func TestH2NegotiatedDial(t *testing.T) {
 	if err != nil {
 		t.Fatalf("server factory: %v", err)
 	}
-	lis.SetSupportedWireFormats([]WireFormat{WireFormatHTTP2, WireFormatCustom16})
 	defer lis.Close()
 
 	// Server responder goroutine.
@@ -60,14 +59,6 @@ func TestH2NegotiatedDial(t *testing.T) {
 		}
 		defer c.Close()
 		conn := c.(*shmConn)
-
-		// Server's data rings should be H2-mode after negotiation.
-		if got := conn.ReadRing().WireFormat(); got != WireFormatHTTP2 {
-			t.Errorf("server readRing wire: got %v want H2", got)
-		}
-		if got := conn.WriteRing().WireFormat(); got != WireFormatHTTP2 {
-			t.Errorf("server writeRing wire: got %v want H2", got)
-		}
 
 		// Echo headers + message + trailers.
 		fh, _, err := readFrame(testCtx, conn.ReadRing())
@@ -95,7 +86,7 @@ func TestH2NegotiatedDial(t *testing.T) {
 		}, encodeTrailers(TrailersV1{Version: 1, GRPCStatusCode: 0}))
 	}()
 
-	// Client dials with H2 advertised first.
+	// Client dials.
 	enableClientReader.Store(false)
 	defer enableClientReader.Store(true)
 
@@ -104,11 +95,10 @@ func TestH2NegotiatedDial(t *testing.T) {
 		t.Fatalf("parse: %v", err)
 	}
 	opts := &DialOptions{
-		SegmentSize:          DefaultSegmentSize,
-		RingASize:            addr.Cap,
-		RingBSize:            addr.Cap,
-		ConnectTimeout:       5 * time.Second,
-		SupportedWireFormats: []WireFormat{WireFormatHTTP2, WireFormatCustom16},
+		SegmentSize:    DefaultSegmentSize,
+		RingASize:      addr.Cap,
+		RingBSize:      addr.Cap,
+		ConnectTimeout: 5 * time.Second,
 	}
 	ctIface, err := DialShm(testCtx, addr.Name, opts)
 	if err != nil {
@@ -116,14 +106,6 @@ func TestH2NegotiatedDial(t *testing.T) {
 	}
 	ct := ctIface.(*ShmClientTransport)
 	defer ct.Close(fmt.Errorf("test done"))
-
-	// Client's data rings should be H2-mode after negotiation.
-	if got := ct.clientToServer.WireFormat(); got != WireFormatHTTP2 {
-		t.Errorf("client clientToServer wire: got %v want H2", got)
-	}
-	if got := ct.serverToClient.WireFormat(); got != WireFormatHTTP2 {
-		t.Errorf("client serverToClient wire: got %v want H2", got)
-	}
 
 	// Send headers + message; read server response frames.
 	streamID := uint32(1)
@@ -173,71 +155,6 @@ func TestH2NegotiatedDial(t *testing.T) {
 	<-serverDone
 }
 
-// TestH2FallbackToCustom16 verifies that a client advertising H2 against a
-// server that does NOT advertise H2 falls back to Custom16 successfully.
-func TestH2FallbackToCustom16(t *testing.T) {
-	testCtx, testCancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer testCancel()
-
-	name := fmt.Sprintf("h2fb-%d", time.Now().UnixNano())
-	addrStr := fmt.Sprintf("shm://%s?cap=65536", name)
-
-	lis, err := newShmServerFactory(addrStr)
-	if err != nil {
-		t.Fatalf("server factory: %v", err)
-	}
-	// Note: NOT calling SetSupportedWireFormats — server defaults to
-	// Custom16 only.
-	defer lis.Close()
-
-	serverDone := make(chan struct{})
-	go func() {
-		defer close(serverDone)
-		c, err := lis.Accept()
-		if err != nil {
-			t.Errorf("server accept: %v", err)
-			return
-		}
-		defer c.Close()
-		conn := c.(*shmConn)
-		// Server should fall back to Custom16.
-		if got := conn.ReadRing().WireFormat(); got != WireFormatCustom16 {
-			t.Errorf("server wire: got %v want C16 (fallback)", got)
-		}
-		// Drain one frame to keep the goroutine alive a moment.
-		_, _, _ = readFrame(testCtx, conn.ReadRing())
-	}()
-
-	enableClientReader.Store(false)
-	defer enableClientReader.Store(true)
-
-	addr, _ := ParseAddress(addrStr)
-	opts := &DialOptions{
-		SegmentSize:          DefaultSegmentSize,
-		RingASize:            addr.Cap,
-		RingBSize:            addr.Cap,
-		ConnectTimeout:       5 * time.Second,
-		SupportedWireFormats: []WireFormat{WireFormatHTTP2}, // client wants H2
-	}
-	ctIface, err := DialShm(testCtx, addr.Name, opts)
-	if err != nil {
-		t.Fatalf("dial: %v", err)
-	}
-	ct := ctIface.(*ShmClientTransport)
-	defer ct.Close(fmt.Errorf("test done"))
-
-	// Should fall back to Custom16 because server doesn't advertise H2.
-	if got := ct.clientToServer.WireFormat(); got != WireFormatCustom16 {
-		t.Errorf("client wire: got %v want C16 (fallback)", got)
-	}
-
-	// Send a single frame to wake the server.
-	_ = writeFrame(testCtx, ct.clientToServer, FrameHeader{
-		StreamID: 1, Type: FrameTypeHEADERS, Flags: HeadersFlagINITIAL,
-	}, encodeHeaders(HeadersV1{Version: 1, HdrType: 0, Method: "/svc/X"}))
-	<-serverDone
-}
-
 // TestH2ClientStreaming_TwoMessagesBeforeEndStream verifies the
 // codec's MORE-flag derivation is wired correctly end-to-end through
 // the production server transport: a client sends two complete LPMs
@@ -261,8 +178,6 @@ func TestH2ClientStreaming_TwoMessagesBeforeEndStream(t *testing.T) {
 
 	tx := NewShmRingFromSegment(seg.A, seg.Mem)
 	rx := NewShmRingFromSegment(seg.A, seg.Mem)
-	tx.SetWireFormat(WireFormatHTTP2)
-	rx.SetWireFormat(WireFormatHTTP2)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -370,9 +285,6 @@ func TestH2ServerTransport_HeadersEndStream_HandlerSeesEOF(t *testing.T) {
 	// Force H2 wire on both rings — bypassing the negotiation
 	// handshake keeps this test focused on the codec/dispatch
 	// integration rather than wire-format selection.
-	st.clientToServer.SetWireFormat(WireFormatHTTP2)
-	st.serverToClient.SetWireFormat(WireFormatHTTP2)
-
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 

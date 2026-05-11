@@ -245,7 +245,12 @@ func (t *ShmServerTransport) sendWindowUpdate(streamID uint32, delta uint32) {
 	t.sendQuotaMu.Unlock()
 
 	buf := make([]byte, 4)
-	binary.LittleEndian.PutUint32(buf, delta)
+	// RFC 7540 §6.9.1: WINDOW_UPDATE Window Size Increment is a 31-bit
+	// big-endian unsigned integer. Match the spec so the codec's
+	// validate-non-zero check (which reads BigEndian) sees the
+	// correct value, and so an external HTTP/2 peer parsing this
+	// frame interprets the increment correctly.
+	binary.BigEndian.PutUint32(buf, delta)
 	_ = t.frameWriter.enqueue(frameEntry{
 		ctx:     context.Background(),
 		fh:      FrameHeader{Type: FrameTypeWindowUpdate, StreamID: streamID},
@@ -521,8 +526,7 @@ func (t *ShmServerTransport) processIncomingData(ctx context.Context) {
 				t.handleMessage(fh.StreamID, fh.Flags, payload)
 			}
 		case FrameTypeHALFCLOSE:
-			// Client signalled it is done sending. Custom16 writer
-			// emits this as a separate frame; the H2 codec emits it
+			// Client signalled it is done sending. The H2 codec emits this
 			// after an initial HEADERS frame whose source H2 frame
 			// carried END_STREAM (zero-message client-streaming
 			// request). Without this case, such a stream would hang
@@ -541,7 +545,9 @@ func (t *ShmServerTransport) processIncomingData(ctx context.Context) {
 			release()
 		case FrameTypeWindowUpdate:
 			if len(payload) >= 4 {
-				delta := binary.LittleEndian.Uint32(payload[:4])
+				// RFC 7540 §6.9.1: increment is big-endian. Senders
+				// (sendWindowUpdate above) write BigEndian so this matches.
+				delta := binary.BigEndian.Uint32(payload[:4])
 				t.addSendQuota(fh.StreamID, delta)
 			}
 			release()
@@ -1225,8 +1231,8 @@ func (t *ShmServerTransport) writeProto(s *ServerStream, msg any, _ *WriteOption
 	}
 
 	pSize := protoSize(pm)
-	ringSize := frameHeaderSize + 5 + pSize // total bytes in ring
-	quotaSize := 5 + pSize                  // flow-control size (matches receiver accounting)
+	ringSize := h2FrameHeaderSize + 5 + pSize // total bytes in ring (H2 header + gRPC LPM + proto)
+	quotaSize := 5 + pSize                    // flow-control size (matches receiver accounting)
 
 	// Skip ZC if the message is too large for a single frame.
 	if uint64(ringSize) > t.serverToClient.Capacity()/3 {
@@ -1234,7 +1240,7 @@ func (t *ShmServerTransport) writeProto(s *ServerStream, msg any, _ *WriteOption
 	}
 
 	// Flow control: account only the gRPC payload (5-byte LPM + proto body).
-	// The 16-byte ring frame header is NOT included in WINDOW_UPDATE.
+	// The 9-byte H2 frame header is NOT included in WINDOW_UPDATE.
 	if err := t.acquireSendQuota(s.ctx, s.id, quotaSize); err != nil {
 		return false, err
 	}
@@ -1306,11 +1312,10 @@ func (t *ShmServerTransport) write(s *ServerStream, hdr []byte, data mem.BufferS
 
 	// Write frame via the dedicated writer goroutine.
 	if err := t.frameWriter.enqueueAndWait(frameEntry{
-		ctx:      context.Background(),
-		fh:       fh,
-		hdr:      hdr,
-		data:     data,
-		maxChunk: 0,
+		ctx:  context.Background(),
+		fh:   fh,
+		hdr:  hdr,
+		data: data,
 	}); err != nil {
 		if shmDebugEnabled {
 			shmDebugf("[ERROR] ShmServerTransport.write: Failed to write frame: %v", err)

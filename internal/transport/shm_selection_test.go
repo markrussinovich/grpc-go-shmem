@@ -22,6 +22,7 @@ package transport
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"runtime"
 	"testing"
@@ -112,13 +113,12 @@ func TestSelection_ChoosesSHM_and_ExecutesUnary(t *testing.T) {
 	runtime.Gosched()
 	seg := ct.(*ShmClientTransport).segment
 	cli := NewShmUnaryClient(seg)
-	payload := make([]byte, 5+3)
+	// LPM: 1-byte compression flag + 4-byte big-endian length + body.
+	body := []byte("hey")
+	payload := make([]byte, 5+len(body))
 	payload[0] = 0
-	payload[1] = 3
-	payload[2] = 0
-	payload[3] = 0
-	payload[4] = 0
-	copy(payload[5:], []byte("hey"))
+	binary.BigEndian.PutUint32(payload[1:5], uint32(len(body)))
+	copy(payload[5:], body)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	_, msg, tr, err := cli.UnaryCall(ctx, "/echo.Svc/Echo", name, nil, payload)

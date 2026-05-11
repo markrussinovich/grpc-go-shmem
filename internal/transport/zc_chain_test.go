@@ -73,12 +73,12 @@ func TestZcDeferredPublish_SingleFrame(t *testing.T) {
 	}
 
 	// While buf is held, header.ReadIdx must be at the frame-header
-	// boundary (advanced by the 16-byte header commit) but NOT past
-	// the payload (frozen at baseZc + frameHeaderSize).
+	// boundary (advanced by the 9-byte H2 frame header commit) but NOT past
+	// the payload (frozen at baseZc + h2FrameHeaderSize).
 	readIdxDuring := hdr.ReadIndex()
-	if readIdxDuring != readIdxBefore+frameHeaderSize {
+	if readIdxDuring != readIdxBefore+h2FrameHeaderSize {
 		t.Errorf("readIdx during ZC: got %d want %d (= before %d + headerSize %d)",
-			readIdxDuring, readIdxBefore+frameHeaderSize, readIdxBefore, frameHeaderSize)
+			readIdxDuring, readIdxBefore+h2FrameHeaderSize, readIdxBefore, h2FrameHeaderSize)
 	}
 	if !rx.IsZcChainActive() {
 		t.Error("expected zcActive=1 while ZC buffer is held")
@@ -97,7 +97,7 @@ func TestZcDeferredPublish_SingleFrame(t *testing.T) {
 	if rx.IsZcChainActive() {
 		t.Error("expected zcActive=0 after buffer Free")
 	}
-	expectedReadIdxAfter := readIdxBefore + frameHeaderSize + uint64(len(payload))
+	expectedReadIdxAfter := readIdxBefore + h2FrameHeaderSize + uint64(len(payload))
 	if got := hdr.ReadIndex(); got != expectedReadIdxAfter {
 		t.Errorf("readIdx after Free: got %d want %d", got, expectedReadIdxAfter)
 	}
@@ -158,7 +158,7 @@ func TestZcDeferredPublish_DeferredCommit(t *testing.T) {
 
 	// header.ReadIdx must STILL be at the post-frame-1-header position
 	// (frame 1's payload + frame 2's bytes are deferred).
-	expectedFrozen := readIdxBefore + frameHeaderSize
+	expectedFrozen := readIdxBefore + h2FrameHeaderSize
 	if got := hdr.ReadIndex(); got != expectedFrozen {
 		t.Errorf("readIdx during ZC hold: got %d want %d", got, expectedFrozen)
 	}
@@ -177,7 +177,7 @@ func TestZcDeferredPublish_DeferredCommit(t *testing.T) {
 	if rx.IsZcChainActive() {
 		t.Error("expected zcActive=0 after ZC buffer Free")
 	}
-	expectedAfter := readIdxBefore + 2*frameHeaderSize + uint64(len(payload1)) + uint64(len(payload2))
+	expectedAfter := readIdxBefore + 2*h2FrameHeaderSize + uint64(len(payload1)) + uint64(len(payload2))
 	if got := hdr.ReadIndex(); got != expectedAfter {
 		t.Errorf("readIdx after ZC Free: got %d want %d", got, expectedAfter)
 	}
@@ -228,6 +228,16 @@ func TestZcChainReleasePool_DecrementOnly(t *testing.T) {
 // TestChainZc_BudgetReject verifies that messages exceeding
 // ChainZcBudget (cap/2) fall through to the copy path.
 func TestChainZc_BudgetReject(t *testing.T) {
+	// The Custom16 wire used a MORE flag to express "this MESSAGE frame
+	// continues a logical LPM split across multiple SHM frames", which
+	// is what drives the ring-level multi-frame chain ZC machinery this
+	// test exercises. Under H2-only, multi-frame LPMs are reassembled by
+	// the H2 codec's lpmAccumulator (which copies into a heap buffer) and
+	// the upper transport sees exactly one MESSAGE per logical LPM, so
+	// the SHM-level chain-ZC budget reject path does not get activated
+	// the same way. The single-frame ZC behaviour is still covered by
+	// TestZcDeferredPublish_SingleFrame and TestZcDeferredPublish_DeferredCommit.
+	t.Skip("chain-ZC budget reject is Custom16-MORE specific; not reachable through the H2 LPM accumulator")
 	if !memBufferPoolingAvailable() {
 		t.Skip("mem.Buffer pooling not available")
 	}
@@ -311,6 +321,9 @@ func memBufferPoolingAvailable() bool {
 // (without AddChainZcInFlight) so the chain's lifecycle is driven by
 // the larger chunks alone.
 func TestChainZc_TinyTailChunk(t *testing.T) {
+	// See TestChainZc_BudgetReject for why the multi-frame chain-ZC path
+	// is not reachable from the H2-only wire.
+	t.Skip("tiny-tail chunk path is Custom16-MORE specific; not reachable through the H2 LPM accumulator")
 	if !memBufferPoolingAvailable() {
 		t.Skip("mem.Buffer pooling not available")
 	}
@@ -394,7 +407,7 @@ func TestChainZc_TinyTailChunk(t *testing.T) {
 
 	// header.ReadIdx must have advanced past both chunks (2 frame
 	// headers + both payloads).
-	expectedAfter := readIdxBefore + 2*frameHeaderSize + uint64(bigSize+tailSize)
+	expectedAfter := readIdxBefore + 2*h2FrameHeaderSize + uint64(bigSize+tailSize)
 	if got := hdr.ReadIndex(); got != expectedAfter {
 		t.Errorf("readIdx after Free: got %d want %d", got, expectedAfter)
 	}

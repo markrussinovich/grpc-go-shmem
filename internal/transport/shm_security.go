@@ -272,12 +272,12 @@ func (h *ShmSecurityHandshaker) ClientHandshake(ctx context.Context, ring *ShmRi
 		identity: []byte(h.Identity),
 		nonce:    nonce,
 	}
-	if err := writeFrame(ctx, txRing, FrameHeader{Type: FrameTypeHandshakeInit}, encodeHandshakeInit(init)); err != nil {
+	if err := writeCtlFrame(ctx, txRing, FrameHeader{Type: FrameTypeHandshakeInit}, encodeHandshakeInit(init)); err != nil {
 		return nil, fmt.Errorf("failed to send handshake init: %w", err)
 	}
 
 	// Wait for response
-	fh, payload, err := readFrame(ctx, ring)
+	fh, payload, err := readCtlFrame(ctx, ring)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read handshake response: %w", err)
 	}
@@ -299,14 +299,14 @@ func (h *ShmSecurityHandshaker) ClientHandshake(ctx context.Context, ring *ShmRi
 					code:    HandshakeErrIdentityInvalid,
 					message: []byte(err.Error()),
 				}
-				_ = writeFrame(ctx, txRing, FrameHeader{Type: FrameTypeHandshakeFail}, encodeHandshakeFail(fail))
+				_ = writeCtlFrame(ctx, txRing, FrameHeader{Type: FrameTypeHandshakeFail}, encodeHandshakeFail(fail))
 				return nil, fmt.Errorf("server identity verification failed: %w", err)
 			}
 		}
 
 		// Send acknowledgement
 		ack := handshakeAck{version: handshakeVersion, status: 0}
-		if err := writeFrame(ctx, txRing, FrameHeader{Type: FrameTypeHandshakeAck}, encodeHandshakeAck(ack)); err != nil {
+		if err := writeCtlFrame(ctx, txRing, FrameHeader{Type: FrameTypeHandshakeAck}, encodeHandshakeAck(ack)); err != nil {
 			return nil, fmt.Errorf("failed to send handshake ack: %w", err)
 		}
 
@@ -331,7 +331,7 @@ func (h *ShmSecurityHandshaker) ClientHandshake(ctx context.Context, ring *ShmRi
 // ServerHandshake performs the server-side security handshake
 func (h *ShmSecurityHandshaker) ServerHandshake(ctx context.Context, ring *ShmRing, txRing *ShmRing) (*ShmAuthInfo, error) {
 	// Wait for handshake init
-	fh, payload, err := readFrame(ctx, ring)
+	fh, payload, err := readCtlFrame(ctx, ring)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read handshake init: %w", err)
 	}
@@ -347,7 +347,7 @@ func (h *ShmSecurityHandshaker) ServerHandshake(ctx context.Context, ring *ShmRi
 			code:    HandshakeErrInternal,
 			message: []byte(err.Error()),
 		}
-		_ = writeFrame(ctx, txRing, FrameHeader{Type: FrameTypeHandshakeFail}, encodeHandshakeFail(fail))
+		_ = writeCtlFrame(ctx, txRing, FrameHeader{Type: FrameTypeHandshakeFail}, encodeHandshakeFail(fail))
 		return nil, err
 	}
 
@@ -360,7 +360,7 @@ func (h *ShmSecurityHandshaker) ServerHandshake(ctx context.Context, ring *ShmRi
 				code:    HandshakeErrIdentityInvalid,
 				message: []byte(err.Error()),
 			}
-			_ = writeFrame(ctx, txRing, FrameHeader{Type: FrameTypeHandshakeFail}, encodeHandshakeFail(fail))
+			_ = writeCtlFrame(ctx, txRing, FrameHeader{Type: FrameTypeHandshakeFail}, encodeHandshakeFail(fail))
 			return nil, fmt.Errorf("client identity verification failed: %w", err)
 		}
 	}
@@ -376,12 +376,12 @@ func (h *ShmSecurityHandshaker) ServerHandshake(ctx context.Context, ring *ShmRi
 		identity: []byte(h.Identity),
 		nonce:    serverNonce,
 	}
-	if err := writeFrame(ctx, txRing, FrameHeader{Type: FrameTypeHandshakeResp}, encodeHandshakeResp(resp)); err != nil {
+	if err := writeCtlFrame(ctx, txRing, FrameHeader{Type: FrameTypeHandshakeResp}, encodeHandshakeResp(resp)); err != nil {
 		return nil, fmt.Errorf("failed to send handshake response: %w", err)
 	}
 
 	// Wait for acknowledgement
-	fh, payload, err = readFrame(ctx, ring)
+	fh, payload, err = readCtlFrame(ctx, ring)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read handshake ack: %w", err)
 	}

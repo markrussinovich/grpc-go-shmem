@@ -36,6 +36,17 @@ func testSegName(prefix string) string {
 	return fmt.Sprintf("%s_%d_%d", prefix, time.Now().UnixNano(), testSegCounter.Add(1))
 }
 
+// makeLPM wraps body in a 5-byte gRPC length-prefixed message header so
+// it can ride inside an H2 DATA frame and be reconstructed by the codec's
+// LPM accumulator.
+func makeLPM(body []byte) []byte {
+	out := make([]byte, 5+len(body))
+	out[0] = 0
+	binary.BigEndian.PutUint32(out[1:5], uint32(len(body)))
+	copy(out[5:], body)
+	return out
+}
+
 // ---------------------------------------------------------------------------
 // shmFrameWriter tests
 // ---------------------------------------------------------------------------
@@ -65,7 +76,8 @@ func TestShmFrameWriterEnqueueAndRead(t *testing.T) {
 	w, _, rx, cleanup := newTestFrameWriter(t)
 	defer cleanup()
 
-	payload := []byte("hello shm frame writer")
+	body := []byte("hello shm frame writer")
+	payload := makeLPM(body)
 	err := w.enqueueAndWait(frameEntry{
 		ctx:     context.Background(),
 		fh:      FrameHeader{Type: FrameTypeMESSAGE, StreamID: 1},
@@ -96,7 +108,7 @@ func TestShmFrameWriterAsyncEnqueue(t *testing.T) {
 
 	const n = 10
 	for i := 0; i < n; i++ {
-		payload := []byte(fmt.Sprintf("msg-%d", i))
+		payload := makeLPM([]byte(fmt.Sprintf("msg-%d", i)))
 		if err := w.enqueue(frameEntry{
 			ctx:     context.Background(),
 			fh:      FrameHeader{Type: FrameTypeMESSAGE, StreamID: uint32(i + 1)},
@@ -114,8 +126,8 @@ func TestShmFrameWriterAsyncEnqueue(t *testing.T) {
 		if fh.StreamID != uint32(i+1) {
 			t.Errorf("frame %d: streamID = %d, want %d", i, fh.StreamID, i+1)
 		}
-		want := fmt.Sprintf("msg-%d", i)
-		if string(data) != want {
+		want := makeLPM([]byte(fmt.Sprintf("msg-%d", i)))
+		if string(data) != string(want) {
 			t.Errorf("frame %d: payload = %q, want %q", i, data, want)
 		}
 	}
@@ -666,8 +678,9 @@ func TestShmFrameWriterOrdering(t *testing.T) {
 		go func(streamID uint32) {
 			defer wg.Done()
 			for i := 0; i < msgsPerStream; i++ {
-				payload := make([]byte, 4)
-				binary.LittleEndian.PutUint32(payload, uint32(i))
+				body := make([]byte, 4)
+				binary.LittleEndian.PutUint32(body, uint32(i))
+				payload := makeLPM(body)
 				if err := w.enqueueAndWait(frameEntry{
 					ctx:     context.Background(),
 					fh:      FrameHeader{Type: FrameTypeMESSAGE, StreamID: streamID},
@@ -688,7 +701,11 @@ func TestShmFrameWriterOrdering(t *testing.T) {
 		if err != nil {
 			t.Fatalf("readFrame %d: %v", i, err)
 		}
-		seq := binary.LittleEndian.Uint32(data)
+		// Strip the 5-byte LPM prefix to recover the sequence body.
+		if len(data) < 5+4 {
+			t.Fatalf("frame %d: payload too short (%d bytes)", i, len(data))
+		}
+		seq := binary.LittleEndian.Uint32(data[5:9])
 		expected := nextSeq[fh.StreamID]
 		if seq != expected {
 			t.Errorf("stream %d: got seq %d, want %d (per-stream ordering broken)", fh.StreamID, seq, expected)
@@ -731,7 +748,7 @@ func TestShmBatchSignalSuppression(t *testing.T) {
 	// Write 5 frames in batch mode.
 	tx.BeginBatch()
 	for i := 0; i < 5; i++ {
-		payload := []byte(fmt.Sprintf("batch-msg-%d", i))
+		payload := makeLPM([]byte(fmt.Sprintf("batch-msg-%d", i)))
 		if err := writeFrame(context.Background(), tx, FrameHeader{Type: FrameTypeMESSAGE, StreamID: 1}, payload); err != nil {
 			t.Fatalf("writeFrame %d: %v", i, err)
 		}
@@ -759,8 +776,8 @@ func TestShmBatchSignalSuppression(t *testing.T) {
 		if fh.Type != FrameTypeMESSAGE {
 			t.Errorf("frame %d: type=%d, want MESSAGE", i, fh.Type)
 		}
-		want := fmt.Sprintf("batch-msg-%d", i)
-		if string(data) != want {
+		want := makeLPM([]byte(fmt.Sprintf("batch-msg-%d", i)))
+		if string(data) != string(want) {
 			t.Errorf("frame %d: payload=%q, want %q", i, data, want)
 		}
 	}
@@ -850,10 +867,11 @@ func TestShmZeroCopyContiguousMessage(t *testing.T) {
 	tx := NewShmRingFromSegment(seg.A, seg.Mem)
 	rx := NewShmRingFromSegment(seg.A, seg.Mem)
 
-	payload := make([]byte, 4096)
-	for i := range payload {
-		payload[i] = byte(i % 251)
+	body := make([]byte, 4096)
+	for i := range body {
+		body[i] = byte(i % 251)
 	}
+	payload := makeLPM(body)
 	if err := writeFrame(context.Background(), tx, FrameHeader{
 		Type: FrameTypeMESSAGE, StreamID: 1,
 	}, payload); err != nil {
@@ -894,7 +912,8 @@ func TestShmZeroCopyWrapAroundCopies(t *testing.T) {
 	rx := NewShmRingFromSegment(seg.A, seg.Mem)
 
 	// Fill most of the ring to force next write to wrap.
-	pad := make([]byte, 3500)
+	padBody := make([]byte, 3500)
+	pad := makeLPM(padBody)
 	if err := writeFrame(context.Background(), tx, FrameHeader{
 		Type: FrameTypeMESSAGE, StreamID: 1,
 	}, pad); err != nil {
@@ -908,7 +927,7 @@ func TestShmZeroCopyWrapAroundCopies(t *testing.T) {
 		padBuf.Free()
 	}
 
-	payload := []byte("wrap-around-test-data-payload")
+	payload := makeLPM([]byte("wrap-around-test-data-payload"))
 	if err := writeFrame(context.Background(), tx, FrameHeader{
 		Type: FrameTypeMESSAGE, StreamID: 1,
 	}, payload); err != nil {
@@ -939,7 +958,10 @@ func TestShmZeroCopyNonMessageCopies(t *testing.T) {
 	tx := NewShmRingFromSegment(seg.A, seg.Mem)
 	rx := NewShmRingFromSegment(seg.A, seg.Mem)
 
-	headersPayload := []byte("test-headers-payload")
+	// Use a valid HeadersV1 payload — under H2-only, HEADERS is HPACK-
+	// encoded on write and re-encoded as HeadersV1 on read.
+	hv := HeadersV1{Version: 1, HdrType: 0, Method: "/test/Method", Authority: "localhost"}
+	headersPayload := encodeHeaders(hv)
 	if err := writeFrame(context.Background(), tx, FrameHeader{
 		Type: FrameTypeHEADERS, StreamID: 1,
 	}, headersPayload); err != nil {
@@ -953,8 +975,12 @@ func TestShmZeroCopyNonMessageCopies(t *testing.T) {
 	if fh.Type != FrameTypeHEADERS {
 		t.Fatalf("type = %d, want HEADERS", fh.Type)
 	}
-	if string(buf.ReadOnlyData()) != string(headersPayload) {
-		t.Fatalf("payload = %q, want %q", buf.ReadOnlyData(), headersPayload)
+	gotHv, derr := decodeHeaders(buf.ReadOnlyData())
+	if derr != nil {
+		t.Fatalf("decodeHeaders: %v", derr)
+	}
+	if gotHv.Method != hv.Method || gotHv.Authority != hv.Authority {
+		t.Fatalf("HeadersV1 mismatch: got %+v, want %+v", gotHv, hv)
 	}
 	buf.Free()
 }
@@ -981,15 +1007,15 @@ func TestShmZeroCopyMultiStreamCorrectness(t *testing.T) {
 	for i := 0; i < streams*msgsPerStream; i++ {
 		streamID := uint32((i % streams) + 1)
 		seqNum := i / streams
-		payload := make([]byte, payloadSize)
-		binary.LittleEndian.PutUint32(payload[0:4], streamID)
-		binary.LittleEndian.PutUint32(payload[4:8], uint32(seqNum))
-		for j := 8; j < len(payload); j++ {
-			payload[j] = byte(streamID)*37 + byte(seqNum)
+		body := make([]byte, payloadSize)
+		binary.LittleEndian.PutUint32(body[0:4], streamID)
+		binary.LittleEndian.PutUint32(body[4:8], uint32(seqNum))
+		for j := 8; j < len(body); j++ {
+			body[j] = byte(streamID)*37 + byte(seqNum)
 		}
 		if err := writeFrame(context.Background(), tx, FrameHeader{
 			Type: FrameTypeMESSAGE, StreamID: streamID,
-		}, payload); err != nil {
+		}, makeLPM(body)); err != nil {
 			t.Fatalf("writeFrame stream=%d seq=%d: %v", streamID, seqNum, err)
 		}
 	}
@@ -1002,8 +1028,13 @@ func TestShmZeroCopyMultiStreamCorrectness(t *testing.T) {
 			t.Fatalf("readFrameView %d: %v", i, err)
 		}
 		data := buf.ReadOnlyData()
-		gotStream := binary.LittleEndian.Uint32(data[0:4])
-		gotSeq := binary.LittleEndian.Uint32(data[4:8])
+		// Strip 5-byte LPM prefix.
+		if len(data) < 5+8 {
+			t.Fatalf("frame %d: payload too short (%d bytes)", i, len(data))
+		}
+		body := data[5:]
+		gotStream := binary.LittleEndian.Uint32(body[0:4])
+		gotSeq := binary.LittleEndian.Uint32(body[4:8])
 
 		if fh.StreamID != gotStream {
 			t.Errorf("frame %d: header streamID=%d, payload says %d", i, fh.StreamID, gotStream)
@@ -1014,9 +1045,9 @@ func TestShmZeroCopyMultiStreamCorrectness(t *testing.T) {
 		streamSeq[gotStream]++
 
 		expectedByte := byte(gotStream)*37 + byte(gotSeq)
-		for j := 8; j < len(data); j++ {
-			if data[j] != expectedByte {
-				t.Fatalf("stream %d seq %d: data[%d]=%d, want %d", gotStream, gotSeq, j, data[j], expectedByte)
+		for j := 8; j < len(body); j++ {
+			if body[j] != expectedByte {
+				t.Fatalf("stream %d seq %d: body[%d]=%d, want %d", gotStream, gotSeq, j, body[j], expectedByte)
 			}
 		}
 		buf.Free()
@@ -1044,7 +1075,7 @@ func TestShmZeroCopyDataSurvivesSubsequentWrites(t *testing.T) {
 	tx := NewShmRingFromSegment(seg.A, seg.Mem)
 	rx := NewShmRingFromSegment(seg.A, seg.Mem)
 
-	payloadA := []byte("AAAA-important-data-AAAA")
+	payloadA := makeLPM([]byte("AAAA-important-data-AAAA"))
 	if err := writeFrame(context.Background(), tx, FrameHeader{
 		Type: FrameTypeMESSAGE, StreamID: 1,
 	}, payloadA); err != nil {
@@ -1059,7 +1090,7 @@ func TestShmZeroCopyDataSurvivesSubsequentWrites(t *testing.T) {
 
 	// Write more messages after A.
 	for _, name := range []string{"BBBB", "CCCC", "DDDD"} {
-		p := []byte(name + "-subsequent-data-" + name)
+		p := makeLPM([]byte(name + "-subsequent-data-" + name))
 		if err := writeFrame(context.Background(), tx, FrameHeader{
 			Type: FrameTypeMESSAGE, StreamID: 1,
 		}, p); err != nil {
@@ -1073,14 +1104,16 @@ func TestShmZeroCopyDataSurvivesSubsequentWrites(t *testing.T) {
 	}
 	bufA.Free()
 
-	// Read and verify B, C, D.
+	// Read and verify B, C, D. The 5-byte LPM header sits before the body,
+	// so the prefix we want to compare is at offset [5:9].
 	for _, want := range []string{"BBBB", "CCCC", "DDDD"} {
 		_, buf, err := readFrameView(context.Background(), rx)
 		if err != nil {
 			t.Fatalf("readFrameView: %v", err)
 		}
-		if string(buf.ReadOnlyData()[:4]) != want {
-			t.Errorf("expected prefix %s, got %s", want, buf.ReadOnlyData()[:4])
+		data := buf.ReadOnlyData()
+		if len(data) < 5+4 || string(data[5:9]) != want {
+			t.Errorf("expected body prefix %s, got %q", want, data)
 		}
 		buf.Free()
 	}

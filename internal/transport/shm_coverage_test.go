@@ -1092,7 +1092,15 @@ func TestShmLargeMessageWithDelayRead(t *testing.T) {
 	// Start write in a goroutine - this may block on flow control
 	writeDone := make(chan error, 1)
 	go func() {
-		err := s.Write(nil, newBufferSlice(largeMsg), &WriteOptions{Last: true})
+		// gRPC transport layer expects callers to format the 5-byte LPM
+		// header in hdr; the data buffer carries only the message body.
+		hdr := make([]byte, 5)
+		hdr[0] = 0
+		hdr[1] = byte(len(largeMsg) >> 24)
+		hdr[2] = byte(len(largeMsg) >> 16)
+		hdr[3] = byte(len(largeMsg) >> 8)
+		hdr[4] = byte(len(largeMsg))
+		err := s.Write(hdr, newBufferSlice(largeMsg), &WriteOptions{Last: true})
 		writeDone <- err
 	}()
 

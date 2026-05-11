@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"golang.org/x/net/http2/hpack"
+	"google.golang.org/grpc/mem"
 )
 
 // decodeHpackToFields is a test helper that runs a fresh HPACK decoder
@@ -127,11 +128,27 @@ func TestH2EncodeDecodeHeaders_Initial(t *testing.T) {
 	if got.HdrType != 0 {
 		t.Errorf("expected HdrType=0 (client-initial), got %d", got.HdrType)
 	}
-	if len(got.Metadata) != 1 || got.Metadata[0].Key != "x-custom" {
-		t.Fatalf("metadata not preserved: %+v", got.Metadata)
+	// Metadata round-trips both the user header (x-custom) and the
+	// transport-emitted content-type. Ordering is encoder-order
+	// (content-type first because it's written before user metadata).
+	var customKV *KV
+	var sawContentType bool
+	for i := range got.Metadata {
+		switch got.Metadata[i].Key {
+		case "x-custom":
+			customKV = &got.Metadata[i]
+		case "content-type":
+			sawContentType = true
+		}
 	}
-	if len(got.Metadata[0].Values) != 2 {
-		t.Errorf("expected 2 values, got %d", len(got.Metadata[0].Values))
+	if !sawContentType {
+		t.Errorf("expected content-type in decoded metadata, got %+v", got.Metadata)
+	}
+	if customKV == nil {
+		t.Fatalf("x-custom not preserved: %+v", got.Metadata)
+	}
+	if len(customKV.Values) != 2 {
+		t.Errorf("expected 2 x-custom values, got %d", len(customKV.Values))
 	}
 }
 
@@ -193,9 +210,6 @@ func TestH2WriteReadFrame_RoundTrip(t *testing.T) {
 
 	tx := NewShmRingFromSegment(seg.A, seg.Mem)
 	rx := NewShmRingFromSegment(seg.A, seg.Mem)
-	tx.SetWireFormat(WireFormatHTTP2)
-	rx.SetWireFormat(WireFormatHTTP2)
-
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -241,13 +255,10 @@ func TestH2WriteReadFrame_Headers(t *testing.T) {
 
 	tx := NewShmRingFromSegment(seg.A, seg.Mem)
 	rx := NewShmRingFromSegment(seg.A, seg.Mem)
-	tx.SetWireFormat(WireFormatHTTP2)
-	rx.SetWireFormat(WireFormatHTTP2)
-
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	// Write a HEADERS frame using the Custom16 KV encoding.
+	// Write a HEADERS frame using the internal HeadersV1 KV encoding.
 	hdrPayload := encodeHeaders(HeadersV1{
 		Version:   1,
 		HdrType:   0,
@@ -294,9 +305,6 @@ func TestH2WriteReadFrame_Trailers(t *testing.T) {
 
 	tx := NewShmRingFromSegment(seg.A, seg.Mem)
 	rx := NewShmRingFromSegment(seg.A, seg.Mem)
-	tx.SetWireFormat(WireFormatHTTP2)
-	rx.SetWireFormat(WireFormatHTTP2)
-
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -329,106 +337,6 @@ func TestH2WriteReadFrame_Trailers(t *testing.T) {
 	}
 }
 
-func TestNegotiateWireFormat(t *testing.T) {
-	l := &ShmListener{}
-	// Empty supported list always returns Custom16.
-	if got := l.negotiateWireFormat([]WireFormat{WireFormatHTTP2}); got != WireFormatCustom16 {
-		t.Errorf("empty supported: got %v want Custom16", got)
-	}
-
-	l.SetSupportedWireFormats([]WireFormat{WireFormatHTTP2, WireFormatCustom16})
-	// Client only advertises H2 → pick H2.
-	if got := l.negotiateWireFormat([]WireFormat{WireFormatHTTP2}); got != WireFormatHTTP2 {
-		t.Errorf("client=H2: got %v want H2", got)
-	}
-	// Client advertises Custom16 first → pick Custom16.
-	if got := l.negotiateWireFormat([]WireFormat{WireFormatCustom16, WireFormatHTTP2}); got != WireFormatCustom16 {
-		t.Errorf("client=C16,H2: got %v want C16", got)
-	}
-	// Client doesn't advertise → Custom16 default.
-	if got := l.negotiateWireFormat(nil); got != WireFormatCustom16 {
-		t.Errorf("nil client: got %v want C16", got)
-	}
-}
-
-func TestConnectRequest_RoundTripWithWireFormats(t *testing.T) {
-	req := connectRequest{
-		ringA:                1024,
-		ringB:                2048,
-		singleStreamMode:     true,
-		supportedWireFormats: []WireFormat{WireFormatHTTP2, WireFormatCustom16},
-	}
-	b := encodeConnectRequest(req)
-	got, err := decodeConnectRequest(b)
-	if err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	if got.ringA != req.ringA || got.ringB != req.ringB {
-		t.Errorf("ring sizes mismatch: %+v", got)
-	}
-	if !got.singleStreamMode {
-		t.Error("singleStreamMode lost")
-	}
-	if len(got.supportedWireFormats) != 2 {
-		t.Errorf("wire formats: got %v want %v", got.supportedWireFormats, req.supportedWireFormats)
-	}
-}
-
-func TestConnectRequest_BackwardCompat(t *testing.T) {
-	// 18-byte CONNECT request without wire format extension (legacy peer).
-	req := connectRequest{ringA: 100, ringB: 200, singleStreamMode: false}
-	b := encodeConnectRequest(req)
-	if len(b) != 18 {
-		t.Errorf("expected 18-byte legacy request, got %d", len(b))
-	}
-	got, err := decodeConnectRequest(b)
-	if err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	if len(got.supportedWireFormats) != 0 {
-		t.Errorf("expected no wire formats from legacy request, got %v", got.supportedWireFormats)
-	}
-}
-
-func TestConnectResponse_RoundTripWithWireFormat(t *testing.T) {
-	resp := connectResponse{
-		segmentName:  "test_seg_42",
-		selectedWire: WireFormatHTTP2,
-	}
-	b := encodeConnectResponse(resp)
-	got, err := decodeConnectResponse(b)
-	if err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	if got.segmentName != resp.segmentName {
-		t.Errorf("segment name mismatch: got %q want %q", got.segmentName, resp.segmentName)
-	}
-	if got.selectedWire != WireFormatHTTP2 {
-		t.Errorf("selected wire: got %v want H2", got.selectedWire)
-	}
-}
-
-func TestConnectResponse_LegacyDefault(t *testing.T) {
-	// Legacy response (no selectedWire byte) → decode defaults to Custom16.
-	resp := connectResponse{segmentName: "old"}
-	// Manually craft a v1 baseline buffer (no extension byte).
-	name := []byte(resp.segmentName)
-	b := make([]byte, 1+4+len(name))
-	b[0] = controlWireV1
-	b[1] = 3 // little-endian uint32 = 3
-	b[2] = 0
-	b[3] = 0
-	b[4] = 0
-	copy(b[5:], name)
-	got, err := decodeConnectResponse(b)
-	if err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	if got.selectedWire != WireFormatCustom16 {
-		t.Errorf("legacy decode: got %v want C16", got.selectedWire)
-	}
-}
-
 // TestH2BinaryMetadata_HeaderRoundTrip verifies that arbitrary byte values
 // passed in HeadersV1.Metadata for keys with the "-bin" suffix survive an
 // H2 wire encode→decode cycle as raw bytes — i.e. that the HPACK adapter
@@ -446,9 +354,6 @@ func TestH2BinaryMetadata_HeaderRoundTrip(t *testing.T) {
 
 	tx := NewShmRingFromSegment(seg.A, seg.Mem)
 	rx := NewShmRingFromSegment(seg.A, seg.Mem)
-	tx.SetWireFormat(WireFormatHTTP2)
-	rx.SetWireFormat(WireFormatHTTP2)
-
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -526,9 +431,6 @@ func TestH2BinaryMetadata_TrailerRoundTrip(t *testing.T) {
 
 	tx := NewShmRingFromSegment(seg.A, seg.Mem)
 	rx := NewShmRingFromSegment(seg.A, seg.Mem)
-	tx.SetWireFormat(WireFormatHTTP2)
-	rx.SetWireFormat(WireFormatHTTP2)
-
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -707,8 +609,6 @@ func newH2RingPair(t *testing.T) (tx, rx *ShmRing, ctx context.Context, cancel c
 	}
 	tx = NewShmRingFromSegment(seg.A, seg.Mem)
 	rx = NewShmRingFromSegment(seg.A, seg.Mem)
-	tx.SetWireFormat(WireFormatHTTP2)
-	rx.SetWireFormat(WireFormatHTTP2)
 	ctx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
 	t.Cleanup(func() {
 		cancel()
@@ -841,6 +741,51 @@ func TestH2Validate_WindowUpdateZeroIncrement(t *testing.T) {
 		t.Fatal("expected error on WINDOW_UPDATE increment=0")
 	}
 	readNormalMessageH2(ctx, t, rx, []byte("ok"))
+}
+
+// TestH2WindowUpdate_BigEndianWire verifies that the SHM sender writes
+// the WINDOW_UPDATE Window Size Increment as big-endian (RFC 7540
+// §6.9.1) and that the receive path interprets it consistently.
+//
+// Regression: prior to this commit the senders wrote little-endian
+// while the codec's non-zero validator (h2_codec.go around line 1204)
+// read big-endian. Both ends of the SHM connection used the same
+// codebase, so the validator's "non-zero" check was unreliable for
+// certain magic values where the LE bytes look like 0x80000000 in BE
+// (clearing bit 31 via `& 0x7FFFFFFF` would zero them, triggering a
+// spurious "WINDOW_UPDATE increment must be non-zero" connection
+// error). The wire format also violated the RFC, making the SHM
+// transport non-interoperable with a wire conformance audit even
+// though both same-codebase peers happened to agree.
+//
+// The test injects a known increment value as a raw H2 WINDOW_UPDATE
+// payload (big-endian bytes), then asserts the validator accepts it
+// AND the application-level handler decodes the same value.
+func TestH2WindowUpdate_BigEndianWire(t *testing.T) {
+	tx, rx, ctx, _, _ := newH2RingPair(t)
+
+	// A WINDOW_UPDATE increment whose LE encoding would look like
+	// 0x80000000 in BE: increment = 128 (LE bytes [0x80,0,0,0]).
+	// BE encoding of 128 = [0,0,0,0x80]. Inject the BE-correct bytes;
+	// the validator's `BigEndian.Uint32 & 0x7FFFFFFF` must read 128,
+	// not zero.
+	const increment uint32 = 128
+	beBytes := []byte{0x00, 0x00, 0x00, 0x80}
+	injectH2Frame(ctx, t, tx, H2FrameWINDOWUPDATE, 0, 1, beBytes)
+
+	fh, payload, err := readFrame(ctx, rx)
+	if err != nil {
+		t.Fatalf("readFrame: %v — codec validator likely reads wrong endianness", err)
+	}
+	if fh.Type != FrameTypeWindowUpdate {
+		t.Fatalf("frame type: got %d want WindowUpdate", fh.Type)
+	}
+	// The codec passes the raw payload through to the application
+	// handler. The handler in shm_client_transport / shm_server_transport
+	// decodes via binary.BigEndian.Uint32, matching the wire spec.
+	if got := binary.BigEndian.Uint32(payload); got != increment {
+		t.Errorf("decoded increment: got %d want %d", got, increment)
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -1956,5 +1901,565 @@ func TestH2RstStream_ClearsPendingFrame(t *testing.T) {
 	}
 	if holder.pendingFrameEndStream {
 		t.Error("pendingFrameEndStream not cleared after RST_STREAM")
+	}
+}
+
+// TestH2WriteFrame_PayloadExceedsRingCapacity_Chunks verifies that
+// writeFrame splits a MESSAGE whose total wire size (H2 header +
+// payload) exceeds the ring capacity into multiple H2 DATA frames,
+// and the reader's LPM accumulator reassembles them into a single
+// MESSAGE on the receive side.
+//
+// Without this chunking behavior, ReserveWrite would reject the
+// single-frame write outright (it enforces n <= capacity) and the
+// caller would see an error for a logically-valid message. Per
+// gRFC G3 §"Framing on the Ring": a frame larger than ring capacity
+// is well-formed and must be carried incrementally.
+//
+// Regression test for the H2-only refactor: prior to the fix,
+// writeFrameH2 only chunked when payload exceeded the 16 MiB-1 H2
+// protocol limit, ignoring ring capacity entirely. With a 64 KiB
+// ring, a 128 KiB MESSAGE would fail to send.
+func TestH2WriteFrame_PayloadExceedsRingCapacity_Chunks(t *testing.T) {
+	// Use a small ring so the test stays fast and the chunking path
+	// is exercised even for modest message sizes. Ring capacity must
+	// be a power of two; 64 KiB is the smallest practical size.
+	const ringCap = 64 * 1024
+	segName := fmt.Sprintf("h2chunk-%d-%d", time.Now().UnixNano(), goroutineID())
+	defer RemoveSegment(segName)
+	seg, err := CreateSegment(segName, ringCap, ringCap)
+	if err != nil {
+		t.Fatalf("CreateSegment: %v", err)
+	}
+	defer seg.Close()
+	tx := NewShmRingFromSegment(seg.A, seg.Mem)
+	rx := NewShmRingFromSegment(seg.A, seg.Mem)
+
+	// Build a 128 KiB LPM body (2 * ring capacity) so writeFrameH2
+	// MUST chunk: a single frame of 9 (H2 header) + 5 (LPM) + 131072
+	// (body) = 131086 bytes exceeds the 64 KiB ring capacity.
+	const bodyLen = 2 * ringCap
+	body := make([]byte, bodyLen)
+	for i := range body {
+		body[i] = byte((i * 31) ^ 0xA5)
+	}
+	lpm := make([]byte, 5+len(body))
+	lpm[0] = 0 // no compression
+	binary.BigEndian.PutUint32(lpm[1:5], uint32(len(body)))
+	copy(lpm[5:], body)
+
+	// Writer and reader run concurrently so the ring drains and the
+	// next chunk's ReserveWrite can succeed.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	type readResult struct {
+		fh      FrameHeader
+		payload []byte
+		err     error
+	}
+	resCh := make(chan readResult, 1)
+	go func() {
+		fh, p, err := readFrame(ctx, rx)
+		resCh <- readResult{fh: fh, payload: p, err: err}
+	}()
+
+	if err := writeFrame(ctx, tx, FrameHeader{Type: FrameTypeMESSAGE, StreamID: 1}, lpm); err != nil {
+		t.Fatalf("writeFrame: %v", err)
+	}
+
+	select {
+	case r := <-resCh:
+		if r.err != nil {
+			t.Fatalf("readFrame: %v", r.err)
+		}
+		if r.fh.Type != FrameTypeMESSAGE {
+			t.Fatalf("frame type: got %d want MESSAGE", r.fh.Type)
+		}
+		if r.fh.StreamID != 1 {
+			t.Fatalf("stream id: got %d want 1", r.fh.StreamID)
+		}
+		if !bytes.Equal(r.payload, lpm) {
+			t.Fatalf("payload mismatch: got %d bytes want %d bytes (equal? %v)",
+				len(r.payload), len(lpm), bytes.Equal(r.payload, lpm))
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("read timed out — writer probably failed to chunk")
+	}
+}
+
+// TestH2ReadFrameView_MultiFrameLPM_MidChainGrowDoubling verifies the
+// readFrameViewH2 mid-chain fast path goes through growBufForChunk
+// (explicit 2× doubling) instead of falling back to Go's default 1.25×
+// slice growth.
+//
+// Regression: a multi-frame LPM hit the mid-chain fast path which
+// used `append(acc.buf, ...)` directly without sizing the buffer
+// up-front. For a 4-chunk LPM where each chunk's appended size
+// matches the current cap, Go's 1.25× factor takes ~3-5 grow-realloc
+// cycles to reach the final size; explicit doubling needs just 2.
+// The wasted memcpy cost on a 64 MiB-class message is ~80 MiB.
+//
+// The test reads a 4-chunk LPM through the production readFrameView
+// path while observing total HeapAlloc growth. Without the fix, the
+// observed growth exceeds the LPM size by >= 50% (the grow-cascade
+// allocates intermediate buffers that GC eventually reclaims, but
+// the high-water mark is visible in MemStats during the read).
+//
+// Correctness coverage (wire bytes round-trip intact) is checked
+// alongside the allocation bound.
+func TestH2ReadFrameView_MultiFrameLPM_MidChainGrowDoubling(t *testing.T) {
+	const chunkBody = 1 * 1024 * 1024
+	const numChunks = 4
+	const expectedTotal = numChunks * chunkBody
+	const bodyLen = expectedTotal - 5
+
+	const ringCap = 16 * 1024 * 1024
+	segName := fmt.Sprintf("h2midchain-%d-%d", time.Now().UnixNano(), goroutineID())
+	defer RemoveSegment(segName)
+	seg, err := CreateSegment(segName, ringCap, ringCap)
+	if err != nil {
+		t.Fatalf("CreateSegment: %v", err)
+	}
+	defer seg.Close()
+	tx := NewShmRingFromSegment(seg.A, seg.Mem)
+	rx := NewShmRingFromSegment(seg.A, seg.Mem)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Build the 4-chunk wire stream. Chunk 1 = LPM header + first
+	// body slice; chunks 2-4 = pure body.
+	hdr := buildLPMHeaderTest(bodyLen)
+	chunk1Body := make([]byte, chunkBody-5)
+	for i := range chunk1Body {
+		chunk1Body[i] = byte(i & 0xFF)
+	}
+	chunk1 := append(append([]byte{}, hdr...), chunk1Body...) // 16 MiB wire
+
+	bodyChunks := make([][]byte, numChunks-1)
+	for i := range bodyChunks {
+		bodyChunks[i] = make([]byte, chunkBody)
+		for j := range bodyChunks[i] {
+			bodyChunks[i][j] = byte((j + i + 1) & 0xFF)
+		}
+	}
+
+	// Inject all 4 frames. The first three carry no END_STREAM; the
+	// fourth completes the LPM (still no END_STREAM since this is
+	// a streaming-style send, not the final DATA of an RPC).
+	injectH2Frame(ctx, t, tx, H2FrameDATA, 0, 1, chunk1)
+	for _, b := range bodyChunks {
+		injectH2Frame(ctx, t, tx, H2FrameDATA, 0, 1, b)
+	}
+
+	// The reader's mid-chain fast path is hit between chunks 2-4
+	// (chunk 1 goes through feedSplit). We can't observe the cap
+	// progression mid-frame from outside readFrameViewH2, but we
+	// CAN measure the total heap growth during the multi-chunk
+	// read. Under explicit 2× doubling, the high-water allocation
+	// is at most 2 × expectedTotal (final cap = expectedTotal, last
+	// grow temporarily holds previous cap + new cap = 1.5×).
+	// Under Go's default 1.25× factor, the multiple grow-realloc
+	// cycles allocate >= 2.5 × expectedTotal in total because each
+	// intermediate buffer survives until the next realloc copies it.
+	// We assert the bound at 2.5 × expectedTotal as the regression
+	// threshold.
+	runtime.GC()
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+
+	// First read should consume all 4 chunks and emit the assembled
+	// MESSAGE (chunk 4 fills acc.pos == expectedTotal).
+	fh, buf, err := readFrameView(ctx, rx)
+	if err != nil {
+		t.Fatalf("readFrameView: %v", err)
+	}
+	runtime.ReadMemStats(&after)
+
+	if buf != nil {
+		defer buf.Free()
+	}
+	if fh.Type != FrameTypeMESSAGE {
+		t.Fatalf("frame type: got %d want MESSAGE", fh.Type)
+	}
+	if fh.StreamID != 1 {
+		t.Fatalf("stream id: got %d want 1", fh.StreamID)
+	}
+
+	// TotalAlloc grew by all allocations during the read, including
+	// throwaway intermediate buffers from grow-reallocs. With
+	// doubling: ~expectedTotal + (chunkBody for the first chunk
+	// alloc) + ~2 × intermediate grows ≈ 2 × expectedTotal.
+	// Without doubling: 4-5 intermediate grow-allocs > 2.5 ×
+	// expectedTotal.
+	allocGrowth := after.TotalAlloc - before.TotalAlloc
+	const maxAllocGrowth = uint64(expectedTotal) * 5 / 2 // 2.5x
+	if allocGrowth > maxAllocGrowth {
+		t.Errorf("allocation growth %d bytes > bound %d (2.5 × expectedTotal=%d) — mid-chain grow-realloc regression: accumulator likely fell back to Go's default 1.25× slice growth instead of explicit 2× doubling",
+			allocGrowth, maxAllocGrowth, expectedTotal)
+	}
+
+	// Correctness: assembled wire bytes match what we injected.
+	data := buf.ReadOnlyData()
+	if got, want := len(data), expectedTotal; got != want {
+		t.Fatalf("assembled length: got %d want %d", got, want)
+	}
+	for i := 0; i < 5; i++ {
+		if data[i] != hdr[i] {
+			t.Fatalf("header byte %d: got %d want %d", i, data[i], hdr[i])
+		}
+	}
+	for i := 0; i < len(chunk1Body); i++ {
+		if data[5+i] != chunk1Body[i] {
+			t.Fatalf("chunk1 body byte %d: got %d want %d", i, data[5+i], chunk1Body[i])
+		}
+	}
+	off := 5 + len(chunk1Body)
+	for i, b := range bodyChunks {
+		for j := 0; j < len(b); j++ {
+			if data[off+j] != b[j] {
+				t.Fatalf("chunk %d body byte %d: got %d want %d (mid-chain assembly broken)", i+2, j, data[off+j], b[j])
+			}
+		}
+		off += len(b)
+	}
+}
+
+// TestWriteFrameBuffersVectoredMessage exercises the vectored MESSAGE
+// write path in writeFrameBuffers / writeFrameH2Message. The path is
+// triggered automatically by writeFrameBuffers for MESSAGE frames whose
+// body fits in a single H2 DATA frame; we verify that the resulting
+// on-wire bytes (and the reader's reassembled MESSAGE) are bit-identical
+// to the previous materialise-then-writeFrame path across:
+//   - single-segment payload
+//   - multi-segment payload (BufferSlice with 3 segments)
+//   - empty data (just the 5-byte LPM header)
+//   - END_STREAM flag propagation
+//   - segment boundary that straddles the ring wrap point
+//
+// The vectored path's whole point is to avoid materialising hdr+data
+// into a contiguous heap buffer; this test gives us the safety net so
+// any regression in segment-layout logic is caught immediately.
+func TestWriteFrameBuffersVectoredMessage(t *testing.T) {
+	mkBuf := func(b []byte) mem.Buffer { return mem.SliceBuffer(b) }
+	cases := []struct {
+		name      string
+		hdr       []byte
+		segments  [][]byte
+		endStream bool
+	}{
+		{
+			name:     "single-segment",
+			hdr:      []byte{0, 0, 0, 0, 11},
+			segments: [][]byte{[]byte("hello world")},
+		},
+		{
+			name: "multi-segment",
+			hdr:  []byte{0, 0, 0, 0, 21},
+			segments: [][]byte{
+				[]byte("multi-"),
+				[]byte("segment-"),
+				[]byte("payload"),
+			},
+		},
+		{
+			name:     "empty-data-just-hdr",
+			hdr:      []byte{0, 0, 0, 0, 0},
+			segments: nil,
+		},
+		{
+			name:      "end-stream-single",
+			hdr:       []byte{0, 0, 0, 0, 4},
+			segments:  [][]byte{[]byte("eos!")},
+			endStream: true,
+		},
+		{
+			// Explicit MORE: gRPC streaming SendMsg with more
+			// messages to follow ΓÇö caller passes Flags=0 (no
+			// EndStream), which the H2 codec translates to no
+			// END_STREAM bit on the wire; the H2 reader surfaces
+			// the FrameHeader with MessageFlagMORE set so the
+			// upper layer continues reading.
+			name:     "more-no-end-stream",
+			hdr:      []byte{0, 0, 0, 0, 5},
+			segments: [][]byte{[]byte("more!")},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			segName := fmt.Sprintf("h2vmsg-%s-%d", tc.name, time.Now().UnixNano())
+			defer RemoveSegment(segName)
+			seg, err := CreateSegment(segName, 1<<20, 1<<20)
+			if err != nil {
+				t.Fatalf("CreateSegment: %v", err)
+			}
+			defer seg.Close()
+			tx := NewShmRingFromSegment(seg.A, seg.Mem)
+			rx := NewShmRingFromSegment(seg.A, seg.Mem)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+
+			data := make(mem.BufferSlice, 0, len(tc.segments))
+			for _, s := range tc.segments {
+				data = append(data, mkBuf(s))
+			}
+			fh := FrameHeader{StreamID: 7, Type: FrameTypeMESSAGE}
+			if tc.endStream {
+				fh.Flags = MessageFlagEndStream
+			}
+			if err := writeFrameBuffers(ctx, tx, fh, tc.hdr, data); err != nil {
+				t.Fatalf("writeFrameBuffers: %v", err)
+			}
+			rfh, payload, err := readFrame(ctx, rx)
+			if err != nil {
+				t.Fatalf("readFrame: %v", err)
+			}
+			if rfh.Type != FrameTypeMESSAGE {
+				t.Fatalf("frame type: got %d want MESSAGE", rfh.Type)
+			}
+			if rfh.StreamID != 7 {
+				t.Fatalf("stream id: got %d want 7", rfh.StreamID)
+			}
+			// MORE bit reflects END_STREAM on the wire: MORE=0 means
+			// END_STREAM observed (last MESSAGE in this direction).
+			gotMore := rfh.Flags&MessageFlagMORE != 0
+			wantMore := !tc.endStream
+			if gotMore != wantMore {
+				t.Fatalf("MORE flag: got %v want %v", gotMore, wantMore)
+			}
+			// Expected body = lpmHdr || flatten(segments).
+			var want []byte
+			want = append(want, tc.hdr...)
+			for _, s := range tc.segments {
+				want = append(want, s...)
+			}
+			if !bytes.Equal(payload, want) {
+				t.Fatalf("payload mismatch:\n got %d bytes %x\nwant %d bytes %x",
+					len(payload), payload, len(want), want)
+			}
+		})
+	}
+}
+
+// TestWriteFrameBuffersVectoredMessage_WrapStraddle stresses the
+// res.First / res.Second boundary by writing many small MESSAGE frames
+// until the ring write head crosses the wrap point, then writing a
+// final vectored MESSAGE whose payload is large enough to straddle the
+// wrap. Verifies that the ringSegWriter correctly emits across the
+// two-slice reservation.
+//
+// Sizing arithmetic (ringSize = 4096, smallFrame = 9 H2 hdr + 5 LPM
+// hdr + 4 body = 18 bytes, finalFrame = 9 + 5 + 333+444+555 = 1346
+// bytes): for the final write to straddle, we need writeIdx mod 4096
+// to lie in [4096-1346+1, 4096-1] = [2751, 4095]. With each warmup
+// iteration advancing writeIdx by exactly 18 bytes, ceil(2751/18) =
+// 153 iterations is the minimum that *could* land in the straddle
+// band. Anywhere from 153..227 iterations land somewhere in [2754,
+// 4086]. We use 200 to land squarely inside.
+//
+// The post-write assertion `len(res.Second) > 0` is not directly
+// observable from outside the codec, so we instead inspect
+// `tx.ContiguousWriteSpace()` immediately BEFORE the final write — it
+// returns the contiguous bytes remaining in res.First. If that is
+// less than finalFrame, the reservation MUST straddle. The test
+// fatally fails the wrap precondition before the actual write so a
+// regression in the warmup arithmetic is loud, not silent.
+func TestWriteFrameBuffersVectoredMessage_WrapStraddle(t *testing.T) {
+	const ringSize = 4096
+	segName := fmt.Sprintf("h2vwrap-%d", time.Now().UnixNano())
+	defer RemoveSegment(segName)
+	seg, err := CreateSegment(segName, ringSize, ringSize)
+	if err != nil {
+		t.Fatalf("CreateSegment: %v", err)
+	}
+	defer seg.Close()
+	tx := NewShmRingFromSegment(seg.A, seg.Mem)
+	rx := NewShmRingFromSegment(seg.A, seg.Mem)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Repeatedly write+read a small MESSAGE to advance head/tail
+	// past the wrap point. See the function-level comment for the
+	// 200-iteration choice.
+	smallBody := []byte("ping")
+	smallHdr := []byte{0, 0, 0, 0, byte(len(smallBody))}
+	const warmupIters = 200
+	for i := 0; i < warmupIters; i++ {
+		if err := writeFrameBuffers(ctx, tx,
+			FrameHeader{StreamID: uint32(i + 1), Type: FrameTypeMESSAGE},
+			smallHdr, mem.BufferSlice{mem.SliceBuffer(smallBody)},
+		); err != nil {
+			t.Fatalf("warmup writeFrameBuffers[%d]: %v", i, err)
+		}
+		fh, payload, err := readFrame(ctx, rx)
+		if err != nil {
+			t.Fatalf("warmup readFrame[%d]: %v", i, err)
+		}
+		if fh.Type != FrameTypeMESSAGE {
+			t.Fatalf("warmup frame type: got %d want MESSAGE", fh.Type)
+		}
+		if !bytes.Equal(payload, append(append([]byte{}, smallHdr...), smallBody...)) {
+			t.Fatalf("warmup payload mismatch")
+		}
+	}
+
+	// Now write a multi-segment MESSAGE whose serialised form is
+	// large enough that res.First+res.Second must straddle wrap.
+	body0 := bytes.Repeat([]byte{0xAB}, 333)
+	body1 := bytes.Repeat([]byte{0xCD}, 444)
+	body2 := bytes.Repeat([]byte{0xEF}, 555)
+	totalBody := len(body0) + len(body1) + len(body2)
+	hdr := []byte{0, 0, 0, 0, 0}
+	binary.BigEndian.PutUint32(hdr[1:5], uint32(totalBody))
+	const finalFrameTotal = h2FrameHeaderSize + 5 + 333 + 444 + 555 // 1346
+
+	// Precondition: the next write must straddle the wrap. If
+	// ContiguousWriteSpace returns >= finalFrameTotal, res.Second
+	// will be empty and we'd be testing the non-straddle branch only
+	// — a silent regression of this test's stated purpose.
+	if contig := tx.ContiguousWriteSpace(); contig >= uint64(finalFrameTotal) {
+		t.Fatalf("test setup broken: ContiguousWriteSpace=%d >= finalFrameTotal=%d, "+
+			"final write will not straddle the wrap. Adjust warmupIters.",
+			contig, finalFrameTotal)
+	}
+
+	if err := writeFrameBuffers(ctx, tx,
+		FrameHeader{StreamID: 999, Type: FrameTypeMESSAGE},
+		hdr,
+		mem.BufferSlice{mem.SliceBuffer(body0), mem.SliceBuffer(body1), mem.SliceBuffer(body2)},
+	); err != nil {
+		t.Fatalf("wrap-straddle writeFrameBuffers: %v", err)
+	}
+	rfh, payload, err := readFrame(ctx, rx)
+	if err != nil {
+		t.Fatalf("wrap-straddle readFrame: %v", err)
+	}
+	if rfh.Type != FrameTypeMESSAGE || rfh.StreamID != 999 {
+		t.Fatalf("wrap-straddle frame header: %+v", rfh)
+	}
+	var want []byte
+	want = append(want, hdr...)
+	want = append(want, body0...)
+	want = append(want, body1...)
+	want = append(want, body2...)
+	if !bytes.Equal(payload, want) {
+		t.Fatalf("wrap-straddle payload mismatch: len got=%d want=%d", len(payload), len(want))
+	}
+}
+
+// TestReadFrameViewH2_MultiLPMLeftoverNoAliasing is a regression test
+// for a data-corruption bug: when one H2 DATA frame body carries
+// multiple gRPC LPMs, readFrameViewH2 used to stash the leftover
+// (start of the next LPM) in holder.pendingFrame as a slice that
+// aliased ring memory. commitPayload.Commit(int(h2fh.Length)) ran
+// IMMEDIATELY before the leftover was stored, so the writer was free
+// to advance into the just-committed bytes — corrupting the second
+// LPM the next read would surface.
+//
+// The fix copies leftover to a heap-owned buffer before commit. This
+// test exercises the path by:
+//  1. Building a single DATA frame body containing TWO complete
+//     LPMs (so feedSplit returns msg=first LPM + leftover=second).
+//  2. Reading the first LPM via readFrameView (which commits the
+//     whole DATA payload to the ring read pointer).
+//  3. Writing many junk frames to drive the ring writer past the
+//     previous read position — overwriting the bytes that USED to
+//     back the leftover slice.
+//  4. Reading the second LPM via readFrameView. It should still
+//     decode to the original bytes; before the fix it would decode
+//     to junk (whatever the writer left in those ring slots).
+func TestReadFrameViewH2_MultiLPMLeftoverNoAliasing(t *testing.T) {
+	const ringSize = 4096
+	segName := fmt.Sprintf("h2multilpm-%d", time.Now().UnixNano())
+	defer RemoveSegment(segName)
+	seg, err := CreateSegment(segName, ringSize, ringSize)
+	if err != nil {
+		t.Fatalf("CreateSegment: %v", err)
+	}
+	defer seg.Close()
+	tx := NewShmRingFromSegment(seg.A, seg.Mem)
+	rx := NewShmRingFromSegment(seg.A, seg.Mem)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Build a DATA payload containing two LPMs:
+	//
+	//	LPM_A = [0][len(A)][bodyA]  bodyA = 0xAA × 100
+	//	LPM_B = [0][len(B)][bodyB]  bodyB = 0xBB × 200
+	const aLen, bLen = 100, 200
+	bodyA := bytes.Repeat([]byte{0xAA}, aLen)
+	bodyB := bytes.Repeat([]byte{0xBB}, bLen)
+	lpmA := append(buildLPMHeaderTest(aLen), bodyA...)
+	lpmB := append(buildLPMHeaderTest(bLen), bodyB...)
+	combined := append(append([]byte{}, lpmA...), lpmB...)
+
+	injectH2Frame(ctx, t, tx, H2FrameDATA, 0, 1, combined)
+
+	// Read 1: surfaces LPM_A; leftover (LPM_B bytes) gets stashed in
+	// holder.pendingFrame. Before the fix, that stash aliased ring
+	// memory which is about to be released.
+	fh1, buf1, err := readFrameView(ctx, rx)
+	if err != nil {
+		t.Fatalf("read 1: %v", err)
+	}
+	if fh1.Type != FrameTypeMESSAGE {
+		t.Fatalf("read 1 type: got %d want MESSAGE", fh1.Type)
+	}
+	dataA := append([]byte{}, buf1.ReadOnlyData()...) // snapshot
+	if buf1 != nil {
+		buf1.Free()
+	}
+	wantA := append(append([]byte{}, buildLPMHeaderTest(aLen)...), bodyA...)
+	if !bytes.Equal(dataA, wantA) {
+		t.Fatalf("read 1 payload mismatch")
+	}
+
+	// Stomp the ring without draining: inject junk DATA frames whose
+	// bytes will overwrite the ring slots where LPM_B *used* to
+	// live. We do NOT readFrameView these — pendingFrame is replayed
+	// FIRST on every readFrameView call (before any new ring read),
+	// so any read here would consume the pendingFrame and mask the
+	// bug. We just want the ring writer's bytes to land on top of
+	// the leftover slice's backing memory.
+	//
+	// Ring layout: ringSize = 4096. After read 1 commits, both
+	// readIdx and writeIdx are at 9 (H2 hdr) + 5+100+5+200 = 319,
+	// modular = 319. The leftover (LPM_B body) used to back ring
+	// positions [9+5+100 .. 9+5+100+5+200] = [114..319]. To
+	// overwrite those positions the writer must wrap past 4096 and
+	// re-enter [0..319]. From writeIdx=319, advancing by
+	// (4096-319) + 319 = 4096 bytes wraps back exactly to position
+	// 319 — covering ALL ring positions including [114..319]. Each
+	// junk DATA frame is 9 (H2 hdr) + 5 (LPM hdr) + 32 (body) = 46
+	// bytes. 89 junk frames advance writeIdx by 89*46 = 4094 — just
+	// shy of full ring (4096) so reservation does not block, but
+	// enough to land at position (319+4094) mod 4096 = 317,
+	// definitely past 319.
+	junkBody := bytes.Repeat([]byte{0xCC}, 32)
+	junkPayload := append(buildLPMHeaderTest(len(junkBody)), junkBody...)
+	for i := 0; i < 89; i++ {
+		injectH2Frame(ctx, t, tx, H2FrameDATA, 0, uint32(100+i), junkPayload)
+	}
+
+	// Read 2: should pull LPM_B from holder.pendingFrame (replayed
+	// before any new ring read). Pre-fix: pendingFrame aliases the
+	// just-overwritten ring memory and we get junk bytes. Post-fix:
+	// pendingFrame is a heap copy taken before commit and LPM_B is
+	// intact.
+	fh2, buf2, err := readFrameView(ctx, rx)
+	if err != nil {
+		t.Fatalf("read 2: %v", err)
+	}
+	if buf2 != nil {
+		defer buf2.Free()
+	}
+	if fh2.Type != FrameTypeMESSAGE {
+		t.Fatalf("read 2 type: got %d want MESSAGE", fh2.Type)
+	}
+	wantB := append(append([]byte{}, buildLPMHeaderTest(bLen)...), bodyB...)
+	if !bytes.Equal(buf2.ReadOnlyData(), wantB) {
+		t.Fatalf("read 2 payload mismatch:\n got %d bytes head=%x\nwant %d bytes head=%x",
+			len(buf2.ReadOnlyData()), buf2.ReadOnlyData()[:min(16, len(buf2.ReadOnlyData()))],
+			len(wantB), wantB[:min(16, len(wantB))])
 	}
 }

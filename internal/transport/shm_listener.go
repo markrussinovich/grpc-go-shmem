@@ -79,12 +79,6 @@ type ShmListener struct {
 	ringBSize   uint64
 	maxStreams  uint32
 
-	// supportedWireFormats lists the wire formats this listener accepts,
-	// in preference order. The first format from the client's
-	// advertisement that also appears in this list is selected. Empty
-	// means only Custom16 is supported (legacy default).
-	supportedWireFormats []WireFormat
-
 	// Keepalive configuration for server transports
 	kp  keepalive.ServerParameters
 	kep keepalive.EnforcementPolicy
@@ -187,34 +181,6 @@ func (l *ShmListener) SetMaxStreams(max uint32) {
 	atomic.StoreUint32(&l.maxStreams, max)
 }
 
-// SetSupportedWireFormats configures which on-ring frame encodings this
-// listener accepts, in preference order. The negotiation picks the first
-// client-advertised format that also appears in this list. Empty means
-// only Custom16 (legacy default). Must be called before the listener
-// accepts any connection.
-func (l *ShmListener) SetSupportedWireFormats(formats []WireFormat) {
-	l.supportedWireFormats = append([]WireFormat(nil), formats...)
-}
-
-// negotiateWireFormat picks the first client-advertised format that the
-// listener also supports. Defaults to Custom16 when there's no overlap or
-// neither side advertised — preserving backward compatibility.
-func (l *ShmListener) negotiateWireFormat(clientAdvertised []WireFormat) WireFormat {
-	if len(clientAdvertised) == 0 || len(l.supportedWireFormats) == 0 {
-		return WireFormatCustom16
-	}
-	supported := make(map[WireFormat]struct{}, len(l.supportedWireFormats))
-	for _, w := range l.supportedWireFormats {
-		supported[w] = struct{}{}
-	}
-	for _, w := range clientAdvertised {
-		if _, ok := supported[w]; ok {
-			return w
-		}
-	}
-	return WireFormatCustom16
-}
-
 // Accept waits for and returns the next connection to the listener
 // Creates a new segment for each connection, similar to TCP socket model
 func (l *ShmListener) Accept() (net.Conn, error) {
@@ -233,7 +199,7 @@ func (l *ShmListener) Accept() (net.Conn, error) {
 
 	// Read a CONNECT request from the control ring.
 	for {
-		fh, payload, err := readFrame(l.ctx, l.ctlRx)
+		fh, payload, err := readCtlFrame(l.ctx, l.ctlRx)
 		if err != nil {
 			return nil, err
 		}
@@ -242,16 +208,12 @@ func (l *ShmListener) Accept() (net.Conn, error) {
 		}
 		connReq, err := decodeConnectRequest(payload)
 		if err != nil {
-			_ = writeFrame(l.ctx, l.ctlTx, FrameHeader{Type: FrameTypeREJECT}, encodeConnectReject(connectReject{message: err.Error()}))
+			_ = writeCtlFrame(l.ctx, l.ctlTx, FrameHeader{Type: FrameTypeREJECT}, encodeConnectReject(connectReject{message: err.Error()}))
 			continue
 		}
 
 		connID := l.connID.Add(1)
 		segmentName := fmt.Sprintf("%s_conn_%d", l.baseName, connID)
-
-		// Negotiate the on-ring wire format from the client's advertisement.
-		// Falls back to Custom16 when there's no overlap.
-		selectedWire := l.negotiateWireFormat(connReq.supportedWireFormats)
 
 		// Proactively clean up any stale segment from a previous run.
 		if SegmentExists(segmentName) {
@@ -260,7 +222,7 @@ func (l *ShmListener) Accept() (net.Conn, error) {
 
 		segment, err := CreateSegment(segmentName, l.ringASize, l.ringBSize)
 		if err != nil {
-			_ = writeFrame(l.ctx, l.ctlTx, FrameHeader{Type: FrameTypeREJECT}, encodeConnectReject(connectReject{message: err.Error()}))
+			_ = writeCtlFrame(l.ctx, l.ctlTx, FrameHeader{Type: FrameTypeREJECT}, encodeConnectReject(connectReject{message: err.Error()}))
 			continue
 		}
 		segment.H.SetMaxStreams(atomic.LoadUint32(&l.maxStreams))
@@ -283,12 +245,7 @@ func (l *ShmListener) Accept() (net.Conn, error) {
 		readRing.SetEvents(readEvents)
 		writeRing.SetEvents(writeEvents)
 
-		// Apply the negotiated wire format to the data rings used by both
-		// the security handshaker (here) and the eventual server transport.
-		readRing.SetWireFormat(selectedWire)
-		writeRing.SetWireFormat(selectedWire)
-
-		if err := writeFrame(l.ctx, l.ctlTx, FrameHeader{Type: FrameTypeACCEPT}, encodeConnectResponse(connectResponse{segmentName: segmentName, selectedWire: selectedWire})); err != nil {
+		if err := writeCtlFrame(l.ctx, l.ctlTx, FrameHeader{Type: FrameTypeACCEPT}, encodeConnectResponse(connectResponse{segmentName: segmentName})); err != nil {
 			if readEvents != nil {
 				readEvents.Close()
 			}
@@ -357,10 +314,6 @@ func (l *ShmListener) Accept() (net.Conn, error) {
 			_ = RemoveSegment(segmentName)
 			return nil, fmt.Errorf("failed to create server transport: %v", err)
 		}
-		// Apply negotiated wire format to the data rings the server
-		// transport uses for actual gRPC traffic.
-		serverTransport.clientToServer.SetWireFormat(selectedWire)
-		serverTransport.serverToClient.SetWireFormat(selectedWire)
 		// Configure keepalive on the server transport.
 		serverTransport.ConfigureKeepalive(l.kp, l.kep)
 		serverTransport.singleStreamMode = conn.singleStreamMode
@@ -398,7 +351,7 @@ func (l *ShmListener) Close() error {
 			}
 
 			// Wait for Accept to finish touching control ring memory.
-			// The ring closures above ensure Accept's readFrame returns
+			// The ring closures above ensure Accept's readCtlFrame returns
 			// promptly with an error, so this won't block indefinitely.
 			l.acceptWG.Wait()
 

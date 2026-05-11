@@ -22,6 +22,7 @@ package transport
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -242,12 +243,20 @@ func (c *ShmStreamingClient) runStreamSender(s *StreamingClientStream) {
 			if !ok {
 				return
 			}
-			// Send message frame
+			// Send message frame. H2 codec on the receive side requires
+			// the MESSAGE body to be gRPC LPM-prefixed (1-byte compressed
+			// flag + 4-byte big-endian length + body). The user-facing
+			// SendMsg / RecvMsg API operates on raw payload bytes, so we
+			// wrap on send and strip on receive (dispatchMessage).
+			wrapped := make([]byte, 5+len(msg))
+			wrapped[0] = 0 // not compressed
+			binary.BigEndian.PutUint32(wrapped[1:5], uint32(len(msg)))
+			copy(wrapped[5:], msg)
 			fh := FrameHeader{
 				StreamID: s.id,
 				Type:     FrameTypeMESSAGE,
 			}
-			if err := c.writeFrameSafe(s.ctx, fh, msg); err != nil {
+			if err := c.writeFrameSafe(s.ctx, fh, wrapped); err != nil {
 				log.Printf("StreamingClient: failed to send message on stream %d: %v", s.id, err)
 				s.closeWithError(err)
 				return
@@ -291,8 +300,16 @@ func (c *ShmStreamingClient) dispatchMessage(id uint32, p []byte) {
 	if s == nil {
 		return
 	}
+	// Strip the gRPC LPM 5-byte prefix added by the sender (the H2 codec
+	// passes the LPM through verbatim, so the wrapped header is still
+	// present here). If the frame is malformed (too short) drop it.
+	body, ok := stripLPMHeader(p)
+	if !ok {
+		log.Printf("StreamingClient: dropping malformed MESSAGE on stream %d (len=%d)", id, len(p))
+		return
+	}
 	// Make a copy since the payload buffer may be reused
-	msg := append([]byte(nil), p...)
+	msg := append([]byte(nil), body...)
 	select {
 	case s.msgCh <- msg:
 		return

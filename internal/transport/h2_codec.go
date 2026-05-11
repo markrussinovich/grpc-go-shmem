@@ -37,24 +37,25 @@ import (
 // h2Codec encodes and decodes the SHM transport's in-memory frame model
 // (FrameHeader + payload bytes) on top of the HTTP/2 wire format.
 //
-// The mapping between Custom16 frame types and HTTP/2 frame types is:
+// The mapping between the in-memory FrameHeader types and HTTP/2 frame
+// types is:
 //
-//	Custom16 HEADERS  (initial)  → H2 HEADERS  + END_HEADERS
-//	Custom16 HEADERS  (server)   → H2 HEADERS  + END_HEADERS
-//	Custom16 MESSAGE  (more=0)   → H2 DATA
-//	Custom16 MESSAGE  (more=1)   → H2 DATA (intermediate chunk; END_STREAM=0)
-//	Custom16 TRAILERS            → H2 HEADERS  + END_HEADERS + END_STREAM
-//	Custom16 CANCEL              → H2 RST_STREAM (error_code=CANCEL)
-//	Custom16 GOAWAY              → H2 GOAWAY
-//	Custom16 PING/PONG           → H2 PING (PONG = PING + ACK)
-//	Custom16 HALFCLOSE           → H2 DATA  (empty, END_STREAM=1)
-//	Custom16 WINDOW_UPDATE       → H2 WINDOW_UPDATE
+//	HEADERS  (initial)  → H2 HEADERS  + END_HEADERS
+//	HEADERS  (server)   → H2 HEADERS  + END_HEADERS
+//	MESSAGE  (more=0)   → H2 DATA
+//	MESSAGE  (more=1)   → H2 DATA (intermediate chunk; END_STREAM=0)
+//	TRAILERS            → H2 HEADERS  + END_HEADERS + END_STREAM
+//	CANCEL              → H2 RST_STREAM (error_code=CANCEL)
+//	GOAWAY              → H2 GOAWAY
+//	PING/PONG           → H2 PING (PONG = PING + ACK)
+//	HALFCLOSE           → H2 DATA  (empty, END_STREAM=1)
+//	WINDOW_UPDATE       → H2 WINDOW_UPDATE
 //
-// The HEADERS/TRAILERS payloads, which are Custom16 KV blobs in the legacy
-// codec, are HPACK-encoded as H2 :pseudo-header fields plus regular gRPC
-// metadata. The decoder converts back to the same in-memory HeadersV1 /
-// TrailersV1 structs the rest of the transport already uses, so callers
-// remain wire-format-agnostic.
+// HEADERS/TRAILERS payloads are KV blobs in the in-memory HeadersV1 /
+// TrailersV1 model. They are HPACK-encoded as H2 :pseudo-header fields
+// plus regular gRPC metadata. The decoder converts back to the same
+// HeadersV1 / TrailersV1 structs the rest of the transport already
+// uses.
 
 // hpackEncoderHolder bundles a per-ring HPACK encoder with its scratch
 // buffer. The encoder is single-threaded (writer goroutine).
@@ -208,7 +209,7 @@ func (h *hpackDecoderHolder) removeLpmAccumulator(sid uint32) {
 }
 
 // h2Encoder lazily initializes and returns the HPACK encoder for this
-// ring. Must only be called when r.wire == WireFormatHTTP2.
+// ring. Allocated on first use.
 func (r *ShmRing) h2Encoder() *hpackEncoderHolder {
 	if r.h2Enc == nil {
 		r.h2Enc = newHpackEncoderHolder()
@@ -217,7 +218,7 @@ func (r *ShmRing) h2Encoder() *hpackEncoderHolder {
 }
 
 // h2Decoder lazily initializes and returns the HPACK decoder for this
-// ring. Must only be called when r.wire == WireFormatHTTP2.
+// ring. Allocated on first use.
 func (r *ShmRing) h2Decoder() *hpackDecoderHolder {
 	if r.h2Dec == nil {
 		r.h2Dec = newHpackDecoderHolder()
@@ -236,9 +237,6 @@ func (r *ShmRing) h2Decoder() *hpackDecoderHolder {
 //     such headers on receipt, and emitting raw bytes here would violate
 //     the spec and confuse anyone tracing the wire (Wireshark, gRPC tracing,
 //     debug proxies).
-//   - Custom16 wire is unaffected: it transports metadata as raw bytes
-//     end-to-end via encodeHeaders/encodeTrailers, never reaching this
-//     adapter.
 //   - HPACK header names MUST be lowercase (RFC 7540 §8.1.2). This is a
 //     hard requirement for real H2 peer interop — receivers that follow
 //     the spec strictly will reject any uppercase byte in the field name
@@ -308,7 +306,11 @@ func h2EncodeHeaders(enc *hpack.Encoder, scratch *bytes.Buffer, h HeadersV1) []b
 			_ = enc.WriteField(hpack.HeaderField{Name: ":authority", Value: h.Authority})
 		}
 		_ = enc.WriteField(hpack.HeaderField{Name: "te", Value: "trailers"})
-		_ = enc.WriteField(hpack.HeaderField{Name: "content-type", Value: "application/grpc"})
+		// content-type defaults to "application/grpc" but caller may
+		// request a subtype (e.g. "application/grpc+proto" /
+		// "+json" / "+<custom>") via the Metadata "content-type"
+		// key per gRFC G2 / gRPC-over-HTTP/2.
+		_ = enc.WriteField(hpack.HeaderField{Name: "content-type", Value: pickContentType(h.Metadata)})
 		if h.DeadlineUnixNano != 0 {
 			ns := int64(h.DeadlineUnixNano) - time.Now().UnixNano()
 			if ns < 0 {
@@ -325,14 +327,33 @@ func h2EncodeHeaders(enc *hpack.Encoder, scratch *bytes.Buffer, h HeadersV1) []b
 	} else {
 		// Server-initial.
 		_ = enc.WriteField(hpack.HeaderField{Name: ":status", Value: "200"})
-		_ = enc.WriteField(hpack.HeaderField{Name: "content-type", Value: "application/grpc"})
+		_ = enc.WriteField(hpack.HeaderField{Name: "content-type", Value: pickContentType(h.Metadata)})
 	}
 	for _, kv := range h.Metadata {
+		// content-type was already written above (potentially derived
+		// from this metadata); skip the duplicate to avoid emitting
+		// the same header twice on the wire.
+		if strings.EqualFold(kv.Key, "content-type") {
+			continue
+		}
 		for _, v := range kv.Values {
 			writeMetadataField(enc, kv.Key, v)
 		}
 	}
 	return scratch.Bytes()
+}
+
+// pickContentType returns the content-type value to write on the wire.
+// If the caller supplied a "content-type" metadata key with at least one
+// value, the first value is used (case-insensitive key match). Otherwise
+// returns the canonical "application/grpc" default.
+func pickContentType(md []KV) string {
+	for _, kv := range md {
+		if strings.EqualFold(kv.Key, "content-type") && len(kv.Values) > 0 {
+			return string(kv.Values[0])
+		}
+	}
+	return "application/grpc"
 }
 
 // h2EncodeTrailers HPACK-encodes a TrailersV1 into an H2 HEADERS frame
@@ -389,8 +410,20 @@ func (s *h2DecodeState) emit(hf hpack.HeaderField) {
 		s.h.Authority = hf.Value
 	case ":status":
 		s.h.HdrType = 1
-	case "te", "content-type":
-		// Standard gRPC headers; ignore for in-memory model.
+	case "te":
+		// Standard gRPC header; ignore for in-memory model.
+	case "content-type":
+		// Surface the content-type into the metadata map so the
+		// upper-layer transport can extract a non-default subtype
+		// (e.g. "application/grpc+proto" → ContentSubtype "proto").
+		// The encoder is symmetric: it picks the metadata
+		// "content-type" value when present, defaulting to the
+		// canonical "application/grpc" otherwise.
+		if s.isTrailers {
+			appendKV(&s.t.Metadata, "content-type", []byte(hf.Value))
+		} else {
+			appendKV(&s.h.Metadata, "content-type", []byte(hf.Value))
+		}
 	case "grpc-timeout":
 		if d, perr := decodeTimeout(hf.Value); perr == nil {
 			s.h.DeadlineUnixNano = uint64(time.Now().Add(d).UnixNano())
@@ -726,9 +759,9 @@ func validateH2ControlFrame(h2fh H2FrameHeader) error {
 	return nil
 }
 
-// translateCustomToH2 maps an in-memory FrameHeader (Custom16 model) to the
-// equivalent H2 frame type and flags. The caller is responsible for any
-// payload transformation (HPACK for HEADERS/TRAILERS, etc.).
+// translateCustomToH2 maps an in-memory FrameHeader to the equivalent
+// H2 frame type and flags. The caller is responsible for any payload
+// transformation (HPACK for HEADERS/TRAILERS, etc.).
 func translateCustomToH2(fh FrameHeader) (H2FrameType, byte) {
 	switch fh.Type {
 	case FrameTypeMESSAGE:
@@ -766,9 +799,9 @@ func translateCustomToH2(fh FrameHeader) (H2FrameType, byte) {
 	return H2FrameType(0xFF), 0
 }
 
-// translateH2ToCustom maps an H2 frame to a Custom16 frame type and flags
-// for delivery into the existing dispatch machinery. The caller has
-// already decoded the header.
+// translateH2ToCustom maps an H2 frame to the in-memory FrameHeader's
+// frame type and flags for delivery into the existing dispatch
+// machinery. The caller has already decoded the header.
 //
 // HEADERS frames require examining the payload (after HPACK decode) to
 // distinguish initial-headers from trailers (presence of grpc-status).
@@ -778,10 +811,9 @@ func translateCustomToH2(fh FrameHeader) (H2FrameType, byte) {
 // DATA with empty body or HEADERS with grpc-status). Within a stream,
 // each DATA frame is a complete LPM message (no chunking — the LPM
 // accumulator in the reader handles fragmented LPMs across DATA frames).
-// We therefore never set MessageFlagMORE on the synthesized Custom16
-// MESSAGE frame. Multi-chunk Custom16 → H2 emission would require a
-// separate accumulator on the reader side; for now writeProtoToRingH2
-// always emits a single DATA frame per message.
+// We therefore never set MessageFlagMORE on the synthesized MESSAGE
+// frame at this layer; the per-LPM MORE derivation happens in the read
+// loop based on END_STREAM + leftover bytes.
 func translateH2ToCustom(t H2FrameType, flags byte) (FrameType, uint8, bool) {
 	switch t {
 	case H2FrameDATA:
@@ -819,7 +851,7 @@ func rstStreamPayload(code H2ErrorCode) []byte {
 }
 
 // goawayPayloadH2 encodes a GOAWAY payload. layout: lastStreamID(4) +
-// errorCode(4) + opaque debug data. We pack the Custom16 payload (a UTF-8
+// errorCode(4) + opaque debug data. We pack the payload (a UTF-8
 // debug message) into the debug-data section and use NoError as the code.
 func goawayPayloadH2(custom []byte) []byte {
 	out := make([]byte, 8+len(custom))
@@ -958,7 +990,7 @@ func readFrameH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolder) (
 			return FrameHeader{}, nil, verr
 		}
 
-		// Translate H2 → Custom16 frame model.
+		// Translate H2 → internal frame model.
 		switch h2fh.Type {
 		case H2FrameSETTINGS, H2FramePRIORITY, H2FramePUSHPROMISE:
 			// Skipped at this layer.
@@ -1083,7 +1115,7 @@ func readFrameH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolder) (
 			}
 			continue
 		case H2FrameHEADERS:
-			// HPACK-decode and convert to Custom16 HeadersV1 / TrailersV1
+			// HPACK-decode and convert to the internal HeadersV1 / TrailersV1
 			// payload format the rest of the transport expects.
 			//
 			// RFC 7540 §6.2: PADDED and PRIORITY flags add a 1-byte
@@ -1115,6 +1147,16 @@ func readFrameH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolder) (
 				if err != nil {
 					return FrameHeader{}, nil, err
 				}
+			} else if len(hpackBlock) > h2MaxHeaderListSize {
+				// Single-fragment HEADERS: the multi-fragment path enforces
+				// this cap inside readH2HeadersWithContinuations, but a peer
+				// can also fit up to (2^24-1) bytes in a single HEADERS frame
+				// when END_HEADERS is set. Apply the same h2MaxHeaderListSize
+				// bound here so the DoS guard documented on that constant
+				// holds for both paths.
+				return FrameHeader{}, nil, fmt.Errorf(
+					"h2 HEADERS payload exceeds %d bytes (got %d)",
+					h2MaxHeaderListSize, len(hpackBlock))
 			}
 			h, t, isTrailers, derr := h2DecodeHeaders(holder, hpackBlock)
 			if derr != nil {
@@ -1194,10 +1236,10 @@ func readFrameH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolder) (
 // readFrameViewH2 is the H2 analogue of readFrameView. For single-frame
 // DATA payloads carrying exactly one complete LPM, returns a ring-backed
 // mem.Buffer using the deferred-publish ZC protocol — same model as
-// Custom16's readFrameView. HEADERS, multi-frame DATA, and other small
+// the upstream readFrameView contract. HEADERS, multi-frame DATA, and other small
 // frames go through the copy path.
 //
-// ZC eligibility (mirrors Custom16):
+// ZC eligibility:
 //   - DATA frame with one complete LPM in body (body == 5+lpmLen)
 //   - lpmAccumulator is empty (no in-progress chain)
 //   - body slice contiguous in the ring (no wrap)
@@ -1367,7 +1409,7 @@ func readFrameViewH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolde
 				//     at-most-one-ZC, not under back-pressure)
 				//
 				// The body bytes returned to the caller include the gRPC LPM
-				// 5-byte prefix, matching Custom16 readFrameView.
+				// 5-byte prefix.
 				if !acc.inProgress() && len(pSecond) == 0 && len(pFirst) >= 5 {
 					bodyLen := int(binary.BigEndian.Uint32(pFirst[1:5]))
 					if 5+bodyLen == payloadLen && rx.IsSpeculativeZCEligible(payloadLen, true) {
@@ -1412,7 +1454,7 @@ func readFrameViewH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolde
 				// payloadLen)` for the heap copy AND its own `acc.buf` then
 				// appends into it — two allocs + two memcpys per frame.
 				// Single mem.Copy gives us one alloc + one memcpy, matching
-				// Custom16 readFrameView's parity.
+				// readFrameView parity.
 				//
 				// Reads the 5-byte LPM header from the (possibly split) ring
 				// slice via a small stack array so the fast path applies
@@ -1473,6 +1515,17 @@ func readFrameViewH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolde
 				// via mem.NewBuffer(&msg, nil) (no pool round-trip), saving
 				// one further mem.Copy that the prior code performed.
 				if acc.inProgress() && acc.expectedTotal-acc.pos >= payloadLen {
+					// Mid-chain chunk: route through growBufForChunk to
+					// pick up the explicit 2× doubling rather than Go's
+					// default 1.25× slice growth. Without this, after
+					// feedSplit sized acc.buf to the first chunk
+					// exactly, every subsequent chunk would trigger a
+					// realloc + memcpy of the entire accumulated body
+					// (a 64 MiB / 4-chunk LPM costs ~80 MiB of wasted
+					// grow-copy under default append growth).
+					if acc.pos+payloadLen > cap(acc.buf) {
+						acc.growBufForChunk(payloadLen)
+					}
 					acc.buf = append(acc.buf, pFirst...)
 					if len(pSecond) > 0 {
 						acc.buf = append(acc.buf, pSecond...)
@@ -1508,6 +1561,59 @@ func readFrameViewH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolde
 				}
 			} // end isPadded fast-path skip
 
+			// Non-padded fast path: feed ring slices into the
+			// accumulator directly, skipping the intermediate
+			// `make([]byte, h2fh.Length)` allocation + ring→heap copy
+			// that the padded path below still requires (padding is
+			// stripped in-place on the heap copy). For large
+			// multi-frame LPMs (e.g., the first 16 MiB chunk of a
+			// 64 MiB MESSAGE) this saves one 16 MiB allocation and
+			// one 16 MiB memcpy per first chunk — material at the
+			// upper end of the size range.
+			if h2fh.Flags&H2FlagPadded == 0 {
+				msg, leftover, ferr := acc.feedSplit(pFirst, pSecond, h2MaxLPMBodyBytes)
+				// leftover may alias ring memory (pFirst/pSecond) when
+				// feedSplit consumes only one source slice. Copying to a
+				// heap-owned buffer BEFORE Commit prevents the writer
+				// (cross-process or another goroutine on the same ring)
+				// from overwriting the bytes between this call and the
+				// next readFrameViewH2 invocation that replays them.
+				// Without this copy, a multi-LPM DATA frame can corrupt
+				// subsequent messages under ring reuse.
+				if len(leftover) > 0 {
+					leftover = append([]byte(nil), leftover...)
+				}
+				commitPayload.Commit(int(h2fh.Length))
+				if ferr != nil {
+					return FrameHeader{}, nil, ferr
+				}
+				if msg != nil {
+					msgFlags := MessageFlagMORE
+					if len(leftover) > 0 {
+						holder.pendingFrame = leftover
+						holder.pendingStreamID = h2fh.StreamID
+						holder.pendingFrameEndStream = h2fh.Flags&H2FlagEndStream != 0
+					} else if h2fh.Flags&H2FlagEndStream != 0 {
+						msgFlags = 0
+						holder.removeLpmAccumulator(h2fh.StreamID)
+					}
+					return FrameHeader{
+						Type:     FrameTypeMESSAGE,
+						StreamID: h2fh.StreamID,
+						Length:   uint32(len(msg)),
+						Flags:    msgFlags,
+					}, mem.NewBuffer(&msg, nil), nil
+				}
+				if h2fh.Flags&H2FlagEndStream != 0 && acc.inProgress() {
+					return FrameHeader{}, nil, errors.New("h2: END_STREAM with incomplete LPM in accumulator")
+				}
+				continue
+			}
+
+			// Padded path: heap copy required to strip padding bytes
+			// (the 1-byte pad-length prefix + trailing padding can't
+			// be stripped while data lives in ring slices that may
+			// straddle the wrap boundary).
 			payload := make([]byte, h2fh.Length)
 			cn := copy(payload, pFirst)
 			if cn < int(h2fh.Length) && len(pSecond) > 0 {
@@ -1517,13 +1623,11 @@ func readFrameViewH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolde
 
 			// RFC 7540 §6.1: PADDED DATA. Strip after commit so the
 			// ring read pointer is in sync; data slice is heap-owned.
-			if h2fh.Flags&H2FlagPadded != 0 {
-				stripped, serr := stripDataPadding(payload, h2fh.Flags)
-				if serr != nil {
-					return FrameHeader{}, nil, serr
-				}
-				payload = stripped
+			stripped, serr := stripDataPadding(payload, h2fh.Flags)
+			if serr != nil {
+				return FrameHeader{}, nil, serr
 			}
+			payload = stripped
 
 			data := payload
 			for len(data) > 0 {
@@ -1608,6 +1712,19 @@ func readFrameViewH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolde
 					return FrameHeader{}, nil, aerr
 				}
 				payload = assembled
+			} else if len(payload) > h2MaxHeaderListSize {
+				// Single-fragment HEADERS: the multi-fragment path
+				// enforces this cap inside readH2HeadersWithContinuations,
+				// but a peer can also fit up to (2^24-1) bytes in a single
+				// HEADERS frame when END_HEADERS is set. Apply the same
+				// h2MaxHeaderListSize bound here so the DoS guard
+				// documented on that constant holds for both paths.
+				if commitPayload != nil {
+					commitPayload.Commit(int(h2fh.Length))
+				}
+				return FrameHeader{}, nil, fmt.Errorf(
+					"h2 HEADERS payload exceeds %d bytes (got %d)",
+					h2MaxHeaderListSize, len(payload))
 			}
 			h, t, isTrailers, derr := h2DecodeHeaders(holder, payload)
 			if commitPayload != nil {
@@ -1754,12 +1871,22 @@ func writeFrameH2(ctx context.Context, tx *ShmRing, fh FrameHeader, payload []by
 		h2payload = payload
 	}
 
-	// MESSAGE payloads exceeding the 16MB-1 H2 frame limit are split
-	// into multiple DATA frames. The reader's lpmAccumulator reassembles
-	// them. This is mandatory for protocol compliance with peers that
-	// honor SETTINGS_MAX_FRAME_SIZE: even a peer with the default 16 KiB
-	// max frame size must be able to receive arbitrarily large messages.
-	if fh.Type == FrameTypeMESSAGE && len(h2payload) > h2MaxFramePayload {
+	// MESSAGE payloads are split into multiple DATA frames in two cases:
+	//
+	//  (1) Protocol limit: the payload exceeds the 16 MiB-1 maximum H2
+	//      frame size (mandatory for compliance with peers honoring
+	//      SETTINGS_MAX_FRAME_SIZE).
+	//
+	//  (2) Ring capacity: the payload plus the 9-byte H2 header doesn't
+	//      fit in the ring's reserve-write budget. ReserveWrite rejects
+	//      requests larger than ring capacity; without chunking,
+	//      messages exceeding ring capacity would fail to send. Per
+	//      gRFC G3 ring framing, a frame larger than ring capacity is
+	//      well-formed and must be transported incrementally. The
+	//      reader's lpmAccumulator reassembles the chunks.
+	if fh.Type == FrameTypeMESSAGE &&
+		(len(h2payload) > h2MaxFramePayload ||
+			uint64(h2FrameHeaderSize+len(h2payload)) > tx.Capacity()) {
 		return writeFrameH2DataChunked(ctx, tx, fh.StreamID, h2payload, h2f)
 	}
 
@@ -1849,6 +1976,134 @@ func writeFrameH2DataChunked(ctx context.Context, tx *ShmRing, streamID uint32, 
 	return nil
 }
 
+// writeFrameH2Message writes a single H2 DATA frame for a MESSAGE
+// whose body is composed of a gRPC LPM 5-byte header prefix plus the
+// segments of a mem.BufferSlice. The header, prefix, and each segment
+// are copied directly into the ring reservation, eliminating the
+// per-send heap allocation that writeFrameBuffers' contiguous
+// materialisation would otherwise perform on every gRPC SendMsg.
+//
+// The caller is responsible for ensuring the body fits in a single H2
+// DATA frame (i.e. len(lpmHdr) + data.Len() ≤ h2MaxFramePayload) and
+// in the ring (h2FrameHeaderSize + body ≤ ring capacity). The MESSAGE
+// frame's flags are translated to H2 END_STREAM via the same rule as
+// translateCustomToH2.
+func writeFrameH2Message(
+	ctx context.Context,
+	tx *ShmRing,
+	streamID uint32,
+	msgFlags uint8,
+	lpmHdr []byte,
+	data mem.BufferSlice,
+) error {
+	bodyLen := len(lpmHdr) + data.Len()
+	total := h2FrameHeaderSize + bodyLen
+
+	// Defensive: caller (writeFrameBuffers) checks these, but
+	// re-assert for callers that might be added later.
+	if bodyLen > h2MaxFramePayload {
+		return fmt.Errorf("writeFrameH2Message: body %d exceeds max H2 DATA frame %d", bodyLen, h2MaxFramePayload)
+	}
+	if uint64(total) > tx.Capacity() {
+		return fmt.Errorf("writeFrameH2Message: frame %d exceeds ring capacity %d", total, tx.Capacity())
+	}
+
+	res, err := tx.ReserveWrite(ctx, total)
+	if err != nil {
+		return err
+	}
+
+	var h2flags byte
+	if msgFlags&MessageFlagEndStream != 0 {
+		h2flags = H2FlagEndStream
+	}
+	var hdr [h2FrameHeaderSize]byte
+	encodeH2FrameHeaderTo(&hdr, H2FrameHeader{
+		Length:   uint32(bodyLen),
+		Type:     H2FrameDATA,
+		Flags:    h2flags,
+		StreamID: streamID,
+	})
+
+	// Sequential writer across the two-slice reservation. The wrap
+	// boundary between res.First and res.Second may fall anywhere
+	// within the H2 header, LPM header, or any data segment.
+	rw := ringSegWriter{first: res.First, second: res.Second}
+	rw.write(hdr[:])
+	if len(lpmHdr) > 0 {
+		rw.write(lpmHdr)
+	}
+	for _, b := range data {
+		seg := b.ReadOnlyData()
+		if len(seg) > 0 {
+			rw.write(seg)
+		}
+	}
+	if rw.err != nil {
+		// Invariant violation: release the reservation without
+		// publishing bytes (Commit(0) leaves writeIdx unchanged) so
+		// the writer state stays consistent and the caller's
+		// frameWriter.inlineMu unlock can run.
+		_ = res.Commit(0)
+		return rw.err
+	}
+	return res.Commit(total)
+}
+
+// ringSegWriter emits sequential bytes into a two-slice ring
+// reservation (res.First then res.Second), straddling the ring
+// wrap-around boundary transparently. Used by writeFrameH2Message for
+// the vectored MESSAGE-write path that avoids materialising header +
+// payload into an intermediate heap buffer.
+type ringSegWriter struct {
+	first, second []byte
+	off           int // total bytes written into the reservation so far
+	err           error
+}
+
+// write copies src into the reservation, advancing the cursor. On
+// invariant violation (sum of writes exceeds the reservation), records
+// an error and otherwise no-ops; the caller should inspect w.err
+// before Commit. The error path returns rather than panics so the
+// caller's deferred mutex unlocks (e.g., frameWriter.inlineMu) still
+// run; a panic mid-write would leave inlineMu held forever and freeze
+// the transport's writer goroutine. The caller is responsible for
+// ensuring the reservation has enough remaining capacity
+// (len(first) + len(second) - off ≥ len(src)); writeFrameH2Message
+// guarantees this by reserving the exact total up-front. The bounds
+// check costs one compare per write call on the cold path (≤ 3 calls
+// per MESSAGE: H2 hdr, LPM hdr, segments) so the overhead is
+// negligible.
+func (w *ringSegWriter) write(src []byte) {
+	if w.err != nil {
+		return
+	}
+	if w.off < len(w.first) {
+		n := copy(w.first[w.off:], src)
+		w.off += n
+		src = src[n:]
+		if len(src) == 0 {
+			return
+		}
+	}
+	pos := w.off - len(w.first)
+	if pos+len(src) > len(w.second) {
+		// Invariant violation: caller reserved fewer bytes than the
+		// sum of segment lengths it then tried to write. Always a bug
+		// in writeFrameH2Message (or any future caller); silently
+		// truncating would corrupt the ring's next frame. Record the
+		// error so writeFrameH2Message returns it to its caller; do
+		// NOT panic — that would leak the frameWriter.inlineMu lock
+		// the caller holds.
+		w.err = fmt.Errorf(
+			"ringSegWriter overflow: off=%d, src=%d, len(first)=%d, len(second)=%d",
+			w.off, len(src), len(w.first), len(w.second))
+		return
+	}
+	copy(w.second[pos:], src)
+	w.off += len(src)
+}
+
 // writeProtoToRingH2 is the H2 analogue of writeProtoToRing: it marshals
 // a proto.Message directly into the ring as the body of an H2 DATA frame,
 // preceded by the gRPC LPM 5-byte length-prefix. Returns (true, err) when
@@ -1859,13 +2114,13 @@ func writeFrameH2DataChunked(ctx context.Context, tx *ShmRing, streamID uint32, 
 //
 //	[9-byte H2 DATA header][1-byte LPM compressed=0][4-byte LPM length][proto body]
 //
-// Total = 9 + 5 + pSize. ZC eligibility mirrors the Custom16 path: the
+// Total = 9 + 5 + pSize. ZC eligibility uses the same heuristic as the
 // frame must fit contiguously in the ring without wrap.
 func writeProtoToRingH2(ctx context.Context, tx *ShmRing, streamID uint32, msg proto.Message, pSize int, flags uint8) (bool, error) {
 	total := h2FrameHeaderSize + 5 + pSize
 
 	// Skip ZC for messages that won't fit in a single frame.
-	// cap/3 mirrors the Custom16 chunking-path budget.
+	// cap/3 budget keeps headroom for the chunking-path writer.
 	if uint64(total) > tx.Capacity()/3 {
 		return false, nil
 	}
