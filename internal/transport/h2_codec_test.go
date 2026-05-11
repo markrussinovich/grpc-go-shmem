@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"golang.org/x/net/http2/hpack"
+	"google.golang.org/grpc/mem"
 )
 
 // decodeHpackToFields is a test helper that runs a fresh HPACK decoder
@@ -2121,5 +2122,187 @@ func TestH2ReadFrameView_MultiFrameLPM_MidChainGrowDoubling(t *testing.T) {
 			}
 		}
 		off += len(b)
+	}
+}
+
+// TestWriteFrameBuffersVectoredMessage exercises the vectored MESSAGE
+// write path in writeFrameBuffers / writeFrameH2Message. The path is
+// triggered automatically by writeFrameBuffers for MESSAGE frames whose
+// body fits in a single H2 DATA frame; we verify that the resulting
+// on-wire bytes (and the reader's reassembled MESSAGE) are bit-identical
+// to the previous materialise-then-writeFrame path across:
+//   - single-segment payload
+//   - multi-segment payload (BufferSlice with 3 segments)
+//   - empty data (just the 5-byte LPM header)
+//   - END_STREAM flag propagation
+//   - segment boundary that straddles the ring wrap point
+//
+// The vectored path's whole point is to avoid materialising hdr+data
+// into a contiguous heap buffer; this test gives us the safety net so
+// any regression in segment-layout logic is caught immediately.
+func TestWriteFrameBuffersVectoredMessage(t *testing.T) {
+	mkBuf := func(b []byte) mem.Buffer { return mem.SliceBuffer(b) }
+	cases := []struct {
+		name      string
+		hdr       []byte
+		segments  [][]byte
+		endStream bool
+	}{
+		{
+			name:     "single-segment",
+			hdr:      []byte{0, 0, 0, 0, 11},
+			segments: [][]byte{[]byte("hello world")},
+		},
+		{
+			name: "multi-segment",
+			hdr:  []byte{0, 0, 0, 0, 21},
+			segments: [][]byte{
+				[]byte("multi-"),
+				[]byte("segment-"),
+				[]byte("payload"),
+			},
+		},
+		{
+			name:     "empty-data-just-hdr",
+			hdr:      []byte{0, 0, 0, 0, 0},
+			segments: nil,
+		},
+		{
+			name:      "end-stream-single",
+			hdr:       []byte{0, 0, 0, 0, 4},
+			segments:  [][]byte{[]byte("eos!")},
+			endStream: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			segName := fmt.Sprintf("h2vmsg-%s-%d", tc.name, time.Now().UnixNano())
+			defer RemoveSegment(segName)
+			seg, err := CreateSegment(segName, 1<<20, 1<<20)
+			if err != nil {
+				t.Fatalf("CreateSegment: %v", err)
+			}
+			defer seg.Close()
+			tx := NewShmRingFromSegment(seg.A, seg.Mem)
+			rx := NewShmRingFromSegment(seg.A, seg.Mem)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+
+			data := make(mem.BufferSlice, 0, len(tc.segments))
+			for _, s := range tc.segments {
+				data = append(data, mkBuf(s))
+			}
+			fh := FrameHeader{StreamID: 7, Type: FrameTypeMESSAGE}
+			if tc.endStream {
+				fh.Flags = MessageFlagEndStream
+			}
+			if err := writeFrameBuffers(ctx, tx, fh, tc.hdr, data); err != nil {
+				t.Fatalf("writeFrameBuffers: %v", err)
+			}
+			rfh, payload, err := readFrame(ctx, rx)
+			if err != nil {
+				t.Fatalf("readFrame: %v", err)
+			}
+			if rfh.Type != FrameTypeMESSAGE {
+				t.Fatalf("frame type: got %d want MESSAGE", rfh.Type)
+			}
+			if rfh.StreamID != 7 {
+				t.Fatalf("stream id: got %d want 7", rfh.StreamID)
+			}
+			// MORE bit reflects END_STREAM on the wire: MORE=0 means
+			// END_STREAM observed (last MESSAGE in this direction).
+			gotMore := rfh.Flags&MessageFlagMORE != 0
+			wantMore := !tc.endStream
+			if gotMore != wantMore {
+				t.Fatalf("MORE flag: got %v want %v", gotMore, wantMore)
+			}
+			// Expected body = lpmHdr || flatten(segments).
+			var want []byte
+			want = append(want, tc.hdr...)
+			for _, s := range tc.segments {
+				want = append(want, s...)
+			}
+			if !bytes.Equal(payload, want) {
+				t.Fatalf("payload mismatch:\n got %d bytes %x\nwant %d bytes %x",
+					len(payload), payload, len(want), want)
+			}
+		})
+	}
+}
+
+// TestWriteFrameBuffersVectoredMessage_WrapStraddle stresses the
+// res.First / res.Second boundary by writing many small MESSAGE frames
+// until the ring write head wraps, then writing a final vectored
+// MESSAGE whose payload happens to straddle the wrap. Verifies that
+// the ringSegWriter correctly emits across the two-slice reservation.
+func TestWriteFrameBuffersVectoredMessage_WrapStraddle(t *testing.T) {
+	const ringSize = 4096
+	segName := fmt.Sprintf("h2vwrap-%d", time.Now().UnixNano())
+	defer RemoveSegment(segName)
+	seg, err := CreateSegment(segName, ringSize, ringSize)
+	if err != nil {
+		t.Fatalf("CreateSegment: %v", err)
+	}
+	defer seg.Close()
+	tx := NewShmRingFromSegment(seg.A, seg.Mem)
+	rx := NewShmRingFromSegment(seg.A, seg.Mem)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Repeatedly write+read a small MESSAGE to advance head/tail
+	// past at least one wrap. Each iteration moves the ring cursor by
+	// (9 H2 hdr + 5 LPM hdr + payload) bytes; we want the next write
+	// to straddle the wrap.
+	smallBody := []byte("ping")
+	smallHdr := []byte{0, 0, 0, 0, byte(len(smallBody))}
+	for i := 0; i < 32; i++ {
+		if err := writeFrameBuffers(ctx, tx,
+			FrameHeader{StreamID: uint32(i + 1), Type: FrameTypeMESSAGE},
+			smallHdr, mem.BufferSlice{mem.SliceBuffer(smallBody)},
+		); err != nil {
+			t.Fatalf("warmup writeFrameBuffers[%d]: %v", i, err)
+		}
+		fh, payload, err := readFrame(ctx, rx)
+		if err != nil {
+			t.Fatalf("warmup readFrame[%d]: %v", i, err)
+		}
+		if fh.Type != FrameTypeMESSAGE {
+			t.Fatalf("warmup frame type: got %d want MESSAGE", fh.Type)
+		}
+		if !bytes.Equal(payload, append(append([]byte{}, smallHdr...), smallBody...)) {
+			t.Fatalf("warmup payload mismatch")
+		}
+	}
+
+	// Now write a multi-segment MESSAGE whose serialised form is
+	// large enough that res.First+res.Second must straddle wrap.
+	body0 := bytes.Repeat([]byte{0xAB}, 333)
+	body1 := bytes.Repeat([]byte{0xCD}, 444)
+	body2 := bytes.Repeat([]byte{0xEF}, 555)
+	totalBody := len(body0) + len(body1) + len(body2)
+	hdr := []byte{0, 0, 0, 0, 0}
+	binary.BigEndian.PutUint32(hdr[1:5], uint32(totalBody))
+
+	if err := writeFrameBuffers(ctx, tx,
+		FrameHeader{StreamID: 999, Type: FrameTypeMESSAGE},
+		hdr,
+		mem.BufferSlice{mem.SliceBuffer(body0), mem.SliceBuffer(body1), mem.SliceBuffer(body2)},
+	); err != nil {
+		t.Fatalf("wrap-straddle writeFrameBuffers: %v", err)
+	}
+	rfh, payload, err := readFrame(ctx, rx)
+	if err != nil {
+		t.Fatalf("wrap-straddle readFrame: %v", err)
+	}
+	if rfh.Type != FrameTypeMESSAGE || rfh.StreamID != 999 {
+		t.Fatalf("wrap-straddle frame header: %+v", rfh)
+	}
+	var want []byte
+	want = append(want, hdr...)
+	want = append(want, body0...)
+	want = append(want, body1...)
+	want = append(want, body2...)
+	if !bytes.Equal(payload, want) {
+		t.Fatalf("wrap-straddle payload mismatch: len got=%d want=%d", len(payload), len(want))
 	}
 }

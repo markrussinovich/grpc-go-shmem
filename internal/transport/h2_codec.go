@@ -1942,6 +1942,100 @@ func writeFrameH2DataChunked(ctx context.Context, tx *ShmRing, streamID uint32, 
 	return nil
 }
 
+// writeFrameH2Message writes a single H2 DATA frame for a MESSAGE
+// whose body is composed of a gRPC LPM 5-byte header prefix plus the
+// segments of a mem.BufferSlice. The header, prefix, and each segment
+// are copied directly into the ring reservation, eliminating the
+// per-send heap allocation that writeFrameBuffers' contiguous
+// materialisation would otherwise perform on every gRPC SendMsg.
+//
+// The caller is responsible for ensuring the body fits in a single H2
+// DATA frame (i.e. len(lpmHdr) + data.Len() ≤ h2MaxFramePayload) and
+// in the ring (h2FrameHeaderSize + body ≤ ring capacity). The MESSAGE
+// frame's flags are translated to H2 END_STREAM via the same rule as
+// translateCustomToH2.
+func writeFrameH2Message(
+	ctx context.Context,
+	tx *ShmRing,
+	streamID uint32,
+	msgFlags uint8,
+	lpmHdr []byte,
+	data mem.BufferSlice,
+) error {
+	bodyLen := len(lpmHdr) + data.Len()
+	total := h2FrameHeaderSize + bodyLen
+
+	// Defensive: caller (writeFrameBuffers) checks these, but
+	// re-assert for callers that might be added later.
+	if bodyLen > h2MaxFramePayload {
+		return fmt.Errorf("writeFrameH2Message: body %d exceeds max H2 DATA frame %d", bodyLen, h2MaxFramePayload)
+	}
+	if uint64(total) > tx.Capacity() {
+		return fmt.Errorf("writeFrameH2Message: frame %d exceeds ring capacity %d", total, tx.Capacity())
+	}
+
+	res, err := tx.ReserveWrite(ctx, total)
+	if err != nil {
+		return err
+	}
+
+	var h2flags byte
+	if msgFlags&MessageFlagEndStream != 0 {
+		h2flags = H2FlagEndStream
+	}
+	var hdr [h2FrameHeaderSize]byte
+	encodeH2FrameHeaderTo(&hdr, H2FrameHeader{
+		Length:   uint32(bodyLen),
+		Type:     H2FrameDATA,
+		Flags:    h2flags,
+		StreamID: streamID,
+	})
+
+	// Sequential writer across the two-slice reservation. The wrap
+	// boundary between res.First and res.Second may fall anywhere
+	// within the H2 header, LPM header, or any data segment.
+	rw := ringSegWriter{first: res.First, second: res.Second}
+	rw.write(hdr[:])
+	if len(lpmHdr) > 0 {
+		rw.write(lpmHdr)
+	}
+	for _, b := range data {
+		seg := b.ReadOnlyData()
+		if len(seg) > 0 {
+			rw.write(seg)
+		}
+	}
+	return res.Commit(total)
+}
+
+// ringSegWriter emits sequential bytes into a two-slice ring
+// reservation (res.First then res.Second), straddling the ring
+// wrap-around boundary transparently. Used by writeFrameH2Message for
+// the vectored MESSAGE-write path that avoids materialising header +
+// payload into an intermediate heap buffer.
+type ringSegWriter struct {
+	first, second []byte
+	off           int // total bytes written into the reservation so far
+}
+
+// write copies src into the reservation, advancing the cursor. The
+// caller must ensure the reservation has enough remaining capacity
+// (len(first) + len(second) - off ≥ len(src)); writeFrameH2Message
+// guarantees this by reserving the exact total up-front.
+func (w *ringSegWriter) write(src []byte) {
+	if w.off < len(w.first) {
+		n := copy(w.first[w.off:], src)
+		w.off += n
+		src = src[n:]
+		if len(src) == 0 {
+			return
+		}
+	}
+	pos := w.off - len(w.first)
+	copy(w.second[pos:], src)
+	w.off += len(src)
+}
+
 // writeProtoToRingH2 is the H2 analogue of writeProtoToRing: it marshals
 // a proto.Message directly into the ring as the body of an H2 DATA frame,
 // preceded by the gRPC LPM 5-byte length-prefix. Returns (true, err) when

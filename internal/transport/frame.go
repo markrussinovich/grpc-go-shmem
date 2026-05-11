@@ -390,8 +390,21 @@ func writeFrame(ctx context.Context, tx *ShmRing, fh FrameHeader, payload []byte
 }
 
 // writeFrameBuffers writes a frame whose payload is composed of an
-// optional gRPC-LPM header prefix plus a BufferSlice. It materialises
-// the segments into a contiguous buffer for the H2 codec.
+// optional gRPC-LPM header prefix plus a BufferSlice.
+//
+// For MESSAGE frames that fit in a single H2 DATA frame and in the
+// ring without straddle-induced complications, the segments are
+// streamed directly into the ring reservation via writeFrameH2Message —
+// no intermediate contiguous heap buffer. This eliminates a per-send
+// allocation of (len(hdr) + payload.Len()) bytes plus an extra memcpy
+// on the streaming hot path; it is the production analogue of the
+// writeProtoToRingH2 unary ZC path.
+//
+// Non-MESSAGE frame types (HEADERS, TRAILERS, CANCEL, ...) and MESSAGE
+// frames that require chunking (body > h2MaxFramePayload or > ring
+// capacity) still materialise into a contiguous buffer here, because
+// the H2 codec path for those types operates on the materialised form
+// (HPACK re-encode, multi-DATA chunking).
 func writeFrameBuffers(ctx context.Context, tx *ShmRing, fh FrameHeader, hdr []byte, payload mem.BufferSlice) error {
 	dataLen := payload.Len()
 	if len(hdr) == 0 && dataLen == 0 {
@@ -400,6 +413,15 @@ func writeFrameBuffers(ctx context.Context, tx *ShmRing, fh FrameHeader, hdr []b
 	if len(hdr) == 0 && len(payload) == 1 {
 		// Fast path: single buffer, no header prefix.
 		return writeFrame(ctx, tx, fh, payload[0].ReadOnlyData())
+	}
+	// Vectored fast path for MESSAGE frames: writes hdr + segments
+	// directly into the ring reservation when the body fits in a
+	// single H2 DATA frame.
+	if fh.Type == FrameTypeMESSAGE {
+		bodyLen := len(hdr) + dataLen
+		if bodyLen <= h2MaxFramePayload && uint64(h2FrameHeaderSize+bodyLen) <= tx.Capacity() {
+			return writeFrameH2Message(ctx, tx, fh.StreamID, fh.Flags, hdr, payload)
+		}
 	}
 	buf := make([]byte, len(hdr)+dataLen)
 	copy(buf, hdr)
