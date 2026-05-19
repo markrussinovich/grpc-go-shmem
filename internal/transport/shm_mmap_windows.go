@@ -112,6 +112,20 @@ func CreateSegment(name string, ringCapA, ringCapB uint64) (*Segment, error) {
 	segment.B.SetReadIndex(0)
 	segment.B.SetClosed(false)
 
+	// SHM_DATASEG_WAKE no-op on Windows. Kept for cross-platform
+	// symbol parity.
+	setupDataSegWakeForCreator(segment)
+
+	// Close the backing file handle: the MapViewOfFile holds an
+	// independent reference on the section/file, so the mapped
+	// region stays valid. Saves 1 handle/segment.
+	if err := file.Close(); err != nil {
+		munmapImpl(mem)
+		os.Remove(path)
+		return nil, fmt.Errorf("close handle after mmap: %w", err)
+	}
+	segment.File = nil
+
 	return segment, nil
 }
 
@@ -166,6 +180,17 @@ func OpenSegment(name string) (*Segment, error) {
 	// SetClientReadyAndSignal() after WaitForServer completes.
 	// This ensures the event exists before we try to signal it.
 	segment.H.SetClientReady(true)
+
+	// SHM_DATASEG_WAKE no-op on Windows.
+	setupDataSegWakeForOpener(segment)
+
+	// Close the backing file handle: MapViewOfFile holds its own
+	// reference. Saves 1 handle/segment.
+	if err := file.Close(); err != nil {
+		munmapImpl(mem)
+		return nil, fmt.Errorf("close handle after mmap: %w", err)
+	}
+	segment.File = nil
 
 	return segment, nil
 }

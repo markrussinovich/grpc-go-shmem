@@ -94,6 +94,23 @@ type ShmRing struct {
 	// Access via atomic operations (single reader in SPSC design).
 	pendingReadIdx uint64
 
+	// segmentID identifies the backing mmap region for cross-Ring
+	// matching of same-process wake registrations. Two ShmRing structs
+	// that wrap the same /dev/shm file share the same segmentID, so a
+	// signalData on one side can find the waitForData on the other
+	// side via the (segmentID, ring-relative offset) registry. Empty
+	// outside the SHM_INPROC_WAKE=1 path.
+	segmentID string
+
+	// dataSegWaker is the per-data-segment per-direction eventfd
+	// waker (2 eventfds per segment, 1 read fd held per side per
+	// direction), propagated from the owning Segment at RegisterRing
+	// time. Used by waitFor*/signal* when non-nil; otherwise falls
+	// through to the per-address eventfd registry / Windows events /
+	// Linux futex path. Always nil for control segments and when
+	// SHM_DATASEG_WAKE is off.
+	dataSegWaker *shmDataSegWaker
+
 	// Adaptive spin state for minimizing latency on fast paths.
 	// These are process-local and help tune spin duration based on workload.
 	dataSpinCutoff  uint32 // Current spin iterations for waiting on data
@@ -393,21 +410,39 @@ func (r *ShmRing) publishTarget(hdr *RingHeader, target uint64) {
 // (excluding wire headers). contiguous is true iff the payload reservation
 // is contiguous (no ring wrap).
 //
-// Heuristic (mirrors grpc-dotnet-shm):
+// The whole point of SHM is to avoid the per-byte memcpy that UDS / TCP
+// pay on every RPC. ZC is the mechanism that delivers on that promise,
+// so we want ZC to fire for as many payload sizes as physically safe.
+// The eligibility rules below were chosen accordingly:
 //
-//   - Adaptive minimum payload threshold: 64 KiB on rings ≥ 1 MiB
-//     (large enough that a 64 KiB ZC hold leaves >> 90% of the ring
-//     free for the writer); progressively smaller on smaller rings
-//     so ZC stays useful for the dominant message size; never below
-//     4 KiB where memcpy is faster than ZC bookkeeping.
-//   - Disabled entirely on rings below 1 MiB: a single 64 KiB ZC hold
-//     would freeze 25% of a 256 KiB ring and stall the writer.
-//   - Back-pressure self-disable: if the ring is already > 75% full
-//     (used×4 > cap×3), taking ZC would risk stalling the writer.
-//   - At-most-one-ZC: zcActive==0 enforces a single ZC payload in
-//     flight per ring. The deferred-publish protocol assumes a single
-//     producer of bumps to zcDeferredTarget; multiple concurrent ZC
-//     frames would require multi-producer ordering not yet implemented.
+//   - At-most-one-ZC in flight per ring (zcActive). The deferred-
+//     publish protocol assumes a single producer of bumps to
+//     zcDeferredTarget; multiple concurrent ZC frames would require
+//     multi-producer ordering not yet implemented. For pipelined
+//     streaming this means the second message of a back-to-back burst
+//     falls back to the single-mem.Copy fast path, which is correct
+//     and inexpensive.
+//
+//   - Payload must be contiguous (no ring wrap). The H2 codec's
+//     copy-fallback handles wrap-aware reassembly.
+//
+//   - Ring must be at least 1 MiB. Below that a single ZC hold would
+//     freeze a measurable fraction of the ring (e.g., 64 KiB out of
+//     256 KiB = 25 %) and stall the writer.
+//
+//   - Minimum payload of 4 KiB. Below that the ZC bookkeeping cost
+//     (atomic bumps + Buffer wrap + EndZcReservation publish) reliably
+//     loses to a direct mem.Copy. 4 KiB is one page; copying a single
+//     page is sub-µs on modern HW.
+//
+//   - Back-pressure self-disable: when the ring is already > 75 % full
+//     (used*4 > cap*3), holding any extra bytes via ZC risks stalling
+//     the writer; let the copy path drain into heap instead.
+//
+// Compared to the previous heuristic (64 KiB minimum), the 4 KiB floor
+// lets ZC fire on the medium-message sizes (4 KiB – 16 KiB) where the
+// SHM advantage over UDS / TCP is most visible: those sizes still cost
+// the kernel two per-byte copies on UDS but zero on SHM with ZC.
 func (r *ShmRing) IsSpeculativeZCEligible(payloadLength int, contiguous bool) bool {
 	if !contiguous {
 		return false
@@ -416,15 +451,9 @@ func (r *ShmRing) IsSpeculativeZCEligible(payloadLength int, contiguous bool) bo
 	if r.capacity < minRingForZC {
 		return false
 	}
-	// Adaptive minimum: min(64 KiB, cap/16), floored at 4 KiB.
-	adaptiveMin := uint64(64 * 1024)
-	if r.capacity/16 < adaptiveMin {
-		adaptiveMin = r.capacity / 16
-	}
-	if adaptiveMin < 4*1024 {
-		adaptiveMin = 4 * 1024
-	}
-	if uint64(payloadLength) < adaptiveMin {
+	// 4 KiB minimum payload — below this a direct mem.Copy beats the
+	// per-ZC bookkeeping cost.
+	if payloadLength < 4*1024 {
 		return false
 	}
 	if atomic.LoadUint32(&r.zcActive) != 0 {
@@ -569,8 +598,8 @@ func NewShmRingFromSegment(ringView *ringView, mem []byte) *ShmRing {
 		dataOff:         uintptr(ringView.offset + RingHeaderSize),
 		mem:             mem,
 		capacity:        capacity, // Store actual capacity separately
-		dataSpinCutoff:  spinIterationsDefault,
-		spaceSpinCutoff: spinIterationsDefault,
+		dataSpinCutoff:  loadShmSpinDefault(),
+		spaceSpinCutoff: loadShmSpinDefault(),
 	}
 	// Initialize read commit context with back-pointer (reads are single-threaded)
 	r.readCommit.ring = r
@@ -584,6 +613,25 @@ func NewShmRingFromSegment(ringView *ringView, mem []byte) *ShmRing {
 // On Linux, this is a no-op since futex works natively across mappings.
 func (r *ShmRing) SetEvents(events *RingEvents) {
 	r.events = events
+}
+
+// SetSegmentID identifies the backing mmap for same-process wake
+// matching. Two ShmRing structs that map the same /dev/shm file get
+// the same segmentID, so a signalData on one side can find the
+// waitForData on the other side via the inproc wake registry. Only
+// used when SHM_INPROC_WAKE=1; ignored otherwise.
+func (r *ShmRing) SetSegmentID(id string) {
+	r.segmentID = id
+}
+
+// SetDataSegWaker attaches the per-data-segment per-direction
+// eventfd waker (one read fd on this side) to this ring. Called by
+// Segment.RegisterRing, which propagates the segment-level waker to
+// all rings registered against it. Passing nil disables the per-
+// data-segment fast path (callers fall through to the per-address
+// eventfd registry / events / futex).
+func (r *ShmRing) SetDataSegWaker(w *shmDataSegWaker) {
+	r.dataSegWaker = w
 }
 
 // header returns a pointer to the RingHeader in shared memory
@@ -651,6 +699,14 @@ func (r *ShmRing) DebugState() RingState {
 // waitForData waits until data is available.
 // On Windows, uses named events. On Linux, uses futex.
 func (r *ShmRing) waitForData(addr *uint32, val uint32, timeout time.Duration) error {
+	if r.dataSegWaker != nil {
+		return r.dataSegWaker.WaitForChange(addr, val, timeout)
+	}
+	if shmInprocWakeEnabled && r.segmentID != "" {
+		if w := getInprocWaker(r.segmentID, unsafe.Pointer(&r.mem[0]), addr); w != nil {
+			return w.Wait(timeout)
+		}
+	}
 	if r.events != nil {
 		return r.events.WaitData(addr, val, timeout)
 	}
@@ -663,6 +719,14 @@ func (r *ShmRing) waitForData(addr *uint32, val uint32, timeout time.Duration) e
 // waitForSpace waits until space is available.
 // On Windows, uses named events. On Linux, uses futex.
 func (r *ShmRing) waitForSpace(addr *uint32, val uint32, timeout time.Duration) error {
+	if r.dataSegWaker != nil {
+		return r.dataSegWaker.WaitForChange(addr, val, timeout)
+	}
+	if shmInprocWakeEnabled && r.segmentID != "" {
+		if w := getInprocWaker(r.segmentID, unsafe.Pointer(&r.mem[0]), addr); w != nil {
+			return w.Wait(timeout)
+		}
+	}
 	if r.events != nil {
 		return r.events.WaitSpace(addr, val, timeout)
 	}
@@ -675,6 +739,14 @@ func (r *ShmRing) waitForSpace(addr *uint32, val uint32, timeout time.Duration) 
 // waitForContig waits until contiguous space improves.
 // On Windows, uses named events. On Linux, uses futex.
 func (r *ShmRing) waitForContig(addr *uint32, val uint32, timeout time.Duration) error {
+	if r.dataSegWaker != nil {
+		return r.dataSegWaker.WaitForChange(addr, val, timeout)
+	}
+	if shmInprocWakeEnabled && r.segmentID != "" {
+		if w := getInprocWaker(r.segmentID, unsafe.Pointer(&r.mem[0]), addr); w != nil {
+			return w.Wait(timeout)
+		}
+	}
 	if r.events != nil {
 		return r.events.WaitContig(addr, val, timeout)
 	}
@@ -687,6 +759,25 @@ func (r *ShmRing) waitForContig(addr *uint32, val uint32, timeout time.Duration)
 // signalData signals that new data is available.
 // On Windows, signals the named event. On Linux, uses futex wake.
 func (r *ShmRing) signalData(addr *uint32) {
+	if r.dataSegWaker != nil {
+		r.dataSegWaker.Wake()
+		// Also issue a futex_wake on the same address so peers using a
+		// different wake primitive (raw-ring tests that bypass
+		// RegisterRing; cross-process peers until Phase 2 SCM_RIGHTS
+		// passes the eventfds across) still observe the signal. Safe:
+		// futex_wake on an address with no waiters is a cheap kernel
+		// hash lookup (~150 ns) -- negligible against the ~100 us
+		// per-RPC cost. Use the on-Linux primitive directly so the
+		// Windows events path is not double-fired.
+		futexWake(addr, 1)
+		return
+	}
+	if shmInprocWakeEnabled && r.segmentID != "" {
+		if w := getInprocWaker(r.segmentID, unsafe.Pointer(&r.mem[0]), addr); w != nil {
+			w.Wake()
+			return
+		}
+	}
 	if r.events != nil {
 		r.events.SignalData()
 	} else {
@@ -697,6 +788,18 @@ func (r *ShmRing) signalData(addr *uint32) {
 // signalSpace signals that space is available.
 // On Windows, signals the named event. On Linux, uses futex wake.
 func (r *ShmRing) signalSpace(addr *uint32) {
+	if r.dataSegWaker != nil {
+		r.dataSegWaker.Wake()
+		// See signalData for the futex_wake-after-dataSegWaker rationale.
+		futexWake(addr, 1)
+		return
+	}
+	if shmInprocWakeEnabled && r.segmentID != "" {
+		if w := getInprocWaker(r.segmentID, unsafe.Pointer(&r.mem[0]), addr); w != nil {
+			w.Wake()
+			return
+		}
+	}
 	if r.events != nil {
 		r.events.SignalSpace()
 	} else {
@@ -707,6 +810,18 @@ func (r *ShmRing) signalSpace(addr *uint32) {
 // signalContig signals that contiguous space improved.
 // On Windows, signals the named event. On Linux, uses futex wake.
 func (r *ShmRing) signalContig(addr *uint32) {
+	if r.dataSegWaker != nil {
+		r.dataSegWaker.Wake()
+		// See signalData for the futex_wake-after-dataSegWaker rationale.
+		futexWake(addr, 1)
+		return
+	}
+	if shmInprocWakeEnabled && r.segmentID != "" {
+		if w := getInprocWaker(r.segmentID, unsafe.Pointer(&r.mem[0]), addr); w != nil {
+			w.Wake()
+			return
+		}
+	}
 	if r.events != nil {
 		r.events.SignalContig()
 	} else {
@@ -820,9 +935,9 @@ func (r *ShmRing) WriteBlocking(data []byte) error {
 				if r.effectiveSpace(writeIdx, readIdx) >= uint64(len(data)) {
 					// Space available! Update adaptive cutoff
 					if spin > 0 {
-						target := min(spinIterationsMax, spin*2)
+						target := min(loadShmSpinMax(), spin*2)
 						newCutoff := (7*spinLimit + target) / 8
-						atomic.StoreUint32(&r.spaceSpinCutoff, max(spinIterationsMin, newCutoff))
+						atomic.StoreUint32(&r.spaceSpinCutoff, max(loadShmSpinMin(), newCutoff))
 					}
 					spaceAvailable = true
 					break
@@ -836,8 +951,8 @@ func (r *ShmRing) WriteBlocking(data []byte) error {
 				continue
 			}
 			// Phase 2: Spin failed, reduce cutoff and fall back to futex
-			newCutoff := (7*spinLimit + spinIterationsMin) / 8
-			atomic.StoreUint32(&r.spaceSpinCutoff, max(spinIterationsMin, newCutoff))
+			newCutoff := (7*spinLimit + loadShmSpinMin()) / 8
+			atomic.StoreUint32(&r.spaceSpinCutoff, max(loadShmSpinMin(), newCutoff))
 
 			hdr.IncSpaceWaiters()
 			exp := hdr.SpaceSequence()
@@ -865,9 +980,9 @@ func (r *ShmRing) WriteBlocking(data []byte) error {
 			readIdx = hdr.ReadIndex()
 			if r.effectiveSpace(writeIdx, readIdx) >= uint64(len(data)) {
 				if spin > 0 {
-					target := min(spinIterationsMax, spin*2)
+					target := min(loadShmSpinMax(), spin*2)
 					newCutoff := (7*spinLimit + target) / 8
-					atomic.StoreUint32(&r.spaceSpinCutoff, max(spinIterationsMin, newCutoff))
+					atomic.StoreUint32(&r.spaceSpinCutoff, max(loadShmSpinMin(), newCutoff))
 				}
 				spaceAvailable = true
 				break
@@ -881,8 +996,8 @@ func (r *ShmRing) WriteBlocking(data []byte) error {
 			continue
 		}
 		// Phase 2: Spin failed, fall back to futex
-		newCutoff := (7*spinLimit + spinIterationsMin) / 8
-		atomic.StoreUint32(&r.spaceSpinCutoff, max(spinIterationsMin, newCutoff))
+		newCutoff := (7*spinLimit + loadShmSpinMin()) / 8
+		atomic.StoreUint32(&r.spaceSpinCutoff, max(loadShmSpinMin(), newCutoff))
 
 		hdr.IncContigWaiters()
 		exp := hdr.ContigSequence()
@@ -1007,9 +1122,9 @@ func (r *ShmRing) ReadBlocking(buf []byte) (int, error) {
 					// Data arrived! Update adaptive cutoff (success = spin faster next time)
 					if spin > 0 {
 						// Exponential moving average: new = (7*old + target) / 8
-						target := min(spinIterationsMax, spin*2)
+						target := min(loadShmSpinMax(), spin*2)
 						newCutoff := (7*spinLimit + target) / 8
-						atomic.StoreUint32(&r.dataSpinCutoff, max(spinIterationsMin, newCutoff))
+						atomic.StoreUint32(&r.dataSpinCutoff, max(loadShmSpinMin(), newCutoff))
 					}
 					break // Exit spin loop; outer loop will read data
 				}
@@ -1024,8 +1139,8 @@ func (r *ShmRing) ReadBlocking(buf []byte) (int, error) {
 
 			// Phase 2: Spin didn't succeed, fall back to futex
 			// Reduce spin cutoff (timeout = spin less next time)
-			newCutoff := (7*spinLimit + spinIterationsMin) / 8
-			atomic.StoreUint32(&r.dataSpinCutoff, max(spinIterationsMin, newCutoff))
+			newCutoff := (7*spinLimit + loadShmSpinMin()) / 8
+			atomic.StoreUint32(&r.dataSpinCutoff, max(loadShmSpinMin(), newCutoff))
 
 			hdr.IncDataWaiters()
 			dataSeq := hdr.DataSequence()
@@ -1088,6 +1203,26 @@ func (r *ShmRing) Available() uint64 {
 		return 0
 	}
 	return r.effectiveAvailable()
+}
+
+// HasPendingData reports whether the ring has data that the reader has not
+// yet picked up. Cheap: two atomic loads, no syscall. Intended for hot-path
+// gating decisions (e.g. "should the reader yield after delivering a MESSAGE
+// to the application or keep draining?").
+//
+// This is a best-effort scheduling hint, not a synchronisation primitive:
+// the answer can be stale on either side (a freshly-committed write may not
+// yet be visible; a freshly-advanced read may still appear pending). Stale
+// `false` causes one extra cooperative yield; stale `true` causes one extra
+// loop iteration that will then either find the frame or fall into the real
+// wait-with-sequence-snapshot path in ReadSlices. Both outcomes are
+// performance-only and cannot cause a missed wake or a deadlock.
+func (r *ShmRing) HasPendingData() bool {
+	if atomic.LoadUint32(&r.closed) != 0 {
+		return false
+	}
+	hdr := r.header()
+	return hdr.WriteIndex() > atomic.LoadUint64(&r.pendingReadIdx)
 }
 
 // effectiveAvailable returns the bytes available for writing, deducting
@@ -1717,9 +1852,9 @@ func (r *ShmRing) ReserveWrite(ctx context.Context, n int) (WriteReservation, er
 			if avail >= uint64(n) {
 				spinSuccess = true
 				// Adapt spin cutoff upward
-				newCutoff := (7*spinCutoff + spinIterationsMax) / 8
-				if newCutoff > spinIterationsMax {
-					newCutoff = spinIterationsMax
+				newCutoff := (7*spinCutoff + loadShmSpinMax()) / 8
+				if newCutoff > loadShmSpinMax() {
+					newCutoff = loadShmSpinMax()
 				}
 				atomic.StoreUint32(&r.spaceSpinCutoff, newCutoff)
 				break
@@ -1729,9 +1864,9 @@ func (r *ShmRing) ReserveWrite(ctx context.Context, n int) (WriteReservation, er
 			continue // Loop back to reserve space
 		}
 		// Spin timed out - adapt cutoff downward
-		newCutoff := (7*spinCutoff + spinIterationsMin) / 8
-		if newCutoff < spinIterationsMin {
-			newCutoff = spinIterationsMin
+		newCutoff := (7*spinCutoff + loadShmSpinMin()) / 8
+		if newCutoff < loadShmSpinMin() {
+			newCutoff = loadShmSpinMin()
 		}
 		atomic.StoreUint32(&r.spaceSpinCutoff, newCutoff)
 
@@ -1745,6 +1880,32 @@ func (r *ShmRing) ReserveWrite(ctx context.Context, n int) (WriteReservation, er
 		writeIdx = hdr.WriteIndex()
 		readIdx = hdr.ReadIndex()
 		free := r.effectiveSpace(writeIdx, readIdx)
+
+		// Deadlock guard: if we're inside an open BeginBatch session
+		// and about to park waiting for space, we must first flush
+		// the deferred data signal. Otherwise the reader -- which is
+		// the only party that can free space for us -- may be parked
+		// on a DataSequence value the batch has not yet
+		// incremented, and our committed bytes are invisible to it
+		// as "new data". Net effect: ring is full from our side,
+		// reader is asleep with stale seq, neither makes progress.
+		//
+		// Triggered when a chunked writer (writeFrameH2DataChunked,
+		// emitH2DataFromCursor) batches a logical MESSAGE whose
+		// total bytes exceed effective ring capacity -- the same
+		// pattern that caused BenchmarkGRPCShmLargeUnary/size=64MB
+		// to hang on a 64-MiB ring.
+		//
+		// The flushed increment may pair with the eventual EndBatch
+		// to fire two signals instead of one; the reader's loop
+		// tolerates that by re-checking writeIdx after each wake.
+		if atomic.LoadUint32(&r.batchDepth) > 0 {
+			hdr.IncrementDataSequence()
+			if hdr.DataWaiters() > 0 {
+				r.signalData(&hdr.dataSeq)
+			}
+		}
+
 		if free == 0 {
 			hdr.IncSpaceWaiters()
 			exp := hdr.SpaceSequence()
@@ -1946,9 +2107,9 @@ func (r *ShmRing) ReadSlices(ctx context.Context, n int) (first, second []byte, 
 			if writeIdx-pendingIdx >= uint64(n) {
 				spinSuccess = true
 				// Adapt spin cutoff upward (exponential moving average)
-				newCutoff := (7*spinCutoff + spinIterationsMax) / 8
-				if newCutoff > spinIterationsMax {
-					newCutoff = spinIterationsMax
+				newCutoff := (7*spinCutoff + loadShmSpinMax()) / 8
+				if newCutoff > loadShmSpinMax() {
+					newCutoff = loadShmSpinMax()
 				}
 				atomic.StoreUint32(&r.dataSpinCutoff, newCutoff)
 				break
@@ -1958,9 +2119,9 @@ func (r *ShmRing) ReadSlices(ctx context.Context, n int) (first, second []byte, 
 			continue // Loop back to return data
 		}
 		// Spin timed out - adapt cutoff downward
-		newCutoff := (7*spinCutoff + spinIterationsMin) / 8
-		if newCutoff < spinIterationsMin {
-			newCutoff = spinIterationsMin
+		newCutoff := (7*spinCutoff + loadShmSpinMin()) / 8
+		if newCutoff < loadShmSpinMin() {
+			newCutoff = loadShmSpinMin()
 		}
 		atomic.StoreUint32(&r.dataSpinCutoff, newCutoff)
 

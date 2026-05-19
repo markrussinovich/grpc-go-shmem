@@ -36,6 +36,15 @@ import (
 // These named events enable cross-mapping synchronization since
 // Windows WaitOnAddress/WakeByAddress only work within the same
 // virtual address mapping.
+//
+// In the same-process bench/test scenario the listener (CreateRingEvents)
+// and the dialer (OpenRingEvents) end up sharing the SAME *RingEvents
+// via ringEventsRegistry. To prevent one side's deferred Close from
+// zeroing the other side's event handles -- which silently breaks
+// SetEvent and parks ring waiters forever -- RingEvents is reference
+// counted. refCount is bumped on every Create/Open registry hit and
+// decremented on Close; the handles are only released when the count
+// reaches zero.
 type RingEvents struct {
 	// dataEvent is signaled when new data is available (writer -> reader)
 	dataEvent windows.Handle
@@ -46,6 +55,11 @@ type RingEvents struct {
 
 	// eventName prefix for cleanup
 	namePrefix string
+
+	// refCount counts active references to this RingEvents instance.
+	// Incremented on Create and on every Open registry hit; decremented
+	// on Close. Handles are released when refCount reaches zero.
+	refCount atomic.Int32
 }
 
 // Global registry of ring events by segment+ring name.
@@ -70,14 +84,16 @@ func CreateRingEvents(segmentName string, ringID string) (*RingEvents, error) {
 	prefix := eventNamePrefix(segmentName, ringID)
 	shmDebugf("[DEBUG] CreateRingEvents: segment=%s ring=%s prefix=%s", segmentName, ringID, prefix)
 
-	// Check if already in registry (another goroutine might have created them)
-	ringEventsMu.RLock()
+	// Check if already in registry (another goroutine might have created them).
+	// Bump refCount before returning so a later Close from this caller is balanced.
+	ringEventsMu.Lock()
 	if events, ok := ringEventsRegistry[prefix]; ok {
-		ringEventsMu.RUnlock()
-		shmDebugf("[DEBUG] CreateRingEvents: found existing events in registry")
+		events.refCount.Add(1)
+		ringEventsMu.Unlock()
+		shmDebugf("[DEBUG] CreateRingEvents: found existing events in registry (refCount=%d)", events.refCount.Load())
 		return events, nil
 	}
-	ringEventsMu.RUnlock()
+	ringEventsMu.Unlock()
 
 	// Create or open events - handles race where client created them first
 	dataEvent, err := openOrCreateNamedEvent(prefix + "_data")
@@ -107,9 +123,20 @@ func CreateRingEvents(segmentName string, ringID string) (*RingEvents, error) {
 		contigEvent: contigEvent,
 		namePrefix:  prefix,
 	}
+	events.refCount.Store(1)
 
-	// Register in global registry
+	// Register in global registry. A concurrent Create/Open could have
+	// raced and inserted the same prefix; in that case discard ours and
+	// take a reference on the existing entry.
 	ringEventsMu.Lock()
+	if existing, ok := ringEventsRegistry[prefix]; ok {
+		existing.refCount.Add(1)
+		ringEventsMu.Unlock()
+		windows.CloseHandle(dataEvent)
+		windows.CloseHandle(spaceEvent)
+		windows.CloseHandle(contigEvent)
+		return existing, nil
+	}
 	ringEventsRegistry[prefix] = events
 	ringEventsMu.Unlock()
 
@@ -123,14 +150,16 @@ func OpenRingEvents(segmentName string, ringID string) (*RingEvents, error) {
 	prefix := eventNamePrefix(segmentName, ringID)
 	shmDebugf("[DEBUG] OpenRingEvents: segment=%s ring=%s prefix=%s", segmentName, ringID, prefix)
 
-	// Check if already opened in this process
-	ringEventsMu.RLock()
+	// Check if already opened in this process.
+	// Bump refCount so the caller's eventual Close is balanced.
+	ringEventsMu.Lock()
 	if events, ok := ringEventsRegistry[prefix]; ok {
-		ringEventsMu.RUnlock()
-		shmDebugf("[DEBUG] OpenRingEvents: found existing events in registry")
+		events.refCount.Add(1)
+		ringEventsMu.Unlock()
+		shmDebugf("[DEBUG] OpenRingEvents: found existing events in registry (refCount=%d)", events.refCount.Load())
 		return events, nil
 	}
-	ringEventsMu.RUnlock()
+	ringEventsMu.Unlock()
 
 	// Open or create events (handles race condition where client starts before server)
 	dataEvent, err := openOrCreateNamedEvent(prefix + "_data")
@@ -160,19 +189,58 @@ func OpenRingEvents(segmentName string, ringID string) (*RingEvents, error) {
 		contigEvent: contigEvent,
 		namePrefix:  prefix,
 	}
+	events.refCount.Store(1)
 
-	// Register in global registry
+	// Register in global registry. A concurrent Create/Open could have
+	// raced and inserted the same prefix; in that case discard ours and
+	// take a reference on the existing entry.
 	ringEventsMu.Lock()
+	if existing, ok := ringEventsRegistry[prefix]; ok {
+		existing.refCount.Add(1)
+		ringEventsMu.Unlock()
+		windows.CloseHandle(dataEvent)
+		windows.CloseHandle(spaceEvent)
+		windows.CloseHandle(contigEvent)
+		return existing, nil
+	}
 	ringEventsRegistry[prefix] = events
 	ringEventsMu.Unlock()
 
 	return events, nil
 }
 
-// Close closes all event handles and removes from registry.
+// Close drops one reference on this RingEvents. Handles are only
+// released and the registry entry removed when the reference count
+// reaches zero. This makes Close safe to call from any holder of the
+// pointer -- including the in-process bench harness where both the
+// listener (Create side) and the dialer (Open side) end up sharing
+// the same *RingEvents via the registry.
+//
+// The decrement-to-zero transition AND the registry deletion both
+// happen under ringEventsMu. This is required because
+// CreateRingEvents / OpenRingEvents bump refCount while holding the
+// same mutex; doing the Add(-1) outside the lock would allow a
+// concurrent Create/Open between the decrement and the lock to
+// resurrect a doomed entry, then we would close its handles out
+// from under the new caller.
 func (e *RingEvents) Close() error {
 	ringEventsMu.Lock()
-	delete(ringEventsRegistry, e.namePrefix)
+	n := e.refCount.Add(-1)
+	if n > 0 {
+		ringEventsMu.Unlock()
+		return nil
+	}
+	if n < 0 {
+		// Double Close on the same reference. Don't underflow further
+		// and don't release handles that may already have been freed
+		// by the first decrement-to-zero caller.
+		e.refCount.Add(1)
+		ringEventsMu.Unlock()
+		return nil
+	}
+	if ringEventsRegistry[e.namePrefix] == e {
+		delete(ringEventsRegistry, e.namePrefix)
+	}
 	ringEventsMu.Unlock()
 
 	var firstErr error

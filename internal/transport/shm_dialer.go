@@ -57,6 +57,22 @@ type DialOptions struct {
 	// and skip the frame writer queue for reduced latency.
 	// Default: false.
 	SingleStreamMode bool
+
+	// InitialWindowSize overrides the per-stream HTTP/2 send / receive
+	// window for the SHM transport. When <= 0 the SHM-tuned default
+	// (maxWindowSize, ~2 GiB, i.e. flow control effectively disabled
+	// and the ring buffer is the only backpressure signal) is used.
+	// Set non-zero to make grpc.WithInitialWindowSize take effect on
+	// the SHM transport — primarily useful for benchmarks that need
+	// apples-to-apples comparison against HTTP/2 over TCP / UDS at
+	// matched settings. With non-default values the SHM transport
+	// behaves like HTTP/2: producer chunks writes under the window;
+	// receiver credits WINDOW_UPDATE per DATA frame.
+	InitialWindowSize int32
+
+	// InitialConnWindowSize overrides the connection-level HTTP/2
+	// send / receive window. Same semantics as InitialWindowSize.
+	InitialConnWindowSize int32
 }
 
 // DefaultDialOptions returns sensible defaults for dialing
@@ -101,6 +117,10 @@ func DialShm(ctx context.Context, addr string, opts *DialOptions) (ClientTranspo
 
 	ctlTx := NewShmRingFromSegment(ctlSeg.A, ctlSeg.Mem)
 	ctlRx := NewShmRingFromSegment(ctlSeg.B, ctlSeg.Mem)
+	ctlTx.SetSegmentID(ctlSeg.Path)
+	ctlRx.SetSegmentID(ctlSeg.Path)
+	ctlSeg.RegisterRing(ctlTx)
+	ctlSeg.RegisterRing(ctlRx)
 
 	// Create events for control rings (Windows). On Linux, these are no-ops.
 	ctlTxEvents, _ := OpenRingEvents(ctlName, "A")
@@ -162,6 +182,10 @@ func DialShm(ctx context.Context, addr string, opts *DialOptions) (ClientTranspo
 			// Create rings for handshake - client writes to A, reads from B
 			txRing := NewShmRingFromSegment(segment.A, segment.Mem)
 			rxRing := NewShmRingFromSegment(segment.B, segment.Mem)
+			txRing.SetSegmentID(segment.Path)
+			rxRing.SetSegmentID(segment.Path)
+			segment.RegisterRing(txRing)
+			segment.RegisterRing(rxRing)
 
 			// Open events for rings (Windows)
 			txEvents, _ := OpenRingEvents(segName, "A")
@@ -190,6 +214,30 @@ func DialShm(ctx context.Context, addr string, opts *DialOptions) (ClientTranspo
 			return nil, NewShmErrorWithCause(ShmErrUnknown, "failed to create client transport", err)
 		}
 		clientTransport.singleStreamMode = opts.SingleStreamMode
+		// Override flow-control windows when the caller requested
+		// non-default sizes. This is how grpc.WithInitialWindowSize /
+		// WithInitialConnWindowSize take effect on the SHM transport.
+		// With production defaults (opts.* <= 0) the transport keeps
+		// its 2 GiB quotas i.e. flow control disabled, ring buffer
+		// is the only backpressure. With non-default values both
+		// quotas are clamped to the requested sizes so producer
+		// chunked write + per-DATA-frame consumer credit (the rest
+		// of this commit's machinery) actually exercise the HTTP/2
+		// flow-control state machine.
+		if opts.InitialConnWindowSize > 0 {
+			clientTransport.sendQuotaMu.Lock()
+			clientTransport.connSendQuota = int64(opts.InitialConnWindowSize)
+			clientTransport.sendQuotaMu.Unlock()
+			clientTransport.connInFlow = trInFlow{limit: uint32(opts.InitialConnWindowSize)}
+			clientTransport.connInFlow.updateEffectiveWindowSize()
+		}
+		if opts.InitialWindowSize > 0 {
+			// stream quota is initialised per-NewStream; expose the
+			// override via the transport's initialStreamWindow field
+			// so each new stream picks it up.
+			clientTransport.initialStreamWindow = int64(opts.InitialWindowSize)
+			clientTransport.initialWindowSize = opts.InitialWindowSize
+		}
 		// Store auth info on transport
 		if authInfo != nil {
 			clientTransport.SetAuthInfo(authInfo)

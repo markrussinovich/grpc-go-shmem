@@ -20,27 +20,13 @@
 
 package transport
 
-// Windows spin-wait constants tuned for WaitOnAddress which goes through
-// runtime.cgocall (~40µs per wait/wake cycle). Aggressive spinning keeps
-// both reader and writer in user space, avoiding the costly kernel transition.
+// Windows spin-wait UPPER bound. See shm_spin_linux.go for the
+// rationale: default behaviour is no spin, operators opt in via
+// ConfigureShmSpinIterations. Windows WaitOnAddress costs ~40 µs
+// (cgocall), so the operator-facing cap can be a bit higher than on
+// Linux without the spin ever exceeding the cost of a kernel wait.
 const (
-	// spinIterationsDefault: ~14µs of spinning (2000 × 7ns PAUSE).
-	// Covers the typical SHM peer write latency without falling back
-	// to WaitOnAddress/cgocall.
-	spinIterationsDefault = 2000
-
-	// spinIterationsMin: minimum adaptive floor.
-	spinIterationsMin = 500
-
-	// spinIterationsMax: cap for sustained throughput workloads.
-	// ~350µs at 7ns/PAUSE. The adaptive algorithm only reaches this
-	// during sustained high-throughput transfers where spinning
-	// consistently succeeds.
-	spinIterationsMax = 50000
-
-	// spinMoreBoost: when a MORE chunk is detected, boost spin to
-	// ~1.4ms (200K × 7ns). While the reader spins, DataWaiters == 0,
-	// so the writer skips WakeByAddress — eliminating cgocall on
-	// BOTH sides. This is the Go equivalent of C#'s fire-and-forget.
-	spinMoreBoost = 200000
+	// spinIterationsLimit caps the maximum value the adaptive spin
+	// cutoff can be configured to on Windows. ~280 µs at 7 ns/PAUSE.
+	spinIterationsLimit = 40000
 )

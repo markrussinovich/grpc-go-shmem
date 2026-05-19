@@ -70,7 +70,7 @@ func TestClientTransport_NewStream_Integration(t *testing.T) {
 		Method: "/test.Service/TestMethod",
 	}
 
-	stream, err := clientTransport.NewStream(ctx, callHdr)
+	stream, err := clientTransport.NewStream(ctx, callHdr, nil)
 	if err != nil {
 		t.Fatalf("NewStream failed: %v", err)
 	}
@@ -250,7 +250,7 @@ func TestFullRPC_Integration(t *testing.T) {
 		Method: "/test.Service/TestMethod",
 	}
 
-	stream, err := clientTransport.NewStream(ctx, callHdr)
+	stream, err := clientTransport.NewStream(ctx, callHdr, nil)
 	if err != nil {
 		t.Fatalf("Client: NewStream failed: %v", err)
 	}
@@ -349,7 +349,7 @@ func TestShmDeadlinePropagation(t *testing.T) {
 	deadline := time.Now().Add(deadlineDuration)
 
 	callHdr := &CallHdr{Host: "testhost", Method: "/test.Service/Deadline"}
-	_, err = clientTransport.NewStream(ctx, callHdr)
+	_, err = clientTransport.NewStream(ctx, callHdr, nil)
 	if err != nil {
 		t.Fatalf("Client: NewStream failed: %v", err)
 	}
@@ -440,7 +440,7 @@ func TestShmMetadataPropagation(t *testing.T) {
 	defer cancel()
 	ctx = metadata.NewOutgoingContext(ctx, metadata.Pairs("x-test", "abc"))
 
-	stream, err := clientTransport.NewStream(ctx, &CallHdr{Host: "testhost", Method: "/test.Service/Metadata"})
+	stream, err := clientTransport.NewStream(ctx, &CallHdr{Host: "testhost", Method: "/test.Service/Metadata"}, nil)
 	if err != nil {
 		t.Fatalf("Client: NewStream failed: %v", err)
 	}
@@ -529,7 +529,7 @@ func TestShmContentTypeAndEncodingNegotiation(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	stream, err := clientTransport.NewStream(ctx, &CallHdr{Host: "testhost", Method: "/test.Service/Negotiation", ContentSubtype: "proto", SendCompress: "gzip"})
+	stream, err := clientTransport.NewStream(ctx, &CallHdr{Host: "testhost", Method: "/test.Service/Negotiation", ContentSubtype: "proto", SendCompress: "gzip"}, nil)
 	if err != nil {
 		t.Fatalf("Client: NewStream failed: %v", err)
 	}
@@ -606,7 +606,7 @@ func TestShmServerDrain(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	stream, err := clientTransport.NewStream(ctx, &CallHdr{Host: "testhost", Method: "/test.Service/Drain"})
+	stream, err := clientTransport.NewStream(ctx, &CallHdr{Host: "testhost", Method: "/test.Service/Drain"}, nil)
 	if err != nil {
 		t.Fatalf("Client: NewStream failed: %v", err)
 	}
@@ -632,7 +632,7 @@ func TestShmServerDrain(t *testing.T) {
 		t.Fatalf("GetGoAwayReason() debug message empty")
 	}
 
-	if _, err := clientTransport.NewStream(ctx, &CallHdr{Host: "testhost", Method: "/test.Service/AfterDrain"}); err == nil {
+	if _, err := clientTransport.NewStream(ctx, &CallHdr{Host: "testhost", Method: "/test.Service/AfterDrain"}, nil); err == nil {
 		t.Fatalf("NewStream succeeded after Drain, want error")
 	}
 
@@ -702,7 +702,7 @@ func TestShmTrailerMetadataPropagation(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	stream, err := clientTransport.NewStream(ctx, &CallHdr{Host: "testhost", Method: "/test.Service/Trailer"})
+	stream, err := clientTransport.NewStream(ctx, &CallHdr{Host: "testhost", Method: "/test.Service/Trailer"}, nil)
 	if err != nil {
 		t.Fatalf("Client: NewStream failed: %v", err)
 	}
@@ -777,7 +777,7 @@ func TestShmServerCloseTerminatesActiveStreams(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	_, err = clientTransport.NewStream(ctx, &CallHdr{Host: "testhost", Method: "/test.Service/Close"})
+	_, err = clientTransport.NewStream(ctx, &CallHdr{Host: "testhost", Method: "/test.Service/Close"}, nil)
 	if err != nil {
 		t.Fatalf("Client: NewStream failed: %v", err)
 	}

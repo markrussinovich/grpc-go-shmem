@@ -450,7 +450,7 @@ func TestShmInflightStreamClosing(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	stream, err := clientTransport.NewStream(ctx, &CallHdr{Method: "/test/Stream"})
+	stream, err := clientTransport.NewStream(ctx, &CallHdr{Method: "/test/Stream"}, nil)
 	if err != nil {
 		t.Fatalf("NewStream failed: %v", err)
 	}
@@ -540,7 +540,7 @@ func TestShmContextCanceledOnClose(t *testing.T) {
 	}
 	defer clientTransport.Close(nil)
 
-	cs, err := clientTransport.NewStream(ctx, &CallHdr{Method: "/test/CtxCancel"})
+	cs, err := clientTransport.NewStream(ctx, &CallHdr{Method: "/test/CtxCancel"}, nil)
 	if err != nil {
 		t.Fatalf("NewStream failed: %v", err)
 	}
@@ -641,7 +641,7 @@ func TestShmGracefulClose(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	cs, err := clientTransport.NewStream(ctx, &CallHdr{Method: "/test/GracefulClose"})
+	cs, err := clientTransport.NewStream(ctx, &CallHdr{Method: "/test/GracefulClose"}, nil)
 	if err != nil {
 		t.Fatalf("NewStream(_, _) = _, %v, want _, <nil>", err)
 	}
@@ -680,7 +680,7 @@ func TestShmGracefulClose(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_, err := clientTransport.NewStream(ctx, &CallHdr{Method: "/test/NewStreamAfterGracefulClose"})
+			_, err := clientTransport.NewStream(ctx, &CallHdr{Method: "/test/NewStreamAfterGracefulClose"}, nil)
 			if err != nil {
 				if nse, ok := err.(*NewStreamError); ok && nse.Err == ErrConnClosing && nse.AllowTransparentRetry {
 					return
@@ -756,7 +756,7 @@ func TestShmMaxStreams(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	cs1, err := clientTransport.NewStream(ctx, &CallHdr{Method: "/test/MaxStreams"})
+	cs1, err := clientTransport.NewStream(ctx, &CallHdr{Method: "/test/MaxStreams"}, nil)
 	if err != nil {
 		t.Fatalf("NewStream(_, _) = _, %v, want _, <nil>", err)
 	}
@@ -772,7 +772,7 @@ func TestShmMaxStreams(t *testing.T) {
 	// completes. With a short context deadline, it should fail.
 	shortCtx, shortCancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
 	defer shortCancel()
-	if _, err := clientTransport.NewStream(shortCtx, &CallHdr{Method: "/test/MaxStreamsShort"}); err == nil {
+	if _, err := clientTransport.NewStream(shortCtx, &CallHdr{Method: "/test/MaxStreamsShort"}, nil); err == nil {
 		t.Fatalf("NewStream(_, _) = _, <nil>, want deadline exceeded")
 	} else if err.Error() != status.Error(codes.DeadlineExceeded, context.DeadlineExceeded.Error()).Error() {
 		t.Fatalf("NewStream(_, _) = _, %v, want _, %v", err, status.Error(codes.DeadlineExceeded, context.DeadlineExceeded.Error()))
@@ -784,7 +784,7 @@ func TestShmMaxStreams(t *testing.T) {
 	go func() {
 		ctx2, cancel2 := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel2()
-		cs2, err := clientTransport.NewStream(ctx2, &CallHdr{Method: "/test/MaxStreamsWait"})
+		cs2, err := clientTransport.NewStream(ctx2, &CallHdr{Method: "/test/MaxStreamsWait"}, nil)
 		if err == nil {
 			cs2.Close(nil)
 		}
@@ -847,7 +847,7 @@ func TestShmServerHandlesClientGoAwayDraining(t *testing.T) {
 	// Create one active stream, then send GOAWAY via GracefulClose.
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	cs, err := clientTransport.NewStream(ctx, &CallHdr{Method: "/test/GoAway"})
+	cs, err := clientTransport.NewStream(ctx, &CallHdr{Method: "/test/GoAway"}, nil)
 	if err != nil {
 		t.Fatalf("NewStream failed: %v", err)
 	}

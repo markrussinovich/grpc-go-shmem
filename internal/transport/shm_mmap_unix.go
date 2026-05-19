@@ -124,6 +124,28 @@ func CreateSegment(name string, ringCapA, ringCapB uint64) (*Segment, error) {
 		segment.B.SetReadIndex(0)
 		segment.B.SetClosed(false)
 
+		// If SHM_DATASEG_WAKE=1 and this is a non-control segment,
+		// allocate a SOCK_STREAM socketpair and stash one endpoint
+		// for the matching OpenSegment to claim. No-op otherwise.
+		setupDataSegWakeForCreator(segment)
+
+		// Close the backing file fd: the mmap holds an independent
+		// inode reference, so the mapped region stays valid for the
+		// segment's lifetime. Saves 1 FD/segment (2 FDs/conn over
+		// control + data segments). Path is preserved in segment.Path
+		// for path-based unlink via RemoveSegment / Segment.Close.
+		//
+		// Phase 2 cross-process: SCM_RIGHTS handshake must complete
+		// BEFORE this close. Phase 1 is single-process / handle-by-
+		// path, so the fd is no longer needed after mmap.
+		if err := file.Close(); err != nil {
+			munmapImpl(mem)
+			os.Remove(tryPath)
+			lastErr = fmt.Errorf("close fd after mmap: %w", err)
+			continue
+		}
+		segment.File = nil
+
 		return segment, nil
 	}
 
@@ -196,6 +218,22 @@ func OpenSegment(name string) (*Segment, error) {
 	// Set client PID and ready flag
 	segment.H.SetClientPID(uint32(os.Getpid()))
 	segment.H.SetClientReady(true)
+
+	// Claim the stashed per-data-segment socketpair endpoint (if
+	// SHM_DATASEG_WAKE=1 and a matching CreateSegment ran in this
+	// process). No-op for control segments / cross-process / when
+	// the wake mode is off.
+	setupDataSegWakeForOpener(segment)
+
+	// Close the backing file fd: the mmap holds an independent
+	// inode reference, so the mapped region stays valid for the
+	// segment's lifetime. Saves 1 FD/segment. See CreateSegment
+	// for the full rationale.
+	if err := file.Close(); err != nil {
+		munmapImpl(mem)
+		return nil, fmt.Errorf("close fd after mmap: %w", err)
+	}
+	segment.File = nil
 
 	return segment, nil
 }

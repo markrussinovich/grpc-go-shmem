@@ -20,26 +20,28 @@
 
 package transport
 
-// Linux spin-wait constants tuned for native futex which costs ~1-2µs per
-// wake/wait cycle. Moderate spin counts balance latency vs CPU usage —
-// too low (32) causes futex fallback on every frame, too high (2000+)
-// starves the peer goroutine on shared hyperthreads.
+// Linux spin-wait UPPER bounds. The actual spin behaviour is controlled
+// by ConfigureShmSpinIterations (or the dial / server option that wraps
+// it) — the constants below cap how aggressive an operator can ask
+// the implementation to be on Linux.
+//
+// The DEFAULT spin behaviour is *no spin*. Reviewer (Doug) flagged that
+// busy-spinning costs CPU that UDS / TCP don't incur, and the project's
+// own anti-busy-wait rule (copilot-instructions) says spinning should
+// not tie up a CPU. Operators that want sub-µs latency for hot streams
+// must explicitly call ConfigureShmSpinIterations(n) (or pass the
+// matching dial / server option) to trade CPU for latency.
+//
+// Why this cap is ~225 µs (not lower): empirically the gap between
+// "writer commits" and "reader sees data" in this codebase's full
+// gRPC stack — even on a quiescent dedicated core — is on the order of
+// 30–100 µs (covers the handler dispatch, gRPC framework overhead,
+// goroutine scheduling, and ring memory ordering). A spin cap below
+// that range almost never catches the data and devolves to "pay
+// spin cost AND futex cost". The cap is well below scheduler quantum
+// (~10 ms) so a runnable peer is never starved.
 const (
-	// spinIterationsDefault: ~2.1µs of spinning (300 × 7ns PAUSE).
-	// Covers typical SHM peer write latency for small/medium payloads.
-	spinIterationsDefault = 300
-
-	// spinIterationsMin: minimum adaptive floor.
-	spinIterationsMin = 50
-
-	// spinIterationsMax: cap for sustained throughput workloads.
-	// ~28µs at 7ns/PAUSE — moderate because Linux futex has no
-	// cgocall overhead, so falling back is cheap.
-	spinIterationsMax = 4000
-
-	// spinMoreBoost: when a MORE chunk is detected, boost spin to
-	// cover the inter-chunk latency (~5-20µs). On Linux, futex
-	// wake is cheap so we don't need the extreme 200K of Windows.
-	// ~70µs at 7ns/PAUSE covers the typical chunk write time.
-	spinMoreBoost = 10000
+	// spinIterationsLimit caps the maximum value the adaptive spin
+	// cutoff can be configured to on Linux. ~225 µs at 7 ns/PAUSE.
+	spinIterationsLimit = 32000
 )

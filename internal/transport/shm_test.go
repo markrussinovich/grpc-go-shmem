@@ -337,9 +337,14 @@ func TestCreateAndOpenSegment(t *testing.T) {
 	}
 	defer segment.Close()
 
-	// Verify segment properties
-	if segment.File == nil {
-		t.Error("segment.File is nil")
+	// Verify segment properties.
+	//
+	// segment.File is intentionally nil: CreateSegment closes the
+	// backing fd immediately after mmap to keep the per-segment FD
+	// footprint to the wake fds only. The mmap holds an inode
+	// reference, so segment.Mem remains valid.
+	if segment.File != nil {
+		t.Error("segment.File should be nil after mmap-close optimisation")
 	}
 	if segment.Mem == nil {
 		t.Error("segment.Mem is nil")

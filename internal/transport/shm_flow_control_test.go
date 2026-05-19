@@ -74,7 +74,7 @@ func TestShmFlowControlBlocksUntilWindowUpdate(t *testing.T) {
 		_ = s.WriteStatus(status.New(codes.OK, ""))
 	})
 
-	cs, err := cliTransport.NewStream(ctx, &CallHdr{Method: "/test/FlowControl"})
+	cs, err := cliTransport.NewStream(ctx, &CallHdr{Method: "/test/FlowControl"}, nil)
 	if err != nil {
 		t.Fatalf("NewStream: %v", err)
 	}
@@ -170,7 +170,7 @@ func TestShmFlowControlMultiStreamAccountCheck(t *testing.T) {
 	// Create multiple streams
 	streams := make([]*ClientStream, numStreams)
 	for i := 0; i < numStreams; i++ {
-		s, err := cliTransport.NewStream(testCtx, &CallHdr{Method: fmt.Sprintf("/test/Stream%d", i)})
+		s, err := cliTransport.NewStream(testCtx, &CallHdr{Method: fmt.Sprintf("/test/Stream%d", i)}, nil)
 		if err != nil {
 			t.Fatalf("NewStream %d: %v", i, err)
 		}

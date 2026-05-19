@@ -67,6 +67,10 @@ func NewShmUnaryClient(seg *Segment) *ShmUnaryClient {
 
 	tx := NewShmRingFromSegment(seg.A, seg.Mem)
 	rx := NewShmRingFromSegment(seg.B, seg.Mem)
+	tx.SetSegmentID(seg.Path)
+	rx.SetSegmentID(seg.Path)
+	seg.RegisterRing(tx)
+	seg.RegisterRing(rx)
 
 	// Open events for cross-mapping synchronization (Windows).
 	// Client opens events created by server. On Linux, these are no-ops.
@@ -98,6 +102,14 @@ func (c *ShmUnaryClient) Close() error {
 
 	// Close the rx ring to unblock the reader
 	_ = c.rx.Close()
+
+	// Unblock the long-lived reader goroutine if it's parked in the
+	// per-data-segment eventfd Wait. Closes the eventfd so the Read
+	// returns EBADF and the reader exits its outer loop. No-op when
+	// SHM_DATASEG_WAKE is off.
+	if c.seg != nil {
+		c.seg.UnblockSameSideParkers()
+	}
 
 	// Wait for reader goroutine to exit before closing segment
 	<-c.readerDone

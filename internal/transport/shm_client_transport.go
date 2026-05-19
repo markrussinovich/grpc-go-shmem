@@ -24,9 +24,11 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"math"
 	"net"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -39,6 +41,7 @@ import (
 	"google.golang.org/grpc/mem"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/peer"
+	"google.golang.org/grpc/stats"
 	"google.golang.org/grpc/status"
 )
 
@@ -111,6 +114,15 @@ type ShmClientTransport struct {
 	bdpEst            *shmBDPEstimator
 	initialWindowSize int32
 
+	// initialStreamWindow is the per-stream send-quota value applied
+	// to each new stream's streamSendQuota at NewStream time. When 0
+	// (default), the transport uses maxWindowSize (~2 GiB) i.e. flow
+	// control disabled — production behavior. When set non-zero by
+	// DialShm reading opts.InitialWindowSize, the producer-side
+	// chunked write path (acquireUpToSendQuota) actually enforces
+	// the window.
+	initialStreamWindow int64
+
 	// WindowUpdate batching: accumulate deltas and flush when threshold exceeded.
 	pendingConnWU   uint32            // accumulated connection-level WindowUpdate delta
 	pendingStreamWU map[uint32]uint32 // accumulated per-stream WindowUpdate deltas
@@ -139,7 +151,7 @@ type ShmClientTransport struct {
 	// onClose is a callback invoked when the transport is closed.
 	// This is used by ClientConn/addrConn to track connectivity state.
 	// RFC A73: Required for proper subchannel lifecycle management.
-	onClose func(GoAwayReason)
+	onClose func(GoAwayInfo)
 
 	// authInfo stores the authentication information from security handshake.
 	authInfo credentials.AuthInfo
@@ -163,13 +175,35 @@ func (t *ShmClientTransport) setGoAwayReason(flags uint8, debug string) {
 	})
 }
 
+// notifyQuotaChangeLocked wakes ONE waiter (if any is parked) so it
+// can recheck its quota condition. Successful acquirers chain-wake
+// the next parker via the same signal at their return point, so a
+// single WindowUpdate cascades through all satisfiable waiters.
+//
+// quotaSignal is a buffered-1 channel: a notify while no waiter is
+// parked just buffers; the next acquirer consumes it and proceeds.
+// A notify while the buffer is already full drops, which is fine
+// because the prior pending notify is sufficient to wake one parker
+// (and they chain-wake the next).
+//
+// This replaces the previous close-and-recreate broadcast pattern,
+// which woke EVERY parker on every WindowUpdate. At N=1000
+// concurrent streams with the fair-default 64 KiB HTTP/2 connection
+// window, the broadcast caused a thundering herd that burned ~22%
+// of CPU in runtime.futex (verified by pprof).
 func (t *ShmClientTransport) notifyQuotaChangeLocked() {
-	close(t.quotaSignal)
-	t.quotaSignal = make(chan struct{})
+	select {
+	case t.quotaSignal <- struct{}{}:
+	default:
+	}
 }
 
 func (t *ShmClientTransport) addSendQuota(streamID uint32, delta uint32) {
 	if delta == 0 {
+		return
+	}
+	if shmNoWU() {
+		// v3.4 P1a: no quota tracking; nothing to add.
 		return
 	}
 	t.sendQuotaMu.Lock()
@@ -188,6 +222,14 @@ func (t *ShmClientTransport) acquireSendQuota(ctx context.Context, streamID uint
 	if n == 0 {
 		return nil
 	}
+	if shmNoWU() {
+		// v3.4 P1a: skip quota; ring backpressure is the only limit.
+		shmQuotaSkips.Add(1)
+		if t.closed.Load() {
+			return ErrConnClosing
+		}
+		return nil
+	}
 	t.sendQuotaMu.Lock()
 	for {
 		if t.closed.Load() {
@@ -202,6 +244,12 @@ func (t *ShmClientTransport) acquireSendQuota(ctx context.Context, streamID uint
 		if connOK && streamOK {
 			t.connSendQuota -= int64(n)
 			t.streamSendQuota[streamID] -= int64(n)
+			// Chain-wake: signal one more parker so cascading WUs reach
+			// every satisfiable waiter without thundering herd.
+			select {
+			case t.quotaSignal <- struct{}{}:
+			default:
+			}
 			t.sendQuotaMu.Unlock()
 			return nil
 		}
@@ -218,8 +266,92 @@ func (t *ShmClientTransport) acquireSendQuota(ctx context.Context, streamID uint
 	}
 }
 
+// acquireUpToSendQuota acquires up to `want` bytes of send quota,
+// returning whatever is currently available on both the stream and
+// connection windows (min of the two, capped at want). Blocks only
+// when zero bytes are available on either window; on a nil error it
+// returns got > 0.
+//
+// This is the correct primitive for writing a MESSAGE whose total
+// size may exceed the per-stream HTTP/2 flow-control window.
+// acquireSendQuota waits for `n` bytes atomically and deadlocks when
+// n > stream window because the receiver never gets data to consume,
+// never sends WINDOW_UPDATE, and the window never grows.
+// acquireUpToSendQuota lets the caller drain the window in chunks,
+// give the receiver a chance to credit it back, then continue.
+//
+// Callers MUST loop until they have written the full message, and
+// MUST set MessageFlagMORE / clear MessageFlagEndStream on
+// intermediate chunks so the receiver's lpmAccumulator stitches the
+// DATA frames into one LPM. Only the final chunk carries the caller's
+// intended EndStream signal.
+func (t *ShmClientTransport) acquireUpToSendQuota(ctx context.Context, streamID uint32, want int) (got int, err error) {
+	if want <= 0 {
+		return 0, nil
+	}
+	if shmNoWU() {
+		// v3.4 P1a: skip quota; grant the full request immediately.
+		// Ring backpressure (downstream) enforces real limits.
+		shmQuotaSkips.Add(1)
+		if t.closed.Load() {
+			return 0, ErrConnClosing
+		}
+		return want, nil
+	}
+	t.sendQuotaMu.Lock()
+	for {
+		if t.closed.Load() {
+			t.sendQuotaMu.Unlock()
+			return 0, ErrConnClosing
+		}
+		avail := t.connSendQuota
+		q, ok := t.streamSendQuota[streamID]
+		if !ok {
+			// Stream not registered — caller violated the contract
+			// (must NewStream before write). Surface as errStreamDone
+			// rather than block forever on a quota that will never
+			// be created.
+			t.sendQuotaMu.Unlock()
+			return 0, errStreamDone
+		}
+		if q < avail {
+			avail = q
+		}
+		if avail > 0 {
+			grant := avail
+			if grant > int64(want) {
+				grant = int64(want)
+			}
+			t.connSendQuota -= grant
+			t.streamSendQuota[streamID] -= grant
+			// Chain-wake: see notifyQuotaChangeLocked.
+			select {
+			case t.quotaSignal <- struct{}{}:
+			default:
+			}
+			t.sendQuotaMu.Unlock()
+			return int(grant), nil
+		}
+		ch := t.quotaSignal
+		t.sendQuotaMu.Unlock()
+		select {
+		case <-ch:
+		case <-ctx.Done():
+			return 0, ContextErr(ctx.Err())
+		case <-t.ctx.Done():
+			return 0, ErrConnClosing
+		}
+		t.sendQuotaMu.Lock()
+	}
+}
+
 func (t *ShmClientTransport) sendWindowUpdate(streamID uint32, delta uint32) {
 	if delta == 0 || t.closed.Load() {
+		return
+	}
+	if shmNoWU() {
+		// v3.4 P1a: do not emit WU frames between SHM peers.
+		shmWUFramesElided.Add(1)
 		return
 	}
 	// Batch WindowUpdate deltas: only send a frame when the accumulated
@@ -228,7 +360,7 @@ func (t *ShmClientTransport) sendWindowUpdate(streamID uint32, delta uint32) {
 	t.sendQuotaMu.Lock()
 	if streamID == 0 {
 		t.pendingConnWU += delta
-		if t.pendingConnWU < shmWindowUpdateThreshold {
+		if t.pendingConnWU < uint32(shmWindowUpdateThreshold) {
 			t.sendQuotaMu.Unlock()
 			return
 		}
@@ -236,7 +368,7 @@ func (t *ShmClientTransport) sendWindowUpdate(streamID uint32, delta uint32) {
 		t.pendingConnWU = 0
 	} else {
 		t.pendingStreamWU[streamID] += delta
-		if t.pendingStreamWU[streamID] < shmWindowUpdateThreshold {
+		if t.pendingStreamWU[streamID] < uint32(shmWindowUpdateThreshold) {
 			t.sendQuotaMu.Unlock()
 			return
 		}
@@ -252,7 +384,13 @@ func (t *ShmClientTransport) sendWindowUpdate(streamID uint32, delta uint32) {
 	// correct value, and so an external HTTP/2 peer parsing this
 	// frame interprets the increment correctly.
 	binary.BigEndian.PutUint32(buf, delta)
-	_ = t.frameWriter.enqueue(frameEntry{
+	// enqueueOrInline: writes the WU frame directly on this goroutine if
+	// the frame writer is idle (the common case on the receive path,
+	// since the writer parks waiting for app traffic). Falls back to
+	// async enqueue under contention. Saves one goroutine hop +
+	// scheduler wake per WU; matters under fair-default flow control
+	// where the producer stalls one round-trip per ~16 KiB consumed.
+	_ = t.frameWriter.enqueueOrInline(frameEntry{
 		ctx:     context.Background(),
 		fh:      FrameHeader{Type: FrameTypeWindowUpdate, StreamID: streamID},
 		payload: buf,
@@ -309,6 +447,17 @@ func NewShmClientTransport(segment *Segment, localAddr, remoteAddr net.Addr) (*S
 	clientToServer := NewShmRingFromSegment(segment.A, segment.Mem)
 	serverToClient := NewShmRingFromSegment(segment.B, segment.Mem)
 
+	// Tag both rings with the segment path so the same-process wake
+	// registry (SHM_INPROC_WAKE=1 experimental path) can match the
+	// producer's signalData with the consumer's waitForData by
+	// (segmentID, byte-offset) instead of by vaddr. Different mmap
+	// calls of the same /dev/shm file return different virtual
+	// addresses, so vaddr-keying fails.
+	clientToServer.SetSegmentID(segment.Path)
+	serverToClient.SetSegmentID(segment.Path)
+	segment.RegisterRing(clientToServer)
+	segment.RegisterRing(serverToClient)
+
 	// Open events for cross-mapping synchronization (Windows).
 	// Client opens events created by the server. On Linux, these are no-ops.
 	writeEvents, _ := OpenRingEvents(segmentName, "A")
@@ -349,6 +498,26 @@ func NewShmClientTransport(segment *Segment, localAddr, remoteAddr net.Addr) (*S
 	}
 	// Start the dedicated frame writer goroutine for the client→server ring.
 	t.frameWriter = newShmFrameWriter(clientToServer)
+	// Surface async write failures (SHM_NO_WU=1 fire-and-forget MESSAGE
+	// path, and async HEADERS/GOAWAY) by tearing down the transport.
+	// Without this hook the writer goroutine would silently drop bytes
+	// after data.Free(), and the peer would wait forever for a MESSAGE
+	// that was never sent. The handler runs in a fresh goroutine so it
+	// can safely call Close (which waits for the writer goroutine that
+	// is currently invoking the callback). Close is guarded by
+	// closeOnce so concurrent invocations are idempotent.
+	t.frameWriter.setAsyncErrorHandler(func(err error) {
+		// Context cancellation on the per-stream context is benign —
+		// the stream is gone and the client doesn't need the bytes.
+		// Ring closed errors mean we are already tearing down.
+		if err == context.Canceled || err == context.DeadlineExceeded {
+			return
+		}
+		if t.closed.Load() {
+			return
+		}
+		go t.Close(fmt.Errorf("shm client: async write failed: %w", err))
+	})
 
 	// Initialize dormancy condition variable.
 	t.kpDormancyCond = sync.NewCond(&t.mu)
@@ -360,7 +529,7 @@ func NewShmClientTransport(segment *Segment, localAddr, remoteAddr net.Addr) (*S
 	// Initialize BDP estimation for dynamic flow control (RFC A73 Phase 5).
 	// SHM uses a much larger initial window (32MB) than HTTP/2 (64KB) because
 	// local memory has near-zero RTT and high bandwidth.
-	t.initialWindowSize = shmInitialWindowSize
+	t.initialWindowSize = int32(shmInitialWindowSize)
 	t.bdpEst = newShmBDPEstimator(uint32(shmInitialWindowSize), t.updateFlowControl)
 
 	max := segment.H.MaxStreams()
@@ -384,7 +553,7 @@ func NewShmClientTransport(segment *Segment, localAddr, remoteAddr net.Addr) (*S
 
 // SetOnClose sets the callback to be invoked when the transport is closed.
 // RFC A73: This integrates with gRPC's ClientConn connectivity state management.
-func (t *ShmClientTransport) SetOnClose(f func(GoAwayReason)) {
+func (t *ShmClientTransport) SetOnClose(f func(GoAwayInfo)) {
 	t.onClose = f
 }
 
@@ -424,6 +593,13 @@ func (t *ShmClientTransport) processIncomingData(ctx context.Context) {
 	if shmDebugEnabled {
 		shmDebugf("[DEBUG] ShmClientTransport.processIncomingData: STARTED")
 	}
+	// Install the per-DATA-frame flow-control callback on the H2
+	// decoder for the server→client ring. See the matching block in
+	// ShmServerTransport.processIncomingData for the design rationale
+	// (decouple H2 conn-flow credit from gRPC LPM reassembly so
+	// multi-DATA-frame responses don't deadlock under a small
+	// per-stream send window).
+	t.serverToClient.h2Decoder().onDataFrame = t.onDataFrameReceived
 	defer func() {
 		if shmDebugEnabled {
 			shmDebugf("[DEBUG] ShmClientTransport.processIncomingData: EXITING")
@@ -432,6 +608,14 @@ func (t *ShmClientTransport) processIncomingData(ctx context.Context) {
 			go t.Close(errors.New("incoming data processing ended"))
 		}
 	}()
+
+	// Bounded burst counter: number of MESSAGE frames delivered since the
+	// last cooperative yield. When the ring keeps producing data the reader
+	// stays on-CPU to drain it, but we cap the burst so app goroutines that
+	// just got data on their recvBuffer get a chance to run and post their
+	// next Send. See shmClientMaxMessageBurst doc-comment for the cap value
+	// rationale.
+	messageBurst := 0
 
 	for {
 		if t.closed.Load() {
@@ -511,6 +695,12 @@ func (t *ShmClientTransport) processIncomingData(ctx context.Context) {
 			release()
 			continue
 		case FrameTypeWindowUpdate:
+			if shmNoWU() {
+				// v3.4 P1a: SHM peers MUST NOT emit WU. If we get one, ignore.
+				shmWUFramesIgnored.Add(1)
+				release()
+				continue
+			}
 			if len(payload) >= 4 {
 				// RFC 7540 §6.9.1: increment is big-endian. Senders
 				// (sendWindowUpdate above) write BigEndian so this matches.
@@ -592,17 +782,10 @@ func (t *ShmClientTransport) processIncomingData(ctx context.Context) {
 				sendBDPPing = t.bdpEst.add(sz)
 			}
 
-			if wu := t.connInFlow.onData(sz); wu > 0 {
-				t.sendWindowUpdate(0, wu)
-			}
-			if err := stream.fc.onData(sz); err != nil {
-				if shmDebugEnabled {
-					shmDebugf("[DEBUG] ShmClientTransport: MESSAGE flow control error: %v", err)
-				}
-				release()
-				t.closeStream(stream, err, true, http2.ErrCodeFlowControl, status.New(codes.Internal, err.Error()), nil, false)
-				continue
-			}
+			// NOTE: connection + stream flow-control credit is done
+			// per H2 DATA frame in onDataFrameReceived (installed on
+			// the h2 decoder above). Crediting here would double-
+			// count. See onDataFrameReceived for the design rationale.
 
 			// Send BDP ping if BDP estimator requests it
 			if sendBDPPing {
@@ -627,6 +810,41 @@ func (t *ShmClientTransport) processIncomingData(ctx context.Context) {
 				}
 				buf := mem.Copy(payload, mem.DefaultBufferPool())
 				stream.write(recvMsg{buffer: buf})
+			}
+			// Yield to the app goroutine that was just goready'd by the channel
+			// send. The recvBuffer's channel put places the receiver G on the
+			// current P's local runq head; without a Gosched the runtime's
+			// wakep then tries to find an idle M on another P to run the
+			// woken G in parallel — which costs a futex syscall on Linux.
+			// For ping-pong RPCs the parallelism is illusory (the reader has
+			// nothing else to do until the server replies, which itself waits
+			// on the app's next Send), so co-locating the two Gs on this M
+			// strictly wins. The runtime.Gosched is a cooperative yield, not
+			// a spin: it costs no CPU when no other G is runnable.
+			//
+			// AT HIGH STREAM CONCURRENCY (N=1000+), this unconditional yield
+			// costs N park/unpark cycles per RPC round. Skip the yield when
+			// more frames are immediately ready in the ring — keep draining
+			// instead of round-tripping through the scheduler. The ping-pong
+			// win is preserved because in the 1-stream case the ring is
+			// almost always empty after the MESSAGE is delivered. A burst
+			// cap (shmClientMaxMessageBurst) bounds how many frames the
+			// reader will process without yielding so that app goroutines
+			// waiting on recvBuffer don't starve.
+			//
+			// SIZE-AWARE: only the small-payload case wins from skipping
+			// the yield. At medium payloads (e.g. N=100 streams sending
+			// 64 KiB messages) the parallel app goroutine work outweighs
+			// the wakep cost — let work-stealing pick up the recvBuffer
+			// reader on another P. Always yield when the just-delivered
+			// payload is above shmYieldSkipMaxPayload bytes.
+			messageBurst++
+			yield := sz > shmYieldSkipMaxPayload ||
+				messageBurst >= shmClientMaxMessageBurst ||
+				!t.serverToClient.HasPendingData()
+			if yield {
+				runtime.Gosched()
+				messageBurst = 0
 			}
 			if shmDebugEnabled {
 				shmDebugf("[DEBUG] ShmClientTransport: MESSAGE delivered to stream %d", fh.StreamID)
@@ -764,6 +982,18 @@ func (t *ShmClientTransport) Close(err error) {
 			t.closeStream(stream, err, false, 0, status.Convert(err), nil, false)
 		}
 
+		// Stop the reader goroutine. Under SHM_DATASEG_WAKE the reader
+		// is parked in shmDataSegWaker.WaitForChange (an *os.File.Read
+		// on the eventfd via Go netpoll); ring.Close above set
+		// hdr.Closed but the parker has no way to observe that without
+		// a wake. Closing the eventfd makes Read return EBADF, which
+		// WaitForChange surfaces as ErrRingClosed, and the reader
+		// outer-loop exits. No-op on the per-address eventfd / futex
+		// path (signal* above already woke same-side parkers there).
+		if t.segment != nil {
+			t.segment.UnblockSameSideParkers()
+		}
+
 		t.readerWG.Wait()
 
 		// Close the named events (Windows)
@@ -788,7 +1018,7 @@ func (t *ShmClientTransport) Close(err error) {
 		// RFC A73: Invoke onClose callback to notify ClientConn of transport closure.
 		// This allows the addrConn to update connectivity state properly.
 		if t.onClose != nil {
-			t.onClose(t.goAwayReason)
+			t.onClose(GoAwayInfo{Reason: t.goAwayReason})
 		}
 	})
 }
@@ -828,7 +1058,7 @@ func (t *ShmClientTransport) GracefulClose() {
 }
 
 // NewStream creates a Stream for an RPC.
-func (t *ShmClientTransport) NewStream(ctx context.Context, callHdr *CallHdr) (*ClientStream, error) {
+func (t *ShmClientTransport) NewStream(ctx context.Context, callHdr *CallHdr, handler stats.Handler) (*ClientStream, error) {
 	if t.closed.Load() || t.draining.Load() {
 		return nil, &NewStreamError{Err: ErrConnClosing, AllowTransparentRetry: true}
 	}
@@ -886,13 +1116,17 @@ func (t *ShmClientTransport) NewStream(ctx context.Context, callHdr *CallHdr) (*
 				sendCompress:   callHdr.SendCompress,
 				contentSubtype: callHdr.ContentSubtype,
 			},
-			ct:         t, // Set the client transport (now an interface, no unsafe needed)
-			done:       make(chan struct{}),
-			headerChan: make(chan struct{}),
-			doneFunc:   callHdr.DoneFunc,
+			ct:           t, // Set the client transport (now an interface, no unsafe needed)
+			done:         make(chan struct{}),
+			headerChan:   make(chan struct{}),
+			doneFunc:     callHdr.DoneFunc,
+			statsHandler: handler,
 		}
 		s.Stream.buf.init()
 		s.fc = inFlow{limit: uint32(maxWindowSize)}
+		if t.initialStreamWindow > 0 && t.initialStreamWindow < int64(maxWindowSize) {
+			s.fc = inFlow{limit: uint32(t.initialStreamWindow)}
+		}
 		s.readRequester = s
 
 		// Set up transport reader for this stream
@@ -915,7 +1149,11 @@ func (t *ShmClientTransport) NewStream(ctx context.Context, callHdr *CallHdr) (*
 			t.cachedStream.Store(nil)
 		}
 		t.sendQuotaMu.Lock()
-		t.streamSendQuota[streamID] = int64(maxWindowSize)
+		streamWindow := int64(maxWindowSize)
+		if t.initialStreamWindow > 0 {
+			streamWindow = t.initialStreamWindow
+		}
+		t.streamSendQuota[streamID] = streamWindow
 		t.sendQuotaMu.Unlock()
 		t.streamInFlow[streamID] = &s.fc
 		if t.streamQuota > 0 && t.waitingStreams > 0 {
@@ -1096,6 +1334,36 @@ func (t *ShmClientTransport) updateWindow(s *ClientStream, n uint32) {
 	}
 }
 
+// onDataFrameReceived is the per-DATA-frame flow-control callback
+// the H2 decoder fires on the reader goroutine (see
+// processIncomingData where this is installed on the server→client
+// ring's hpackDecoderHolder). Same design as the server side: credit
+// HTTP/2 connection + stream windows as soon as we've seen the bytes
+// on the wire, decoupled from gRPC LPM reassembly. Without this, a
+// multi-DATA-frame response message larger than the per-stream send
+// window will deadlock the server because the client's recv-side
+// lpmAccumulator is buffering the partial LPM and won't trigger
+// handleMessage → connInFlow.onData until the whole LPM completes.
+//
+// `size` is the on-wire DATA payload length (h2fh.Length); auto-acked
+// via onRead because the SHM transport treats the ring buffer (not
+// HTTP/2 flow control) as the real backpressure signal.
+func (t *ShmClientTransport) onDataFrameReceived(streamID uint32, size uint32) {
+	if size == 0 {
+		return
+	}
+	// Refill the connection + stream windows by exactly `size`. The
+	// sendWindowUpdate batching layer (shmWindowUpdateThreshold)
+	// keeps the WINDOW_UPDATE rate sane; we don't gate through
+	// trInFlow.onData / inFlow.onData here because their limit/4
+	// thresholds are tied to maxWindowSize and won't fire under
+	// configurations where the producer's per-stream send window is
+	// smaller than the receive limit. See the matching method in
+	// shm_server_transport.go for the design rationale.
+	t.sendWindowUpdate(0, size)
+	t.sendWindowUpdate(streamID, size)
+}
+
 // closeStream closes the given stream and cleans up resources.
 // This is called by ClientStream.Close() to terminate the stream.
 func (t *ShmClientTransport) closeStream(s *ClientStream, err error, rst bool, _ http2.ErrCode, st *status.Status, mdata map[string][]string, _ bool) {
@@ -1213,6 +1481,25 @@ func (t *ShmClientTransport) writeProto(s *ClientStream, msg any, opts *WriteOpt
 		return false, nil
 	}
 
+	// Skip ZC when the message wouldn't fit in the current per-stream
+	// send window. acquireSendQuota is atomic on `quotaSize` bytes —
+	// when quotaSize exceeds the stream window it would deadlock
+	// (the receiver never gets the data so never sends a WindowUpdate
+	// big enough to admit it). The fallback write() path handles
+	// over-window messages by chunking under flow control, so just
+	// return false and let it run.
+	if !shmNoWU() {
+		t.sendQuotaMu.Lock()
+		streamQ, hasStreamQ := t.streamSendQuota[s.id]
+		if !hasStreamQ || streamQ < int64(quotaSize) || t.connSendQuota < int64(quotaSize) {
+			t.sendQuotaMu.Unlock()
+			atomic.AddUint64(&shmZCWriteSkipQuota, 1)
+			return false, nil
+		}
+		t.sendQuotaMu.Unlock()
+	}
+	// In shmNoWU mode, skip the window pre-check; ring backpressure handles it.
+
 	// Flow control: account only the gRPC payload (5-byte LPM header + proto
 	// body). The 9-byte H2 frame header is a transport-level concern and
 	// is NOT included in WINDOW_UPDATE accounting on the receive side.
@@ -1251,6 +1538,7 @@ func (t *ShmClientTransport) writeProto(s *ClientStream, msg any, opts *WriteOpt
 	}
 	if !t.frameWriter.inlineMu.TryLock() {
 		t.frameWriter.closeMu.RUnlock()
+		atomic.AddUint64(&shmZCWriteSkipInlineBusy, 1)
 		// Writer goroutine is busy — release quota and let caller fall back
 		// to the standard write path (which goes through enqueueAndWait).
 		t.sendQuotaMu.Lock()
@@ -1325,54 +1613,158 @@ func (t *ShmClientTransport) write(s *ClientStream, hdr []byte, data mem.BufferS
 
 	payloadLen := len(hdr) + data.Len()
 
-	// Enforce outbound flow control: wait for available send window.
+	// Flow-control aware write. The producer's send quota may be
+	// smaller than the full message (when grpc.WithInitialWindowSize
+	// lowers it, or — once that option is plumbed through — at the
+	// HTTP/2 default of 65535 B). The legacy acquireSendQuota call
+	// waits atomically for `payloadLen` bytes which deadlocks when
+	// payloadLen > stream window. Instead we loop:
+	//
+	//   - acquire up to `remaining` bytes of currently-available
+	//     quota (blocks only if both windows are zero),
+	//   - send that many bytes as one MESSAGE frame carrying
+	//     MessageFlagMORE so the receiver's lpmAccumulator stitches
+	//     it together with the rest of the LPM,
+	//   - repeat until the full payload has been written.
+	//
+	// Only the LAST chunk carries the caller's intended EndStream /
+	// MORE flag. Intermediate chunks always set MessageFlagMORE so
+	// the H2 codec emits DATA frames without END_STREAM.
+	//
+	// Fast path: when the first acquireUpToSendQuota grant covers
+	// the full payload (the common case in production where the
+	// stream quota is maxWindowSize = 2 GiB), we preserve the
+	// existing vectored single-frame path through writeFrameBuffers
+	// and avoid the materialisation step. The slow path materialises
+	// hdr+data once into a contiguous byte slice so we can slice
+	// across the hdr/segment boundary without ad-hoc indexing; for
+	// messages large enough to span the window this extra copy is
+	// dominated by the actual send time.
 	if shmDebugEnabled {
 		shmDebugf("[DEBUG] ShmClientTransport.write: acquiring send quota for %d bytes", payloadLen)
 	}
-	if err := t.acquireSendQuota(s.ctx, s.id, payloadLen); err != nil {
+	got, err := t.acquireUpToSendQuota(s.ctx, s.id, payloadLen)
+	if err != nil {
 		if shmDebugEnabled {
-			shmDebugf("[DEBUG] ShmClientTransport.write: acquireSendQuota failed: %v", err)
+			shmDebugf("[DEBUG] ShmClientTransport.write: acquireUpToSendQuota failed: %v", err)
 		}
 		return err
 	}
-	if shmDebugEnabled {
-		shmDebugf("[DEBUG] ShmClientTransport.write: send quota acquired")
-	}
 
-	// Write MESSAGE frame. See ringWriteProto for the rationale on
-	// the MORE / EndStream flag pair (MORE=0 signals half-close;
-	// writeFrameH2 derives the on-wire END_STREAM bit from
-	// MessageFlagEndStream).
-	fh := FrameHeader{
-		StreamID: s.id,
-		Type:     FrameTypeMESSAGE,
-		Flags:    0,
-	}
-	if opts != nil && !opts.Last {
-		fh.Flags = MessageFlagMORE
-	} else {
-		fh.Flags = MessageFlagEndStream
-	}
-
-	if shmDebugEnabled {
-		shmDebugf("[DEBUG] ShmClientTransport.write: writing frame to ring")
-	}
-	if err := t.frameWriter.enqueueAndWait(frameEntry{
-		ctx:  s.ctx,
-		fh:   fh,
-		hdr:  hdr,
-		data: data,
-	}); err != nil {
-		if shmDebugEnabled {
-			shmDebugf("[ERROR] ShmClientTransport.write: frame write failed: %v", err)
+	if got == payloadLen {
+		// Fast path: full payload fits in the currently-available
+		// window. Use the vectored frame writer to avoid materialising
+		// hdr+data into a contiguous buffer.
+		fh := FrameHeader{StreamID: s.id, Type: FrameTypeMESSAGE}
+		if opts != nil && !opts.Last {
+			fh.Flags = MessageFlagMORE
+		} else {
+			fh.Flags = MessageFlagEndStream
 		}
-		return err
-	}
-	if shmDebugEnabled {
-		shmDebugf("[DEBUG] ShmClientTransport.write: frame written successfully")
+		if shmDebugEnabled {
+			shmDebugf("[DEBUG] ShmClientTransport.write: writing single frame (fast path)")
+		}
+		// v3.4 P1a-async: under SHM_NO_WU mode, fire-and-forget the
+		// MESSAGE frame. Take ownership via data.Ref() so the caller's
+		// `defer data.Free()` does NOT prematurely release buffers
+		// the writer goroutine still needs.
+		//
+		// Errors are surfaced asynchronously: a failed ring write closes
+		// the transport, which marks all streams errored; the next stream
+		// operation observes the error. This matches stock grpc-go's
+		// loopyWriter pattern (sender does not wait for socket write ack).
+		if shmNoWU() {
+			data.Ref()
+			if err := t.frameWriter.enqueue(frameEntry{
+				ctx:      s.ctx,
+				fh:       fh,
+				hdr:      hdr,
+				data:     data,
+				freeData: true, // writer Free()s; balances our Ref()
+			}); err != nil {
+				// enqueue failed (transport closed): writer won't see
+				// the entry, so balance the Ref() here.
+				data.Free()
+				return err
+			}
+			return nil
+		}
+		if err := t.frameWriter.enqueueAndWait(frameEntry{
+			ctx:  s.ctx,
+			fh:   fh,
+			hdr:  hdr,
+			data: data,
+		}); err != nil {
+			if shmDebugEnabled {
+				shmDebugf("[ERROR] ShmClientTransport.write: frame write failed: %v", err)
+			}
+			return err
+		}
+		if shmDebugEnabled {
+			shmDebugf("[DEBUG] ShmClientTransport.write: frame written successfully")
+		}
+		return nil
 	}
 
-	return nil
+	// Slow path: payload spans multiple flow-control chunks.
+	if shmDebugEnabled {
+		shmDebugf("[DEBUG] ShmClientTransport.write: chunked write, got %d / %d on first acquire", got, payloadLen)
+	}
+	// v3.4 P5: emit each per-window iteration directly from a vecCursor
+	// over (hdr || data BufferSlice) so the producer never has to
+	// materialise the LPM into one contiguous buffer first. The
+	// pre-P5 code allocated a payloadLen-sized slice from shmLpmPool
+	// and copied hdr+data into it once before iterating — that
+	// materialise step costs one full payload-size memcpy per RPC,
+	// which at fair-default's 65535-byte initial window and 16 MB
+	// LargeUnary contributes ~3 ms of producer-side latency.
+	//
+	// The cursor's invariant is that emitMessageInlineVec advances it
+	// by exactly the requested chunk length on success, so we can
+	// walk the entire (hdr || data) once across however many
+	// flow-control grants we need. Errors abort early; the cursor's
+	// position is then meaningless but we don't reuse it.
+	cur := vecCursor{lpmHdr: hdr, data: data}
+	off := 0
+	for {
+		end := off + got
+		isLast := end == payloadLen
+		fh := FrameHeader{StreamID: s.id, Type: FrameTypeMESSAGE}
+		switch {
+		case !isLast:
+			// Intermediate chunk: receiver concatenates into one LPM.
+			fh.Flags = MessageFlagMORE
+		case opts != nil && !opts.Last:
+			// Final chunk of THIS message; more messages to follow on
+			// the stream. MessageFlagMORE here means "LPM done, more
+			// messages later" — same encoding the codec uses to keep
+			// END_STREAM off the wire.
+			fh.Flags = MessageFlagMORE
+		default:
+			// Final chunk of the LAST message on the stream.
+			fh.Flags = MessageFlagEndStream
+		}
+		if err := t.frameWriter.emitMessageInlineVec(s.ctx, fh, &cur, got); err != nil {
+			if shmDebugEnabled {
+				shmDebugf("[ERROR] ShmClientTransport.write: chunk write failed at off=%d: %v", off, err)
+			}
+			return err
+		}
+		off = end
+		if isLast {
+			if shmDebugEnabled {
+				shmDebugf("[DEBUG] ShmClientTransport.write: chunked write complete (%d bytes)", payloadLen)
+			}
+			return nil
+		}
+		got, err = t.acquireUpToSendQuota(s.ctx, s.id, payloadLen-off)
+		if err != nil {
+			if shmDebugEnabled {
+				shmDebugf("[DEBUG] ShmClientTransport.write: acquireUpToSendQuota failed mid-chunk: %v", err)
+			}
+			return err
+		}
+	}
 }
 
 // sendPing sends a PING frame with 8-byte opaque data.

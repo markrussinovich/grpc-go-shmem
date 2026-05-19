@@ -47,6 +47,32 @@ const (
 	defaultClientMaxHeaderListSize = uint32(16 << 20)
 	defaultServerMaxHeaderListSize = uint32(16 << 20)
 	upcomingDefaultHeaderListSize  = uint32(8 << 10)
+
+	// shmClientMaxMessageBurst caps the number of MESSAGE frames the client
+	// reader will deliver to recvBuffer between cooperative yields. The
+	// reader normally yields after every frame to let the app goroutine
+	// pick up the recv on the same M (avoids cross-M wakep + futex), but
+	// at high stream concurrency that yield costs N park/unparks per RPC
+	// round. The burst cap lets the reader drain a sub-batch from the
+	// ring before yielding, then yield so the woken app goroutines get
+	// scheduled. 32 is empirically large enough that one frame per
+	// stream at N <= 32 never hits the cap, and small enough that
+	// medium-payload streaming at N=100 with multi-DATA-frame messages
+	// does not starve app receivers.
+	shmClientMaxMessageBurst = 32
+	// shmServerMaxMessageBurst — same as the client cap, see comment above.
+	shmServerMaxMessageBurst = 32
+
+	// shmYieldSkipMaxPayload is the payload-size ceiling below which the
+	// receiver may skip its post-MESSAGE cooperative yield (see
+	// shm{Client,Server}MaxMessageBurst). At small payloads the app
+	// goroutine's recv work is negligible compared to the wakep cost, so
+	// staying on-CPU to drain the ring wins. At larger payloads the
+	// parallel work warrants yielding so other Ps can pick up app
+	// goroutines via work-stealing. 4 KiB is chosen empirically: below
+	// it the N=1000/64B latency improvement dominates; above it the
+	// N=100/64KB throughput would otherwise regress.
+	shmYieldSkipMaxPayload = uint32(4096)
 )
 
 // MaxStreamID is the upper bound for the stream ID before the current

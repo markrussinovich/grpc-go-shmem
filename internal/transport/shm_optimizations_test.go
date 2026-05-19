@@ -245,7 +245,7 @@ func TestShmWindowUpdateBatching(t *testing.T) {
 	}
 
 	// Now send a large delta that pushes past the threshold.
-	ct.sendWindowUpdate(0, shmWindowUpdateThreshold)
+	ct.sendWindowUpdate(0, uint32(shmWindowUpdateThreshold))
 
 	ct.sendQuotaMu.Lock()
 	pendingAfter := ct.pendingConnWU
@@ -286,7 +286,7 @@ func TestShmWindowUpdateStreamCleanup(t *testing.T) {
 	// Create a real stream.
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	s, err := ct.NewStream(ctx, &CallHdr{Host: "localhost", Method: "/test/Cleanup"})
+	s, err := ct.NewStream(ctx, &CallHdr{Host: "localhost", Method: "/test/Cleanup"}, nil)
 	if err != nil {
 		t.Fatalf("NewStream: %v", err)
 	}
@@ -449,7 +449,7 @@ func TestShmTransportInitialWindowSize(t *testing.T) {
 	}
 	defer ct.Close(nil)
 
-	if ct.initialWindowSize != shmInitialWindowSize {
+	if ct.initialWindowSize != int32(shmInitialWindowSize) {
 		t.Errorf("client initialWindowSize = %d, want %d", ct.initialWindowSize, shmInitialWindowSize)
 	}
 
@@ -459,7 +459,7 @@ func TestShmTransportInitialWindowSize(t *testing.T) {
 	}
 	defer st.Close(nil)
 
-	if st.initialWindowSize != shmInitialWindowSize {
+	if st.initialWindowSize != int32(shmInitialWindowSize) {
 		t.Errorf("server initialWindowSize = %d, want %d", st.initialWindowSize, shmInitialWindowSize)
 	}
 }
@@ -469,23 +469,53 @@ func TestShmTransportInitialWindowSize(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestShmSpinConstants(t *testing.T) {
-	// Verify spin parameters are tuned for SHM (higher than Folly defaults).
-	// Values are platform-specific: Windows uses higher values due to
-	// costlier WaitOnAddress/cgocall (~40µs), Linux uses lower values.
-	if spinIterationsDefault < 100 {
-		t.Errorf("spinIterationsDefault = %d, should be >= 100 for SHM", spinIterationsDefault)
+	// Default behaviour is no spin (loadShmSpin* all 0). Verify that
+	// ConfigureShmSpinIterations correctly applies bounded values and
+	// that ResetShmSpinIterationsForBench restores the no-spin
+	// default. The platform-specific spinIterationsLimit caps the
+	// upper bound an operator can ask for.
+	defer ResetShmSpinIterationsForBench()
+
+	// Default state: no spin.
+	if got := loadShmSpinDefault(); got != 0 {
+		t.Errorf("default shmSpinDefault = %d, want 0", got)
 	}
-	if spinIterationsMin < 10 {
-		t.Errorf("spinIterationsMin = %d, should be >= 10 for SHM", spinIterationsMin)
+	if got := loadShmSpinMax(); got != 0 {
+		t.Errorf("default shmSpinMax = %d, want 0", got)
 	}
-	if spinIterationsMax < 2000 {
-		t.Errorf("spinIterationsMax = %d, should be >= 2000 for SHM", spinIterationsMax)
+	if got := loadShmSpinMin(); got != 0 {
+		t.Errorf("default shmSpinMin = %d, want 0", got)
 	}
-	if spinIterationsMin >= spinIterationsDefault {
-		t.Error("spinIterationsMin should be < spinIterationsDefault")
+
+	// Operator opts in.
+	ConfigureShmSpinIterations(2000)
+	if got, want := loadShmSpinMax(), uint32(2000); got != want {
+		t.Errorf("after Configure(2000): shmSpinMax = %d, want %d", got, want)
 	}
-	if spinIterationsDefault >= spinIterationsMax {
-		t.Error("spinIterationsDefault should be < spinIterationsMax")
+	if got, want := loadShmSpinDefault(), uint32(2000); got != want {
+		t.Errorf("after Configure(2000): shmSpinDefault = %d, want %d (optimistic start at max)", got, want)
+	}
+	if got := loadShmSpinMin(); got != 0 {
+		t.Errorf("after Configure(2000): shmSpinMin = %d, want 0 (floor)", got)
+	}
+
+	// Clamping above platform limit.
+	ConfigureShmSpinIterations(spinIterationsLimit * 10)
+	if got, want := loadShmSpinMax(), uint32(spinIterationsLimit); got != want {
+		t.Errorf("clamp: shmSpinMax = %d, want %d (platform limit)", got, want)
+	}
+
+	// Negative input is clamped to 0.
+	ConfigureShmSpinIterations(-1)
+	if got := loadShmSpinMax(); got != 0 {
+		t.Errorf("Configure(-1): shmSpinMax = %d, want 0", got)
+	}
+
+	// Reset restores defaults.
+	ConfigureShmSpinIterations(1000)
+	ResetShmSpinIterationsForBench()
+	if got := loadShmSpinMax(); got != 0 {
+		t.Errorf("after Reset: shmSpinMax = %d, want 0", got)
 	}
 }
 
@@ -783,6 +813,107 @@ func TestShmBatchSignalSuppression(t *testing.T) {
 	}
 }
 
+// TestShmBatchDeadlockGuard verifies that a writer inside an active
+// BeginBatch session does NOT deadlock when its working set exceeds
+// ring capacity. Without the deadlock guard in ReserveWrite, this
+// scenario hangs forever: writer's per-frame Commits suppress the
+// DataSequence increment under batch mode, leaving any already-parked
+// reader sleeping on a stale sequence; the writer then fills the ring,
+// blocks in ReserveWrite, and neither side makes progress because the
+// only party that can free space (the reader) cannot see the new data.
+//
+// Regression test for BenchmarkGRPCShmLargeUnary/size=64MB on the
+// 64 MiB ring used by the bench harness.
+//
+// Uses raw ReserveWrite / ReadSlices to isolate the guard logic from
+// the H2 codec layer (which enforces HEADERS-before-DATA and would
+// otherwise reject the synthetic frames produced here).
+func TestShmBatchDeadlockGuard(t *testing.T) {
+	const ringSize = 64 * 1024 // 64 KiB ring keeps the test fast
+	segName := testSegName("test_batch_dl")
+	defer RemoveSegment(segName)
+
+	seg, err := CreateSegment(segName, ringSize, ringSize)
+	if err != nil {
+		t.Fatalf("CreateSegment: %v", err)
+	}
+	defer seg.Close()
+
+	tx := NewShmRingFromSegment(seg.A, seg.Mem)
+	rx := NewShmRingFromSegment(seg.A, seg.Mem)
+
+	// Pre-park a reader so the writer's batched commits land while the
+	// reader is asleep on dataSeq. Without this the reader may drain
+	// eagerly via spin and the deadlock window never opens.
+	const chunkCount = 5
+	const chunkSize = 16 * 1024 // 16 KiB; 5 × 16 KiB = 80 KiB > 64 KiB ring
+	readerDone := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		var consumed int
+		buf := make([]byte, chunkSize)
+		for consumed < chunkCount*chunkSize {
+			first, second, rc, err := rx.ReadSlices(ctx, 1)
+			if err != nil {
+				readerDone <- fmt.Errorf("ReadSlices at %d: %w", consumed, err)
+				return
+			}
+			n := len(first) + len(second)
+			if n > chunkSize {
+				n = chunkSize
+			}
+			// Copy what we got (we don't actually inspect it; only space
+			// freeing matters for the deadlock check).
+			off := copy(buf, first)
+			if off < n {
+				copy(buf[off:], second[:n-off])
+			}
+			rc.Commit(n)
+			consumed += n
+		}
+		readerDone <- nil
+	}()
+
+	// Give the reader a moment to enter the futex wait. The deadlock
+	// guard only matters when the reader is already parked when the
+	// writer enters its batch.
+	time.Sleep(100 * time.Millisecond)
+
+	writerCtx, writerCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer writerCancel()
+
+	tx.BeginBatch()
+	chunk := make([]byte, chunkSize)
+	for i := 0; i < chunkCount; i++ {
+		chunk[0] = byte(i)
+		res, err := tx.ReserveWrite(writerCtx, chunkSize)
+		if err != nil {
+			tx.EndBatch()
+			t.Fatalf("ReserveWrite %d: %v", i, err)
+		}
+		// Copy chunk into reservation slices (handles wrap).
+		off := copy(res.First, chunk)
+		if off < chunkSize {
+			copy(res.Second, chunk[off:])
+		}
+		if err := res.Commit(chunkSize); err != nil {
+			tx.EndBatch()
+			t.Fatalf("Commit %d: %v", i, err)
+		}
+	}
+	tx.EndBatch()
+
+	select {
+	case err := <-readerDone:
+		if err != nil {
+			t.Fatalf("reader: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("reader did not finish: deadlock guard regressed")
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Single stream cache tests
 // ---------------------------------------------------------------------------
@@ -818,7 +949,7 @@ func TestShmSingleStreamCache(t *testing.T) {
 
 	// Create first stream → cache should be set.
 	ctx := context.Background()
-	s1, err := ct.NewStream(ctx, &CallHdr{Host: "localhost", Method: "/test/SSM1"})
+	s1, err := ct.NewStream(ctx, &CallHdr{Host: "localhost", Method: "/test/SSM1"}, nil)
 	if err != nil {
 		t.Fatalf("NewStream 1: %v", err)
 	}
@@ -827,7 +958,7 @@ func TestShmSingleStreamCache(t *testing.T) {
 	}
 
 	// Create second stream → cache should be nil.
-	s2, err := ct.NewStream(ctx, &CallHdr{Host: "localhost", Method: "/test/SSM2"})
+	s2, err := ct.NewStream(ctx, &CallHdr{Host: "localhost", Method: "/test/SSM2"}, nil)
 	if err != nil {
 		t.Fatalf("NewStream 2: %v", err)
 	}

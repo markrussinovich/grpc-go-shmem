@@ -256,7 +256,7 @@ func MustUseShmForAddress(addr resolver.Address, cfg *ShmServiceConfig) bool {
 //   - onClose: Callback invoked when transport is closed
 //
 // Returns the ClientTransport or an error if connection fails.
-func NewShmClient(connectCtx, _ context.Context, addr resolver.Address, opts ConnectOptions, onClose func(GoAwayReason)) (ClientTransport, error) {
+func NewShmClient(connectCtx, _ context.Context, addr resolver.Address, opts ConnectOptions, onClose func(GoAwayInfo)) (ClientTransport, error) {
 	segmentName := GetSegmentName(addr)
 	if segmentName == "" {
 		return nil, fmt.Errorf("shm: no segment name available for address %q", addr.Addr)
@@ -266,6 +266,17 @@ func NewShmClient(connectCtx, _ context.Context, addr resolver.Address, opts Con
 	dialOpts := DefaultDialOptions()
 	if opts.KeepaliveParams != (keepalive.ClientParameters{}) {
 		dialOpts.KeepaliveParams = opts.KeepaliveParams
+	}
+	// Propagate flow-control window overrides from gRPC dial options
+	// (grpc.WithInitialWindowSize / WithInitialConnWindowSize). These
+	// reach us through ConnectOptions; we just forward them. With the
+	// default zero values the SHM transport keeps its 2 GiB quota
+	// (flow control disabled, ring buffer is backpressure).
+	if opts.InitialWindowSize > 0 {
+		dialOpts.InitialWindowSize = opts.InitialWindowSize
+	}
+	if opts.InitialConnWindowSize > 0 {
+		dialOpts.InitialConnWindowSize = opts.InitialConnWindowSize
 	}
 
 	// Use connect context timeout if available

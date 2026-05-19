@@ -20,11 +20,9 @@
 
 package transport
 
-// Stub spin constants for unsupported platforms. Uses conservative values
-// similar to Linux (low spin to avoid wasting CPU).
+// Stub spin upper bound for unsupported platforms. See shm_spin_linux.go
+// for the rationale (default is no spin; operators opt in via
+// ConfigureShmSpinIterations).
 const (
-	spinIterationsDefault = 300
-	spinIterationsMin     = 50
-	spinIterationsMax     = 4000
-	spinMoreBoost         = 10000
+	spinIterationsLimit = 4000
 )

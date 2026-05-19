@@ -21,6 +21,8 @@ package transport
 import (
 	"fmt"
 	"os"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"unsafe"
 )
@@ -560,6 +562,31 @@ type Segment struct {
 	Path string    // File path
 
 	closed atomic.Bool
+
+	// rings tracks ShmRing structs that wrap this segment's mmap.
+	// Segment.Close() walks this list and sets each ring's local
+	// closed flag BEFORE unmapping memory, so a reader / writer
+	// returning from a wake call observes localClosed=1 and skips
+	// the header access that would otherwise touch unmapped memory.
+	//
+	// Registered via Segment.RegisterRing; safe for concurrent
+	// append (registration happens during transport construction,
+	// before any goroutine is touching the ring).
+	ringsMu sync.Mutex
+	rings   []*ShmRing
+
+	// dataSegWaker is the per-data-segment per-direction eventfd
+	// waker for the SHM_DATASEG_WAKE=1 fast path. Set by
+	// CreateSegment (on the listener side) or OpenSegment (claimed
+	// from stash on the dialer side) ONLY for non-control segments.
+	// Nil for control segments (which still use the per-address
+	// eventfd registry — see shm_inproc_wake_linux.go) and when
+	// SHM_DATASEG_WAKE is not set.
+	//
+	// Propagated to every Ring registered via RegisterRing so the
+	// ring's waitFor* / signal* call sites can route through the
+	// segment's waker without a per-call lookup.
+	dataSegWaker *shmDataSegWaker
 }
 
 // hdrView provides typed access to the segment header via pointer arithmetic
@@ -573,11 +600,175 @@ type ringView struct {
 	offset  uint64         // Offset to the ring header within the segment
 }
 
+// RegisterRing records r as wrapping this segment's mmap. On
+// Segment.Close, every registered ring has its local closed flag
+// set BEFORE the segment is unmapped, so any reader / writer
+// returning from a wake call observes r.closed=1 and skips the
+// header access that would otherwise touch unmapped memory.
+//
+// Idempotent; safe to call from transport / dialer / listener
+// construction paths regardless of how many of them happen to wrap
+// the same segment.
+func (s *Segment) RegisterRing(r *ShmRing) {
+	if r == nil || s == nil {
+		return
+	}
+	s.ringsMu.Lock()
+	for _, existing := range s.rings {
+		if existing == r {
+			s.ringsMu.Unlock()
+			return
+		}
+	}
+	s.rings = append(s.rings, r)
+	// Propagate the segment's per-data-segment eventfd waker (if
+	// any) to this ring. Rings registered against a non-data segment
+	// or before the wake mode is enabled inherit nil and fall through
+	// to the per-address eventfd registry / futex path.
+	if s.dataSegWaker != nil {
+		r.SetDataSegWaker(s.dataSegWaker)
+	}
+	s.ringsMu.Unlock()
+}
+
+// SetDataSegWaker installs a per-data-segment per-direction eventfd
+// waker as the segment's wake channel. Idempotent in the sense that
+// all future RegisterRing calls propagate this waker; rings already
+// registered are NOT retroactively updated (they keep whatever they
+// had at register time). Wire-up callers (CreateSegment /
+// OpenSegment) must therefore set the waker BEFORE the first
+// RegisterRing.
+func (s *Segment) SetDataSegWaker(w *shmDataSegWaker) {
+	s.dataSegWaker = w
+}
+
+// UnblockSameSideParkers closes the per-data-segment eventfd so any
+// goroutine blocked in shmDataSegWaker.WaitForChange returns
+// immediately (the eventfd file's Read syscall returns EBADF once
+// the underlying *os.File is closed; WaitForChange maps that to
+// ErrRingClosed). Idempotent via the waker's sync.Once. No-op when
+// SHM_DATASEG_WAKE is off (waker is nil).
+//
+// Transport-level Close paths (ShmClientTransport.Close,
+// ShmServerTransport.Close) MUST call this BEFORE wg.Wait()-ing on
+// the reader/writer goroutines. The reader, parked on this side's
+// recv eventfd via Go netpoll, can only exit on Read error; without
+// this call wg.Wait deadlocks. Segment.Close (which runs later in
+// the teardown sequence) also calls the waker's Close, but by then
+// we're already past wg.Wait so it would be too late.
+//
+// This is a stop-signal, not a fan-out wake: the eventfd is
+// permanently closed, not just signalled. Subsequent Wake/Wait
+// calls become no-ops. Safe because the transport is being torn
+// down and will not produce further data on this segment.
+func (s *Segment) UnblockSameSideParkers() {
+	if s.dataSegWaker != nil {
+		s.dataSegWaker.Close()
+	}
+}
+
+// setupDataSegWakeForCreator allocates a fresh pair of per-direction
+// eventfds and binds one side to this segment, stashing the peer
+// side for the matching OpenSegment call to claim. Called by
+// CreateSegment on platforms where the primitive is supported and
+// the SHM_DATASEG_WAKE env var is set; no-op for control segments
+// (whose name ends in shmControlSuffix) since their long-lived
+// listener side never has a matching opener-creator pair within the
+// same process.
+//
+// Falls through silently if the eventfd syscalls fail: the
+// segment's rings keep their nil dataSegWaker and the existing per-
+// address eventfd / futex path handles wakes.
+func setupDataSegWakeForCreator(seg *Segment) {
+	if seg == nil || !shmDataSegWakeEnabled {
+		return
+	}
+	if strings.HasSuffix(seg.Path, shmControlSuffix) {
+		return
+	}
+	a, b, err := newShmDataSegWakerPair()
+	if err != nil || a == nil || b == nil {
+		return
+	}
+	seg.SetDataSegWaker(a)
+	stashShmDataSegWakerForOpener(seg.Path, b)
+}
+
+// setupDataSegWakeForOpener claims the stashed peer endpoint from
+// the matching CreateSegment call. No-op for control segments and
+// when the wake mode is disabled or when there is no stashed entry
+// (the cross-process case, which Phase 2 will replace with
+// SCM_RIGHTS).
+func setupDataSegWakeForOpener(seg *Segment) {
+	if seg == nil || !shmDataSegWakeEnabled {
+		return
+	}
+	if strings.HasSuffix(seg.Path, shmControlSuffix) {
+		return
+	}
+	if w := claimShmDataSegWakerForOpener(seg.Path); w != nil {
+		seg.SetDataSegWaker(w)
+	}
+}
+
 // Close unmaps the memory and closes the file
 func (s *Segment) Close() error {
 	if !s.closed.CompareAndSwap(false, true) {
 		return nil
 	}
+
+	// Set the local closed flag on every Ring that wraps this segment
+	// BEFORE unmapping. Readers / writers parked in waitForData /
+	// waitForSpace re-check `r.closed` after wake and skip any
+	// further header access if set, avoiding use-after-unmap when
+	// the segment tears down with a wait outstanding.
+	s.ringsMu.Lock()
+	for _, r := range s.rings {
+		atomic.StoreUint32(&r.closed, 1)
+	}
+	registered := s.rings
+	s.rings = nil
+	s.ringsMu.Unlock()
+
+	// Wake any waiters so they return from waitFor* and observe the
+	// localClosed flag set above. Use the abstracted wake APIs so the
+	// inproc-wake path (Go channels) and the futex / events path both
+	// drain correctly.
+	for _, r := range registered {
+		hdr := r.header()
+		r.signalData(&hdr.dataSeq)
+		r.signalSpace(&hdr.spaceSeq)
+		r.signalContig(&hdr.contigSeq)
+	}
+
+	// NOTE: We intentionally do NOT call dataSegWaker.RewakeLocal()
+	// here. ring.Close() already does it for each registered ring
+	// during the transport-level teardown which happens BEFORE
+	// Segment.Close. Doing it again here would create a race window:
+	// (1) we wake a same-side parker, (2) the parker's outer loop
+	// re-enters waitFor*/header access, (3) the unmap below frees
+	// the header memory mid-access. The dataSegWaker.Close() further
+	// down closes the eventfd which will return ErrClosed to any
+	// final parker through the read syscall path -- that is the
+	// correct teardown route at the segment level.
+
+	// Release any same-process wake channels registered against this
+	// segment so subsequent tests / connections don't reuse stale
+	// entries pointing into the about-to-unmap region. No-op on the
+	// futex path (registry is empty).
+	dropInprocWakersForSegment(s.Path)
+
+	// Release the per-data-segment socketpair endpoint (if any).
+	// Closing the *os.File causes the peer's parked Read to return
+	// io.EOF -- our shmDataSegWaker.Wait maps that to ErrRingClosed
+	// so the peer's ring loop exits cleanly. Also drains any
+	// unclaimed stash entry (in case CreateSegment ran but the
+	// matching OpenSegment never happened).
+	if s.dataSegWaker != nil {
+		s.dataSegWaker.Close()
+		s.dataSegWaker = nil
+	}
+	dropShmDataSegWakerStash(s.Path)
 
 	var firstErr error
 
