@@ -59,11 +59,14 @@ Both read from `tmp/fair_results/A_fair_default*.txt` and
 | Var | Meaning |
 |---|---|
 | `BENCH_PROFILE=fair-default` | HTTP/2 stock window=65535, frame=16384 applied uniformly to SHM/UDS/TCP. |
-| `SHM_NO_WU=1` | SHM elides HTTP/2 `WINDOW_UPDATE`; ring backpressure is the canonical FC primitive. (Will be specified in the gRFC.) |
-| `SHM_DATASEG_WAKE=1` | `eventfd` wake on the data segment (Linux production default). |
-| `SHM_INPROC_WAKE` | **Leave unset.** In-process same-binary wake shortcut; bench-only optimisation that overstates SHM small-message numbers by 2-3× and has no UDS/TCP equivalent. |
 | `BENCH_DIRTY_DEFAULT_POOL=1` | Swaps grpc-go's process-wide default buffer pool to a dirty (no-memclr-on-Get) variant. **Cross-transport** (affects SHM + UDS + TCP). Off by default in the canonical numbers. |
 | `SHM_BENCH_CPU=1` | Include `%cpu` and `cpu-ns/op` columns in bench output (Linux only, ResourceUsage). |
+
+Note: the v3.4 baseline (no-WINDOW_UPDATE flow control + per-data-segment eventfd waker)
+is now the default behaviour of the SHM transport. There are no env vars to enable them;
+tests/benchmarks that want to compare against the futex / HTTP/2-WU paths can call
+`transport.ConfigureShmNoWindowUpdate(false)` and / or
+`transport.ConfigureShmEventfdWakerForBench(false)` before running.
 
 ## Output layout reference
 

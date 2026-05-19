@@ -1189,7 +1189,7 @@ func (s *Server) sendResponse(ctx context.Context, stream *transport.ServerStrea
 	// the default proto codec, and the message is a proto.Message (not an
 	// adapted v1 message), try to serialize directly into the ring buffer.
 	if cp == nil && comp == nil && stream.ContentSubtype() == "" {
-		if pm, ok := msg.(protoV2Message); ok {
+		if pm, ok := msg.(protobuf.Message); ok {
 			pSize := protobuf.Size(pm)
 			if pSize > s.opts.maxSendMessageSize {
 				return status.Errorf(codes.ResourceExhausted, "grpc: trying to send message larger than max (%d vs. %d)", pSize, s.opts.maxSendMessageSize)

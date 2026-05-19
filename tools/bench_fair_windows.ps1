@@ -47,19 +47,15 @@ function Invoke-PreClean {
         Remove-Item -Force -ErrorAction SilentlyContinue
 }
 
-# --- Env (matches Linux fair-bench knobs minus *_WAKE which are Linux-only)
+# --- Env (v3.4 baseline: no-WU + eventfd waker are now ON by default in
+# the SHM transport, not env-driven. Only BENCH_PROFILE etc. remain.)
 function Set-BenchEnv {
     param([switch]$DirtyPool)
-    # Clear all SHM_* first
-    'SHM_INPROC_WAKE','SHM_NO_WU','BENCH_PROFILE','SHM_DATASEG_WAKE',
-    'SHM_BENCH_CPU','BENCH_DIRTY_DEFAULT_POOL' | ForEach-Object {
+    'BENCH_PROFILE','SHM_BENCH_CPU','BENCH_DIRTY_DEFAULT_POOL' | ForEach-Object {
         Remove-Item "Env:$_" -ErrorAction SilentlyContinue
     }
-    $env:SHM_NO_WU       = '1'
     $env:BENCH_PROFILE   = 'fair-default'
     $env:SHM_BENCH_CPU   = '1'
-    # Note: SHM_DATASEG_WAKE / SHM_INPROC_WAKE are Linux eventfd-specific
-    # and ignored on Windows (Windows uses Events for wake).
     if ($DirtyPool) { $env:BENCH_DIRTY_DEFAULT_POOL = '1' }
 }
 

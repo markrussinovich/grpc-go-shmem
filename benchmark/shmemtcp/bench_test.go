@@ -52,6 +52,7 @@ import (
 	"google.golang.org/grpc/benchmark"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/experimental"
+	"google.golang.org/grpc/experimental/shm"
 	imem "google.golang.org/grpc/internal/mem"
 	"google.golang.org/grpc/internal/transport"
 	testgrpc "google.golang.org/grpc/interop/grpc_testing"
@@ -136,6 +137,17 @@ func TestMain(m *testing.M) {
 		}
 		experimental.SetDefaultBufferPool(dirty)
 	}
+
+	// The bench harness measures the production-equivalent SHM path:
+	// no-WU is on by default; the per-data-segment eventfd waker is
+	// OFF by default for cross-process safety (see internal/transport
+	// shmDataSegWakerEnabledAtomic doc). Same-process benchmarks
+	// running here reproduce the v3.4 baseline numbers, which were
+	// captured with eventfd ON, by enabling it explicitly. Use
+	// ConfigureShmEventfdWakerForBench(false) in an individual bench
+	// to compare against the futex fallback.
+	transport.ConfigureShmEventfdWakerForBench(true)
+
 	sweepStaleShmSegments()
 	code := m.Run()
 	sweepStaleShmSegments()
@@ -197,20 +209,6 @@ func logBenchEnvOnce(b *testing.B) {
 		if spin == "" {
 			spin = "0 (default, no spin)"
 		}
-		dsWake := os.Getenv("SHM_DATASEG_WAKE")
-		if dsWake == "" {
-			dsWake = "0 (off)"
-		}
-		inprocWake := os.Getenv("SHM_INPROC_WAKE")
-		if inprocWake == "" {
-			inprocWake = "0 (off, futex fallback)"
-		}
-		noWU := os.Getenv("SHM_NO_WU")
-		if noWU == "" {
-			noWU = "0 (off, flow control + WU active)"
-		} else if noWU == "1" {
-			noWU = "1 (WU elided, send-quota skipped; fast-path async fire-and-forget)"
-		}
 		dirtyPool := os.Getenv("BENCH_DIRTY_DEFAULT_POOL")
 		if dirtyPool == "" {
 			dirtyPool = "0 (off, grpc-go stock pool: shouldZero=true clears tier on every Get -- applies to ALL transports)"
@@ -221,8 +219,13 @@ func logBenchEnvOnce(b *testing.B) {
 		if bProf == "" {
 			bProf = "shm-tuned (SHM keeps 2 GiB quota, TCP/UDS HTTP/2 defaults)"
 		}
-		b.Logf("SHM bench env: BENCH_PROFILE=%s SHM_NO_WU=%s BENCH_DIRTY_DEFAULT_POOL=%s SHM_DATASEG_WAKE=%s SHM_INPROC_WAKE=%s SHM_SPIN_ITERS=%s initialWindowSize=%d maxFrameSize=%d applyToShm=%v",
-			bProf, noWU, dirtyPool, dsWake, inprocWake, spin,
+		// Note: no-WU flow control and eventfd waker are now ON by
+		// default (v3.4 baseline). Tests that want to compare against
+		// the futex / HTTP/2-WU path can call
+		// transport.ConfigureShmNoWindowUpdate(false) or
+		// transport.ConfigureShmEventfdWakerForBench(false).
+		b.Logf("SHM bench env: BENCH_PROFILE=%s BENCH_DIRTY_DEFAULT_POOL=%s SHM_SPIN_ITERS=%s initialWindowSize=%d maxFrameSize=%d applyToShm=%v",
+			bProf, dirtyPool, spin,
 			prof.initialWindowSize, prof.maxFrameSize, prof.applyToShm,
 		)
 	})
@@ -243,17 +246,17 @@ func logBenchEnvOnce(b *testing.B) {
 // BENCH_PROFILE to one of:
 //
 //   - shm-tuned    : (default) SHM keeps its production 2 GiB quota;
-//                    TCP / UDS use HTTP/2 default 65535. Matches the
-//                    historical numbers in the repo. Shows SHM's
-//                    upper bound when tuned for local IPC.
+//     TCP / UDS use HTTP/2 default 65535. Matches the
+//     historical numbers in the repo. Shows SHM's
+//     upper bound when tuned for local IPC.
 //
 //   - fair-default : All three transports use HTTP/2 default 65535 B.
-//                    Doug's preferred comparison. Tests SHM purely on
-//                    transport mechanics, no flow-control advantage.
+//     Doug's preferred comparison. Tests SHM purely on
+//     transport mechanics, no flow-control advantage.
 //
 //   - fair-32mb    : All three transports use 32 MiB windows. Tests
-//                    SHM against TCP / UDS when operators tune
-//                    grpc.WithInitialWindowSize for streaming.
+//     SHM against TCP / UDS when operators tune
+//     grpc.WithInitialWindowSize for streaming.
 type benchProfile struct {
 	// initialWindowSize, when > 0, is passed as
 	// grpc.WithInitialWindowSize on the client and
@@ -400,7 +403,7 @@ func newShmEnv(b *testing.B) *grpcBenchEnv {
 	stop := benchmark.StartServer(benchmark.ServerInfo{Type: "protobuf", Listener: lis}, srvOpts...)
 
 	dialOpts := []grpc.DialOption{
-		grpc.WithShmTransport(),
+		shm.WithTransport(),
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithDefaultCallOptions(
 			grpc.MaxCallRecvMsgSize(benchMaxMsg),

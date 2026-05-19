@@ -18,12 +18,12 @@
 #
 # All bench runs use:
 #   BENCH_PROFILE=fair-default     (Doug D-B2: equalize HTTP/2 settings)
-#   SHM_DATASEG_WAKE=1             (per-direction eventfd waker)
-#   SHM_INPROC_WAKE=1              (per-address eventfd registry; both
-#                                   layers are opt-in but compatible)
 #   SHM_BENCH_CPU=1                (Doug D-B3: report cpu-ns/op)
 #   SHM_BENCH_ZC=1                 (zero-copy probe metrics)
 #   no SHM_SPIN_ITERS              (Doug D-B5: spin OFF by default)
+#
+# v3.4 baseline behaviours (no-WU + eventfd waker) are now the SHM
+# transport defaults; no env var is needed to enable them.
 #
 # Required tools: go (>=1.25), pidstat (sysstat package), lsof.
 
@@ -55,9 +55,7 @@ GO="${GO:-/usr/local/go/bin/go}"
 } > "$OUT/env.txt" 2>&1
 echo "--> env.txt"
 
-# Common SHM-wake flags across all profiles.
-export SHM_DATASEG_WAKE=1
-export SHM_INPROC_WAKE=1
+# Common bench-harness flags across all profiles.
 export SHM_BENCH_CPU=1
 export SHM_BENCH_ZC=1
 unset SHM_SPIN_ITERS

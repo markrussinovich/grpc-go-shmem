@@ -34,25 +34,25 @@ import (
 //
 // Persistent FDs per SHM connection per process, on Linux:
 //
-//   0 × FD  → /dev/shm/grpc_shm_<name>  — the mmap'd segment file fd
-//                                         is closed immediately after
-//                                         mmap. The kernel keeps the
-//                                         inode alive via the VMA
-//                                         mapping, so the segment
-//                                         remains valid. RemoveSegment
-//                                         uses path-based unlink, no
-//                                         fd needed.
-//   0 × eventfd — by default (futex fallback path). With
-//                 SHM_INPROC_WAKE=1, a small number of eventfds
-//                 (one per (segmentID, address) lazily allocated)
-//                 are used for netpoll-integrated waits. See
-//                 TestShmFDCountEnd2End for live numbers.
+//	0 × FD  → /dev/shm/grpc_shm_<name>  — the mmap'd segment file fd
+//	                                      is closed immediately after
+//	                                      mmap. The kernel keeps the
+//	                                      inode alive via the VMA
+//	                                      mapping, so the segment
+//	                                      remains valid. RemoveSegment
+//	                                      uses path-based unlink, no
+//	                                      fd needed.
+//	2 × eventfd — a pair of eventfds per data segment
+//	              (1 per direction) backing the per-data-segment
+//	              wake primitive. ON by default on Linux.
+//	              See TestShmFDCountEnd2End for live numbers.
 //
 // Total persistent SHM-file FDs per process per connection: ZERO.
 //
 // Compare to:
-//   TCP loopback : 1 socket FD per side
-//   UDS          : 1 socket FD per side
+//
+//	TCP loopback : 1 socket FD per side
+//	UDS          : 1 socket FD per side
 //
 // SHM is now strictly better than TCP/UDS for the data plane FD
 // footprint (zero persistent FDs for the segment files themselves).

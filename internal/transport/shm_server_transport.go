@@ -353,12 +353,6 @@ func NewShmServerTransport(segment *Segment, localAddr, remoteAddr net.Addr) (*S
 	clientToServer := NewShmRingFromSegment(segment.A, segment.Mem)
 	serverToClient := NewShmRingFromSegment(segment.B, segment.Mem)
 
-	// Tag both rings with the segment path so the same-process wake
-	// registry (SHM_INPROC_WAKE=1 experimental path) can match
-	// producer / consumer by (segmentID, byte-offset). See ring.go
-	// SetSegmentID for rationale.
-	clientToServer.SetSegmentID(segment.Path)
-	serverToClient.SetSegmentID(segment.Path)
 	segment.RegisterRing(clientToServer)
 	segment.RegisterRing(serverToClient)
 
@@ -1160,7 +1154,7 @@ func (t *ShmServerTransport) Close(err error) {
 			t.writeEvents.Close()
 		}
 
-		// Stop the reader goroutine. Under SHM_DATASEG_WAKE the reader
+		// Stop the reader goroutine. Under the eventfd waker the reader
 		// is parked in shmDataSegWaker.WaitForChange (an *os.File.Read
 		// on the eventfd via Go netpoll); ring.Close above set
 		// hdr.Closed but the parker has no way to observe that without

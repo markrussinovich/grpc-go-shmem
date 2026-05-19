@@ -103,57 +103,102 @@ func (c *shmTC) Info() credentials.ProtocolInfo {
 }
 
 // ClientHandshake performs the client-side handshake for shared memory transport.
-// For shared memory, authentication is implicit - both processes can access
-// the same memory segment has already proved locality.
+//
+// The actual identity exchange happens at the transport layer (see
+// internal/transport.ShmSecurityHandshaker), which mutually exchanges
+// per-side identity tokens during the SHM control-segment handshake.
+// By the time this method runs, the conn already carries an AuthInfo
+// (typically a transport.ShmAuthInfo) populated with the verified peer
+// identity. This method simply forwards that AuthInfo and applies the
+// caller-supplied VerifyIdentity callback, if any.
+//
+// If conn does not expose a transport-level AuthInfo (e.g. the conn was
+// produced by a test harness that bypassed the handshake), this method
+// returns Info with RemoteIdentity == "" and SecurityLevel
+// PrivacyAndIntegrity. A non-nil VerifyIdentity callback configured via
+// Options will be invoked with that empty string so the caller can
+// decide whether to reject the connection.
 func (c *shmTC) ClientHandshake(_ context.Context, _ string, conn net.Conn) (net.Conn, credentials.AuthInfo, error) {
 	// Verify this is a shared memory connection
 	if conn.RemoteAddr().Network() != "shm" {
 		return nil, nil, fmt.Errorf("shm credentials require shm network, got %q", conn.RemoteAddr().Network())
 	}
 
-	// For shared memory, the handshake is performed at the transport level
-	// using the ShmSecurityHandshaker. Here we just return the AuthInfo.
-	// The actual handshake frames are exchanged in the transport layer.
-
-	// Check if AuthInfo was already set by transport-level handshake
-	if shmConn, ok := conn.(interface{ AuthInfo() credentials.AuthInfo }); ok {
-		if authInfo := shmConn.AuthInfo(); authInfo != nil {
-			return conn, authInfo, nil
-		}
-	}
-
-	// Return basic auth info - transport layer handles the actual handshake
-	return conn, Info{
+	// Prefer the transport-layer AuthInfo if available (real handshake).
+	var authInfo credentials.AuthInfo = Info{
 		CommonAuthInfo: credentials.CommonAuthInfo{
 			SecurityLevel: credentials.PrivacyAndIntegrity,
 		},
-		LocalIdentity:  c.identity,
-		RemoteIdentity: "", // Will be set by transport handshake
-	}, nil
+		LocalIdentity: c.identity,
+	}
+	if p, ok := conn.(interface{ AuthInfo() credentials.AuthInfo }); ok {
+		if ai := p.AuthInfo(); ai != nil {
+			authInfo = ai
+		}
+	}
+
+	if err := c.runVerify(authInfo); err != nil {
+		return nil, nil, err
+	}
+	return conn, authInfo, nil
 }
 
 // ServerHandshake performs the server-side handshake for shared memory transport.
+//
+// See ClientHandshake for the model: the actual identity exchange happens
+// at the transport layer; this method forwards the resulting AuthInfo
+// and applies the caller-supplied VerifyIdentity callback, if any.
 func (c *shmTC) ServerHandshake(conn net.Conn) (net.Conn, credentials.AuthInfo, error) {
 	// Verify this is a shared memory connection
 	if conn.RemoteAddr().Network() != "shm" {
 		return nil, nil, fmt.Errorf("shm credentials require shm network, got %q", conn.RemoteAddr().Network())
 	}
 
-	// Check if AuthInfo was already set by transport-level handshake
-	if shmConn, ok := conn.(interface{ AuthInfo() credentials.AuthInfo }); ok {
-		if authInfo := shmConn.AuthInfo(); authInfo != nil {
-			return conn, authInfo, nil
-		}
-	}
-
-	// Return basic auth info - transport layer handles the actual handshake
-	return conn, Info{
+	var authInfo credentials.AuthInfo = Info{
 		CommonAuthInfo: credentials.CommonAuthInfo{
 			SecurityLevel: credentials.PrivacyAndIntegrity,
 		},
-		LocalIdentity:  c.identity,
-		RemoteIdentity: "", // Will be set by transport handshake
-	}, nil
+		LocalIdentity: c.identity,
+	}
+	if p, ok := conn.(interface{ AuthInfo() credentials.AuthInfo }); ok {
+		if ai := p.AuthInfo(); ai != nil {
+			authInfo = ai
+		}
+	}
+
+	if err := c.runVerify(authInfo); err != nil {
+		return nil, nil, err
+	}
+	return conn, authInfo, nil
+}
+
+// runVerify invokes the caller-supplied VerifyIdentity callback (if any)
+// against the RemoteIdentity carried by the handshake's AuthInfo. The
+// AuthInfo may be either this package's Info or the internal transport
+// ShmAuthInfo (which exposes RemoteIdentity through the
+// remoteIdentityCarrier duck-typed interface so this package does not
+// have to import internal/transport).
+func (c *shmTC) runVerify(ai credentials.AuthInfo) error {
+	if c.verify == nil {
+		return nil
+	}
+	var remote string
+	switch v := ai.(type) {
+	case Info:
+		remote = v.RemoteIdentity
+	case remoteIdentityCarrier:
+		remote = v.GetRemoteIdentity()
+	}
+	return c.verify(remote)
+}
+
+// remoteIdentityCarrier is satisfied by any AuthInfo implementation that
+// can surface a remote identity string. Notably the internal transport's
+// ShmAuthInfo type implements this method, allowing this package to
+// extract the verified peer identity without taking a build-time
+// dependency on internal/transport.
+type remoteIdentityCarrier interface {
+	GetRemoteIdentity() string
 }
 
 // Clone makes a copy of shared memory credentials.

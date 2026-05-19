@@ -41,6 +41,7 @@ import (
 	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/stats"
 	"google.golang.org/grpc/status"
+	protobuf "google.golang.org/protobuf/proto"
 )
 
 func init() {
@@ -1036,13 +1037,13 @@ func recv(p *parser, c baseCodec, s recvCompressor, dc Decompressor, m any, maxR
 	// buffer without MaterializeToBuffer copy. Custom codecs are not
 	// bypassed — they may have validation or different serialization.
 	if len(data) == 1 {
-		if pm, ok := m.(protoV2Message); ok {
+		if pm, ok := m.(protobuf.Message); ok {
 			isProtoCodec := true
 			if nc, ok := c.(interface{ Name() string }); ok {
 				isProtoCodec = nc.Name() == "proto"
 			}
 			if isProtoCodec {
-				if err := protoUnmarshalDirect(data[0].ReadOnlyData(), pm); err != nil {
+				if err := protobuf.Unmarshal(data[0].ReadOnlyData(), pm); err != nil {
 					return status.Errorf(codes.Internal, "grpc: failed to unmarshal the received message: %v", err)
 				}
 				return nil

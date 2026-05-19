@@ -14,53 +14,214 @@
  * limitations under the License.
  */
 
-// Package transport provides a shared memory transport implementation for gRPC.
+// Package transport contains gRPC-Go's transport plumbing, including the
+// experimental shared-memory transport (SHM). This file documents the SHM
+// transport at the level of architecture, on-wire layout, lifecycle, and
+// runtime tunables. The user-facing entry points (NewShmListener,
+// WithShmTransport, ShmDiscovery*) live in the top-level
+// google.golang.org/grpc package and are marked Experimental.
 //
-// This package implements a high-performance shared memory transport that allows
-// gRPC communication between processes on the same machine without going through
-// the kernel network stack. The transport uses memory-mapped files and efficient
-// synchronization primitives to minimize latency and maximize throughput for
-// local inter-process communication.
+// # Goal
 //
-// # Core Components
+// SHM provides low-latency, high-throughput gRPC communication between
+// two processes (or two goroutines within one process) on the same host
+// without traversing the kernel network stack. Frames are written
+// directly into a memory region that is mmapped into both peers and
+// flow-controlled via in-region ring buffers. The transport is intended
+// for the local-loopback case where TCP and UDS impose unnecessary
+// per-message kernel work.
 //
-// The foundation is a lock-free ring buffer (Ring) that provides:
+// # Architecture overview
 //
-//   - Single-Producer/Single-Consumer (SPSC) semantics for optimal performance
-//   - Non-blocking operations that return immediately with progress made
-//   - Power-of-two capacity requirement for efficient modulo operations
-//   - Zero-copy reservation API for high-performance in-place I/O
-//   - Cache-line padding to prevent false sharing between producer and consumer
+//	Process A (client)                Process B (server)
+//	+------------------+             +------------------+
+//	|  ShmClient       |             |  ShmServer       |
+//	|  Transport       |             |  Transport       |
+//	+------+-----------+             +----------+-------+
+//	       |   read/write frames                |
+//	       v                                    v
+//	+-------------------------------------------------+
+//	|     Data segment  /dev/shm/grpc_shm_<rand>      |
+//	|  +----------------+    +----------------+       |
+//	|  | Ring A (C->S)  |    | Ring B (S->C)  |       |
+//	|  |  ring header   |    |  ring header   |       |
+//	|  |  ring buffer   |    |  ring buffer   |       |
+//	|  +----------------+    +----------------+       |
+//	+-------------------------------------------------+
 //
-// # SPSC Design
+// Each ClientConn has its own data segment. A separate, smaller "control
+// segment" is created by the listener and used for the initial dial /
+// accept handshake (segment-name exchange, capability negotiation). See
+// shm_listener.go for the control-segment lifecycle.
 //
-// The ring buffer is designed for exactly one writer goroutine and one reader
-// goroutine operating concurrently. This constraint enables lock-free operation
-// using only atomic operations for synchronization. Each side owns its respective
-// index (writer owns write index, reader owns read index) and only reads the
-// other side's index, eliminating contention.
+// # Segment layout
 //
-// # Non-Blocking Semantics
+//	Offset       Length    Field
+//	0x00          8        SegmentMagic "GRPCSHM\0"
+//	0x08          4        SegmentVersion (uint32, currently 1)
+//	0x0C          4        flags
+//	0x10          8        totalSize
+//	0x18          8        ringAOff
+//	0x20          8        ringACap (power-of-two)
+//	0x28          8        ringBOff
+//	0x30          8        ringBCap (power-of-two)
+//	0x38          4        serverPID
+//	0x3C          4        clientPID
+//	0x40          4        serverReady flag
+//	0x44          4        clientReady flag
+//	0x48          4        closed flag
+//	0x4C          4        pad
+//	0x50          4        maxStreams
+//	0x54-0x7F    44        reserved
 //
-// All I/O operations (Read, Write, ReserveWrite, PeekRead) are non-blocking and
-// return immediately. If insufficient space or data is available, operations
-// return partial progress (which may be zero) rather than blocking. This design
-// enables building event-driven systems on top of the ring buffer.
+// At the offsets carried by the header, each Ring has its own header
+// (capacity, monotonic widx/ridx, waiter counts, futex sequence words)
+// followed by the ring data area. RingHeader fields are defined in
+// shm_segment.go.
 //
-// # Power-of-Two Capacity
+// On creation, the server writes Magic, Version, capacities, and PIDs,
+// then sets serverReady. On open, the client validates Magic and Version
+// (see ValidateSegmentHeader) before touching any other field.
 //
-// Ring buffer capacity is always rounded up to the next power of two (minimum 16 bytes).
-// This requirement enables efficient modulo operations using bitwise AND with a mask,
-// avoiding expensive division operations in the critical path. The capacity constraint
-// also aligns with typical CPU cache line sizes for optimal memory access patterns.
+// # Wire frames
 //
-// # Thread Safety
+// Frames carried in each ring follow gRPC-over-HTTP/2 semantics adapted
+// to a byte-stream-free medium: each frame has a fixed 9-byte header
+// (Type/Flags/Length/StreamID) followed by Length bytes of payload. The
+// frame layer is in shm_frame.go. Supported frame types include the
+// usual HTTP/2 set (HEADERS, DATA, WINDOW_UPDATE, RST_STREAM, PING,
+// GOAWAY, SETTINGS) plus a few SHM-specific control frames (Handshake
+// Init/Resp, Connect/ConnectAck for stream setup).
 //
-// The ring buffer is safe for concurrent use by one writer and one reader goroutine.
-// All synchronization is handled through atomic operations on the read and write
-// indices. The implementation has been thoroughly tested with Go's race detector
-// and stress-tested with high-throughput concurrent workloads.
+// Stream multiplexing follows HTTP/2 stream-ID semantics: odd IDs are
+// client-initiated, even IDs reserved. Concurrency is bounded by the
+// header's maxStreams field.
 //
-// The implementation prioritizes correctness and portability while maintaining
-// low-overhead data paths suitable for high-frequency gRPC communication.
+// # Connection lifecycle
+//
+//  1. Listen. NewShmListener creates a control segment (a small
+//     SegmentMagic-tagged region) at a caller-supplied path. The server
+//     starts accepting via Accept.
+//  2. Dial. The client calls DialShm with the same segment name. It
+//     opens and validates the control segment, then exchanges a small
+//     CONNECT frame to learn the dynamic name of a private data segment
+//     the server allocates per-connection.
+//  3. Handshake. The client opens the data segment, mmaps it, and the
+//     SHM security handshaker (shm_security.go) exchanges identity
+//     tokens over the data rings, producing a ShmAuthInfo carried up
+//     via credentials.AuthInfo.
+//  4. Steady state. Both sides run a writer loop (loopyWriter
+//     equivalent) and a reader loop on their respective ring. Streams
+//     are created, framed, and torn down per HTTP/2 semantics.
+//  5. Close. Either side may set the segment's closed flag and signal
+//     the wake primitive. The peer drains in-flight frames and unmaps;
+//     the server unlinks the segment file from /dev/shm.
+//
+// # Wake primitives
+//
+// Ring backpressure is the canonical flow-control primitive. When a
+// reader finds the ring empty (or a writer finds it full), it must park
+// efficiently rather than spin. Three wake primitives are available:
+//
+//   - Futex (default, Linux). A uint32 sequence word in the ring
+//     header. FUTEX_WAIT/FUTEX_WAKE on Linux gives sub-microsecond wake
+//     latency with no per-connection file descriptor cost.
+//   - Eventfd (default, Linux). A pair of eventfds per data segment
+//     (one per direction) registered with Go's netpoller. Integrates
+//     with select/epoll, scales to many connections, ~1µs wake
+//     latency.
+//   - Windows events. Named events created with CreateRingEvents are
+//     the cross-mapping wake primitive on Windows where futex is
+//     unavailable.
+//
+// All wake-primitive selection is centralized in shm_config.go (env
+// vars) and chosen at process start. The hot path never calls
+// os.Getenv.
+//
+// # Flow control
+//
+// Two modes are supported:
+//
+//   - HTTP/2 WINDOW_UPDATE (default). The transport advertises
+//     INITIAL_WINDOW_SIZE in SETTINGS and the standard send-quota +
+//     WINDOW_UPDATE accounting governs how much data each side may
+//     have in flight. This matches the wire behaviour of the HTTP/2
+//     transport and makes SHM/UDS/TCP bench comparisons honest.
+//   - "no-WU" (default in v3.4, toggle via ConfigureShmNoWindowUpdate).
+//     Sender skips acquireSendQuota and does not emit WINDOW_UPDATE;
+//     receiver drops incoming WINDOW_UPDATE. The ring's natural
+//     backpressure becomes the only flow-control limit. This is the
+//     v3.4 baseline described in shm-rfc/. Both peers MUST be in the
+//     same mode.
+//
+// # Security
+//
+// SHM operates between processes on the same host, so a cooperating
+// peer is assumed to have proven locality by mapping the named segment.
+// On top of that locality proof, ShmSecurityHandshaker exchanges
+// per-side identity strings (default "pid:<getpid>"; configurable
+// through credentials/shm.Options.Identity) which surface in
+// ShmAuthInfo.RemoteIdentity. Callers can supply
+// credentials/shm.Options.VerifyIdentity to reject unknown peers.
+//
+// The implementation does NOT defend against an attacker with write
+// access to /dev/shm. Sites with that threat model must restrict
+// /dev/shm permissions via the OS.
+//
+// # Resource footprint
+//
+// At steady state, a single ClientConn over SHM holds:
+//
+//   - 1 mmapped region per data segment (256 MiB by default).
+//   - 0 open file descriptors for the segment file (the fd is closed
+//     immediately after mmap; the kernel keeps the inode alive via the
+//     VMA mapping).
+//   - 2 eventfds per data segment (1 per direction) for the wake
+//     primitive. ON by default on Linux. Toggle off for tests via
+//     ConfigureShmEventfdWakerForBench.
+//
+// The control segment adds one mmapped region per listener; same fd
+// model.
+//
+// # Cross-platform
+//
+// Linux is the primary target (futex, eventfd, /dev/shm). Windows is
+// supported via memory-mapped files + named events. macOS lacks futex;
+// the gRFC's Open Issues section tracks a kqueue-based design but it is
+// not implemented today; macOS builds compile but skip the
+// platform-specific wake fast paths.
+//
+// # Runtime tunables
+//
+// All environment variables read by production SHM code are declared
+// and documented in shm_config.go. Test and benchmark scaffolding
+// (BENCH_PROFILE, BENCH_DIRTY_DEFAULT_POOL, SHM_SPIN_ITERS,
+// SHM_BENCH_CPU, SHM_BENCH_ZC) is local to its own files and not part
+// of the production runtime API.
+//
+// # Ring buffer SPSC properties
+//
+// The foundation Ring type is a Single-Producer/Single-Consumer
+// lock-free buffer:
+//
+//   - Capacity is rounded to a power of two so wrap-around uses a
+//     single bitwise-AND.
+//   - The writer owns widx, the reader owns ridx; each side only reads
+//     the other's index via atomic load, eliminating contention.
+//   - All I/O calls (Read, Write, ReserveWrite, PeekRead) are
+//     non-blocking and return partial progress. Blocking semantics are
+//     layered on top via the wake primitives described above.
+//   - Cache-line padding between the producer- and consumer-owned
+//     fields avoids false sharing.
+//
+// # Where to read next
+//
+//   - shm_segment.go      on-disk layout, header validation, segment lifecycle
+//   - shm_ring.go / ring.go  lock-free SPSC ring buffer
+//   - shm_frame.go        gRPC-over-SHM frame layout
+//   - shm_listener.go     server-side accept + control segment
+//   - shm_dialer.go       client-side dial + data-segment open
+//   - shm_security.go    handshake / identity exchange
+//   - shm_config.go      centralized env-var tunables
+//   - shm-rfc/           the gRFC proposal in narrative form
 package transport

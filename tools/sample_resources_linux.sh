@@ -14,9 +14,10 @@ clean_shm() {
     sleep 1
 }
 
-unset SHM_INPROC_WAKE
-export SHM_NO_WU=1 BENCH_PROFILE=fair-default SHM_DATASEG_WAKE=1 SHM_BENCH_CPU=1
 unset BENCH_DIRTY_DEFAULT_POOL
+# v3.4 baseline: no-WU + eventfd waker are ON by default (the transport's
+# Configure* APIs control these; no env var needed).
+export BENCH_PROFILE=fair-default SHM_BENCH_CPU=1
 
 # Find the PID of the actual long-running test binary (not go test wrapper, not
 # the transient go-build compile pass). Wait until same PID is seen 2x in a row

@@ -21,7 +21,6 @@
 package transport
 
 import (
-	"os"
 	"sort"
 	"strings"
 	"testing"
@@ -35,11 +34,21 @@ import (
 //
 // Unlike TestShmFDCount (which only measures CreateSegment's immediate
 // allocations), this drives a server + client through a full
-// CreateSegment / RegisterRing / SetSegmentID / one wake-and-wait cycle
-// so any lazily-allocated eventfds get materialised before we snapshot.
+// CreateSegment / RegisterRing / one wake-and-wait cycle so any
+// lazily-allocated eventfds get materialised before we snapshot.
 //
 // Skips on non-Linux (no /proc/self/fd).
 func TestShmFDCountEnd2End(t *testing.T) {
+	// This test audits the production FD footprint, which requires the
+	// eventfd waker. The package-wide TestMain disables it (futex
+	// fallback) because most low-level tests mix raw and registered
+	// rings; here we exercise the production path explicitly. Save and
+	// restore the prior state so subsequent tests see the TestMain
+	// default again.
+	prevEventfd := shmDataSegWakeEnabled()
+	ConfigureShmEventfdWakerForBench(true)
+	t.Cleanup(func() { ConfigureShmEventfdWakerForBench(prevEventfd) })
+
 	before := snapshotProcFDs(t)
 	if before == nil {
 		return
@@ -75,9 +84,6 @@ func TestShmFDCountEnd2End(t *testing.T) {
 	serverRingB := NewShmRingFromSegment(dataServerSeg.B, dataServerSeg.Mem)
 	clientRingA := NewShmRingFromSegment(dataClientSeg.A, dataClientSeg.Mem)
 	clientRingB := NewShmRingFromSegment(dataClientSeg.B, dataClientSeg.Mem)
-	for _, r := range []*ShmRing{serverRingA, serverRingB, clientRingA, clientRingB} {
-		r.SetSegmentID(dataServerSeg.Path)
-	}
 	dataServerSeg.RegisterRing(serverRingA)
 	dataServerSeg.RegisterRing(serverRingB)
 	dataClientSeg.RegisterRing(clientRingA)
@@ -104,10 +110,9 @@ func TestShmFDCountEnd2End(t *testing.T) {
 		items []string
 	}
 	cats := map[string]*bucket{
-		"/dev/shm SHM file":          {},
-		"eventfd (in-proc wake)":     {},
-		"eventfd (data-seg wake)":    {},
-		"other":                      {},
+		"/dev/shm SHM file":       {},
+		"eventfd (data-seg wake)": {},
+		"other":                   {},
 	}
 	fds := make([]string, 0, len(delta))
 	for fd := range delta {
@@ -121,8 +126,8 @@ func TestShmFDCountEnd2End(t *testing.T) {
 			cats["/dev/shm SHM file"].count++
 			cats["/dev/shm SHM file"].items = append(cats["/dev/shm SHM file"].items, fd+" → "+target)
 		case strings.Contains(target, "anon_inode:[eventfd]"):
-			cats["eventfd (in-proc wake)"].count++
-			cats["eventfd (in-proc wake)"].items = append(cats["eventfd (in-proc wake)"].items, fd+" → "+target)
+			cats["eventfd (data-seg wake)"].count++
+			cats["eventfd (data-seg wake)"].items = append(cats["eventfd (data-seg wake)"].items, fd+" → "+target)
 		case strings.Contains(target, "socket:[") || strings.Contains(target, "anon_inode:socket"):
 			cats["eventfd (data-seg wake)"].count++
 			cats["eventfd (data-seg wake)"].items = append(cats["eventfd (data-seg wake)"].items, fd+" → "+target)
@@ -133,8 +138,7 @@ func TestShmFDCountEnd2End(t *testing.T) {
 	}
 
 	t.Logf("=== SHM FD footprint (1 listener + 1 connection, same process) ===")
-	t.Logf("SHM_INPROC_WAKE=%v  SHM_DATASEG_WAKE=%v",
-		os.Getenv("SHM_INPROC_WAKE"), os.Getenv("SHM_DATASEG_WAKE"))
+	t.Logf("eventfd waker: %v (ON by default; toggle via ConfigureShmEventfdWakerForBench)", shmDataSegWakeEnabled())
 	for cat, b := range cats {
 		if b.count == 0 {
 			continue
@@ -155,5 +159,5 @@ func TestShmFDCountEnd2End(t *testing.T) {
 	t.Logf("                             1 per process in cross-process production")
 	t.Logf("  In-proc eventfds:        lazy per (segmentID, address). Counted above.")
 	t.Logf("                             Cross-process production would dup these via SCM_RIGHTS.")
-	t.Logf("  Data-seg eventfds:       2 per side if SHM_DATASEG_WAKE=1 (1 per direction).")
+	t.Logf("  Data-seg eventfds:       2 per side when the eventfd waker is ON (1 per direction; default).")
 }

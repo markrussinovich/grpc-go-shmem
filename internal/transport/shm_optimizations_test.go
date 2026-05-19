@@ -205,6 +205,10 @@ func TestShmFrameWriterConcurrentCloseNoPanic(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestShmWindowUpdateBatching(t *testing.T) {
+	// Exercises WINDOW_UPDATE semantics; opt out of no-WU default.
+	ConfigureShmNoWindowUpdate(false)
+	t.Cleanup(ResetShmNoWindowUpdateForBench)
+
 	segName := testSegName("test_wu_batch")
 	defer RemoveSegment(segName)
 
@@ -257,6 +261,10 @@ func TestShmWindowUpdateBatching(t *testing.T) {
 }
 
 func TestShmWindowUpdateStreamCleanup(t *testing.T) {
+	// Exercises WINDOW_UPDATE semantics; opt out of no-WU default.
+	ConfigureShmNoWindowUpdate(false)
+	t.Cleanup(ResetShmNoWindowUpdateForBench)
+
 	// Verify that pendingStreamWU entries are cleaned up via the real
 	// closeStream path (not manual delete).
 	segName := testSegName("test_wu_cleanup")
@@ -315,6 +323,10 @@ func TestShmWindowUpdateStreamCleanup(t *testing.T) {
 }
 
 func TestShmWindowUpdateServerStreamCleanup(t *testing.T) {
+	// Exercises WINDOW_UPDATE semantics; opt out of no-WU default.
+	ConfigureShmNoWindowUpdate(false)
+	t.Cleanup(ResetShmNoWindowUpdateForBench)
+
 	// Verify that pendingStreamWU entries are cleaned up on the server side
 	// when a stream is terminated via handleTrailers or handleCancel.
 	segName := testSegName("test_wu_srv_cleanup")

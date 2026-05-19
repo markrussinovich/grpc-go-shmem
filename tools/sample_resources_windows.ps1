@@ -23,11 +23,9 @@ function Invoke-PreClean {
 }
 
 function Set-BenchEnv {
-    'SHM_INPROC_WAKE','SHM_NO_WU','BENCH_PROFILE','SHM_DATASEG_WAKE',
-    'SHM_BENCH_CPU','BENCH_DIRTY_DEFAULT_POOL' | ForEach-Object {
+    'BENCH_PROFILE','SHM_BENCH_CPU','BENCH_DIRTY_DEFAULT_POOL' | ForEach-Object {
         Remove-Item "Env:$_" -ErrorAction SilentlyContinue
     }
-    $env:SHM_NO_WU       = '1'
     $env:BENCH_PROFILE   = 'fair-default'
     $env:SHM_BENCH_CPU   = '1'
 }

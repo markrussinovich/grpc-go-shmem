@@ -95,6 +95,14 @@ func (s ShmAuthInfo) AuthType() string {
 	return "shm"
 }
 
+// GetRemoteIdentity returns the remote peer's identity string captured
+// during the SHM transport handshake. It is exposed so callers that
+// cannot import this internal package (notably credentials/shm) can
+// retrieve the identity through a duck-typed interface assertion.
+func (s ShmAuthInfo) GetRemoteIdentity() string {
+	return s.RemoteIdentity
+}
+
 // ValidateAuthority allows any authority override for shm connections
 func (s ShmAuthInfo) ValidateAuthority(_ string) error {
 	return nil
@@ -104,14 +112,24 @@ func (s ShmAuthInfo) ValidateAuthority(_ string) error {
 type handshakeInit struct {
 	version  uint8
 	identity []byte          // Client identity token
-	nonce    [NonceSize]byte // Random challenge nonce
+	nonce    [NonceSize]byte // Random nonce (one-way; see note on handshakeResp)
 }
 
-// handshakeResp is the server's response to the handshake init
+// handshakeResp is the server's response to the handshake init.
+//
+// The on-wire layout reserves a NonceSize-byte field that the server
+// currently populates with its own freshly-generated nonce. The client
+// does NOT challenge-bind by verifying that this value echoes
+// handshakeInit.nonce: in the SHM trust model both peers have already
+// proven locality by mmapping the same /dev/shm file, so a
+// cryptographic challenge-response over an in-memory channel adds no
+// extra authentication. The field is retained for forward compatibility
+// if a future version layers an actual challenge-response on top.
+// HandshakeErrNonceMismatch is reserved for that future use.
 type handshakeResp struct {
 	version  uint8
 	identity []byte          // Server identity token
-	nonce    [NonceSize]byte // Echo client nonce + server nonce
+	nonce    [NonceSize]byte // Server nonce (see type doc; not currently challenged)
 }
 
 // handshakeAck is the client's acknowledgement of successful handshake

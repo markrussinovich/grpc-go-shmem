@@ -7,8 +7,9 @@ REPO="${REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 cd "$REPO" || { echo "Cannot cd to $REPO"; exit 1; }
 echo "using REPO=$REPO"
 
-unset SHM_INPROC_WAKE
-export SHM_NO_WU=1 BENCH_PROFILE=fair-default SHM_DATASEG_WAKE=1 SHM_BENCH_CPU=1
+# v3.4 baseline: no-WU + eventfd waker are ON by default (the transport's
+# Configure* APIs control these; no env var needed).
+export BENCH_PROFILE=fair-default SHM_BENCH_CPU=1
 unset BENCH_DIRTY_DEFAULT_POOL
 
 prof_one() {

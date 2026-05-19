@@ -53,15 +53,15 @@ import "sync/atomic"
 //
 // Tuning guidance (Linux):
 //
-//   * n = 0         — no spin (default). Matches UDS-style behaviour.
-//                     Best for latency-insensitive throughput-oriented
-//                     workloads and shared / oversubscribed hosts.
-//   * n = 500–2000  — light spin (3.5–14 µs). Good middle ground:
-//                     catches most local hand-offs without burning a
-//                     measurable fraction of a core on idle rings.
-//   * n = up to spinIterationsLimit — aggressive spin. Hot streaming
-//                     workloads on dedicated cores; idle CPU per ring
-//                     can be visible.
+//   - n = 0         — no spin (default). Matches UDS-style behaviour.
+//     Best for latency-insensitive throughput-oriented
+//     workloads and shared / oversubscribed hosts.
+//   - n = 500–2000  — light spin (3.5–14 µs). Good middle ground:
+//     catches most local hand-offs without burning a
+//     measurable fraction of a core on idle rings.
+//   - n = up to spinIterationsLimit — aggressive spin. Hot streaming
+//     workloads on dedicated cores; idle CPU per ring
+//     can be visible.
 //
 // The values are package-global rather than per-connection because
 // they're effectively a deployment tuning choice (matches the pattern

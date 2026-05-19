@@ -20,6 +20,7 @@ package transport
 
 import (
 	"runtime"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -66,7 +67,8 @@ func TestSegmentHeaderFieldOffsets(t *testing.T) {
 		{"closed", unsafe.Offsetof(h.closed), 0x48},
 		{"pad", unsafe.Offsetof(h.pad), 0x4C},
 		{"maxStreams", unsafe.Offsetof(h.maxStreams), 0x50},
-		{"reserved", unsafe.Offsetof(h.reserved), 0x54},
+		{"openerWakeReady", unsafe.Offsetof(h.openerWakeReady), 0x54},
+		{"reserved", unsafe.Offsetof(h.reserved), 0x58},
 	}
 
 	for _, tt := range tests {
@@ -313,6 +315,28 @@ func TestSegmentHeaderAtomicAccess(t *testing.T) {
 	h.SetClosed(true)
 	if !h.Closed() {
 		t.Error("Closed() = false, want true")
+	}
+}
+
+// TestValidateSegmentHeaderVersionMismatch covers the forward-compat
+// guard: a peer that mmaps a segment whose header version differs from
+// SegmentVersion must refuse to proceed. Bumping SegmentVersion (e.g.,
+// because of a layout change) makes both newer-opens-older and
+// older-opens-newer pairings fail with a clear error here.
+func TestValidateSegmentHeaderVersionMismatch(t *testing.T) {
+	h := &SegmentHeader{}
+	magic := [8]byte{'G', 'R', 'P', 'C', 'S', 'H', 'M', 0}
+	h.SetMagic(magic)
+	// Plausibly-shaped capacities so the version check is reached.
+	h.SetRingACapacity(MinRingCapacity)
+	h.SetRingBCapacity(MinRingCapacity)
+	h.SetVersion(SegmentVersion + 1)
+	err := ValidateSegmentHeader(h)
+	if err == nil {
+		t.Fatal("ValidateSegmentHeader accepted mismatched version; expected error")
+	}
+	if !strings.Contains(err.Error(), "unsupported version") {
+		t.Errorf("ValidateSegmentHeader error = %q, want contains \"unsupported version\"", err.Error())
 	}
 }
 

@@ -40,6 +40,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/benchmark"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/experimental/shm"
 	"google.golang.org/grpc/internal/transport"
 	testpb "google.golang.org/grpc/interop/grpc_testing"
 )
@@ -223,7 +224,7 @@ func startBenchEnv(kind transportKind, ringSize, segmentSize uint64) (*benchEnv,
 	dialOpts := []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())}
 	if kind == transportSHM {
 		target = fmt.Sprintf("shm://%s", env.name)
-		dialOpts = append([]grpc.DialOption{grpc.WithShmTransport()}, dialOpts...)
+		dialOpts = append([]grpc.DialOption{shm.WithTransport()}, dialOpts...)
 	}
 
 	conn, err := grpc.NewClient(target, dialOpts...)

@@ -33,6 +33,12 @@ import (
 // Test that a client write blocks when the outbound flow-control window is
 // exhausted and resumes when WINDOW_UPDATE frames arrive.
 func TestShmFlowControlBlocksUntilWindowUpdate(t *testing.T) {
+	// This test exercises WINDOW_UPDATE semantics, which are disabled
+	// in the v3.4 default no-WU mode. Opt back into HTTP/2-style WU
+	// flow control for the duration of the test.
+	ConfigureShmNoWindowUpdate(false)
+	t.Cleanup(ResetShmNoWindowUpdateForBench)
+
 	testCtx, testCancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	defer testCancel()
 

@@ -112,7 +112,7 @@ func CreateSegment(name string, ringCapA, ringCapB uint64) (*Segment, error) {
 	segment.B.SetReadIndex(0)
 	segment.B.SetClosed(false)
 
-	// SHM_DATASEG_WAKE no-op on Windows. Kept for cross-platform
+	// Eventfd waker no-op on Windows. Kept for cross-platform
 	// symbol parity.
 	setupDataSegWakeForCreator(segment)
 
@@ -175,14 +175,19 @@ func OpenSegment(name string) (*Segment, error) {
 	}
 
 	segment.H.SetClientPID(uint32(os.Getpid()))
+
+	// Eventfd waker no-op on Windows (this records
+	// OpenerWakeReady=false on the header for finalizeDataSegWaker's
+	// benefit; on Windows the creator's waker is also nil so the
+	// flag is unused, but keeping the ordering consistent with the
+	// Linux path avoids surprises).
+	setupDataSegWakeForOpener(segment)
+
 	// Note: We set the clientReady flag here but DON'T signal the event.
 	// The caller (DialShm) will open handshake events and call
 	// SetClientReadyAndSignal() after WaitForServer completes.
 	// This ensures the event exists before we try to signal it.
 	segment.H.SetClientReady(true)
-
-	// SHM_DATASEG_WAKE no-op on Windows.
-	setupDataSegWakeForOpener(segment)
 
 	// Close the backing file handle: MapViewOfFile holds its own
 	// reference. Saves 1 handle/segment.

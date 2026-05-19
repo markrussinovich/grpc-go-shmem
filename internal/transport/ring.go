@@ -94,21 +94,13 @@ type ShmRing struct {
 	// Access via atomic operations (single reader in SPSC design).
 	pendingReadIdx uint64
 
-	// segmentID identifies the backing mmap region for cross-Ring
-	// matching of same-process wake registrations. Two ShmRing structs
-	// that wrap the same /dev/shm file share the same segmentID, so a
-	// signalData on one side can find the waitForData on the other
-	// side via the (segmentID, ring-relative offset) registry. Empty
-	// outside the SHM_INPROC_WAKE=1 path.
-	segmentID string
-
 	// dataSegWaker is the per-data-segment per-direction eventfd
 	// waker (2 eventfds per segment, 1 read fd held per side per
 	// direction), propagated from the owning Segment at RegisterRing
 	// time. Used by waitFor*/signal* when non-nil; otherwise falls
 	// through to the per-address eventfd registry / Windows events /
 	// Linux futex path. Always nil for control segments and when
-	// SHM_DATASEG_WAKE is off.
+	// the eventfd waker is disabled.
 	dataSegWaker *shmDataSegWaker
 
 	// Adaptive spin state for minimizing latency on fast paths.
@@ -615,15 +607,6 @@ func (r *ShmRing) SetEvents(events *RingEvents) {
 	r.events = events
 }
 
-// SetSegmentID identifies the backing mmap for same-process wake
-// matching. Two ShmRing structs that map the same /dev/shm file get
-// the same segmentID, so a signalData on one side can find the
-// waitForData on the other side via the inproc wake registry. Only
-// used when SHM_INPROC_WAKE=1; ignored otherwise.
-func (r *ShmRing) SetSegmentID(id string) {
-	r.segmentID = id
-}
-
 // SetDataSegWaker attaches the per-data-segment per-direction
 // eventfd waker (one read fd on this side) to this ring. Called by
 // Segment.RegisterRing, which propagates the segment-level waker to
@@ -702,11 +685,6 @@ func (r *ShmRing) waitForData(addr *uint32, val uint32, timeout time.Duration) e
 	if r.dataSegWaker != nil {
 		return r.dataSegWaker.WaitForChange(addr, val, timeout)
 	}
-	if shmInprocWakeEnabled && r.segmentID != "" {
-		if w := getInprocWaker(r.segmentID, unsafe.Pointer(&r.mem[0]), addr); w != nil {
-			return w.Wait(timeout)
-		}
-	}
 	if r.events != nil {
 		return r.events.WaitData(addr, val, timeout)
 	}
@@ -722,11 +700,6 @@ func (r *ShmRing) waitForSpace(addr *uint32, val uint32, timeout time.Duration) 
 	if r.dataSegWaker != nil {
 		return r.dataSegWaker.WaitForChange(addr, val, timeout)
 	}
-	if shmInprocWakeEnabled && r.segmentID != "" {
-		if w := getInprocWaker(r.segmentID, unsafe.Pointer(&r.mem[0]), addr); w != nil {
-			return w.Wait(timeout)
-		}
-	}
 	if r.events != nil {
 		return r.events.WaitSpace(addr, val, timeout)
 	}
@@ -741,11 +714,6 @@ func (r *ShmRing) waitForSpace(addr *uint32, val uint32, timeout time.Duration) 
 func (r *ShmRing) waitForContig(addr *uint32, val uint32, timeout time.Duration) error {
 	if r.dataSegWaker != nil {
 		return r.dataSegWaker.WaitForChange(addr, val, timeout)
-	}
-	if shmInprocWakeEnabled && r.segmentID != "" {
-		if w := getInprocWaker(r.segmentID, unsafe.Pointer(&r.mem[0]), addr); w != nil {
-			return w.Wait(timeout)
-		}
 	}
 	if r.events != nil {
 		return r.events.WaitContig(addr, val, timeout)
@@ -772,12 +740,6 @@ func (r *ShmRing) signalData(addr *uint32) {
 		futexWake(addr, 1)
 		return
 	}
-	if shmInprocWakeEnabled && r.segmentID != "" {
-		if w := getInprocWaker(r.segmentID, unsafe.Pointer(&r.mem[0]), addr); w != nil {
-			w.Wake()
-			return
-		}
-	}
 	if r.events != nil {
 		r.events.SignalData()
 	} else {
@@ -794,12 +756,6 @@ func (r *ShmRing) signalSpace(addr *uint32) {
 		futexWake(addr, 1)
 		return
 	}
-	if shmInprocWakeEnabled && r.segmentID != "" {
-		if w := getInprocWaker(r.segmentID, unsafe.Pointer(&r.mem[0]), addr); w != nil {
-			w.Wake()
-			return
-		}
-	}
 	if r.events != nil {
 		r.events.SignalSpace()
 	} else {
@@ -815,12 +771,6 @@ func (r *ShmRing) signalContig(addr *uint32) {
 		// See signalData for the futex_wake-after-dataSegWaker rationale.
 		futexWake(addr, 1)
 		return
-	}
-	if shmInprocWakeEnabled && r.segmentID != "" {
-		if w := getInprocWaker(r.segmentID, unsafe.Pointer(&r.mem[0]), addr); w != nil {
-			w.Wake()
-			return
-		}
 	}
 	if r.events != nil {
 		r.events.SignalContig()

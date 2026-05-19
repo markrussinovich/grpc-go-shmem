@@ -29,15 +29,32 @@ package transport
 
 import "time"
 
-const shmDataSegWakeEnabled = false
+// shmDataSegWakeEnabled is always false on non-Linux platforms; the
+// eventfd primitive is Linux-specific. Windows uses named events;
+// non-supported platforms fall through to the futex fallback (which
+// itself is a no-op stub on non-Linux).
+func shmDataSegWakeEnabled() bool { return false }
+
+// ConfigureShmEventfdWakerForBench is a no-op on non-Linux platforms;
+// the eventfd primitive does not exist outside Linux.
+//
+// Notice: This API is EXPERIMENTAL and may be changed or removed in a
+// later release.
+func ConfigureShmEventfdWakerForBench(_ bool) {}
+
+// ResetShmEventfdWakerForBench is a no-op on non-Linux platforms.
+//
+// Notice: This API is EXPERIMENTAL and may be changed or removed in a
+// later release.
+func ResetShmEventfdWakerForBench() {}
 
 type shmDataSegWaker struct{}
 
-func (*shmDataSegWaker) Wake()                     {}
-func (*shmDataSegWaker) Wait(time.Duration) error                              { return nil }
-func (*shmDataSegWaker) WaitForChange(*uint32, uint32, time.Duration) error    { return nil }
-func (*shmDataSegWaker) RewakeLocal()                                          {}
-func (*shmDataSegWaker) Close()                                                {}
+func (*shmDataSegWaker) Wake()                                              {}
+func (*shmDataSegWaker) Wait(time.Duration) error                           { return nil }
+func (*shmDataSegWaker) WaitForChange(*uint32, uint32, time.Duration) error { return nil }
+func (*shmDataSegWaker) RewakeLocal()                                       {}
+func (*shmDataSegWaker) Close()                                             {}
 
 func newShmDataSegWakerPair() (*shmDataSegWaker, *shmDataSegWaker, error) {
 	return nil, nil, nil

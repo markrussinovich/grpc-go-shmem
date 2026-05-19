@@ -447,14 +447,6 @@ func NewShmClientTransport(segment *Segment, localAddr, remoteAddr net.Addr) (*S
 	clientToServer := NewShmRingFromSegment(segment.A, segment.Mem)
 	serverToClient := NewShmRingFromSegment(segment.B, segment.Mem)
 
-	// Tag both rings with the segment path so the same-process wake
-	// registry (SHM_INPROC_WAKE=1 experimental path) can match the
-	// producer's signalData with the consumer's waitForData by
-	// (segmentID, byte-offset) instead of by vaddr. Different mmap
-	// calls of the same /dev/shm file return different virtual
-	// addresses, so vaddr-keying fails.
-	clientToServer.SetSegmentID(segment.Path)
-	serverToClient.SetSegmentID(segment.Path)
 	segment.RegisterRing(clientToServer)
 	segment.RegisterRing(serverToClient)
 
@@ -498,7 +490,7 @@ func NewShmClientTransport(segment *Segment, localAddr, remoteAddr net.Addr) (*S
 	}
 	// Start the dedicated frame writer goroutine for the client→server ring.
 	t.frameWriter = newShmFrameWriter(clientToServer)
-	// Surface async write failures (SHM_NO_WU=1 fire-and-forget MESSAGE
+	// Surface async write failures (no-WU fire-and-forget MESSAGE
 	// path, and async HEADERS/GOAWAY) by tearing down the transport.
 	// Without this hook the writer goroutine would silently drop bytes
 	// after data.Free(), and the peer would wait forever for a MESSAGE
@@ -982,7 +974,7 @@ func (t *ShmClientTransport) Close(err error) {
 			t.closeStream(stream, err, false, 0, status.Convert(err), nil, false)
 		}
 
-		// Stop the reader goroutine. Under SHM_DATASEG_WAKE the reader
+		// Stop the reader goroutine. Under the eventfd waker the reader
 		// is parked in shmDataSegWaker.WaitForChange (an *os.File.Read
 		// on the eventfd via Go netpoll); ring.Close above set
 		// hdr.Closed but the parker has no way to observe that without
@@ -1664,7 +1656,7 @@ func (t *ShmClientTransport) write(s *ClientStream, hdr []byte, data mem.BufferS
 		if shmDebugEnabled {
 			shmDebugf("[DEBUG] ShmClientTransport.write: writing single frame (fast path)")
 		}
-		// v3.4 P1a-async: under SHM_NO_WU mode, fire-and-forget the
+		// v3.4 P1a-async: under no-WU mode, fire-and-forget the
 		// MESSAGE frame. Take ownership via data.Ref() so the caller's
 		// `defer data.Free()` does NOT prematurely release buffers
 		// the writer goroutine still needs.

@@ -62,8 +62,6 @@ func NewServerConn(seg *Segment) *ShmConn {
 
 	readR := NewShmRingFromSegment(seg.A, seg.Mem)
 	writeR := NewShmRingFromSegment(seg.B, seg.Mem)
-	readR.SetSegmentID(seg.Path)
-	writeR.SetSegmentID(seg.Path)
 	seg.RegisterRing(readR)
 	seg.RegisterRing(writeR)
 
@@ -95,8 +93,6 @@ func NewClientConn(seg *Segment) *ShmConn {
 
 	readR := NewShmRingFromSegment(seg.B, seg.Mem)
 	writeR := NewShmRingFromSegment(seg.A, seg.Mem)
-	readR.SetSegmentID(seg.Path)
-	writeR.SetSegmentID(seg.Path)
 	seg.RegisterRing(readR)
 	seg.RegisterRing(writeR)
 

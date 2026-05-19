@@ -24,6 +24,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"net"
 	"sync"
@@ -160,8 +161,6 @@ func NewShmListener(addr *ShmAddr, segmentSize, ringASize, ringBSize uint64) (*S
 	l.ctlSegment = ctlSeg
 	l.ctlRx = NewShmRingFromSegment(ctlSeg.A, ctlSeg.Mem)
 	l.ctlTx = NewShmRingFromSegment(ctlSeg.B, ctlSeg.Mem)
-	l.ctlRx.SetSegmentID(ctlSeg.Path)
-	l.ctlTx.SetSegmentID(ctlSeg.Path)
 	ctlSeg.RegisterRing(l.ctlRx)
 	ctlSeg.RegisterRing(l.ctlTx)
 
@@ -239,8 +238,6 @@ func (l *ShmListener) Accept() (net.Conn, error) {
 		// when client opens the segment and creates its transport.
 		readRing := NewShmRingFromSegment(segment.A, segment.Mem)
 		writeRing := NewShmRingFromSegment(segment.B, segment.Mem)
-		readRing.SetSegmentID(segment.Path)
-		writeRing.SetSegmentID(segment.Path)
 		segment.RegisterRing(readRing)
 		segment.RegisterRing(writeRing)
 
@@ -277,6 +274,13 @@ func (l *ShmListener) Accept() (net.Conn, error) {
 			_ = RemoveSegment(segmentName)
 			return nil, err
 		}
+
+		// Resolve the eventfd-waker peer state now that both PIDs
+		// are stably visible in the header. Cross-process segments
+		// converge on the futex fallback; same-process keeps the
+		// eventfd fast path. MUST run before any goroutine starts
+		// using the rings for data-plane reads / writes.
+		segment.finalizeDataSegWaker()
 
 		conn := &shmConn{
 			segment:          segment,
@@ -315,9 +319,12 @@ func (l *ShmListener) Accept() (net.Conn, error) {
 
 		serverTransport, err := NewShmServerTransport(segment, l.addr, conn.remoteAddr)
 		if err != nil {
-			l.mu.Lock()
-			delete(l.activeSegments, segmentName)
-			l.mu.Unlock()
+			if readEvents != nil {
+				readEvents.Close()
+			}
+			if writeEvents != nil {
+				writeEvents.Close()
+			}
 			segment.Close()
 			_ = RemoveSegment(segmentName)
 			return nil, fmt.Errorf("failed to create server transport: %v", err)
@@ -420,28 +427,30 @@ func (l *ShmListener) SetHandshaker(h *ShmSecurityHandshaker) {
 	l.handshaker = h
 }
 
-// shmConn net.Conn implementation
+// shmConn is the server-side counterpart to the client's shmClientConn
+// shim: it satisfies net.Conn so the SHM listener can return values
+// through gRPC's standard Accept() contract, while the actual frame
+// I/O happens through the embedded ShmServerTransport (accessed via
+// ReadRing/WriteRing). As with shmClientConn, the net.Conn surface
+// MUST NOT be reached on the SHM hot path; Read and Write return
+// io.ErrClosedPipe so any unexpected caller fails fast and visibly.
 
-// Read reads data from the connection
+// Read is intentionally unsupported. See the type doc — callers must
+// use the embedded transport instead of going through net.Conn.
 func (c *shmConn) Read(_ []byte) (n int, err error) {
 	if c.closed.Load() {
-		return 0, errors.New("connection closed")
+		return 0, io.ErrClosedPipe
 	}
-
-	// For shared memory, reading is handled by the transport layer
-	// This is a placeholder implementation
-	return 0, errors.New("direct read not supported, use transport layer")
+	return 0, fmt.Errorf("shmConn.Read: %w (use the embedded ShmServerTransport instead)", io.ErrClosedPipe)
 }
 
-// Write writes data to the connection
+// Write is intentionally unsupported. See the type doc — callers must
+// use the embedded transport instead of going through net.Conn.
 func (c *shmConn) Write(_ []byte) (n int, err error) {
 	if c.closed.Load() {
-		return 0, errors.New("connection closed")
+		return 0, io.ErrClosedPipe
 	}
-
-	// For shared memory, writing is handled by the transport layer
-	// This is a placeholder implementation
-	return 0, errors.New("direct write not supported, use transport layer")
+	return 0, fmt.Errorf("shmConn.Write: %w (use the embedded ShmServerTransport instead)", io.ErrClosedPipe)
 }
 
 // Close closes the connection

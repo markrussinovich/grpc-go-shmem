@@ -65,14 +65,12 @@ func startZCProbe(b *testing.B) func() {
 		return func() {}
 	}
 	before := transport.LoadShmPathCounters()
-	beforeWake := transport.LoadShmInprocWakeCounters()
 	beforeDS := transport.LoadShmDataSegWakeCounters()
 	return func() {
 		if b.N <= 0 {
 			return
 		}
 		delta := transport.LoadShmPathCounters().Sub(before)
-		wakeDelta := transport.LoadShmInprocWakeCounters().Sub(beforeWake)
 		dsDelta := transport.LoadShmDataSegWakeCounters().Sub(beforeDS)
 		n := float64(b.N)
 		report := func(name string, v uint64) {
@@ -93,15 +91,8 @@ func startZCProbe(b *testing.B) func() {
 		report("zc-read/op", delta.ZCReadFire)
 		report("copy-read/op", delta.CopyReadFire)
 		report("acc-read/op", delta.AccReadFire)
-		// In-proc wake diagnostics (zero on Windows / when
-		// SHM_INPROC_WAKE != 1):
-		report("wake-calls/op", wakeDelta.WakeCallsTotal)
-		report("wake-sys/op", wakeDelta.WakeSyscalls)
-		report("wait-calls/op", wakeDelta.WaitCallsTotal)
-		report("wait-sys/op", wakeDelta.WaitSyscalls)
-		report("wait-ret/op", wakeDelta.WaitSyscallReturned)
 		// Per-data-segment socketpair waker diagnostics (zero on
-		// non-Linux / when SHM_DATASEG_WAKE != 1).
+		// non-Linux / when the eventfd waker is disabled).
 		report("ds-wake/op", dsDelta.WakeCallsTotal)
 		report("ds-wake-sys/op", dsDelta.WakeSyscalls)
 		report("ds-wait/op", dsDelta.WaitCallsTotal)

@@ -24,7 +24,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
+	"sync"
 	"time"
 
 	"google.golang.org/grpc/credentials"
@@ -117,8 +119,11 @@ func DialShm(ctx context.Context, addr string, opts *DialOptions) (ClientTranspo
 
 	ctlTx := NewShmRingFromSegment(ctlSeg.A, ctlSeg.Mem)
 	ctlRx := NewShmRingFromSegment(ctlSeg.B, ctlSeg.Mem)
-	ctlTx.SetSegmentID(ctlSeg.Path)
-	ctlRx.SetSegmentID(ctlSeg.Path)
+	// Resolve the eventfd-waker peer state for the control segment
+	// before registering rings: same-process keeps the eventfd fast
+	// path; cross-process drops it so both peers use futex. See
+	// Segment.finalizeDataSegWaker for details.
+	ctlSeg.finalizeDataSegWaker()
 	ctlSeg.RegisterRing(ctlTx)
 	ctlSeg.RegisterRing(ctlRx)
 
@@ -173,6 +178,12 @@ func DialShm(ctx context.Context, addr string, opts *DialOptions) (ClientTranspo
 		// This unblocks the server's WaitForClient in Accept().
 		segment.SetClientReadyAndSignal(true)
 
+		// Resolve the eventfd-waker peer state. Cross-process segments
+		// converge on futex; same-process keeps the eventfd fast path.
+		// MUST run before any ring read/write. See
+		// Segment.finalizeDataSegWaker for details.
+		segment.finalizeDataSegWaker()
+
 		localAddr := &ShmAddr{Name: segName + "_client"}
 		remoteAddr := &ShmAddr{Name: segName}
 
@@ -182,8 +193,6 @@ func DialShm(ctx context.Context, addr string, opts *DialOptions) (ClientTranspo
 			// Create rings for handshake - client writes to A, reads from B
 			txRing := NewShmRingFromSegment(segment.A, segment.Mem)
 			rxRing := NewShmRingFromSegment(segment.B, segment.Mem)
-			txRing.SetSegmentID(segment.Path)
-			rxRing.SetSegmentID(segment.Path)
 			segment.RegisterRing(txRing)
 			segment.RegisterRing(rxRing)
 
@@ -279,47 +288,69 @@ func (d *ShmDialer) Dial(ctx context.Context, addr string) (net.Conn, error) {
 	}
 
 	shmTransport := clientTransport.(*ShmClientTransport)
-	// Wrap the transport in a connection-like interface
-	return &shmClientConn{
-		transport:  shmTransport,
-		localAddr:  shmTransport.localAddr,
-		remoteAddr: shmTransport.remoteAddr,
-		authInfo:   shmTransport.GetAuthInfo(),
-	}, nil
+	return NewShmConn(shmTransport, shmTransport.GetAuthInfo()), nil
 }
 
-// shmClientConn wraps the client transport as a net.Conn
+// NewShmConn wraps an already-dialed ShmClientTransport in a net.Conn that
+// also satisfies ClientTransportProvider, so it can flow through gRPC's
+// standard ContextDialer / NewClient path. Callers outside this package
+// (notably experimental/shm) use this constructor to obtain the shim
+// without needing access to the unexported shmClientConn type.
+//
+// authInfo is the credentials.AuthInfo to expose via the AuthInfo()
+// method on the returned conn; pass the value produced by the SHM
+// security handshake (typically shmTransport.GetAuthInfo()).
+func NewShmConn(t *ShmClientTransport, authInfo credentials.AuthInfo) net.Conn {
+	return &shmClientConn{
+		transport:  t,
+		localAddr:  t.localAddr,
+		remoteAddr: t.remoteAddr,
+		authInfo:   authInfo,
+	}
+}
+
+// shmClientConn is an internal shim that lets the shared-memory transport
+// flow through gRPC's standard NewClient / ContextDialer path. gRPC's
+// ContextDialer signature requires a net.Conn, but the SHM transport is
+// not a byte stream — it is a frame-level transport. To bridge that gap
+// shmClientConn implements net.Conn purely so the dialer can return it,
+// and additionally implements ClientTransportProvider.
+//
+// On the consumption side, NewHTTP2Client checks for the
+// ClientTransportProvider interface immediately after the dialer returns
+// and, when present, uses the wrapped ClientTransport directly instead of
+// layering HTTP/2 over the conn. As a result Read and Write on the
+// net.Conn surface MUST NOT be reached on the SHM hot path; they return
+// io.ErrClosedPipe so any unexpected caller fails fast and visibly rather
+// than silently hanging.
+//
+// Close is guarded by a sync.Once so concurrent Close + Read / Write /
+// Close calls cannot race on the underlying transport teardown.
 type shmClientConn struct {
 	transport  *ShmClientTransport
 	localAddr  net.Addr
 	remoteAddr net.Addr
-	closed     bool
+	closeOnce  sync.Once
 	authInfo   credentials.AuthInfo
 }
 
-// Read implements net.Conn - not used directly in gRPC
+// Read is intentionally unsupported. See the type doc — callers must use
+// GetClientTransport() and go through the ClientTransport API.
 func (c *shmClientConn) Read(_ []byte) (n int, err error) {
-	if c.closed {
-		return 0, errors.New("connection closed")
-	}
-	return 0, errors.New("direct read not supported, use transport layer")
+	return 0, fmt.Errorf("shmClientConn.Read: %w (use ClientTransportProvider.GetClientTransport instead)", io.ErrClosedPipe)
 }
 
-// Write implements net.Conn - not used directly in gRPC
+// Write is intentionally unsupported. See the type doc — callers must use
+// GetClientTransport() and go through the ClientTransport API.
 func (c *shmClientConn) Write(_ []byte) (n int, err error) {
-	if c.closed {
-		return 0, errors.New("connection closed")
-	}
-	return 0, errors.New("direct write not supported, use transport layer")
+	return 0, fmt.Errorf("shmClientConn.Write: %w (use ClientTransportProvider.GetClientTransport instead)", io.ErrClosedPipe)
 }
 
-// Close implements net.Conn
+// Close implements net.Conn. Concurrency-safe via sync.Once.
 func (c *shmClientConn) Close() error {
-	if c.closed {
-		return nil
-	}
-	c.closed = true
-	c.transport.Close(errors.New("connection closed"))
+	c.closeOnce.Do(func() {
+		c.transport.Close(errors.New("connection closed"))
+	})
 	return nil
 }
 

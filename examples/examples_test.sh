@@ -179,7 +179,6 @@ for example in ${EXAMPLES[@]}; do
     SERVER_LOG="$(mktemp)"
     server_args=${SERVER_ARGS[$example]:-${SERVER_ARGS["default"]}}
     go run ./$example/*server/*.go $server_args &> $SERVER_LOG  &
-    SERVER_PID=$!
 
     wait_for_server $example
 
@@ -193,23 +192,7 @@ for example in ${EXAMPLES[@]}; do
     # Start client
     CLIENT_LOG="$(mktemp)"
     client_args=${CLIENT_ARGS[$example]:-${CLIENT_ARGS["default"]}}
-    timeout 20 go run ${example}/*client/*.go $client_args &> $CLIENT_LOG
-    CLIENT_EXIT=$?
-
-    # For gracefulstop, the client may exit non-zero due to race conditions
-    # during server shutdown. Check for expected output instead of exit code.
-    if [ "$example" = "features/gracefulstop" ]; then
-        if grep -q "${EXPECTED_CLIENT_OUTPUT[$example]}" $CLIENT_LOG; then
-            pass "client successfully communicated with server"
-        else
-            fail "client failed to communicate with server
-            got server log:
-            $(cat $SERVER_LOG)
-            got client log:
-            $(cat $CLIENT_LOG)
-            "
-        fi
-    elif [ $CLIENT_EXIT -ne 0 ]; then
+    if ! timeout 20 go run ${example}/*client/*.go $client_args &> $CLIENT_LOG; then
         fail "client failed to communicate with server
         got server log:
         $(cat $SERVER_LOG)
@@ -218,12 +201,6 @@ for example in ${EXAMPLES[@]}; do
         "
     else
         pass "client successfully communicated with server"
-    fi
-
-    # For gracefulstop example, wait for server process to exit (like TCP tests
-    # use channels to wait for GracefulStop completion)
-    if [ "$example" = "features/gracefulstop" ]; then
-        wait $SERVER_PID 2>/dev/null || true
     fi
 
     # Check server log for expected output if expecting an

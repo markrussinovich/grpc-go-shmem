@@ -125,13 +125,76 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// shmDataSegWakeEnabled gates the per-data-segment eventfd-per-
-// direction primitive. Off by default; bench harness sets
-// SHM_DATASEG_WAKE=1 to opt in. Cross-process child processes
-// (GRPC_CROSS_PROCESS_CHILD set) opt out for safety until Phase 2
-// wires SCM_RIGHTS.
-var shmDataSegWakeEnabled = os.Getenv("SHM_DATASEG_WAKE") == "1" &&
-	os.Getenv("GRPC_CROSS_PROCESS_CHILD") == ""
+// shmDataSegWakerEnabledAtomic gates the per-data-segment eventfd-
+// per-direction wake primitive on Linux. Default is ON: eventfd is
+// the production wake primitive on Linux (integrates with Go
+// netpoller, scales to many connections, ~1us wake latency).
+//
+// Cross-process safety: the per-segment eventfd file descriptors
+// today live in a process-local in-memory stash keyed by the
+// segment path. A cross-process opener can't reach the creator's
+// stash and therefore has no waker, while the creator keeps one.
+// To prevent asymmetric-wake deadlocks, both peers call
+// Segment.finalizeDataSegWaker after the WaitForServer / WaitForClient
+// handshake; when ServerPID and ClientPID differ the creator
+// releases its waker and clears it from any rings, leaving both
+// peers on the futex fallback. See Segment.finalizeDataSegWaker
+// for details.
+//
+// Phase 2 will hand the eventfd peer endpoint across processes via
+// SCM_RIGHTS so cross-process segments can also use the eventfd
+// fast path. At that point the finalize check becomes a no-op
+// (PIDs differ but both sides have valid wakers).
+//
+// Same-process bench / test code that wants to compare against the
+// futex fallback can disable the waker globally via
+// ConfigureShmEventfdWakerForBench(false). The internal/transport
+// package's TestMain does this by default because many low-level
+// tests use raw NewShmRingFromSegment without going through the
+// handshake path that calls finalizeDataSegWaker.
+var shmDataSegWakerEnabledAtomic atomic.Bool
+
+func init() {
+	// Default ON; see the var doc above for the cross-process safety
+	// mechanism.
+	shmDataSegWakerEnabledAtomic.Store(true)
+}
+
+// shmDataSegWakeEnabled reports whether the per-data-segment eventfd
+// wake primitive is currently active. Hot-path callers read this once
+// per data-plane operation; the atomic read is cheap.
+func shmDataSegWakeEnabled() bool {
+	return shmDataSegWakerEnabledAtomic.Load()
+}
+
+// ConfigureShmEventfdWakerForBench enables or disables the eventfd
+// wake primitive at runtime. The default is ON (v3.4 production
+// behaviour). Benchmarks / tests that want to compare against the
+// futex fallback can pass enabled=false; callers MUST do this
+// before any SHM transport is constructed.
+//
+// If GRPC_CROSS_PROCESS_CHILD is set in the environment, the eventfd
+// waker is unavailable. In that case enabled=true is silently
+// clamped to false; the function does not signal the clamp.
+//
+// Notice: This API is EXPERIMENTAL and may be changed or removed in
+// a later release.
+func ConfigureShmEventfdWakerForBench(enabled bool) {
+	shmDataSegWakerEnabledAtomic.Store(enabled && !shmEnvFlags.crossProcessChild)
+}
+
+// ResetShmEventfdWakerForBench restores the default eventfd-waker
+// state (ON, unless GRPC_CROSS_PROCESS_CHILD is set). Tests and
+// benchmarks should defer this so subsequent tests in the same
+// `go test` invocation do not inherit the override.
+//
+// Notice: This API is EXPERIMENTAL and may be changed or removed in a
+// later release.
+func ResetShmEventfdWakerForBench() {
+	// Default ON (v3.4 baseline); disabled when GRPC_CROSS_PROCESS_CHILD
+	// is set. See shmDataSegWakerEnabledAtomic doc.
+	shmDataSegWakerEnabledAtomic.Store(!shmEnvFlags.crossProcessChild)
+}
 
 // Diagnostic counters.
 var (
@@ -145,7 +208,7 @@ var (
 	shmDataSegWaitReturnEOF     uint64
 	shmDataSegWaitReturnOther   uint64
 	// Fan-out cascade counters.
-	shmDataSegRewakeLocal  uint64 // local re-wakes for cascade
+	shmDataSegRewakeLocal   uint64 // local re-wakes for cascade
 	shmDataSegFanOutBailout uint64 // wrong-parker but no other parker present
 )
 

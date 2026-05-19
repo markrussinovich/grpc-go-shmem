@@ -6,17 +6,7 @@
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
- *     http://www.apach	// Test data sets - current ring implementation has small capacity limits
-	// TODO: investigate why ring capacity is much smaller than expected
-	testCases := []struct {
-		name string
-		data []byte
-	}{
-		{"small", []byte("hello world")},                       // 11 bytes - works
-		{"medium", bytes.Repeat([]byte("x"), 20)},              // 20 bytes - works
-		// Note: larger sizes fail with "data larger than ring capacity"
-		// This suggests actual usable capacity is much smaller than configured
-	}nses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -24,7 +14,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  *
-*/
+ */
 
 package transport
 
@@ -63,6 +53,18 @@ func TestMain(m *testing.M) {
 		segmentName := os.Args[3]
 		os.Exit(runHelperShmDelayedServer(segmentName))
 	}
+
+	// Many tests in this package exercise the raw-ring API
+	// (NewShmRingFromSegment + signalData/waitForData) without going
+	// through Segment.RegisterRing on both sides, which is incompatible
+	// with the default eventfd waker: the producer signals via futex
+	// only, but the registered consumer would park on eventfd. Run the
+	// package's tests under the futex wake path by default so the
+	// mixed-API call sites work; tests that specifically need eventfd
+	// (very few) opt back in via ConfigureShmEventfdWakerForBench(true).
+	// Production code wires both sides via RegisterRing so this
+	// asymmetry never arises outside tests.
+	ConfigureShmEventfdWakerForBench(false)
 
 	// Normal test execution
 	os.Exit(m.Run())

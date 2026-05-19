@@ -57,7 +57,7 @@ type shmFrameWriter struct {
 	inlineMu sync.Mutex
 
 	// onAsyncError, if non-nil, is invoked when an entry without a doneCh
-	// (fire-and-forget enqueue, used by the SHM_NO_WU=1 client MESSAGE
+	// (fire-and-forget enqueue, used by the no-WU client MESSAGE
 	// path and by HEADERS / GOAWAY senders elsewhere) fails to write to
 	// the ring. Without this hook the error would be silently dropped
 	// after data.Free(), leaving the peer waiting forever for bytes that
@@ -178,7 +178,7 @@ func (w *shmFrameWriter) writeLoop() {
 			batchBytes := 0
 			w.tx.BeginBatch()
 			// entryBytes MUST be computed BEFORE processEntry:
-			// processEntry frees entry.data on the SHM_NO_WU=1
+			// processEntry frees entry.data on the no-WU
 			// fire-and-forget path, after which entry.data.Len()
 			// panics with "read freed buffer".
 			eb := entryBytes(entry)

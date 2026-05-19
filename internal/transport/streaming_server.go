@@ -79,10 +79,18 @@ type streamingServerStream struct {
 
 // NewShmStreamingServer creates a new streaming server over an existing segment.
 func NewShmStreamingServer(seg *Segment) *ShmStreamingServer {
+	tx := NewShmRingFromSegment(seg.B, seg.Mem) // server uses ring B for sending
+	rx := NewShmRingFromSegment(seg.A, seg.Mem) // server uses ring A for receiving
+	// Register rings with the segment so the per-data-segment eventfd
+	// waker (when enabled) propagates to ring.dataSegWaker; without
+	// this, the consumer side parks on eventfd while the producer side
+	// only signals via futex — asymmetric wake -> deadlock.
+	seg.RegisterRing(tx)
+	seg.RegisterRing(rx)
 	s := &ShmStreamingServer{
 		seg:        seg,
-		tx:         NewShmRingFromSegment(seg.B, seg.Mem), // server uses ring B for sending
-		rx:         NewShmRingFromSegment(seg.A, seg.Mem), // server uses ring A for receiving
+		tx:         tx,
+		rx:         rx,
 		streams:    make(map[uint32]*streamingServerStream),
 		readerDone: make(chan struct{}),
 	}
