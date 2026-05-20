@@ -130,21 +130,18 @@ import (
 // the production wake primitive on Linux (integrates with Go
 // netpoller, scales to many connections, ~1us wake latency).
 //
-// Cross-process safety: the per-segment eventfd file descriptors
-// today live in a process-local in-memory stash keyed by the
-// segment path. A cross-process opener can't reach the creator's
-// stash and therefore has no waker, while the creator keeps one.
-// To prevent asymmetric-wake deadlocks, both peers call
-// Segment.finalizeDataSegWaker after the WaitForServer / WaitForClient
-// handshake; when ServerPID and ClientPID differ the creator
-// releases its waker and clears it from any rings, leaving both
-// peers on the futex fallback. See Segment.finalizeDataSegWaker
-// for details.
-//
-// Phase 2 will hand the eventfd peer endpoint across processes via
-// SCM_RIGHTS so cross-process segments can also use the eventfd
-// fast path. At that point the finalize check becomes a no-op
-// (PIDs differ but both sides have valid wakers).
+// Cross-process safety: the per-segment eventfd file descriptors live
+// in a process-local in-memory stash keyed by the segment path for
+// same-process openers; cross-process openers receive duplicates via
+// SCM_RIGHTS over a per-segment unix-domain socket bound by the
+// creator (see shm_fdpass_linux.go). When SCM_RIGHTS handoff fails
+// (socket unreachable, sandbox restrictions, non-Linux peer), the
+// opener falls through to the futex wake primitive and reports that
+// outcome in the segment header's OpenerWakeReady flag. The creator's
+// Segment.finalizeDataSegWaker reads the flag after WaitForClient
+// and drops its own waker if OpenerWakeReady is false, so both peers
+// converge on the futex fallback and the asymmetric-wake deadlock is
+// avoided. See Segment.finalizeDataSegWaker for the full sequence.
 //
 // Same-process bench / test code that wants to compare against the
 // futex fallback can disable the waker globally via
@@ -516,8 +513,10 @@ func (w *shmDataSegWaker) Close() {
 }
 
 // shmDataSegWakerStash is the same-process rendezvous keyed by
-// segment path. Cross-process (Phase 2) will replace this with
-// SCM_RIGHTS.
+// segment path. Cross-process openers receive duplicates of the
+// creator-side eventfd pair via SCM_RIGHTS over the per-segment
+// fd-pass socket (see shm_fdpass_linux.go); they do not consult
+// this stash.
 var shmDataSegWakerStash = struct {
 	mu sync.Mutex
 	m  map[string]*shmDataSegWaker

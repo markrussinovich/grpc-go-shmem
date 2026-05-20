@@ -275,11 +275,14 @@ func (l *ShmListener) Accept() (net.Conn, error) {
 			return nil, err
 		}
 
-		// Resolve the eventfd-waker peer state now that both PIDs
-		// are stably visible in the header. Cross-process segments
-		// converge on the futex fallback; same-process keeps the
-		// eventfd fast path. MUST run before any goroutine starts
-		// using the rings for data-plane reads / writes.
+		// Resolve the eventfd-waker peer state now that OpenerWakeReady
+		// is stably published by the client's setupDataSegWakeForOpener.
+		// When the opener obtained a waker (same-process via the in-
+		// memory stash OR cross-process via SCM_RIGHTS) both sides keep
+		// the eventfd fast path; otherwise the creator drops its waker
+		// so both converge on the futex / Windows-events path, avoiding
+		// the asymmetric-wake deadlock. MUST run before any goroutine
+		// starts using the rings for data-plane reads / writes.
 		segment.finalizeDataSegWaker()
 
 		conn := &shmConn{

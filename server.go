@@ -1188,20 +1188,28 @@ func (s *Server) sendResponse(ctx context.Context, stream *transport.ServerStrea
 	// Zero-copy fast path: when no compression is configured, the codec is
 	// the default proto codec, and the message is a proto.Message (not an
 	// adapted v1 message), try to serialize directly into the ring buffer.
-	if cp == nil && comp == nil && stream.ContentSubtype() == "" {
-		if pm, ok := msg.(protobuf.Message); ok {
-			pSize := protobuf.Size(pm)
-			if pSize > s.opts.maxSendMessageSize {
-				return status.Errorf(codes.ResourceExhausted, "grpc: trying to send message larger than max (%d vs. %d)", pSize, s.opts.maxSendMessageSize)
-			}
-			if handled, err := stream.WriteProto(msg, opts); handled {
-				if err != nil {
-					return err
+	// Require an explicit Name() == "proto" match on the codec so a custom
+	// codec registered under a non-empty content subtype is not silently
+	// bypassed.
+	if cp == nil && comp == nil {
+		codec := s.getCodec(stream.ContentSubtype())
+		nc, hasName := codec.(interface{ Name() string })
+		isProtoCodec := hasName && nc.Name() == "proto"
+		if isProtoCodec {
+			if pm, ok := msg.(protobuf.Message); ok {
+				pSize := protobuf.Size(pm)
+				if pSize > s.opts.maxSendMessageSize {
+					return status.Errorf(codes.ResourceExhausted, "grpc: trying to send message larger than max (%d vs. %d)", pSize, s.opts.maxSendMessageSize)
 				}
-				if s.statsHandler != nil {
-					s.statsHandler.HandleRPC(ctx, outPayload(false, msg, pSize, pSize, time.Now()))
+				if handled, err := stream.WriteProto(msg, opts); handled {
+					if err != nil {
+						return err
+					}
+					if s.statsHandler != nil {
+						s.statsHandler.HandleRPC(ctx, outPayload(false, msg, pSize, pSize, time.Now()))
+					}
+					return nil
 				}
-				return nil
 			}
 		}
 	}

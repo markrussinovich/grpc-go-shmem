@@ -119,10 +119,12 @@ func DialShm(ctx context.Context, addr string, opts *DialOptions) (ClientTranspo
 
 	ctlTx := NewShmRingFromSegment(ctlSeg.A, ctlSeg.Mem)
 	ctlRx := NewShmRingFromSegment(ctlSeg.B, ctlSeg.Mem)
-	// Resolve the eventfd-waker peer state for the control segment
-	// before registering rings: same-process keeps the eventfd fast
-	// path; cross-process drops it so both peers use futex. See
-	// Segment.finalizeDataSegWaker for details.
+	// Defensive: finalizeDataSegWaker is a no-op for control segments
+	// (their suffix excludes them from the eventfd waker in
+	// setupDataSegWakeFor{Creator,Opener}). The call is kept here so
+	// that any future change which allowed wakers on control segments
+	// would still observe a stable OpenerWakeReady flag before the
+	// rings start carrying control frames.
 	ctlSeg.finalizeDataSegWaker()
 	ctlSeg.RegisterRing(ctlTx)
 	ctlSeg.RegisterRing(ctlRx)
@@ -178,10 +180,14 @@ func DialShm(ctx context.Context, addr string, opts *DialOptions) (ClientTranspo
 		// This unblocks the server's WaitForClient in Accept().
 		segment.SetClientReadyAndSignal(true)
 
-		// Resolve the eventfd-waker peer state. Cross-process segments
-		// converge on futex; same-process keeps the eventfd fast path.
-		// MUST run before any ring read/write. See
-		// Segment.finalizeDataSegWaker for details.
+		// Resolve the eventfd-waker peer state now that OpenerWakeReady
+		// is stably published by setupDataSegWakeForOpener. When the
+		// opener obtained a waker (same-process via the in-memory stash
+		// OR cross-process via SCM_RIGHTS) both sides keep the eventfd
+		// fast path; otherwise the creator drops its waker so both
+		// converge on the futex / Windows-events path, avoiding the
+		// asymmetric-wake deadlock. MUST run before any ring read/write.
+		// See Segment.finalizeDataSegWaker for details.
 		segment.finalizeDataSegWaker()
 
 		localAddr := &ShmAddr{Name: segName + "_client"}

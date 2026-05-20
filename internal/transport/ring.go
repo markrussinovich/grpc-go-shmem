@@ -731,12 +731,13 @@ func (r *ShmRing) signalData(addr *uint32) {
 		r.dataSegWaker.Wake()
 		// Also issue a futex_wake on the same address so peers using a
 		// different wake primitive (raw-ring tests that bypass
-		// RegisterRing; cross-process peers until Phase 2 SCM_RIGHTS
-		// passes the eventfds across) still observe the signal. Safe:
-		// futex_wake on an address with no waiters is a cheap kernel
-		// hash lookup (~150 ns) -- negligible against the ~100 us
-		// per-RPC cost. Use the on-Linux primitive directly so the
-		// Windows events path is not double-fired.
+		// RegisterRing; cross-process peers whose SCM_RIGHTS handoff
+		// failed and converged on futex via OpenerWakeReady=false)
+		// still observe the signal. Safe: futex_wake on an address
+		// with no waiters is a cheap kernel hash lookup (~150 ns) --
+		// negligible against the ~100 us per-RPC cost. Use the on-
+		// Linux primitive directly so the Windows events path is not
+		// double-fired.
 		futexWake(addr, 1)
 		return
 	}

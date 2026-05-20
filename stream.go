@@ -970,9 +970,11 @@ func (cs *clientStream) SendMsg(m any) (err error) {
 	//    through to the standard a.sendMsg with the pre-encoded bytes.
 	canZC := cs.compressorV0 == nil && cs.compressorV1 == nil
 	if canZC {
-		if nc, ok := cs.codec.(interface{ Name() string }); ok {
-			canZC = nc.Name() == "proto"
-		}
+		// Require an explicit Name() == "proto" match: codecs that do not
+		// implement Name() (an unusual baseCodec) fall through to the
+		// standard sendMsg path so their semantics are preserved.
+		nc, ok := cs.codec.(interface{ Name() string })
+		canZC = ok && nc.Name() == "proto"
 	}
 	if canZC {
 		// Pre-encode for max-size check and retry buffer.
@@ -1839,10 +1841,11 @@ func (ss *serverStream) SendMsg(m any) (err error) {
 	// message is a native proto.Message, serialize directly into the ring.
 	// No retry concerns on the server side.
 	if ss.compressorV0 == nil && ss.compressorV1 == nil {
-		isProtoCodec := true
-		if nc, ok := ss.codec.(interface{ Name() string }); ok {
-			isProtoCodec = nc.Name() == "proto"
-		}
+		// Require an explicit Name() == "proto" match: codecs that do not
+		// implement Name() (an unusual baseCodec) fall through to the
+		// standard send path so their semantics are preserved.
+		nc, hasName := ss.codec.(interface{ Name() string })
+		isProtoCodec := hasName && nc.Name() == "proto"
 		if isProtoCodec {
 			if pm, ok := m.(proto.Message); ok {
 				pSize := proto.Size(pm)

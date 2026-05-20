@@ -1035,12 +1035,15 @@ func recv(p *parser, c baseCodec, s recvCompressor, dc Decompressor, m any, maxR
 	// ring-backed SliceBuffer from SHM transport), the message is a proto,
 	// and the codec is the default proto codec, unmarshal directly from the
 	// buffer without MaterializeToBuffer copy. Custom codecs are not
-	// bypassed — they may have validation or different serialization.
+	// bypassed — they may have validation or different serialization. We
+	// require an explicit Name() == "proto" match: codecs that do not
+	// implement Name() (an unusual baseCodec) fall through to c.Unmarshal
+	// to preserve their semantics.
 	if len(data) == 1 {
 		if pm, ok := m.(protobuf.Message); ok {
-			isProtoCodec := true
-			if nc, ok := c.(interface{ Name() string }); ok {
-				isProtoCodec = nc.Name() == "proto"
+			isProtoCodec := false
+			if nc, ok := c.(interface{ Name() string }); ok && nc.Name() == "proto" {
+				isProtoCodec = true
 			}
 			if isProtoCodec {
 				if err := protobuf.Unmarshal(data[0].ReadOnlyData(), pm); err != nil {
