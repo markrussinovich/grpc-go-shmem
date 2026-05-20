@@ -39,8 +39,20 @@ package transport
 import (
 	"context"
 	"errors"
+	"time"
 
+	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/resolver"
+)
+
+const (
+	// DefaultSegmentSize matches the linux/windows SHM default so callers
+	// can build portable configs even when SHM is unavailable.
+	DefaultSegmentSize = 136 * 1024 * 1024
+	// DefaultRingASize matches the linux/windows client-to-server ring size.
+	DefaultRingASize = 64 * 1024 * 1024
+	// DefaultRingBSize matches the linux/windows server-to-client ring size.
+	DefaultRingBSize = 64 * 1024 * 1024
 )
 
 // Segment is a placeholder type so non-linux/windows builds can declare
@@ -50,6 +62,35 @@ import (
 // instantiates a Segment — anything trying to use it would have
 // failed at IsShmEnabled / NewShmClient earlier.
 type Segment struct{}
+
+// ShmSecurityHandshaker is a placeholder for the linux/windows security
+// handshaker type so portable DialOptions declarations compile.
+type ShmSecurityHandshaker struct{}
+
+// DialOptions contains options for dialing a shared memory connection.
+// On unsupported platforms it is only a configuration placeholder used
+// by the experimental/shm public API.
+type DialOptions struct {
+	SegmentSize           uint64
+	RingASize             uint64
+	RingBSize             uint64
+	ConnectTimeout        time.Duration
+	KeepaliveParams       keepalive.ClientParameters
+	Handshaker            *ShmSecurityHandshaker
+	SingleStreamMode      bool
+	InitialWindowSize     int32
+	InitialConnWindowSize int32
+}
+
+// DefaultDialOptions returns portable defaults for unsupported platforms.
+func DefaultDialOptions() *DialOptions {
+	return &DialOptions{
+		SegmentSize:    DefaultSegmentSize,
+		RingASize:      DefaultRingASize,
+		RingBSize:      DefaultRingBSize,
+		ConnectTimeout: 30 * time.Second,
+	}
+}
 
 // unmapMemory is a no-op stub matching the linux/windows signature
 // (a package-level function variable assigned in mmap init blocks).

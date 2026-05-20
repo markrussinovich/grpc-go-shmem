@@ -553,29 +553,7 @@ func WaitClientReady(ctx context.Context, segmentName string) error {
 	if !ok || events == nil {
 		return fmt.Errorf("no handshake events for segment %s", segmentName)
 	}
-
-	// Calculate timeout
-	var timeout uint32 = windows.INFINITE
-	if dl, ok := ctx.Deadline(); ok {
-		remaining := time.Until(dl)
-		if remaining <= 0 {
-			return context.DeadlineExceeded
-		}
-		timeout = uint32(remaining.Milliseconds())
-	}
-
-	result, err := windows.WaitForSingleObject(events.clientReadyEvent, timeout)
-	if err != nil {
-		return err
-	}
-	switch result {
-	case windows.WAIT_OBJECT_0:
-		return nil
-	case uint32(windows.WAIT_TIMEOUT):
-		return context.DeadlineExceeded
-	default:
-		return fmt.Errorf("WaitForSingleObject returned %d", result)
-	}
+	return waitForHandshakeEvent(ctx, events.clientReadyEvent)
 }
 
 // WaitServerReady waits for the server ready signal with optional timeout.
@@ -586,8 +564,16 @@ func WaitServerReady(ctx context.Context, segmentName string) error {
 	if !ok || events == nil {
 		return fmt.Errorf("no handshake events for segment %s", segmentName)
 	}
+	return waitForHandshakeEvent(ctx, events.serverReadyEvent)
+}
 
-	// Calculate timeout
+func waitForHandshakeEvent(ctx context.Context, event windows.Handle) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+
 	var timeout uint32 = windows.INFINITE
 	if dl, ok := ctx.Deadline(); ok {
 		remaining := time.Until(dl)
@@ -597,17 +583,39 @@ func WaitServerReady(ctx context.Context, segmentName string) error {
 		timeout = uint32(remaining.Milliseconds())
 	}
 
-	result, err := windows.WaitForSingleObject(events.serverReadyEvent, timeout)
+	cancelEvent, err := windows.CreateEvent(nil, 1, 0, nil)
+	if err != nil {
+		return err
+	}
+	done := make(chan struct{})
+	goroutineDone := make(chan struct{})
+	go func() {
+		defer close(goroutineDone)
+		select {
+		case <-ctx.Done():
+			windows.SetEvent(cancelEvent)
+		case <-done:
+		}
+	}()
+	defer func() {
+		close(done)
+		<-goroutineDone
+		windows.CloseHandle(cancelEvent)
+	}()
+
+	result, err := windows.WaitForMultipleObjects([]windows.Handle{event, cancelEvent}, false, timeout)
 	if err != nil {
 		return err
 	}
 	switch result {
 	case windows.WAIT_OBJECT_0:
 		return nil
+	case windows.WAIT_OBJECT_0 + 1:
+		return ctx.Err()
 	case uint32(windows.WAIT_TIMEOUT):
 		return context.DeadlineExceeded
 	default:
-		return fmt.Errorf("WaitForSingleObject returned %d", result)
+		return fmt.Errorf("WaitForMultipleObjects returned %d", result)
 	}
 }
 
