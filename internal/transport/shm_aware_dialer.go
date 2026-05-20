@@ -322,12 +322,20 @@ func NewShmClient(connectCtx, _ context.Context, addr resolver.Address, opts Con
 // fallback path to retry over HTTP/2 (when allowed), preserving the
 // user's stated security intent.
 //
-// SHM-compatible transport-credential protocols:
-//   - "" (nil credentials): accepted, downstream code decides.
-//   - "insecure": accepted, equivalent to no transport security.
-//   - "shm": accepted; this is the SecurityProtocol reported by the
-//     publicly exported credentials/shm package, which performs its
-//     own SHM-segment-based handshake.
+// SHM-compatible transport credentials:
+//   - nil TransportCredentials (no transport-level handshake configured)
+//   - non-nil credentials whose Info().SecurityProtocol == "insecure"
+//     (e.g. insecure.NewCredentials()).
+//
+// The publicly exported credentials/shm package reports
+// Info().SecurityProtocol == "shm" but its ClientHandshake is not
+// currently wired through the RFC-A73 NewShmClient path; accepting
+// "shm" here without invoking the verifier would bypass it silently.
+// Until that wiring lands we reject "shm" credentials with the same
+// structured error so users get a clear failure (and HTTP/2 fallback
+// when allowed) instead of an unauthenticated SHM connection. The
+// in-process ShmSecurityHandshaker on DialOptions.Handshaker remains
+// the supported way to add SHM-specific identity verification.
 //
 // Per-RPC credentials are accepted as long as RequireTransportSecurity()
 // returns false. Bundle-wrapped per-RPC credentials are checked the
@@ -341,15 +349,13 @@ func assertShmCompatibleCredentials(opts ConnectOptions) error {
 		if tc == nil {
 			return nil
 		}
-		switch tc.Info().SecurityProtocol {
-		case "insecure", "shm":
+		if tc.Info().SecurityProtocol == "insecure" {
 			return nil
-		default:
-			return NewShmError(
-				ShmErrConnectionRefused,
-				fmt.Sprintf("shm transport does not accept transport credentials %q; use insecure.NewCredentials(), the credentials/shm package, or allow HTTP/2 fallback for TLS", tc.Info().SecurityProtocol),
-			)
 		}
+		return NewShmError(
+			ShmErrConnectionRefused,
+			fmt.Sprintf("shm transport does not accept transport credentials %q; use insecure.NewCredentials() (with DialOptions.Handshaker for in-process identity verification) or allow HTTP/2 fallback for TLS", tc.Info().SecurityProtocol),
+		)
 	}
 	checkPRC := func(prc credentials.PerRPCCredentials) error {
 		if prc == nil {

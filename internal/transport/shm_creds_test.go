@@ -102,16 +102,29 @@ func TestAssertShmCompatibleCredentials_AcceptsInsecure(t *testing.T) {
 	}
 }
 
-// TestAssertShmCompatibleCredentials_AcceptsShmCreds verifies the
-// SHM-native credentials (SecurityProtocol == "shm" from the public
-// credentials/shm package) are also accepted, otherwise the gate
-// would break the advertised SHM credential story.
-func TestAssertShmCompatibleCredentials_AcceptsShmCreds(t *testing.T) {
+// TestAssertShmCompatibleCredentials_RejectsShmCreds verifies that
+// the publicly-exported credentials/shm package's SecurityProtocol
+// ("shm") is currently rejected by the gate. The credentials/shm
+// package's ClientHandshake is not yet wired through NewShmClient,
+// so allowlisting it here would let a caller configure a verifier
+// that the transport silently ignores. Until the wiring lands the
+// gate rejects "shm" with the same structured error as other
+// non-insecure protocols, so clientconn's RFC-A73 path can drive
+// HTTP/2 fallback (when allowed) and the user gets a clear error
+// otherwise.
+func TestAssertShmCompatibleCredentials_RejectsShmCreds(t *testing.T) {
 	err := assertShmCompatibleCredentials(ConnectOptions{
 		TransportCredentials: fakeTLSCreds{protocol: "shm"},
 	})
-	if err != nil {
-		t.Errorf("assertShmCompatibleCredentials({shm}) = %v; want nil", err)
+	if err == nil {
+		t.Fatal("assertShmCompatibleCredentials({shm}) = nil; want error")
+	}
+	sErr, ok := err.(*ShmError)
+	if !ok {
+		t.Fatalf("error type = %T; want *ShmError", err)
+	}
+	if sErr.Code != ShmErrConnectionRefused {
+		t.Errorf("error code = %v; want ShmErrConnectionRefused", sErr.Code)
 	}
 }
 
@@ -125,6 +138,10 @@ func TestAssertShmCompatibleCredentials_RejectsTLS(t *testing.T) {
 	}{
 		{"tls", ConnectOptions{TransportCredentials: fakeTLSCreds{protocol: "tls"}}},
 		{"alts", ConnectOptions{TransportCredentials: fakeTLSCreds{protocol: "alts"}}},
+		// "shm" reports a SecurityProtocol from credentials/shm but
+		// its ClientHandshake is not wired through NewShmClient yet;
+		// rejecting until that lands prevents a silent verifier bypass.
+		{"shm-not-yet-wired", ConnectOptions{TransportCredentials: fakeTLSCreds{protocol: "shm"}}},
 		// Empty SecurityProtocol on a non-nil credential is suspicious
 		// and not on the SHM whitelist; reject.
 		{"empty-protocol", ConnectOptions{TransportCredentials: fakeTLSCreds{protocol: ""}}},

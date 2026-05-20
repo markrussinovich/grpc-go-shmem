@@ -198,18 +198,34 @@ func DialShm(ctx context.Context, addr string, opts *DialOptions) (ClientTranspo
 		return nil, NewShmErrorWithCause(ShmErrConnectionRefused, "send connect request", err)
 	}
 	sentConnect = true
-	respFH, respPayload, err := readCtlFrame(ctx, ctlRx)
+	// Use a non-cancellable context for the response read, preserving
+	// only ctx's deadline. ctx cancellation (Done channel close) during
+	// readCtlFrame's two-phase header+payload commit would leave Ring B
+	// mid-frame and corrupt the next dialer's read. The outer
+	// DialShm ConnectTimeout (and any caller-supplied deadline)
+	// still bounds the wait via deadline propagation. Residual risk:
+	// a deadline firing between the header commit and payload read
+	// could still leave bytes pending; the deferred drain attempts a
+	// best-effort cleanup. A wire-level request nonce would close
+	// the remaining window; tracked as a gRFC follow-up.
+	readCtx := context.Background()
+	if d, ok := ctx.Deadline(); ok {
+		var cancel context.CancelFunc
+		readCtx, cancel = context.WithDeadline(context.Background(), d)
+		defer cancel()
+	}
+	respFH, respPayload, err := readCtlFrame(readCtx, ctlRx)
 	if err != nil {
 		// Deferred drain + release handles the abandoned-response
 		// recovery; just surface the read error.
 		return nil, NewShmErrorWithCause(ShmErrConnectionRefused, "read connect response", err)
 	}
-	// Success: release the lock now so the next dialer can proceed
-	// while this client continues on the dedicated data segment.
-	// Clear the release closure so the defer above is a no-op.
+	// Mark sentConnect=false BEFORE the explicit release so any
+	// panic in the release path itself does not trigger a stale
+	// drain on already-empty Ring B.
+	sentConnect = false
 	releaseCtlLock()
 	releaseCtlLock = nil
-	sentConnect = false
 	switch respFH.Type {
 	case FrameTypeACCEPT:
 		resp, err := decodeConnectResponse(respPayload)
