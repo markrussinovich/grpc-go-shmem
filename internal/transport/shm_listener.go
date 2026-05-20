@@ -274,6 +274,7 @@ func (l *ShmListener) Accept() (net.Conn, error) {
 			if writeEvents != nil {
 				writeEvents.Close()
 			}
+			CloseHandshakeEvents(segmentName)
 			segment.Close()
 			_ = RemoveSegment(segmentName)
 			return nil, err
@@ -296,6 +297,7 @@ func (l *ShmListener) Accept() (net.Conn, error) {
 			if writeEvents != nil {
 				writeEvents.Close()
 			}
+			CloseHandshakeEvents(segmentName)
 			segment.Close()
 			_ = RemoveSegment(segmentName)
 			// If the listener itself was cancelled, propagate;
@@ -346,6 +348,7 @@ func (l *ShmListener) Accept() (net.Conn, error) {
 				if writeEvents != nil {
 					writeEvents.Close()
 				}
+				CloseHandshakeEvents(segmentName)
 				segment.Close()
 				_ = RemoveSegment(segmentName)
 				return nil, fmt.Errorf("security handshake failed: %v", err)
@@ -361,6 +364,7 @@ func (l *ShmListener) Accept() (net.Conn, error) {
 			if writeEvents != nil {
 				writeEvents.Close()
 			}
+			CloseHandshakeEvents(segmentName)
 			segment.Close()
 			_ = RemoveSegment(segmentName)
 			return nil, fmt.Errorf("failed to create server transport: %v", err)

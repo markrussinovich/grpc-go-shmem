@@ -40,19 +40,22 @@ func (s *Segment) WaitForClient(ctx context.Context) error {
 	// Extract segment name from path
 	segmentName := extractSegmentNameFromPath(s.Path)
 
-	// Wait on the named event
-	if err := WaitClientReady(ctx, segmentName); err != nil {
-		return err
-	}
+	for {
+		if err := WaitClientReady(ctx, segmentName); err != nil {
+			return err
+		}
 
-	// Verify the flag is actually set (belt and suspenders)
-	if atomic.LoadUint32(addr) == 0 {
-		// Event was signaled but flag not set - wait again or return error
-		// This shouldn't happen in practice
-		return nil
+		// Require the shared flag to be set. A stale named-event signal
+		// (from a previous accept that timed out and was cleaned up, or
+		// from a peer that crashed after signalling but before storing)
+		// must NOT count as success: the listener relies on this gate to
+		// know the client actually mapped the segment. The event is
+		// auto-reset, so consuming a stale signal and retrying waits for
+		// the next real transition.
+		if atomic.LoadUint32(addr) != 0 {
+			return nil
+		}
 	}
-
-	return nil
 }
 
 // WaitForServer waits for the server to mark itself as ready.
@@ -68,12 +71,17 @@ func (s *Segment) WaitForServer(ctx context.Context) error {
 	// Extract segment name from path
 	segmentName := extractSegmentNameFromPath(s.Path)
 
-	// Wait on the named event
-	if err := WaitServerReady(ctx, segmentName); err != nil {
-		return err
-	}
+	for {
+		if err := WaitServerReady(ctx, segmentName); err != nil {
+			return err
+		}
 
-	return nil
+		// Require the shared flag to be set. See WaitForClient for
+		// rationale on consuming stale-event signals and retrying.
+		if atomic.LoadUint32(addr) != 0 {
+			return nil
+		}
+	}
 }
 
 // extractSegmentNameFromPath extracts the segment name from the file path.

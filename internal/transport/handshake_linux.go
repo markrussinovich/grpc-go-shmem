@@ -57,8 +57,16 @@ func (s *Segment) WaitForClient(ctx context.Context) error {
 		}
 		if timeoutNs > 0 {
 			if err := futexWaitTimeout(addr, 0, timeoutNs); err != nil {
-				// Translate futex timeout to context deadline exceeded
+				// Translate futex timeout to context deadline exceeded.
+				// Recheck the flag first to catch a peer store that landed
+				// on the same nanosecond as the timeout boundary (futex
+				// is racy at the wake/timeout edge -- a peer store that
+				// happens between our wait setup and the kernel waking us
+				// for timeout would otherwise be lost).
 				if errors.Is(err, ErrFutexTimeout) {
+					if atomic.LoadUint32(addr) != 0 {
+						return nil
+					}
 					return context.DeadlineExceeded
 				}
 				return err
@@ -97,8 +105,12 @@ func (s *Segment) WaitForServer(ctx context.Context) error {
 		}
 		if timeoutNs > 0 {
 			if err := futexWaitTimeout(addr, 0, timeoutNs); err != nil {
-				// Translate futex timeout to context deadline exceeded
+				// Translate futex timeout to context deadline exceeded.
+				// See WaitForClient for the rationale on the recheck.
 				if errors.Is(err, ErrFutexTimeout) {
+					if atomic.LoadUint32(addr) != 0 {
+						return nil
+					}
 					return context.DeadlineExceeded
 				}
 				return err

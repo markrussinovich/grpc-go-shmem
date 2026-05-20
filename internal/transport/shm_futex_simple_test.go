@@ -1,3 +1,5 @@
+//go:build linux || windows
+
 /*
  * Copyright 2024 gRPC authors.
  *
