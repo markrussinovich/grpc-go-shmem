@@ -89,6 +89,9 @@ func DefaultDialOptions() *DialOptions {
 
 // DialShm creates a new shared memory connection to the given address
 func DialShm(ctx context.Context, addr string, opts *DialOptions) (ClientTransport, error) {
+	if err := validateSegmentName(addr); err != nil {
+		return nil, NewShmErrorWithCause(ShmErrInvalidConfig, "invalid segment name", err)
+	}
 	if opts == nil {
 		opts = DefaultDialOptions()
 	}
@@ -145,12 +148,35 @@ func DialShm(ctx context.Context, addr string, opts *DialOptions) (ClientTranspo
 	ctlTx.SetEvents(ctlTxEvents)
 	ctlRx.SetEvents(ctlRxEvents)
 
+	// Acquire the cross-process control-segment lock per gRFC: the
+	// control ring is shared among all clients connecting to the same
+	// server, so the SPSC invariant on Ring A / Ring B only holds for
+	// the duration of one client's CONNECT/ACCEPT exchange. Without
+	// this lock two concurrent dialers race on Ring A writes and
+	// Ring B reads, potentially stealing each other's response or
+	// corrupting ring indices.
+	//
+	// On Linux this is flock(LOCK_EX) on "<ctlPath>.lock"; on Windows
+	// it is a named mutex "<ctlName>.lock". Released after the
+	// ACCEPT/REJECT frame is consumed below.
+	releaseCtlLock, err := acquireControlLock(ctx, ctlName)
+	if err != nil {
+		return nil, NewShmErrorWithCause(ShmErrConnectionRefused, "acquire control lock", err)
+	}
+
 	if err := writeCtlFrame(ctx, ctlTx, FrameHeader{Type: FrameTypeCONNECT}, encodeConnectRequest(connectRequest{
 		singleStreamMode: opts.SingleStreamMode,
 	})); err != nil {
+		releaseCtlLock()
 		return nil, NewShmErrorWithCause(ShmErrConnectionRefused, "send connect request", err)
 	}
 	respFH, respPayload, err := readCtlFrame(ctx, ctlRx)
+	// Release the control-segment lock as soon as the response is
+	// drained from Ring B: the segment name in ACCEPT is what we
+	// hand off to OpenSegment below; further work happens on the
+	// dedicated data segment so the shared control ring is free for
+	// the next client.
+	releaseCtlLock()
 	if err != nil {
 		return nil, NewShmErrorWithCause(ShmErrConnectionRefused, "read connect response", err)
 	}

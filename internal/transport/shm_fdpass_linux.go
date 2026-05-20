@@ -131,6 +131,21 @@ func serveEventfdsForCreatorWaker(segPath string, w *shmDataSegWaker) (stop func
 		return nil, fmt.Errorf("fdpass: listen %s: %w", sockPath, err)
 	}
 
+	// Tighten the socket's permissions to 0600 so only the segment
+	// owner can connect. The default umask of 022 on /dev/shm would
+	// otherwise create a world-readable / world-writable socket,
+	// letting any local process receive the eventfd duplicates and
+	// flood the segment with spurious wakes (DoS). The eventfds carry
+	// no data, but the wake budget belongs to the legitimate peer.
+	if chmodErr := os.Chmod(sockPath, 0o600); chmodErr != nil {
+		_ = listener.Close()
+		_ = os.Remove(sockPath)
+		return nil, fmt.Errorf("fdpass: chmod %s 0600: %w", sockPath, chmodErr)
+	}
+
+	// Snapshot our UID for the per-accept SO_PEERCRED check below.
+	ownerUID := uint32(os.Getuid())
+
 	// Copy the fd slice so callers can free their backing array.
 	// We send the same kernel objects to every opener via dup
 	// (SCM_RIGHTS does the dup; our retained ints stay valid).
@@ -171,6 +186,16 @@ func serveEventfdsForCreatorWaker(segPath string, w *shmDataSegWaker) (stop func
 			// opener doesn't block other concurrent opens.
 			go func(c *net.UnixConn) {
 				defer c.Close()
+				// Reject peers whose UID does not match ours. The
+				// 0600 chmod above narrows the door to same-UID
+				// processes; SO_PEERCRED is the second-line check
+				// that survives any future tightening of the
+				// directory permission story (e.g., a private
+				// 0700 directory under TempDir on systems without
+				// /dev/shm).
+				if !peerUIDMatches(c, ownerUID) {
+					return
+				}
 				_ = c.SetWriteDeadline(time.Now().Add(fdpassRecvTimeout))
 				rights := unix.UnixRights(sendFds...)
 				_, _, _ = c.WriteMsgUnix(fdpassHandshakeToken[:], rights, nil)
@@ -250,6 +275,11 @@ func recvEventfdsFromCreator(segPath string) ([]int, error) {
 	for _, c := range cmsgs {
 		fds, err := unix.ParseUnixRights(&c)
 		if err != nil {
+			// Close any descriptors collected before the failure so we
+			// do not leak them to the caller's process.
+			for _, fd := range got {
+				unix.Close(fd)
+			}
 			return nil, fmt.Errorf("fdpass: ParseUnixRights: %w", err)
 		}
 		got = append(got, fds...)
@@ -292,4 +322,26 @@ func newShmDataSegWakerFromOpenerFds(fds []int) (*shmDataSegWaker, error) {
 		myReadRawFd: myReadFd,
 		peerReadFd:  peerReadFd,
 	}, nil
+}
+
+// peerUIDMatches verifies via SO_PEERCRED that the connected peer is
+// owned by the expected UID. Returns true on match, false on any
+// mismatch or error (defensive: deny on failure to read credentials).
+//
+// SO_PEERCRED is set at connect()/accept() time and is immutable for
+// the life of the socket, so the check is reliable against TOCTOU
+// races where a peer might fork after connecting.
+func peerUIDMatches(c *net.UnixConn, expected uint32) bool {
+	raw, err := c.SyscallConn()
+	if err != nil {
+		return false
+	}
+	var ucred *unix.Ucred
+	var inner error
+	if controlErr := raw.Control(func(fd uintptr) {
+		ucred, inner = unix.GetsockoptUcred(int(fd), unix.SOL_SOCKET, unix.SO_PEERCRED)
+	}); controlErr != nil || inner != nil || ucred == nil {
+		return false
+	}
+	return ucred.Uid == expected
 }

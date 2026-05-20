@@ -118,6 +118,9 @@ func NewShmListener(addr *ShmAddr, segmentSize, ringASize, ringBSize uint64) (*S
 	if addr == nil {
 		return nil, errors.New("address cannot be nil")
 	}
+	if err := validateSegmentName(addr.Name); err != nil {
+		return nil, err
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -376,6 +379,10 @@ func (l *ShmListener) Close() error {
 			l.ctlSegment.Close()
 			CloseHandshakeEvents(l.baseName + shmControlSuffix)
 			_ = RemoveSegment(l.baseName + shmControlSuffix)
+			// Unlink the cross-process control lock file (Linux) so a
+			// later listener start does not inherit a stale inode.
+			// No-op on Windows where the named mutex is refcounted.
+			removeControlLock(l.baseName + shmControlSuffix)
 
 			// Release the listener's reference on the control-ring events.
 			// On Linux these are nil; on Windows the refcount in RingEvents
