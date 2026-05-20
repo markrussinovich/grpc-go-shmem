@@ -33,6 +33,9 @@ func TestValidateSegmentName(t *testing.T) {
 		"foo",
 		"Foo_Bar-1.0",
 		"a",
+		"0",
+		"1",
+		"42",
 		"abcdefghijklmnopqrstuvwxyz0123456789._-",
 		strings.Repeat("x", maxSegmentNameLen),
 	}

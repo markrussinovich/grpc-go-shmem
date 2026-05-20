@@ -60,6 +60,24 @@ func (f fakePerRPCCreds) GetRequestMetadata(_ context.Context, _ ...string) (map
 }
 func (f fakePerRPCCreds) RequireTransportSecurity() bool { return f.requireSec }
 
+// fakeCredsBundle exposes TransportCredentials and PerRPCCredentials
+// via the credentials.Bundle interface so we can drive the bundle-
+// specific branch in assertShmCompatibleCredentials.
+type fakeCredsBundle struct {
+	tc  credentials.TransportCredentials
+	prc credentials.PerRPCCredentials
+}
+
+func (b fakeCredsBundle) TransportCredentials() credentials.TransportCredentials {
+	return b.tc
+}
+func (b fakeCredsBundle) PerRPCCredentials() credentials.PerRPCCredentials {
+	return b.prc
+}
+func (b fakeCredsBundle) NewWithMode(_ string) (credentials.Bundle, error) {
+	return b, nil
+}
+
 // TestAssertShmCompatibleCredentials_AcceptsInsecure verifies that the
 // canonical "insecure.NewCredentials()" plus no PerRPCCredentials, plus
 // a nil credentials.Bundle, is accepted.
@@ -84,9 +102,22 @@ func TestAssertShmCompatibleCredentials_AcceptsInsecure(t *testing.T) {
 	}
 }
 
+// TestAssertShmCompatibleCredentials_AcceptsShmCreds verifies the
+// SHM-native credentials (SecurityProtocol == "shm" from the public
+// credentials/shm package) are also accepted, otherwise the gate
+// would break the advertised SHM credential story.
+func TestAssertShmCompatibleCredentials_AcceptsShmCreds(t *testing.T) {
+	err := assertShmCompatibleCredentials(ConnectOptions{
+		TransportCredentials: fakeTLSCreds{protocol: "shm"},
+	})
+	if err != nil {
+		t.Errorf("assertShmCompatibleCredentials({shm}) = %v; want nil", err)
+	}
+}
+
 // TestAssertShmCompatibleCredentials_RejectsTLS verifies that any
-// non-insecure transport credentials produce a structured ShmError
-// the dialer can use to drive RFC-A73 fallback to HTTP/2.
+// non-insecure / non-shm transport credentials produce a structured
+// ShmError the dialer can use to drive RFC-A73 fallback to HTTP/2.
 func TestAssertShmCompatibleCredentials_RejectsTLS(t *testing.T) {
 	cases := []struct {
 		name string
@@ -94,6 +125,9 @@ func TestAssertShmCompatibleCredentials_RejectsTLS(t *testing.T) {
 	}{
 		{"tls", ConnectOptions{TransportCredentials: fakeTLSCreds{protocol: "tls"}}},
 		{"alts", ConnectOptions{TransportCredentials: fakeTLSCreds{protocol: "alts"}}},
+		// Empty SecurityProtocol on a non-nil credential is suspicious
+		// and not on the SHM whitelist; reject.
+		{"empty-protocol", ConnectOptions{TransportCredentials: fakeTLSCreds{protocol: ""}}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -115,17 +149,55 @@ func TestAssertShmCompatibleCredentials_RejectsTLS(t *testing.T) {
 // TestAssertShmCompatibleCredentials_RejectsRequireTransportSecurity
 // verifies that PerRPCCredentials whose RequireTransportSecurity() ==
 // true are rejected even when the transport credentials are
-// insecure-equivalent.
+// insecure-equivalent. Both direct opts.PerRPCCredentials and
+// bundle-provided per-RPC credentials are covered.
 func TestAssertShmCompatibleCredentials_RejectsRequireTransportSecurity(t *testing.T) {
+	cases := []struct {
+		name string
+		opts ConnectOptions
+	}{
+		{"direct-perRPC-requires-sec", ConnectOptions{
+			TransportCredentials: insecure.NewCredentials(),
+			PerRPCCredentials: []credentials.PerRPCCredentials{
+				fakePerRPCCreds{requireSec: true},
+			},
+		}},
+		{"bundle-perRPC-requires-sec", ConnectOptions{
+			CredsBundle: fakeCredsBundle{
+				tc:  insecure.NewCredentials(),
+				prc: fakePerRPCCreds{requireSec: true},
+			},
+		}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			err := assertShmCompatibleCredentials(c.opts)
+			if err == nil {
+				t.Fatalf("assertShmCompatibleCredentials(%s) = nil; want error", c.name)
+			}
+			sErr, ok := err.(*ShmError)
+			if !ok {
+				t.Fatalf("error type = %T; want *ShmError", err)
+			}
+			if sErr.Code != ShmErrConnectionRefused {
+				t.Errorf("error code = %v; want ShmErrConnectionRefused", sErr.Code)
+			}
+		})
+	}
+}
+
+// TestAssertShmCompatibleCredentials_RejectsTLSInBundle verifies that
+// a CredsBundle carrying TLS-grade TransportCredentials is also
+// rejected (not just direct opts.TransportCredentials).
+func TestAssertShmCompatibleCredentials_RejectsTLSInBundle(t *testing.T) {
 	opts := ConnectOptions{
-		TransportCredentials: insecure.NewCredentials(),
-		PerRPCCredentials: []credentials.PerRPCCredentials{
-			fakePerRPCCreds{requireSec: true},
+		CredsBundle: fakeCredsBundle{
+			tc: fakeTLSCreds{protocol: "tls"},
 		},
 	}
 	err := assertShmCompatibleCredentials(opts)
 	if err == nil {
-		t.Fatal("assertShmCompatibleCredentials with RequireTransportSecurity=true returned nil; want error")
+		t.Fatal("assertShmCompatibleCredentials with bundle TLS creds returned nil; want error")
 	}
 	sErr, ok := err.(*ShmError)
 	if !ok {

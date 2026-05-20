@@ -322,26 +322,43 @@ func NewShmClient(connectCtx, _ context.Context, addr resolver.Address, opts Con
 // fallback path to retry over HTTP/2 (when allowed), preserving the
 // user's stated security intent.
 //
-// Allowed:
-//   - opts.TransportCredentials == nil (no transport-level handshake)
-//   - opts.TransportCredentials.Info().SecurityProtocol == "insecure"
-//   - opts.CredsBundle == nil, or its TransportCredentials() are nil
-//     or report SecurityProtocol == "insecure"
-//   - per-RPC credentials that do NOT report RequireTransportSecurity()
+// SHM-compatible transport-credential protocols:
+//   - "" (nil credentials): accepted, downstream code decides.
+//   - "insecure": accepted, equivalent to no transport security.
+//   - "shm": accepted; this is the SecurityProtocol reported by the
+//     publicly exported credentials/shm package, which performs its
+//     own SHM-segment-based handshake.
 //
-// Rejected (returns a structured error):
-//   - any non-insecure transport credentials (TLS / ALTS / xDS / etc.)
-//   - any per-RPC credential whose RequireTransportSecurity() is true
+// Per-RPC credentials are accepted as long as RequireTransportSecurity()
+// returns false. Bundle-wrapped per-RPC credentials are checked the
+// same way; the bundle's TransportCredentials() must satisfy the same
+// gate as a direct one.
+//
+// On rejection a structured ShmError is returned so clientconn.go's
+// RFC-A73 path can drive HTTP/2 fallback when allowed.
 func assertShmCompatibleCredentials(opts ConnectOptions) error {
 	checkTC := func(tc credentials.TransportCredentials) error {
 		if tc == nil {
 			return nil
 		}
-		info := tc.Info()
-		if info.SecurityProtocol != "" && info.SecurityProtocol != "insecure" {
+		switch tc.Info().SecurityProtocol {
+		case "insecure", "shm":
+			return nil
+		default:
 			return NewShmError(
 				ShmErrConnectionRefused,
-				fmt.Sprintf("shm transport does not support transport credentials %q; use insecure.NewCredentials() (with optional ShmSecurityHandshaker) or allow HTTP/2 fallback for TLS", info.SecurityProtocol),
+				fmt.Sprintf("shm transport does not accept transport credentials %q; use insecure.NewCredentials(), the credentials/shm package, or allow HTTP/2 fallback for TLS", tc.Info().SecurityProtocol),
+			)
+		}
+	}
+	checkPRC := func(prc credentials.PerRPCCredentials) error {
+		if prc == nil {
+			return nil
+		}
+		if prc.RequireTransportSecurity() {
+			return NewShmError(
+				ShmErrConnectionRefused,
+				"shm transport cannot satisfy PerRPCCredentials that require transport security; either drop the requirement or allow HTTP/2 fallback",
 			)
 		}
 		return nil
@@ -353,17 +370,16 @@ func assertShmCompatibleCredentials(opts ConnectOptions) error {
 		if err := checkTC(b.TransportCredentials()); err != nil {
 			return err
 		}
-		// Per-RPC creds attached to a bundle also subject to the
-		// RequireTransportSecurity check below via opts.PerRPCCredentials
-		// since bundles are layered on top of, not instead of, the
-		// per-call options.
+		// CredsBundle layers PerRPCCredentials separately from
+		// opts.PerRPCCredentials: NewHTTP2Client appends them at the
+		// same gate before enforcing security. We mirror that.
+		if err := checkPRC(b.PerRPCCredentials()); err != nil {
+			return err
+		}
 	}
 	for _, prc := range opts.PerRPCCredentials {
-		if prc != nil && prc.RequireTransportSecurity() {
-			return NewShmError(
-				ShmErrConnectionRefused,
-				"shm transport cannot satisfy PerRPCCredentials that require transport security; either drop the requirement or allow HTTP/2 fallback",
-			)
+		if err := checkPRC(prc); err != nil {
+			return err
 		}
 	}
 	return nil

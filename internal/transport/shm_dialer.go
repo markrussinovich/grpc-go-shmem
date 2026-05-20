@@ -157,29 +157,59 @@ func DialShm(ctx context.Context, addr string, opts *DialOptions) (ClientTranspo
 	// corrupting ring indices.
 	//
 	// On Linux this is flock(LOCK_EX) on "<ctlPath>.lock"; on Windows
-	// it is a named mutex "<ctlName>.lock". Released after the
-	// ACCEPT/REJECT frame is consumed below.
+	// it is LockFileEx on the same sibling file (named mutex would not
+	// be safe in Go because mutex ownership is OS-thread-bound). The
+	// lock is released after the ACCEPT/REJECT response is fully
+	// drained from Ring B, or after a drain attempt if the read was
+	// cancelled mid-frame (drain prevents the next dialer from
+	// consuming a stale response and re-aligns the ring header).
 	releaseCtlLock, err := acquireControlLock(ctx, ctlName)
 	if err != nil {
 		return nil, NewShmErrorWithCause(ShmErrConnectionRefused, "acquire control lock", err)
 	}
+	// Track whether we've written CONNECT yet; if so and we later bail
+	// out without successfully reading a response, we must drain Ring B
+	// before releasing the lock so the next dialer does not consume
+	// our abandoned ACCEPT/REJECT. The deferred closure runs only if
+	// we have not already released the lock explicitly via the
+	// release-and-clear-to-nil dance after a clean response read; on
+	// panic, the defer guarantees the lock is released and the ring
+	// is drained.
+	sentConnect := false
+	defer func() {
+		if releaseCtlLock == nil {
+			return
+		}
+		if sentConnect {
+			// Best-effort drain with a fresh context so the original
+			// ctx's cancellation does not abort the drain. The 1-second
+			// cap prevents an adversarial / hung server from holding
+			// the lock forever.
+			drainCtx, drainCancel := context.WithTimeout(context.Background(), time.Second)
+			_, _, _ = readCtlFrame(drainCtx, ctlRx)
+			drainCancel()
+		}
+		releaseCtlLock()
+	}()
 
 	if err := writeCtlFrame(ctx, ctlTx, FrameHeader{Type: FrameTypeCONNECT}, encodeConnectRequest(connectRequest{
 		singleStreamMode: opts.SingleStreamMode,
 	})); err != nil {
-		releaseCtlLock()
 		return nil, NewShmErrorWithCause(ShmErrConnectionRefused, "send connect request", err)
 	}
+	sentConnect = true
 	respFH, respPayload, err := readCtlFrame(ctx, ctlRx)
-	// Release the control-segment lock as soon as the response is
-	// drained from Ring B: the segment name in ACCEPT is what we
-	// hand off to OpenSegment below; further work happens on the
-	// dedicated data segment so the shared control ring is free for
-	// the next client.
-	releaseCtlLock()
 	if err != nil {
+		// Deferred drain + release handles the abandoned-response
+		// recovery; just surface the read error.
 		return nil, NewShmErrorWithCause(ShmErrConnectionRefused, "read connect response", err)
 	}
+	// Success: release the lock now so the next dialer can proceed
+	// while this client continues on the dedicated data segment.
+	// Clear the release closure so the defer above is a no-op.
+	releaseCtlLock()
+	releaseCtlLock = nil
+	sentConnect = false
 	switch respFH.Type {
 	case FrameTypeACCEPT:
 		resp, err := decodeConnectResponse(respPayload)
