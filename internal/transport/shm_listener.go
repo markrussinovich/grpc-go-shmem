@@ -40,6 +40,20 @@ type ShmAddr struct {
 	Name string // Segment name/identifier
 }
 
+// clientReadyTimeout bounds how long the listener's Accept loop waits
+// for an accepted client to map its data segment and signal ClientReady.
+// Without a bound, a client that disappears between consuming the
+// listener's ACCEPT frame and signalling readiness (process crash,
+// kill -9, sandbox restart) would wedge the Accept goroutine
+// indefinitely and prevent the listener from serving subsequent
+// CONNECT requests. The handshake is sub-millisecond in the common
+// case (both endpoints are on the same host); 5s is plenty of
+// headroom while still recovering promptly from a dead client.
+//
+// var rather than const so tests can shrink the wait without
+// rebuilding the binary; production code does not mutate it.
+var clientReadyTimeout = 5 * time.Second
+
 // Network returns the network type
 func (a *ShmAddr) Network() string {
 	return "shm"
@@ -265,8 +279,17 @@ func (l *ShmListener) Accept() (net.Conn, error) {
 			return nil, err
 		}
 
-		// Wait for client to map the segment.
-		if err := segment.WaitForClient(l.ctx); err != nil {
+		// Wait for client to map the segment. Bound this with a timeout
+		// so a client that disappears between consuming ACCEPT and
+		// signalling ClientReady (process crash, kill -9, network
+		// partition for cross-host setups) cannot wedge the listener's
+		// Accept loop indefinitely. On timeout we clean up this
+		// connection's resources and continue the outer for-loop to
+		// service the next CONNECT.
+		waitCtx, waitCancel := context.WithTimeout(l.ctx, clientReadyTimeout)
+		waitErr := segment.WaitForClient(waitCtx)
+		waitCancel()
+		if waitErr != nil {
 			if readEvents != nil {
 				readEvents.Close()
 			}
@@ -275,7 +298,14 @@ func (l *ShmListener) Accept() (net.Conn, error) {
 			}
 			segment.Close()
 			_ = RemoveSegment(segmentName)
-			return nil, err
+			// If the listener itself was cancelled, propagate;
+			// otherwise this was a per-client timeout and we move on
+			// to the next CONNECT instead of failing Accept (which
+			// would shut the entire gRPC server down).
+			if l.ctx.Err() != nil {
+				return nil, waitErr
+			}
+			continue
 		}
 
 		// Resolve the eventfd-waker peer state now that OpenerWakeReady

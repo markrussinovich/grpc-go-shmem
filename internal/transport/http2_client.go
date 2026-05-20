@@ -238,6 +238,19 @@ func NewHTTP2Client(connectCtx, ctx context.Context, addr resolver.Address, opts
 
 	// Check if the connection provides its own transport (e.g., shared memory transport)
 	if provider, ok := conn.(ClientTransportProvider); ok {
+		// The ClientTransportProvider escape hatch bypasses the normal
+		// TransportCredentials.ClientHandshake + PerRPCCredentials
+		// RequireTransportSecurity path that follows below. Validate
+		// up front that the configured credentials are compatible with
+		// the alternative transport (today: only the SHM transport
+		// uses this hook). A user that misconfigures TLS / ALTS / other
+		// transport credentials and ALSO opts into SHM-via-ContextDialer
+		// (experimental/shm.WithTransport) would otherwise silently
+		// dial an unauthenticated shared-memory connection.
+		if err := assertShmCompatibleCredentials(opts); err != nil {
+			conn.Close()
+			return nil, err
+		}
 		// Use the custom transport directly instead of wrapping in HTTP2
 		return provider.GetClientTransport(), nil
 	}

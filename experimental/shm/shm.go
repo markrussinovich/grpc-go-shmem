@@ -155,7 +155,14 @@ func WithTransportConfig(cfg *Config) grpc.DialOption {
 // dialWithFallback attempts to dial via shared memory, falling back to
 // TCP if configured.
 func dialWithFallback(ctx context.Context, addr string, cfg *Config, fallbackHandler *transport.ShmFallbackHandler) (net.Conn, error) {
-	segmentName := strings.TrimPrefix(addr, "shm:")
+	// Strip both URI forms: the canonical "shm://name" (which gRPC's
+	// passthrough resolver may pass through verbatim) and the resolver-
+	// normalised "shm:name". TrimPrefix("shm:") would otherwise leave a
+	// stray "//" prefix that fails segment-name validation downstream.
+	segmentName := strings.TrimPrefix(addr, "shm://")
+	if segmentName == addr {
+		segmentName = strings.TrimPrefix(addr, "shm:")
+	}
 
 	clientTransport, err := transport.DialShm(ctx, segmentName, cfg.DialOptions)
 	if err == nil {

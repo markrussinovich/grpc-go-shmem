@@ -96,12 +96,20 @@ func DialShm(ctx context.Context, addr string, opts *DialOptions) (ClientTranspo
 		opts = DefaultDialOptions()
 	}
 
-	// Apply timeout
-	if opts.ConnectTimeout > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, opts.ConnectTimeout)
-		defer cancel()
+	// Apply timeout. We always install at least the safety-net timeout
+	// even when the caller passed ConnectTimeout == 0, because parts of
+	// the handshake (writing CONNECT then reading the response on the
+	// shared control ring) intentionally use a non-cancellable read
+	// context to avoid mid-frame corruption on Ring B. A caller-supplied
+	// ctx with no deadline combined with ConnectTimeout=0 would
+	// otherwise let DialShm hang forever if the server never replies.
+	connectTimeout := opts.ConnectTimeout
+	if connectTimeout <= 0 {
+		connectTimeout = 30 * time.Second
 	}
+	var cancel context.CancelFunc
+	ctx, cancel = context.WithTimeout(ctx, connectTimeout)
+	defer cancel()
 
 	// Establish the data segment to use via the server's control segment.
 	ctlName := addr + shmControlSuffix
@@ -274,7 +282,13 @@ func DialShm(ctx context.Context, addr string, opts *DialOptions) (ClientTranspo
 			segment.RegisterRing(txRing)
 			segment.RegisterRing(rxRing)
 
-			// Open events for rings (Windows)
+			// Open events for rings (Windows). On Linux these are nil.
+			// The same named events will be re-opened by
+			// NewShmClientTransport below; on Windows each Open bumps
+			// the refcount, so we MUST release these handshake-only
+			// references whether the handshake succeeds or fails.
+			// Otherwise every secured Windows dial leaks one handle
+			// per direction.
 			txEvents, _ := OpenRingEvents(segName, "A")
 			rxEvents, _ := OpenRingEvents(segName, "B")
 			txRing.SetEvents(txEvents)
@@ -283,13 +297,15 @@ func DialShm(ctx context.Context, addr string, opts *DialOptions) (ClientTranspo
 			hsCtx, hsCancel := context.WithTimeout(ctx, HandshakeTimeout)
 			authInfo, err = opts.Handshaker.ClientHandshake(hsCtx, rxRing, txRing)
 			hsCancel()
+			// Release the handshake-local event refs on both success
+			// and failure paths.
+			if txEvents != nil {
+				txEvents.Close()
+			}
+			if rxEvents != nil {
+				rxEvents.Close()
+			}
 			if err != nil {
-				if txEvents != nil {
-					txEvents.Close()
-				}
-				if rxEvents != nil {
-					rxEvents.Close()
-				}
 				segment.Close()
 				return nil, NewShmErrorWithCause(ShmErrUnknown, "security handshake failed", err)
 			}
