@@ -1002,6 +1002,12 @@ func (t *ShmClientTransport) Close(err error) {
 		}
 		if t.segmentName != "" {
 			_ = RemoveSegment(t.segmentName)
+			// Release the dialer-side handshake-events reference held
+			// since DialShm. With refcounting this is safe even when a
+			// same-process listener also holds a reference on the same
+			// registry entry; only the final caller actually closes the
+			// underlying named-event handles. No-op on Linux.
+			CloseHandshakeEvents(t.segmentName)
 		}
 
 		// Signal closure

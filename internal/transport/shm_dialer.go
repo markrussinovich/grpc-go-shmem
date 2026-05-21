@@ -122,7 +122,14 @@ func DialShm(ctx context.Context, addr string, opts *DialOptions) (ClientTranspo
 
 	// Open handshake events for the control segment (Windows).
 	// This must be done before WaitForServer so we can wait on the event.
+	// Pair this Open with a deferred Close so the dialer-side ref is
+	// released whether DialShm succeeds or fails; without this the
+	// Windows registry entry (and its two named-event handles) leaks
+	// once per cross-process dial. Same-process: refcount in the shared
+	// registry keeps the listener-side entry alive until its own
+	// Close decrements to zero.
 	_, _ = OpenHandshakeEvents(ctlName)
+	defer CloseHandshakeEvents(ctlName)
 
 	if err := ctlSeg.WaitForServer(ctx); err != nil {
 		return nil, NewShmErrorWithCause(ShmErrConnectionRefused, "wait for control server", err)
@@ -248,7 +255,18 @@ func DialShm(ctx context.Context, addr string, opts *DialOptions) (ClientTranspo
 		}
 
 		// Open handshake events for the data segment (Windows).
-		_, _ = OpenHandshakeEvents(segName)
+		// On success ownership transfers to ShmClientTransport.Close
+		// which decrements the refcount via CloseHandshakeEvents.
+		// On any failure path before that hand-off the segHandshakeOwned
+		// flag triggers a local CloseHandshakeEvents so we never leak
+		// the dialer-side ref. No-op on Linux.
+		_, hsErr := OpenHandshakeEvents(segName)
+		segHandshakeOwned := hsErr == nil
+		defer func() {
+			if segHandshakeOwned {
+				CloseHandshakeEvents(segName)
+			}
+		}()
 
 		// Wait for server readiness via named event (Windows) or futex (Linux).
 		if err := segment.WaitForServer(ctx); err != nil {
@@ -347,6 +365,9 @@ func DialShm(ctx context.Context, addr string, opts *DialOptions) (ClientTranspo
 		}
 		// Configure keepalive if params are provided.
 		clientTransport.ConfigureKeepalive(opts.KeepaliveParams)
+		// Transfer ownership of the dialer's handshake-events ref to
+		// the transport; ShmClientTransport.Close will release it.
+		segHandshakeOwned = false
 		return clientTransport, nil
 	case FrameTypeREJECT:
 		r, err := decodeConnectReject(respPayload)

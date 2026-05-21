@@ -39,6 +39,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -90,12 +91,11 @@ func acquireControlLock(ctx context.Context, ctlName string) (func(), error) {
 		}
 	}
 
-	released := false
+	var released atomic.Bool
 	return func() {
-		if released {
+		if released.Swap(true) {
 			return
 		}
-		released = true
 		// LOCK_UN is implicit on close, but explicit unlock first makes
 		// the wake of any waiting peer prompt (the close path can be
 		// deferred by the runtime).

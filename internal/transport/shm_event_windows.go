@@ -447,6 +447,14 @@ type HandshakeEvents struct {
 	clientReadyEvent windows.Handle
 	serverReadyEvent windows.Handle
 	segmentName      string
+	// refCount tracks how many callers (Create + Open) currently hold a
+	// reference. CloseHandshakeEvents decrements and only releases the
+	// underlying handles when the count reaches zero. This lets the
+	// dialer-side transport clean up its own reference without breaking
+	// the same-process listener (which obtained an alias to the same
+	// registry entry) and without leaking handles in the cross-process
+	// case (where each process maintains its own private registry).
+	refCount int
 }
 
 // Global registry of handshake events by segment name.
@@ -463,6 +471,7 @@ func CreateHandshakeEvents(segmentName string) (*HandshakeEvents, error) {
 
 	// Check if already exists
 	if events, ok := handshakeEventsRegistry[segmentName]; ok {
+		events.refCount++
 		return events, nil
 	}
 
@@ -484,6 +493,7 @@ func CreateHandshakeEvents(segmentName string) (*HandshakeEvents, error) {
 		clientReadyEvent: clientEvent,
 		serverReadyEvent: serverEvent,
 		segmentName:      segmentName,
+		refCount:         1,
 	}
 
 	handshakeEventsRegistry[segmentName] = events
@@ -498,6 +508,7 @@ func OpenHandshakeEvents(segmentName string) (*HandshakeEvents, error) {
 
 	// Check if already exists in registry
 	if events, ok := handshakeEventsRegistry[segmentName]; ok {
+		events.refCount++
 		return events, nil
 	}
 
@@ -519,6 +530,7 @@ func OpenHandshakeEvents(segmentName string) (*HandshakeEvents, error) {
 		clientReadyEvent: clientEvent,
 		serverReadyEvent: serverEvent,
 		segmentName:      segmentName,
+		refCount:         1,
 	}
 
 	handshakeEventsRegistry[segmentName] = events
@@ -619,21 +631,29 @@ func waitForHandshakeEvent(ctx context.Context, event windows.Handle) error {
 	}
 }
 
-// CloseHandshakeEvents closes and removes handshake events from registry.
+// CloseHandshakeEvents drops one reference held by the caller (Create or
+// Open). The registry entry and the underlying named-event handles are
+// only released when the reference count drops to zero. Safe to call
+// after the entry has already been fully released; no-op in that case.
 func CloseHandshakeEvents(segmentName string) {
 	handshakeEventsMu.Lock()
 	events, ok := handshakeEventsRegistry[segmentName]
-	if ok {
-		delete(handshakeEventsRegistry, segmentName)
+	if !ok {
+		handshakeEventsMu.Unlock()
+		return
 	}
+	events.refCount--
+	if events.refCount > 0 {
+		handshakeEventsMu.Unlock()
+		return
+	}
+	delete(handshakeEventsRegistry, segmentName)
 	handshakeEventsMu.Unlock()
 
-	if events != nil {
-		if events.clientReadyEvent != 0 {
-			windows.CloseHandle(events.clientReadyEvent)
-		}
-		if events.serverReadyEvent != 0 {
-			windows.CloseHandle(events.serverReadyEvent)
-		}
+	if events.clientReadyEvent != 0 {
+		windows.CloseHandle(events.clientReadyEvent)
+	}
+	if events.serverReadyEvent != 0 {
+		windows.CloseHandle(events.serverReadyEvent)
 	}
 }
