@@ -10,16 +10,18 @@
     result files so the contribution of each SHM-only tuning knob is
     isolated against the same fair-default baseline:
 
-        A  fair_default        — 16 KiB frame, no spin (current fair config)
-        B  fair_largeframe     — 16 MiB frame, no spin
-        C  fair_largeframe_spin— 16 MiB frame, SHM_SPIN_ITERS=2000 (light)
+        A  fair_default     — 16 KiB frame, no spin (current fair config)
+        B  fair_1Mframe     — 1 MiB frame, no spin
+        C  fair_1Mframe_spin— 1 MiB frame, SHM_SPIN_ITERS=2000 (light)
 
     Spin and large-frame are SHM-only tunings; TCP keeps its HTTP/2 spec
     defaults across all three cells, so the comparison stays
-    apples-to-apples. UDS is not available on Windows.
+    apples-to-apples. UDS is not available on Windows; on Linux the
+    companion script also reports Unix-domain-socket numbers for the
+    apples-to-apples local-IPC baseline Mark asked for.
 
 .PARAMETER OutputDir
-    Where to write logs. Defaults to bench_win_largeframe_spin under the
+    Where to write logs. Defaults to bench_win_1Mframe_spin under the
     repo root.
 
 .EXAMPLE
@@ -27,7 +29,7 @@
 #>
 
 param(
-    [string]$OutputDir = "$PSScriptRoot\..\bench_win_largeframe_spin"
+    [string]$OutputDir = "$PSScriptRoot\..\bench_win_1Mframe_spin"
 )
 
 $ErrorActionPreference = 'Stop'
@@ -83,13 +85,13 @@ function Invoke-Cell {
 }
 
 # ---- Cell A: baseline (16 KiB frame, no spin) ----
-Invoke-Cell -Label 'A_fair_default'         -MaxFrame ''         -SpinIters ''
+Invoke-Cell -Label 'A_fair_default'      -MaxFrame ''        -SpinIters ''
 
-# ---- Cell B: large frame only ----
-Invoke-Cell -Label 'B_fair_largeframe'      -MaxFrame '16777215' -SpinIters ''
+# ---- Cell B: 1 MiB frame only ----
+Invoke-Cell -Label 'B_fair_1Mframe'      -MaxFrame '1048576' -SpinIters ''
 
-# ---- Cell C: large frame + light spin ----
-Invoke-Cell -Label 'C_fair_largeframe_spin' -MaxFrame '16777215' -SpinIters '2000'
+# ---- Cell C: 1 MiB frame + light spin ----
+Invoke-Cell -Label 'C_fair_1Mframe_spin' -MaxFrame '1048576' -SpinIters '2000'
 
 Pop-Location
 

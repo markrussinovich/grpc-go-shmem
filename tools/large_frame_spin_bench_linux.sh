@@ -2,21 +2,23 @@
 # Large-frame + spin-wait sensitivity bench on Linux.
 #
 # Mark asked: "Can you do a run with large frames and spin wait to show
-# how much it improves?" This script runs three matched cells against
-# the same fair-default baseline so the contribution of each tuning
-# knob is isolated:
+# how much it improves?" His follow-up feedback was: use 1 MiB frame
+# (not 16 MiB) and report UDS alongside TCP so the apples-to-apples
+# local-IPC baseline is included. This script runs three matched cells
+# against the same fair-default baseline so the contribution of each
+# tuning knob is isolated:
 #
-#   A  fair_default        — 16 KiB frame, no spin (current fair config)
-#   B  fair_largeframe     — 16 MiB frame, no spin
-#   C  fair_largeframe_spin— 16 MiB frame, SHM_SPIN_ITERS=2000 (light)
+#   A  fair_default     — 16 KiB frame, no spin (current fair config)
+#   B  fair_1Mframe     — 1 MiB frame, no spin
+#   C  fair_1Mframe_spin— 1 MiB frame, SHM_SPIN_ITERS=2000 (light)
 #
 # Spin and large-frame are SHM-only operator tunings; TCP / UDS keep
 # their HTTP/2 spec defaults across all three cells, so the comparison
 # stays apples-to-apples.
 #
-# Output: ~/bench_out/v34_largeframe_spin/{A,B,C}.txt
+# Output: ~/bench_out/v34_1Mframe_spin/{A,B,C}.txt
 set -u
-OUTROOT=~/bench_out/v34_largeframe_spin
+OUTROOT=~/bench_out/v34_1Mframe_spin
 mkdir -p "$OUTROOT"
 REPO="${REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 cd "$REPO" || { echo "Cannot cd to $REPO"; exit 1; }
@@ -54,15 +56,15 @@ unset SHM_MAX_FRAME_SIZE
 unset SHM_SPIN_ITERS
 run_pass A_fair_default
 
-# ---- Cell B: large frame only ----
-export SHM_MAX_FRAME_SIZE=16777215
+# ---- Cell B: 1 MiB frame only ----
+export SHM_MAX_FRAME_SIZE=1048576   # 1 MiB; per Mark's feedback (was 16 MiB)
 unset SHM_SPIN_ITERS
-run_pass B_fair_largeframe
+run_pass B_fair_1Mframe
 
-# ---- Cell C: large frame + light spin ----
-export SHM_MAX_FRAME_SIZE=16777215
+# ---- Cell C: 1 MiB frame + light spin ----
+export SHM_MAX_FRAME_SIZE=1048576
 export SHM_SPIN_ITERS=2000
-run_pass C_fair_largeframe_spin
+run_pass C_fair_1Mframe_spin
 
 unset SHM_MAX_FRAME_SIZE SHM_SPIN_ITERS
 
