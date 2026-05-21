@@ -25,8 +25,10 @@ import (
 	"net"
 	"net/netip"
 	"sync/atomic"
+	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/peer"
 )
@@ -323,6 +325,37 @@ func DialWithDiscovery(
 	if shmErr != nil {
 		// SHM dial failed — fall back to TCP.
 		logger.Warningf("SHM dial to %q failed, using TCP: %v", segment, shmErr)
+		return tcpConn, nil
+	}
+
+	// grpc.NewClient is lazy: it performs no I/O and only sets up the
+	// ClientConn state machine. A stale segment, missing /dev/shm
+	// entry, permission failure, or other dial-time error therefore
+	// would not surface until the first RPC — by which point we have
+	// already closed the TCP fallback. Drive an explicit connect and
+	// wait until the SHM connection is Ready before discarding TCP.
+	shmConn.Connect()
+	verifyTimeout := 2 * time.Second
+	verifyCtx, cancelVerify := context.WithTimeout(ctx, verifyTimeout)
+	defer cancelVerify()
+	ready := false
+	for {
+		state := shmConn.GetState()
+		if state == connectivity.Ready {
+			ready = true
+			break
+		}
+		if state == connectivity.Shutdown {
+			break
+		}
+		if !shmConn.WaitForStateChange(verifyCtx, state) {
+			// ctx cancelled or timeout elapsed.
+			break
+		}
+	}
+	if !ready {
+		_ = shmConn.Close()
+		logger.Warningf("SHM connect to %q did not reach Ready within %s (state=%v), using TCP", segment, verifyTimeout, shmConn.GetState())
 		return tcpConn, nil
 	}
 

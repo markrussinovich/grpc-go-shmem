@@ -197,6 +197,15 @@ func dialWithFallback(ctx context.Context, addr string, cfg *Config, fallbackHan
 type ListenerConfig struct {
 	// SegmentSize is the total size of the shared memory segment in bytes.
 	// Default: 136 MiB (covers two 64 MiB rings plus headers).
+	//
+	// SegmentSize is treated as a configured upper bound: NewListener
+	// validates that SegmentSize >= 2*RingSize and returns an error
+	// otherwise. The underlying allocator currently derives the actual
+	// segment size from RingSize and headers (so a SegmentSize larger
+	// than the minimum has no effect beyond passing the consistency
+	// check), but this validation prevents silently-ignored
+	// misconfiguration where a smaller SegmentSize gives the
+	// impression of capping memory use.
 	SegmentSize uint64
 
 	// RingSize is the capacity of each ring buffer in bytes. There are
@@ -244,6 +253,15 @@ func NewListener(segmentName string, cfg *ListenerConfig) (net.Listener, error) 
 	}
 	if cfg.RingSize == 0 {
 		cfg.RingSize = transport.DefaultRingASize
+	}
+	// Reject configurations where SegmentSize cannot fit two RingSize
+	// rings. Without this check a too-small SegmentSize would be
+	// silently ignored (the field is documented as an upper bound but
+	// the underlying allocator derives the actual size from RingSize),
+	// giving the impression that the user can cap segment memory below
+	// the ring requirements.
+	if cfg.SegmentSize < 2*cfg.RingSize {
+		return nil, fmt.Errorf("shm: ListenerConfig.SegmentSize (%d) must be at least 2*RingSize (%d)", cfg.SegmentSize, 2*cfg.RingSize)
 	}
 	return transport.NewShmListener(
 		&transport.ShmAddr{Name: segmentName},

@@ -154,9 +154,27 @@ func NewShmListener(addr *ShmAddr, segmentSize, ringASize, ringBSize uint64) (*S
 	// dial-side polling.
 	ctlName := l.baseName + shmControlSuffix
 
-	// Proactively clean up any stale segment from a previous run before creating.
-	// This handles the case where the server crashed without proper cleanup.
+	// If a control segment with this name already exists, probe its
+	// liveness before clobbering it. A simple unconditional unlink
+	// would silently break any listener already serving on this name
+	// (the original /dev/shm inode is unlinked, but the existing
+	// listener keeps its mapping; new clients then map a *different*
+	// inode created by this listener, and the original listener
+	// becomes unreachable). Treat ServerReady=true as "another listener
+	// is active" and refuse to start; treat ServerReady=false (or open
+	// failure) as a stale segment from a crashed previous run and
+	// clean it up.
 	if SegmentExists(ctlName) {
+		existing, openErr := OpenSegment(ctlName)
+		alive := false
+		if openErr == nil {
+			alive = existing.H.ServerReady()
+			existing.Close()
+		}
+		if alive {
+			cancel()
+			return nil, fmt.Errorf("shm: listener %q: control segment %q is already in use by another listener (remove %q manually if the previous server crashed while marked ready)", l.baseName, ctlName, ctlName)
+		}
 		_ = RemoveSegment(ctlName)
 	}
 
@@ -221,6 +239,16 @@ func (l *ShmListener) Accept() (net.Conn, error) {
 	for {
 		fh, payload, err := readCtlFrame(l.ctx, l.ctlRx)
 		if err != nil {
+			// A malformed frame on the control ring is treated as a
+			// per-frame, non-fatal event: log it and keep accepting.
+			// readCtlFrame has already attempted a bounded drain, so
+			// the ring may briefly be misaligned but well-behaved
+			// clients can still re-establish. Other errors (ring
+			// closed, ctx canceled) are fatal and propagated.
+			if errors.Is(err, errMalformedCtlFrame) {
+				logger.Warningf("shm listener %q: discarding malformed control frame: %v", l.baseName, err)
+				continue
+			}
 			return nil, err
 		}
 		if fh.Type != FrameTypeCONNECT {
