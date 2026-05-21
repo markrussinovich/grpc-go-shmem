@@ -14,11 +14,9 @@
         B  fair_1Mframe     — 1 MiB frame, no spin
         C  fair_1Mframe_spin— 1 MiB frame, SHM_SPIN_ITERS=2000 (light)
 
-    Spin and large-frame are SHM-only tunings; TCP keeps its HTTP/2 spec
-    defaults across all three cells, so the comparison stays
-    apples-to-apples. UDS is not available on Windows; on Linux the
-    companion script also reports Unix-domain-socket numbers for the
-    apples-to-apples local-IPC baseline Mark asked for.
+    Spin and large-frame are SHM-only tunings; TCP and UDS keep their
+    HTTP/2 spec defaults across all three cells, so the comparison stays
+    apples-to-apples. AF_UNIX is available on Windows 10+ (matches Linux).
 
 .PARAMETER OutputDir
     Where to write logs. Defaults to bench_win_1Mframe_spin under the
@@ -74,7 +72,7 @@ function Invoke-Cell {
     Write-Host "[$(Get-Date -Format HH:mm:ss)] $Label start  SHM_MAX_FRAME_SIZE=$($env:SHM_MAX_FRAME_SIZE) SHM_SPIN_ITERS=$($env:SHM_SPIN_ITERS)"
     $goArgs = @(
         'test',
-        '-bench=^BenchmarkGRPC(Shm|TCP)(Unary|Stream|Concurrent)$',
+        '-bench=^BenchmarkGRPC(Shm|Unix|TCP)(Unary|Stream|Concurrent)$',
         '-benchtime=2s', '-count=1', '-run=^$', '-timeout=2700s',
         '.\benchmark\shmemtcp\'
     )
