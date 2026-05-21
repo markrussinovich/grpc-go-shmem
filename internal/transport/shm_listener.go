@@ -236,6 +236,23 @@ func (l *ShmListener) Accept() (net.Conn, error) {
 	defer l.acceptWG.Done()
 
 	// Read a CONNECT request from the control ring.
+	//
+	// A malformed control frame is non-fatal (see errMalformedCtlFrame
+	// handling below), but a hostile or buggy peer can flood the ring
+	// with garbage and make this loop CPU-spin. Bound the damage with
+	// two mitigations:
+	//   * A short context-aware backoff between malformed reads, so
+	//     the listener parks instead of hot-looping when the ring is
+	//     misaligned.
+	//   * A hard cap on consecutive malformed frames, after which we
+	//     give up on this listener. ~320ms × 32 frames is enough to
+	//     ride out a transient burst of garbage but bounds wall-clock
+	//     and CPU spent on a clearly bad peer.
+	const (
+		maxConsecutiveMalformed = 32
+		malformedBackoff        = 10 * time.Millisecond
+	)
+	consecutiveMalformed := 0
 	for {
 		fh, payload, err := readCtlFrame(l.ctx, l.ctlRx)
 		if err != nil {
@@ -246,11 +263,21 @@ func (l *ShmListener) Accept() (net.Conn, error) {
 			// clients can still re-establish. Other errors (ring
 			// closed, ctx canceled) are fatal and propagated.
 			if errors.Is(err, errMalformedCtlFrame) {
-				logger.Warningf("shm listener %q: discarding malformed control frame: %v", l.baseName, err)
+				consecutiveMalformed++
+				logger.Warningf("shm listener %q: discarding malformed control frame (%d consecutive): %v", l.baseName, consecutiveMalformed, err)
+				if consecutiveMalformed >= maxConsecutiveMalformed {
+					return nil, fmt.Errorf("shm listener %q: %d consecutive malformed control frames; giving up", l.baseName, consecutiveMalformed)
+				}
+				select {
+				case <-l.ctx.Done():
+					return nil, l.ctx.Err()
+				case <-time.After(malformedBackoff):
+				}
 				continue
 			}
 			return nil, err
 		}
+		consecutiveMalformed = 0
 		if fh.Type != FrameTypeCONNECT {
 			continue
 		}

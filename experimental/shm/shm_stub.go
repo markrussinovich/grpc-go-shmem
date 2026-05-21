@@ -223,6 +223,14 @@ func DiscoveryClientInterceptors(*DiscoveryConfig) (grpc.UnaryClientInterceptor,
 // DialWithDiscovery dials the target using the standard transport on
 // platforms without SHM support.
 //
+// On unsupported platforms the SHM discovery handshake is a no-op: the
+// probeCall callback is NOT invoked, no shm-ctl trailer is examined,
+// and the returned ClientConn is always the plain TCP connection to
+// target. Callers that need cross-platform parity in the offer/probe
+// flow should perform their own probe RPC after this call. The
+// probeCall parameter is accepted (rather than rejecting the call) so
+// the same call site compiles and runs on every platform.
+//
 // Notice: This API is EXPERIMENTAL and may be changed or removed in a
 // later release.
 func DialWithDiscovery(

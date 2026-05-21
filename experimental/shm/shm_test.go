@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -142,5 +143,23 @@ func TestDialWithFallback(t *testing.T) {
 func TestNewListenerValidation(t *testing.T) {
 	if _, err := NewListener("", nil); err == nil {
 		t.Error("NewListener with empty name should return an error")
+	}
+}
+
+// TestNewListenerInvalidSegmentSize verifies that a SegmentSize too
+// small to fit the configured RingSize twice is rejected with a clear
+// error, instead of being silently ignored. Regression guard for the
+// round-1 P2 fix.
+func TestNewListenerInvalidSegmentSize(t *testing.T) {
+	cfg := &ListenerConfig{
+		SegmentSize: 1024,            // too small
+		RingSize:    1 * 1024 * 1024, // 1 MiB
+	}
+	_, err := NewListener("test-bad-size", cfg)
+	if err == nil {
+		t.Fatal("expected error for SegmentSize < 2*RingSize, got nil")
+	}
+	if !strings.Contains(err.Error(), "SegmentSize") {
+		t.Errorf("expected error to mention SegmentSize, got %q", err)
 	}
 }
