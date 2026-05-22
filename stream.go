@@ -21,6 +21,7 @@ package grpc
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"math"
 	rand "math/rand/v2"
@@ -549,7 +550,7 @@ func (a *csAttempt) newStream() error {
 			}
 		}
 	}
-	s, err := a.transport.NewStream(a.ctx, cs.callHdr)
+	s, err := a.transport.NewStream(a.ctx, cs.callHdr, a.statsHandler)
 	if err != nil {
 		nse, ok := err.(*transport.NewStreamError)
 		if !ok {
@@ -750,7 +751,7 @@ func (a *csAttempt) shouldRetry(err error) (bool, error) {
 		return false, err
 	}
 	if cs.numRetries+1 >= rp.MaxAttempts {
-		return false, err
+		return false, fmt.Errorf("max retries exhausted: failed after %d attempts: %w", cs.numRetries+1, err)
 	}
 
 	var dur time.Duration
@@ -969,9 +970,11 @@ func (cs *clientStream) SendMsg(m any) (err error) {
 	//    through to the standard a.sendMsg with the pre-encoded bytes.
 	canZC := cs.compressorV0 == nil && cs.compressorV1 == nil
 	if canZC {
-		if nc, ok := cs.codec.(interface{ Name() string }); ok {
-			canZC = nc.Name() == "proto"
-		}
+		// Require an explicit Name() == "proto" match: codecs that do not
+		// implement Name() (an unusual baseCodec) fall through to the
+		// standard sendMsg path so their semantics are preserved.
+		nc, ok := cs.codec.(interface{ Name() string })
+		canZC = ok && nc.Name() == "proto"
 	}
 	if canZC {
 		// Pre-encode for max-size check and retry buffer.
@@ -1448,7 +1451,8 @@ func newNonRetryClientStream(ctx context.Context, desc *StreamDesc, method strin
 		transport:        t,
 	}
 
-	s, err := as.transport.NewStream(as.ctx, as.callHdr)
+	// nil stats handler: internal streams like health and ORCA do not support telemetry.
+	s, err := as.transport.NewStream(as.ctx, as.callHdr, nil)
 	if err != nil {
 		err = toRPCErr(err)
 		return nil, err
@@ -1837,10 +1841,11 @@ func (ss *serverStream) SendMsg(m any) (err error) {
 	// message is a native proto.Message, serialize directly into the ring.
 	// No retry concerns on the server side.
 	if ss.compressorV0 == nil && ss.compressorV1 == nil {
-		isProtoCodec := true
-		if nc, ok := ss.codec.(interface{ Name() string }); ok {
-			isProtoCodec = nc.Name() == "proto"
-		}
+		// Require an explicit Name() == "proto" match: codecs that do not
+		// implement Name() (an unusual baseCodec) fall through to the
+		// standard send path so their semantics are preserved.
+		nc, hasName := ss.codec.(interface{ Name() string })
+		isProtoCodec := hasName && nc.Name() == "proto"
 		if isProtoCodec {
 			if pm, ok := m.(proto.Message); ok {
 				pSize := proto.Size(pm)

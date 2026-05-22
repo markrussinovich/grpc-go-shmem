@@ -1,3 +1,5 @@
+//go:build linux || windows
+
 /*
  *
  * Copyright 2025 gRPC authors.
@@ -28,6 +30,17 @@ import (
 )
 
 // Helpers operate on the blocking shared-memory ring (ShmRing).
+
+// errMalformedCtlFrame is returned by readCtlFrame when a control-plane
+// frame's length field exceeds the allowed maximum (maxCtlPayload).
+// Callers (in particular the listener's Accept loop) should treat this
+// as a non-fatal, per-frame error: log it and continue, rather than
+// tearing down the listener, because the peer may be buggy or hostile
+// but other clients on the same control segment should still be served.
+// The underlying ring may be left misaligned by the time this error is
+// returned (readCtlFrame attempts a best-effort bounded drain), so a
+// burst of these errors is also possible.
+var errMalformedCtlFrame = errors.New("malformed control-plane frame")
 
 // Frame header layout (16 bytes, little-endian, aligned 16):
 // uint32 length    // payload length in bytes (excludes 16-byte header)
@@ -410,18 +423,40 @@ func writeFrameBuffers(ctx context.Context, tx *ShmRing, fh FrameHeader, hdr []b
 	if len(hdr) == 0 && dataLen == 0 {
 		return writeFrame(ctx, tx, fh, nil)
 	}
-	if len(hdr) == 0 && len(payload) == 1 {
-		// Fast path: single buffer, no header prefix.
-		return writeFrame(ctx, tx, fh, payload[0].ReadOnlyData())
-	}
 	// Vectored fast path for MESSAGE frames: writes hdr + segments
 	// directly into the ring reservation when the body fits in a
-	// single H2 DATA frame.
+	// single H2 DATA frame. Use shmMaxFrameSize (the configurable
+	// per-DATA-frame ceiling) instead of h2MaxFramePayload (the RFC
+	// absolute limit) so a fair-comparison bench profile that sets
+	// max frame to 16384 actually chunks here too.
+	//
+	// Order matters: this must come BEFORE the generic single-buffer
+	// shortcut below, otherwise a MESSAGE with no LPM hdr and one
+	// large BufferSlice element (rare but possible from custom
+	// callers / tests) would fall back to the legacy materialise +
+	// chunked path and bypass the producer-ZC optimisation.
 	if fh.Type == FrameTypeMESSAGE {
 		bodyLen := len(hdr) + dataLen
-		if bodyLen <= h2MaxFramePayload && uint64(h2FrameHeaderSize+bodyLen) <= tx.Capacity() {
+		if bodyLen <= shmMaxFrameSize && uint64(h2FrameHeaderSize+bodyLen) <= tx.Capacity() {
 			return writeFrameH2Message(ctx, tx, fh.StreamID, fh.Flags, hdr, payload)
 		}
+		// Multi-frame MESSAGE (e.g. LargeUnary 16 MB under
+		// fair-default's 16 KiB max-frame): emit DATA frames straight
+		// from the BufferSlice without materialising into a single
+		// contiguous buf. Saves a 16-MB-class memcpy on the producer
+		// hot path. The legacy materialise-then-chunked path
+		// (writeFrameH2DataChunked) is still used by writeFrame
+		// callers that already pass a single []byte (HEADERS,
+		// TRAILERS, plus tests).
+		if uint64(h2FrameHeaderSize+shmMaxFrameSize) <= tx.Capacity() {
+			_, h2f := translateCustomToH2(fh)
+			return writeFrameH2DataChunkedVec(ctx, tx, fh.StreamID, hdr, payload, h2f)
+		}
+	}
+	if len(hdr) == 0 && len(payload) == 1 {
+		// Fast path: single buffer, no header prefix. Applies only to
+		// non-MESSAGE frame types here (MESSAGE is handled above).
+		return writeFrame(ctx, tx, fh, payload[0].ReadOnlyData())
 	}
 	buf := make([]byte, len(hdr)+dataLen)
 	copy(buf, hdr)
@@ -567,7 +602,24 @@ func readCtlFrame(ctx context.Context, rx *ShmRing) (FrameHeader, []byte, error)
 		if fh.Type == FrameTypePAD {
 			if fh.Length > 0 {
 				if fh.Length > maxCtlPayload {
-					return FrameHeader{}, nil, fmt.Errorf("control PAD payload too large: %d (max %d)", fh.Length, maxCtlPayload)
+					// Malformed PAD: drain at most what is currently
+					// buffered to avoid blocking on bytes that may never
+					// arrive (a hostile peer can advertise a huge
+					// Length without ever writing the payload). The
+					// caller should log and continue accepting; the
+					// ring may be left misaligned but subsequent
+					// CONNECT frames from well-behaved clients will
+					// eventually re-align.
+					if avail := rx.Available(); avail > 0 {
+						drainN := uint64(fh.Length)
+						if drainN > avail {
+							drainN = avail
+						}
+						if _, derr := rx.ReadExact(ctx, int(drainN), nil); derr != nil {
+							return FrameHeader{}, nil, derr
+						}
+					}
+					return FrameHeader{}, nil, fmt.Errorf("%w: PAD length=%d (max %d)", errMalformedCtlFrame, fh.Length, maxCtlPayload)
 				}
 				if _, err := rx.ReadExact(ctx, int(fh.Length), nil); err != nil {
 					return FrameHeader{}, nil, err
@@ -579,7 +631,19 @@ func readCtlFrame(ctx context.Context, rx *ShmRing) (FrameHeader, []byte, error)
 		var payload []byte
 		if fh.Length > 0 {
 			if fh.Length > maxCtlPayload {
-				return FrameHeader{}, nil, fmt.Errorf("control frame payload too large: type=%d length=%d (max %d)", fh.Type, fh.Length, maxCtlPayload)
+				// Same recovery strategy as for malformed PAD frames
+				// above: bounded best-effort drain so the listener
+				// loop can continue accepting future clients.
+				if avail := rx.Available(); avail > 0 {
+					drainN := uint64(fh.Length)
+					if drainN > avail {
+						drainN = avail
+					}
+					if _, derr := rx.ReadExact(ctx, int(drainN), nil); derr != nil {
+						return FrameHeader{}, nil, derr
+					}
+				}
+				return FrameHeader{}, nil, fmt.Errorf("%w: type=%d length=%d (max %d)", errMalformedCtlFrame, fh.Type, fh.Length, maxCtlPayload)
 			}
 			p, err := rx.ReadExact(ctx, int(fh.Length), nil)
 			if err != nil {

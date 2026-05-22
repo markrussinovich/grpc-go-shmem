@@ -41,6 +41,7 @@ import (
 	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/stats"
 	"google.golang.org/grpc/status"
+	protobuf "google.golang.org/protobuf/proto"
 )
 
 func init() {
@@ -830,15 +831,15 @@ func compress(in mem.BufferSlice, cp Compressor, compressor encoding.Compressor,
 	if compressor != nil {
 		z, err := compressor.Compress(w)
 		if err != nil {
-			return nil, 0, wrapErr(err)
+			return nil, compressionNone, wrapErr(err)
 		}
 		for _, b := range in {
 			if _, err := z.Write(b.ReadOnlyData()); err != nil {
-				return nil, 0, wrapErr(err)
+				return nil, compressionNone, wrapErr(err)
 			}
 		}
 		if err := z.Close(); err != nil {
-			return nil, 0, wrapErr(err)
+			return nil, compressionNone, wrapErr(err)
 		}
 	} else {
 		// This is obviously really inefficient since it fully materializes the data, but
@@ -848,7 +849,7 @@ func compress(in mem.BufferSlice, cp Compressor, compressor encoding.Compressor,
 		buf := in.MaterializeToBuffer(pool)
 		defer buf.Free()
 		if err := cp.Do(w, buf.ReadOnlyData()); err != nil {
-			return nil, 0, wrapErr(err)
+			return nil, compressionNone, wrapErr(err)
 		}
 	}
 	return out, compressionMade, nil
@@ -961,25 +962,36 @@ func recvAndDecompress(p *parser, s recvCompressor, dc Decompressor, maxReceiveM
 	return out, nil
 }
 
-// decompress processes the given data by decompressing it using either a custom decompressor or a standard compressor.
-// If a custom decompressor is provided, it takes precedence. The function validates that the decompressed data
-// does not exceed the specified maximum size and returns an error if this limit is exceeded.
-// On success, it returns the decompressed data. Otherwise, it returns an error if decompression fails or the data exceeds the size limit.
+// decompress processes the given data by decompressing it using either
+// a custom decompressor or a standard compressor. If a custom decompressor
+// is provided, it takes precedence. The function validates that
+// the decompressed data does not exceed the specified maximum size and returns
+// an error if this limit is exceeded. On success, it returns the decompressed
+// data. Otherwise, it returns an error if decompression fails or the data
+// exceeds the size limit.
 func decompress(compressor encoding.Compressor, d mem.BufferSlice, dc Decompressor, maxReceiveMessageSize int, pool mem.BufferPool) (mem.BufferSlice, error) {
 	if dc != nil {
-		uncompressed, err := dc.Do(d.Reader())
+		r := d.Reader()
+		uncompressed, err := dc.Do(r)
 		if err != nil {
+			r.Close() // ensure buffers are reused
 			return nil, status.Errorf(codes.Internal, "grpc: failed to decompress the received message: %v", err)
 		}
 		if len(uncompressed) > maxReceiveMessageSize {
+			r.Close() // ensure buffers are reused
 			return nil, status.Errorf(codes.ResourceExhausted, "grpc: message after decompression larger than max (%d vs. %d)", len(uncompressed), maxReceiveMessageSize)
 		}
 		return mem.BufferSlice{mem.SliceBuffer(uncompressed)}, nil
 	}
 	if compressor != nil {
-		dcReader, err := compressor.Decompress(d.Reader())
+		r := d.Reader()
+		dcReader, err := compressor.Decompress(r)
 		if err != nil {
+			r.Close() // ensure buffers are reused
 			return nil, status.Errorf(codes.Internal, "grpc: failed to decompress the message: %v", err)
+		}
+		if closer, ok := dcReader.(io.Closer); ok {
+			defer closer.Close()
 		}
 
 		// Read at most one byte more than the limit from the decompressor.
@@ -990,11 +1002,13 @@ func decompress(compressor encoding.Compressor, d mem.BufferSlice, dc Decompress
 		}
 		out, err := mem.ReadAll(dcReader, pool)
 		if err != nil {
+			r.Close() // ensure buffers are reused
 			out.Free()
 			return nil, status.Errorf(codes.Internal, "grpc: failed to read decompressed data: %v", err)
 		}
 
 		if out.Len() > maxReceiveMessageSize {
+			r.Close() // ensure buffers are reused
 			out.Free()
 			return nil, status.Errorf(codes.ResourceExhausted, "grpc: received message after decompression larger than max %d", maxReceiveMessageSize)
 		}
@@ -1024,15 +1038,18 @@ func recv(p *parser, c baseCodec, s recvCompressor, dc Decompressor, m any, maxR
 	// ring-backed SliceBuffer from SHM transport), the message is a proto,
 	// and the codec is the default proto codec, unmarshal directly from the
 	// buffer without MaterializeToBuffer copy. Custom codecs are not
-	// bypassed — they may have validation or different serialization.
+	// bypassed — they may have validation or different serialization. We
+	// require an explicit Name() == "proto" match: codecs that do not
+	// implement Name() (an unusual baseCodec) fall through to c.Unmarshal
+	// to preserve their semantics.
 	if len(data) == 1 {
-		if pm, ok := m.(protoV2Message); ok {
-			isProtoCodec := true
-			if nc, ok := c.(interface{ Name() string }); ok {
-				isProtoCodec = nc.Name() == "proto"
+		if pm, ok := m.(protobuf.Message); ok {
+			isProtoCodec := false
+			if nc, ok := c.(interface{ Name() string }); ok && nc.Name() == "proto" {
+				isProtoCodec = true
 			}
 			if isProtoCodec {
-				if err := protoUnmarshalDirect(data[0].ReadOnlyData(), pm); err != nil {
+				if err := protobuf.Unmarshal(data[0].ReadOnlyData(), pm); err != nil {
 					return status.Errorf(codes.Internal, "grpc: failed to unmarshal the received message: %v", err)
 				}
 				return nil

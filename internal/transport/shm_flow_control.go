@@ -57,23 +57,124 @@ import (
 	"time"
 )
 
-// SHM-specific flow control constants.
-// Unlike HTTP/2 over TCP, shared memory is local with near-zero RTT, so we use
-// much larger initial windows to avoid stalling on WindowUpdate round-trips.
-const (
-	// shmInitialWindowSize is the initial per-stream flow control window for
-	// the shared memory transport. Set to 32 MB to allow large local RPCs
-	// without waiting for BDP ramp-up.
-	shmInitialWindowSize = 32 * 1024 * 1024 // 32 MB
+// SHM-specific flow control. Unlike HTTP/2 over TCP, shared memory is
+// local with near-zero RTT, so production tunes the per-stream window
+// much higher than the 65535-byte HTTP/2 default to avoid WindowUpdate
+// round-trips during bulk streaming.
+//
+// The size knobs below are package-level `var`s rather than `const`s
+// so benchmark / test code can switch the SHM transport into a fair-
+// comparison profile (matching the HTTP/2 default window used by the
+// in-tree TCP and Unix-socket benchmarks). Production code MUST NOT
+// mutate these from the data plane — the transport reads them once
+// at construction (for `initialWindowSize` and the conn / stream
+// quota initial values) and on every WindowUpdate emission (for the
+// batching threshold). Use ConfigureShmFlowControlForBench from test
+// setup BEFORE any transport is dialed or listened.
+var (
+	// shmInitialWindowSize is the initial per-stream flow-control
+	// window the SHM BDP estimator starts from. Default 32 MiB allows
+	// large local RPCs without waiting for BDP ramp-up.
+	shmInitialWindowSize = 32 * 1024 * 1024
 
-	// shmBDPLimit is the maximum BDP window size for SHM. This is 4x the
-	// HTTP/2 limit (16 MB) because local memory bandwidth is much higher.
-	shmBDPLimit = 64 * 1024 * 1024 // 64 MB
+	// shmWindowUpdateThreshold is the minimum accumulated bytes
+	// before a WindowUpdate frame is sent. Batching reduces frame
+	// write overhead. Default is shmInitialWindowSize/4 = 8 MiB.
+	// ConfigureShmFlowControlForBench keeps the relationship sane:
+	// if the threshold ever exceeded the effective window the sender
+	// would deadlock (the consumer can never accumulate enough to
+	// trigger a WindowUpdate before the producer exhausts the window).
+	shmWindowUpdateThreshold = shmInitialWindowSize / 4
 
-	// shmWindowUpdateThreshold is the minimum accumulated bytes before a
-	// WindowUpdate frame is sent. Batching reduces frame write overhead.
-	shmWindowUpdateThreshold = shmInitialWindowSize / 4 // 8 MB
+	// shmMaxFrameSize bounds the body of a single H2 DATA frame the
+	// producer emits. Defaults to the RFC 7540 ceiling (16 MiB - 1)
+	// because SHM is local and per-frame overhead is negligible.
+	// HTTP/2 over TCP / UDS in this codebase uses the HTTP/2 spec
+	// default of 16384 bytes; bench code can match it via
+	// ConfigureShmFlowControlForBench so SHM and TCP / UDS emit the
+	// same number of DATA frames per write. The receiver always
+	// accepts up to the RFC ceiling regardless of this knob.
+	shmMaxFrameSize = h2MaxFramePayload
 )
+
+const (
+	// shmBDPLimit is the maximum BDP window size for SHM. 4× HTTP/2's
+	// limit (16 MiB) because local memory bandwidth is much higher.
+	shmBDPLimit = 64 * 1024 * 1024 // 64 MB
+)
+
+// ConfigureShmFlowControlForBench overrides shmInitialWindowSize and
+// shmWindowUpdateThreshold consistently. Intended for benchmark and
+// regression-test code that wants to exercise the SHM transport under
+// HTTP/2-default (65535 B) or other window sizes — both to compare
+// SHM against TCP / UDS on equal footing and to drive the transport
+// into code paths (multi-DATA-frame LPM under flow control) that are
+// hidden by the SHM-tuned 32 MiB default.
+//
+// MUST be called BEFORE any ShmClientTransport or ShmServerTransport
+// is constructed. The values are captured once at construction. NOT
+// safe to call from the data plane.
+//
+// initialWindow values below 4 KiB are clamped to 4 KiB so the
+// WindowUpdate threshold never collapses to zero (which would cause
+// every byte received to emit a window-update frame).
+func ConfigureShmFlowControlForBench(initialWindow int) {
+	if initialWindow < 4*1024 {
+		initialWindow = 4 * 1024
+	}
+	shmInitialWindowSize = initialWindow
+	// Threshold = window / 4, with a 1 KiB floor (so we don't pay
+	// WindowUpdate overhead per-byte under tiny windows) and a
+	// window/2 ceiling (so the sender can always refill at least
+	// once before exhausting the window).
+	//
+	// We empirically validated window/4 vs window/2: under streaming
+	// the smaller threshold pipelines better — the producer receives
+	// a steady trickle of small credits and never fully drains the
+	// window. window/2 makes the producer wait for larger but less
+	// frequent refills, which adds a full RTT block between each
+	// chunk. HTTP/2 over TCP fires WUs at delta/2 because TCP's
+	// per-segment overhead is high; SHM's per-WU overhead is much
+	// lower so more frequent updates are net positive.
+	threshold := initialWindow / 4
+	if threshold < 1024 {
+		threshold = 1024
+	}
+	if threshold >= initialWindow {
+		threshold = initialWindow / 2
+	}
+	shmWindowUpdateThreshold = threshold
+}
+
+// ConfigureShmMaxFrameSizeForBench overrides shmMaxFrameSize so the SHM
+// producer chunks H2 DATA frames at the given body size, matching the
+// HTTP/2 spec default of 16384 used by TCP / UDS in this codebase
+// when run under a fair-comparison bench profile. Values are clamped
+// to the RFC range [2^14, 2^24-1].
+//
+// MUST be called BEFORE any ShmClientTransport or ShmServerTransport
+// is constructed. Reset via ResetShmFlowControlForBench.
+func ConfigureShmMaxFrameSizeForBench(maxFrame int) {
+	const minFrame = 1 << 14 // RFC 7540 §6.5.2 SETTINGS_MAX_FRAME_SIZE lower bound
+	if maxFrame < minFrame {
+		maxFrame = minFrame
+	}
+	if maxFrame > h2MaxFramePayload {
+		maxFrame = h2MaxFramePayload
+	}
+	shmMaxFrameSize = maxFrame
+}
+
+// ResetShmFlowControlForBench restores the SHM flow-control knobs to
+// their production defaults (32 MiB window, 8 MiB threshold, RFC max
+// frame size). Tests and benchmarks that call ConfigureShmFlowControlForBench
+// or ConfigureShmMaxFrameSizeForBench should `defer` this so subsequent
+// tests in the same `go test` invocation don't inherit the override.
+func ResetShmFlowControlForBench() {
+	shmInitialWindowSize = 32 * 1024 * 1024
+	shmWindowUpdateThreshold = shmInitialWindowSize / 4
+	shmMaxFrameSize = h2MaxFramePayload
+}
 
 // shmBDPEstimator provides bandwidth-delay product estimation for the shared
 // memory transport. It uses the same exponential moving average algorithm as

@@ -22,7 +22,33 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+
+	imem "google.golang.org/grpc/internal/mem"
+	"google.golang.org/grpc/mem"
 )
+
+// shmLpmPool backs lpmAccumulator.buf allocations across all SHM
+// transports. Buffers are pooled by power-of-two size and explicitly
+// NOT zeroed on Get — the accumulator immediately overwrites every
+// returned slice with received DATA-frame bytes before the slice is
+// handed to the gRPC layer, so the runtime.memclrNoHeapPointers cost
+// that the default DefaultBufferPool() pays on every Get is pure
+// waste here. Profiling fair-default 1 MiB streaming after the
+// pre-alloc + cross-RPC pooling fixes showed memclr at ~20% of total
+// CPU; switching to a dirty pool eliminates it.
+//
+// Size tiers match mem.DefaultBufferPool: 256 B, 4 KiB, 16 KiB,
+// 32 KiB, 1 MiB. Requests above 1 MiB fall back to the dirty simple
+// pool which does sync.Pool reuse without the size-bucketing.
+var shmLpmPool = func() mem.BufferPool {
+	p, err := imem.NewDirtyBinaryTieredBufferPool(8, 12, 14, 15, 20)
+	if err != nil {
+		// Argument list is hardcoded above; failure here implies a
+		// programming error in imem itself.
+		panic(fmt.Sprintf("shmLpmPool: NewDirtyBinaryTieredBufferPool failed: %v", err))
+	}
+	return p
+}()
 
 // lpmAccumulator reassembles a single in-progress gRPC length-prefixed
 // message (LPM) across multiple HTTP/2 DATA frames. HTTP/2 DATA frames
@@ -60,6 +86,21 @@ type lpmAccumulator struct {
 	expectedTotal   int     // 5 + body length, set once header complete
 	pos             int     // bytes written into buf (includes 5-byte header)
 	buf             []byte  // accumulated frame, len == pos, cap >= expectedTotal
+
+	// pool, when non-nil, is the source of buf allocations. Each
+	// emitted message takes its backing slice from this pool;
+	// downstream callers re-wrap the slice via mem.NewBuffer(&msg,
+	// pool) so that Buffer.Free() returns the slice to the pool
+	// instead of dropping it on the GC. Reusing the same slice across
+	// RPCs eliminates the runtime.mallocgcLarge + runtime.memclr cost
+	// that profiling showed as the dominant overhead under
+	// fair-default streaming once growBufForChunk was handled.
+	//
+	// The accumulator never auto-pools allocations from the standard
+	// allocator: a nil pool keeps the legacy GC-managed behaviour
+	// (used by unit tests and the H2 codec read paths that don't
+	// pass through SHM).
+	pool mem.BufferPool
 }
 
 // inProgress reports whether the accumulator is mid-message.
@@ -129,24 +170,26 @@ func (a *lpmAccumulator) feed(data []byte, maxBody int) (msg []byte, leftover []
 		//     bytes): cap = 8 KiB, only what was received-or-headroom
 		//     can be allocated. The 256 KiB DoS-bound asserted by
 		//     TestH2LPM_NoPreallocOversized is preserved.
-		//   * Large-body fast path: if data carries ≥
-		//     largeFirstChunkHint body bytes AND expectedTotal is
-		//     larger, allocate the full expectedTotal up-front. See
-		//     feedSplit's matching comment for the rationale and DoS
-		//     argument.
+		//     largeFirstChunkMultiplier × first-chunk body bytes is
+		//     used as the pre-alloc hint: a 16 KiB first chunk grants
+		//     1 MiB up-front (matches a typical fair-default 1 MiB
+		//     LPM where MAX_FRAME_SIZE limits each DATA frame to
+		//     16 KiB), while a 1 KiB DoS chunk only grants 64 KiB,
+		//     well under the 256 KiB bound asserted by
+		//     TestH2LPM_NoPreallocOversized.
 		const initialBufHint = 8 * 1024
-		const largeFirstChunkHint = 1 * 1024 * 1024 // 1 MiB
+		const largeFirstChunkMultiplier = 64
 		initialCap := initialBufHint
 		if 5+len(data) > initialCap {
 			initialCap = 5 + len(data)
 		}
-		if len(data) >= largeFirstChunkHint && a.expectedTotal > initialCap {
-			initialCap = a.expectedTotal
+		if hint := largeFirstChunkMultiplier * len(data); hint > initialCap {
+			initialCap = hint
 		}
 		if initialCap > a.expectedTotal {
 			initialCap = a.expectedTotal
 		}
-		a.buf = make([]byte, 0, initialCap)
+		a.buf = a.allocBuf(initialCap)
 		a.buf = append(a.buf, a.headerBuf[:]...)
 		a.pos = 5
 	}
@@ -213,9 +256,36 @@ func (a *lpmAccumulator) growBufForChunk(need int) {
 		// No grow needed (caller already checked, but be safe).
 		return
 	}
-	newBuf := make([]byte, len(a.buf), newCap)
+	newBuf := a.allocBuf(newCap)[:len(a.buf)]
 	copy(newBuf, a.buf)
+	a.releaseBuf(a.buf)
 	a.buf = newBuf
+}
+
+// allocBuf returns a slice with len=0 cap>=size. When a.pool is set,
+// the slice is taken from the pool (avoiding the runtime.memclr that
+// `make([]byte, 0, size)` would perform on a fresh allocation). The
+// returned slice's cap may exceed size since the binary-tiered pool
+// rounds up to the next power of two; callers MUST honour cap when
+// computing further allocations.
+func (a *lpmAccumulator) allocBuf(size int) []byte {
+	if a.pool == nil {
+		return make([]byte, 0, size)
+	}
+	buf := a.pool.Get(size)
+	// pool returns *[]byte; len may be ≥ size depending on rounding.
+	return (*buf)[:0:cap(*buf)]
+}
+
+// releaseBuf returns a slice to a.pool. No-op when pool is nil or
+// when the slice was never pool-rooted (cap < pool's minimum tier).
+// The pool tolerates either case via its sizedBufferPool fallback.
+func (a *lpmAccumulator) releaseBuf(buf []byte) {
+	if a.pool == nil || cap(buf) == 0 {
+		return
+	}
+	b := buf[:0]
+	a.pool.Put(&b)
 }
 
 // feedSplit is the two-slice analogue of feed: it consumes data from
@@ -274,39 +344,33 @@ func (a *lpmAccumulator) feedSplit(pFirst, pSecond []byte, maxBody int) (msg, le
 		// appended. Bytes after header consumption represent body
 		// only, so we add 5 explicitly here.
 		//
-		// Large-body fast path: if the first chunk carries ≥
-		// largeFirstChunkHint body bytes AND the declared
-		// expectedTotal is also large, allocate the full expectedTotal
-		// up-front. This skips the cascade of doubling-realloc work
-		// (16 MiB → 32 MiB → 64 MiB → ... copying every time) on
-		// the receive side of multi-frame messages, which the CPU
-		// profile shows as the dominant cost for ≥16 MiB unary
-		// throughput.
-		//
-		// DoS safety: this only fires when the peer has ALREADY
-		// committed to sending ≥1 MiB of body bytes in the first
-		// chunk. A peer attacking with a tiny chunk (e.g., 1 KiB)
+		// Large-body fast path: scale the pre-alloc cap by the
+		// first-chunk body size (64× multiplier, clamped to
+		// expectedTotal). This skips the cascade of doubling-realloc
+		// work (16 KiB → 32 KiB → … copying every time) on the
+		// receive side of multi-frame messages, which the CPU
+		// profile of fair-default 1 MiB streaming shows as the
+		// dominant cost (lpmAccumulator.growBufForChunk ~13% of
+		// total). A peer attacking with a tiny chunk (e.g., 1 KiB)
 		// against a huge declared body length still hits the small-
-		// allocation path and is bounded by Fix #2's
-		// "received-so-far + 8 KiB" cap. maxBody (caller-supplied,
-		// typically 511 MiB) is the absolute hard ceiling on
-		// expectedTotal so the upfront alloc cannot exceed it.
+		// allocation path and is bounded by Fix #2's "received-so-
+		// far + 8 KiB" cap. maxBody (caller-supplied, typically
+		// 511 MiB) is the absolute hard ceiling on expectedTotal so
+		// the upfront alloc cannot exceed it.
 		bodyBytes := len(pFirst) + len(pSecond)
 		const initialBufHint = 8 * 1024
-		const largeFirstChunkHint = 1 * 1024 * 1024 // 1 MiB
+		const largeFirstChunkMultiplier = 64
 		initialCap := initialBufHint
 		if 5+bodyBytes > initialCap {
 			initialCap = 5 + bodyBytes
 		}
-		if bodyBytes >= largeFirstChunkHint && a.expectedTotal > initialCap {
-			// Peer is sending real data; trust expectedTotal up to
-			// the maxBody ceiling already enforced above.
-			initialCap = a.expectedTotal
+		if hint := largeFirstChunkMultiplier * bodyBytes; hint > initialCap {
+			initialCap = hint
 		}
 		if initialCap > a.expectedTotal {
 			initialCap = a.expectedTotal
 		}
-		a.buf = make([]byte, 0, initialCap)
+		a.buf = a.allocBuf(initialCap)
 		a.buf = append(a.buf, a.headerBuf[:]...)
 		a.pos = 5
 	}

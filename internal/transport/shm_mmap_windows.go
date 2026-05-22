@@ -112,6 +112,20 @@ func CreateSegment(name string, ringCapA, ringCapB uint64) (*Segment, error) {
 	segment.B.SetReadIndex(0)
 	segment.B.SetClosed(false)
 
+	// Eventfd waker no-op on Windows. Kept for cross-platform
+	// symbol parity.
+	setupDataSegWakeForCreator(segment)
+
+	// Close the backing file handle: the MapViewOfFile holds an
+	// independent reference on the section/file, so the mapped
+	// region stays valid. Saves 1 handle/segment.
+	if err := file.Close(); err != nil {
+		munmapImpl(mem)
+		os.Remove(path)
+		return nil, fmt.Errorf("close handle after mmap: %w", err)
+	}
+	segment.File = nil
+
 	return segment, nil
 }
 
@@ -161,11 +175,27 @@ func OpenSegment(name string) (*Segment, error) {
 	}
 
 	segment.H.SetClientPID(uint32(os.Getpid()))
+
+	// Eventfd waker no-op on Windows (this records
+	// OpenerWakeReady=false on the header for finalizeDataSegWaker's
+	// benefit; on Windows the creator's waker is also nil so the
+	// flag is unused, but keeping the ordering consistent with the
+	// Linux path avoids surprises).
+	setupDataSegWakeForOpener(segment)
+
 	// Note: We set the clientReady flag here but DON'T signal the event.
 	// The caller (DialShm) will open handshake events and call
 	// SetClientReadyAndSignal() after WaitForServer completes.
 	// This ensures the event exists before we try to signal it.
 	segment.H.SetClientReady(true)
+
+	// Close the backing file handle: MapViewOfFile holds its own
+	// reference. Saves 1 handle/segment.
+	if err := file.Close(); err != nil {
+		munmapImpl(mem)
+		return nil, fmt.Errorf("close handle after mmap: %w", err)
+	}
+	segment.File = nil
 
 	return segment, nil
 }

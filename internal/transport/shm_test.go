@@ -1,3 +1,5 @@
+//go:build linux || windows
+
 /*
  *
  * Copyright 2025 gRPC authors.
@@ -20,6 +22,7 @@ package transport
 
 import (
 	"runtime"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -66,7 +69,8 @@ func TestSegmentHeaderFieldOffsets(t *testing.T) {
 		{"closed", unsafe.Offsetof(h.closed), 0x48},
 		{"pad", unsafe.Offsetof(h.pad), 0x4C},
 		{"maxStreams", unsafe.Offsetof(h.maxStreams), 0x50},
-		{"reserved", unsafe.Offsetof(h.reserved), 0x54},
+		{"openerWakeReady", unsafe.Offsetof(h.openerWakeReady), 0x54},
+		{"reserved", unsafe.Offsetof(h.reserved), 0x58},
 	}
 
 	for _, tt := range tests {
@@ -316,6 +320,28 @@ func TestSegmentHeaderAtomicAccess(t *testing.T) {
 	}
 }
 
+// TestValidateSegmentHeaderVersionMismatch covers the forward-compat
+// guard: a peer that mmaps a segment whose header version differs from
+// SegmentVersion must refuse to proceed. Bumping SegmentVersion (e.g.,
+// because of a layout change) makes both newer-opens-older and
+// older-opens-newer pairings fail with a clear error here.
+func TestValidateSegmentHeaderVersionMismatch(t *testing.T) {
+	h := &SegmentHeader{}
+	magic := [8]byte{'G', 'R', 'P', 'C', 'S', 'H', 'M', 0}
+	h.SetMagic(magic)
+	// Plausibly-shaped capacities so the version check is reached.
+	h.SetRingACapacity(MinRingCapacity)
+	h.SetRingBCapacity(MinRingCapacity)
+	h.SetVersion(SegmentVersion + 1)
+	err := ValidateSegmentHeader(h)
+	if err == nil {
+		t.Fatal("ValidateSegmentHeader accepted mismatched version; expected error")
+	}
+	if !strings.Contains(err.Error(), "unsupported version") {
+		t.Errorf("ValidateSegmentHeader error = %q, want contains \"unsupported version\"", err.Error())
+	}
+}
+
 func TestCreateAndOpenSegment(t *testing.T) {
 	// Skip test on non-Linux platforms
 	if !isLinuxPlatform() {
@@ -337,9 +363,14 @@ func TestCreateAndOpenSegment(t *testing.T) {
 	}
 	defer segment.Close()
 
-	// Verify segment properties
-	if segment.File == nil {
-		t.Error("segment.File is nil")
+	// Verify segment properties.
+	//
+	// segment.File is intentionally nil: CreateSegment closes the
+	// backing fd immediately after mmap to keep the per-segment FD
+	// footprint to the wake fds only. The mmap holds an inode
+	// reference, so segment.Mem remains valid.
+	if segment.File != nil {
+		t.Error("segment.File should be nil after mmap-close optimisation")
 	}
 	if segment.Mem == nil {
 		t.Error("segment.Mem is nil")

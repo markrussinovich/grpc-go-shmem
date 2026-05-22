@@ -1,3 +1,5 @@
+//go:build linux || windows
+
 /*
  *
  * Copyright 2025 gRPC authors.
@@ -21,16 +23,35 @@ package transport
 import (
 	"fmt"
 	"os"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"unsafe"
 )
 
 // Memory layout constants
 const (
-	// Magic bytes for segment identification
+	// Magic bytes for segment identification. The trailing NUL byte is
+	// part of the on-wire layout and is checked by ValidateSegmentHeader;
+	// a peer that mmaps a segment with mismatched magic refuses to
+	// proceed so unrelated /dev/shm files cannot be misinterpreted as
+	// grpc-go SHM segments.
 	SegmentMagic = "GRPCSHM\x00"
 
-	// Current protocol version
+	// SegmentVersion is the on-wire version of the SHM segment header
+	// layout. Both peers MUST agree on the version: when a process opens
+	// an existing segment, ValidateSegmentHeader rejects any value !=
+	// SegmentVersion with an "unsupported version" error.
+	//
+	// Compatibility rules going forward:
+	//   - Bump this constant whenever any field in SegmentHeader or
+	//     RingHeader changes shape (offset, size, or semantics).
+	//   - The reserved tail of SegmentHeader allows additive layout
+	//     extensions without a version bump ONLY IF the new field
+	//     defaults to a zero value that older code treats as "absent".
+	//   - There is no negotiated downgrade today; mismatched versions
+	//     are a hard error. A future change may carry a minor-version
+	//     byte for additive features inside the same major.
 	SegmentVersion = uint32(1)
 
 	// Segment header size (aligned to 128 bytes)
@@ -60,22 +81,32 @@ var (
 // SegmentHeader represents the shared memory segment header.
 // Layout follows the specification with 128-byte alignment.
 type SegmentHeader struct {
-	magic       [8]byte  // 0x00: "GRPCSHM\0"
-	version     uint32   // 0x08: protocol version
-	flags       uint32   // 0x0C: reserved flags
-	totalSize   uint64   // 0x10: total segment size
-	ringAOff    uint64   // 0x18: offset to ring A header
-	ringACap    uint64   // 0x20: ring A capacity (power of 2)
-	ringBOff    uint64   // 0x28: offset to ring B header
-	ringBCap    uint64   // 0x30: ring B capacity (power of 2)
-	serverPID   uint32   // 0x38: server process ID
-	clientPID   uint32   // 0x3C: client process ID
-	serverReady uint32   // 0x40: server ready flag (0->1)
-	clientReady uint32   // 0x44: client mapped flag (0->1)
-	closed      uint32   // 0x48: closed flag (0 open, 1 closed)
-	pad         uint32   // 0x4C: padding
-	maxStreams  uint32   // 0x50: max concurrent streams (0 means unlimited)
-	reserved    [44]byte // 0x54-0x7F: reserved/padding to 128B
+	magic       [8]byte // 0x00: "GRPCSHM\0"
+	version     uint32  // 0x08: protocol version
+	flags       uint32  // 0x0C: reserved flags
+	totalSize   uint64  // 0x10: total segment size
+	ringAOff    uint64  // 0x18: offset to ring A header
+	ringACap    uint64  // 0x20: ring A capacity (power of 2)
+	ringBOff    uint64  // 0x28: offset to ring B header
+	ringBCap    uint64  // 0x30: ring B capacity (power of 2)
+	serverPID   uint32  // 0x38: server process ID
+	clientPID   uint32  // 0x3C: client process ID
+	serverReady uint32  // 0x40: server ready flag (0->1)
+	clientReady uint32  // 0x44: client mapped flag (0->1)
+	closed      uint32  // 0x48: closed flag (0 open, 1 closed)
+	pad         uint32  // 0x4C: padding
+	maxStreams  uint32  // 0x50: max concurrent streams (0 means unlimited)
+	// openerWakeReady reports whether the opener obtained an
+	// eventfd-based shmDataSegWaker during setupDataSegWakeForOpener
+	// (1 = waker established, 0 = waker missing). The opener stores
+	// this value BEFORE setting clientReady so the creator can read
+	// it as soon as WaitForClient returns. The creator uses it to
+	// decide whether to keep its own waker (eventfd path on both
+	// sides) or release it (asymmetric -- one side has waker, other
+	// uses futex), preventing a deadlock where the creator parks on
+	// its eventfd Read but the opener only futex_wakes.
+	openerWakeReady uint32   // 0x54
+	reserved        [40]byte // 0x58-0x7F: reserved/padding to 128B
 }
 
 // SegmentHeader atomic access methods
@@ -110,6 +141,24 @@ func (h *SegmentHeader) MaxStreams() uint32 {
 // A value of 0 indicates no limit.
 func (h *SegmentHeader) SetMaxStreams(max uint32) {
 	atomic.StoreUint32(&h.maxStreams, max)
+}
+
+// OpenerWakeReady reports whether the opener established a per-data-
+// segment eventfd waker. Read by the creator after WaitForClient.
+func (h *SegmentHeader) OpenerWakeReady() bool {
+	return atomic.LoadUint32(&h.openerWakeReady) != 0
+}
+
+// SetOpenerWakeReady is invoked by the opener after
+// setupDataSegWakeForOpener completes (success or failure), and
+// before SetClientReady, so the creator observes a stable value
+// once WaitForClient returns.
+func (h *SegmentHeader) SetOpenerWakeReady(ready bool) {
+	var v uint32
+	if ready {
+		v = 1
+	}
+	atomic.StoreUint32(&h.openerWakeReady, v)
 }
 
 // TotalSize returns the total segment size
@@ -560,6 +609,43 @@ type Segment struct {
 	Path string    // File path
 
 	closed atomic.Bool
+
+	// rings tracks ShmRing structs that wrap this segment's mmap.
+	// Segment.Close() walks this list and sets each ring's local
+	// closed flag BEFORE unmapping memory, so a reader / writer
+	// returning from a wake call observes localClosed=1 and skips
+	// the header access that would otherwise touch unmapped memory.
+	//
+	// Registered via Segment.RegisterRing; safe for concurrent
+	// append (registration happens during transport construction,
+	// before any goroutine is touching the ring).
+	ringsMu sync.Mutex
+	rings   []*ShmRing
+
+	// dataSegWaker is the per-data-segment per-direction eventfd
+	// waker (the v3.4 production wake primitive on Linux). Set by
+	// CreateSegment (on the listener side) or OpenSegment (claimed
+	// from stash on the dialer side) ONLY for non-control segments.
+	// Nil for control segments and when the eventfd waker is
+	// disabled (see ConfigureShmEventfdWakerForBench);
+	// the futex fast path in ring.go's waitFor* / signal* handles
+	// the fallback transparently.
+	//
+	// Propagated to every Ring registered via RegisterRing so the
+	// ring's waitFor* / signal* call sites can route through the
+	// segment's waker without a per-call lookup.
+	dataSegWaker *shmDataSegWaker
+
+	// fdpassStop, when non-nil, cancels the SCM_RIGHTS file-
+	// descriptor passing server started for this segment by
+	// setupDataSegWakeForCreator. The server listens on a Unix
+	// domain socket co-located with the segment file
+	// ("<Path>.fds.sock") and hands the per-direction eventfd
+	// pair to a cross-process opener via SCM_RIGHTS. Segment.Close
+	// invokes this to tear the server down and remove the socket
+	// file. Always nil on non-Linux and on Linux when the eventfd
+	// waker is disabled.
+	fdpassStop func()
 }
 
 // hdrView provides typed access to the segment header via pointer arithmetic
@@ -573,11 +659,274 @@ type ringView struct {
 	offset  uint64         // Offset to the ring header within the segment
 }
 
+// RegisterRing records r as wrapping this segment's mmap. On
+// Segment.Close, every registered ring has its local closed flag
+// set BEFORE the segment is unmapped, so any reader / writer
+// returning from a wake call observes r.closed=1 and skips the
+// header access that would otherwise touch unmapped memory.
+//
+// Idempotent; safe to call from transport / dialer / listener
+// construction paths regardless of how many of them happen to wrap
+// the same segment.
+func (s *Segment) RegisterRing(r *ShmRing) {
+	if r == nil || s == nil {
+		return
+	}
+	s.ringsMu.Lock()
+	for _, existing := range s.rings {
+		if existing == r {
+			s.ringsMu.Unlock()
+			return
+		}
+	}
+	s.rings = append(s.rings, r)
+	// Propagate the segment's per-data-segment eventfd waker (if
+	// any) to this ring. Rings registered against a non-data segment
+	// or before the wake mode is enabled inherit nil and fall through
+	// to the per-address eventfd registry / futex path.
+	if s.dataSegWaker != nil {
+		r.SetDataSegWaker(s.dataSegWaker)
+	}
+	s.ringsMu.Unlock()
+}
+
+// SetDataSegWaker installs a per-data-segment per-direction eventfd
+// waker as the segment's wake channel. Idempotent in the sense that
+// all future RegisterRing calls propagate this waker; rings already
+// registered are NOT retroactively updated (they keep whatever they
+// had at register time). Wire-up callers (CreateSegment /
+// OpenSegment) must therefore set the waker BEFORE the first
+// RegisterRing.
+func (s *Segment) SetDataSegWaker(w *shmDataSegWaker) {
+	s.dataSegWaker = w
+}
+
+// finalizeDataSegWaker resolves the eventfd-waker peer state after
+// the segment handshake (WaitForServer / WaitForClient) completes.
+//
+// The per-data-segment eventfd waker requires both peers to share
+// the kernel eventfd objects. The opener's setupDataSegWakeForOpener
+// resolves its waker (via in-memory stash for same-process opens,
+// or SCM_RIGHTS over the per-segment Unix socket for cross-process
+// opens) and records the outcome in the header's OpenerWakeReady
+// field before SetClientReady fires. By the time WaitForClient (on
+// the creator) or WaitForServer (on the opener) returns, that flag
+// is stable.
+//
+// If the opener obtained a waker, both sides have one and we keep
+// the eventfd fast path. If the opener fell through (no stash and
+// SCM_RIGHTS failed -- a rare diagnostic-worthy case on Linux,
+// expected on non-Linux), the creator releases its own waker so
+// both sides converge on the futex / Windows-events path. The same
+// asymmetry, left in place, would deadlock the opener-producer /
+// creator-consumer direction: the producer-without-waker issues
+// futex_wake while the consumer-with-waker parks on a Read of its
+// eventfd that futex_wake cannot reach.
+//
+// Callers MUST invoke this after WaitForServer / WaitForClient
+// returns and BEFORE any goroutine starts using the segment's
+// rings for data-plane reads / writes. At that point both peers'
+// state is stably visible and no goroutine is racing on
+// ring.dataSegWaker.
+func (s *Segment) finalizeDataSegWaker() {
+	if s.dataSegWaker == nil {
+		return
+	}
+	if s.H != nil && s.H.OpenerWakeReady() {
+		// Both peers have wakers (same-process via stash OR
+		// cross-process via SCM_RIGHTS). Keep the fast path.
+		return
+	}
+	// Opener has no waker -- release the local one and clear from
+	// any rings RegisterRing already propagated to. Also stop the
+	// SCM_RIGHTS server so a later straggler opener does not get
+	// an about-to-be-closed eventfd.
+	if s.fdpassStop != nil {
+		s.fdpassStop()
+		s.fdpassStop = nil
+	}
+	s.dataSegWaker.Close()
+	s.dataSegWaker = nil
+	s.ringsMu.Lock()
+	for _, r := range s.rings {
+		r.SetDataSegWaker(nil)
+	}
+	s.ringsMu.Unlock()
+	// The peer endpoint stashed by the creator is orphaned in the
+	// cross-process case (no opener ever claims it). Close it now
+	// to release the eventfd; idempotent for the opener side where
+	// nothing was stashed in this process.
+	dropShmDataSegWakerStash(s.Path)
+}
+
+// UnblockSameSideParkers closes the per-data-segment eventfd so any
+// goroutine blocked in shmDataSegWaker.WaitForChange returns
+// immediately (the eventfd file's Read syscall returns EBADF once
+// the underlying *os.File is closed; WaitForChange maps that to
+// ErrRingClosed). Idempotent via the waker's sync.Once. No-op when
+// the eventfd waker is disabled (waker is nil).
+//
+// Transport-level Close paths (ShmClientTransport.Close,
+// ShmServerTransport.Close) MUST call this BEFORE wg.Wait()-ing on
+// the reader/writer goroutines. The reader, parked on this side's
+// recv eventfd via Go netpoll, can only exit on Read error; without
+// this call wg.Wait deadlocks. Segment.Close (which runs later in
+// the teardown sequence) also calls the waker's Close, but by then
+// we're already past wg.Wait so it would be too late.
+//
+// This is a stop-signal, not a fan-out wake: the eventfd is
+// permanently closed, not just signalled. Subsequent Wake/Wait
+// calls become no-ops. Safe because the transport is being torn
+// down and will not produce further data on this segment.
+func (s *Segment) UnblockSameSideParkers() {
+	if s.dataSegWaker != nil {
+		s.dataSegWaker.Close()
+	}
+}
+
+// setupDataSegWakeForCreator allocates a fresh pair of per-direction
+// eventfds and binds one side to this segment, stashing the peer
+// side for the matching OpenSegment call to claim. Called by
+// CreateSegment on platforms where the primitive is supported and
+// the eventfd waker is enabled; no-op for control segments
+// (whose name ends in shmControlSuffix) since their long-lived
+// listener side never has a matching opener-creator pair within the
+// same process.
+//
+// Falls through silently if the eventfd syscalls fail: the
+// segment's rings keep their nil dataSegWaker and the existing per-
+// address eventfd / futex path handles wakes.
+func setupDataSegWakeForCreator(seg *Segment) {
+	if seg == nil || !shmDataSegWakeEnabled() {
+		return
+	}
+	if strings.HasSuffix(seg.Path, shmControlSuffix) {
+		return
+	}
+	a, b, err := newShmDataSegWakerPair()
+	if err != nil || a == nil || b == nil {
+		return
+	}
+	seg.SetDataSegWaker(a)
+	stashShmDataSegWakerForOpener(seg.Path, b)
+
+	// Expose the eventfd pair via SCM_RIGHTS on a per-segment Unix
+	// domain socket so a cross-process opener (which cannot reach
+	// the in-memory stash) can receive valid duplicates. The helper
+	// reads the creator-side raw fds out of the waker; both eventfds
+	// were just allocated here and remain valid for the segment's
+	// lifetime. Failure to start the server is non-fatal:
+	// same-process openers keep working via the stash; cross-process
+	// openers will observe the missing socket at recv time and fall
+	// through to futex.
+	stop, fdErr := serveEventfdsForCreatorWaker(seg.Path, a)
+	if fdErr == nil {
+		seg.fdpassStop = stop
+	}
+}
+
+// setupDataSegWakeForOpener obtains the per-data-segment eventfd
+// pair for this opener side. It first claims from the same-process
+// in-memory stash (zero-syscall fast path); on miss, it dials the
+// per-segment SCM_RIGHTS socket and receives the eventfd pair from
+// the creator. Both same-process and cross-process scenarios end up
+// with a valid seg.dataSegWaker on success. Failure (no stash entry
+// and no reachable socket) leaves the waker nil and the rings fall
+// through to the futex / Windows-events path.
+//
+// The function records the outcome in the segment header via
+// SetOpenerWakeReady BEFORE OpenSegment signals ClientReady, so the
+// creator's finalizeDataSegWaker can read a stable value and drop
+// its own waker if the opener fell through to futex (avoiding the
+// asymmetric-wake deadlock).
+func setupDataSegWakeForOpener(seg *Segment) {
+	defer func() {
+		if seg != nil && seg.H != nil {
+			seg.H.SetOpenerWakeReady(seg.dataSegWaker != nil)
+		}
+	}()
+	if seg == nil || !shmDataSegWakeEnabled() {
+		return
+	}
+	if strings.HasSuffix(seg.Path, shmControlSuffix) {
+		return
+	}
+	if w := claimShmDataSegWakerForOpener(seg.Path); w != nil {
+		seg.SetDataSegWaker(w)
+		return
+	}
+	// Cross-process: receive the eventfd pair via SCM_RIGHTS.
+	fds, err := recvEventfdsFromCreator(seg.Path)
+	if err != nil {
+		return
+	}
+	w, err := newShmDataSegWakerFromOpenerFds(fds)
+	if err != nil {
+		return
+	}
+	seg.SetDataSegWaker(w)
+}
+
 // Close unmaps the memory and closes the file
 func (s *Segment) Close() error {
 	if !s.closed.CompareAndSwap(false, true) {
 		return nil
 	}
+
+	// Set the local closed flag on every Ring that wraps this segment
+	// BEFORE unmapping. Readers / writers parked in waitForData /
+	// waitForSpace re-check `r.closed` after wake and skip any
+	// further header access if set, avoiding use-after-unmap when
+	// the segment tears down with a wait outstanding.
+	s.ringsMu.Lock()
+	for _, r := range s.rings {
+		atomic.StoreUint32(&r.closed, 1)
+	}
+	registered := s.rings
+	s.rings = nil
+	s.ringsMu.Unlock()
+
+	// Wake any waiters so they return from waitFor* and observe the
+	// localClosed flag set above. Use the abstracted wake APIs so the
+	// futex and eventfd paths both drain correctly.
+	for _, r := range registered {
+		hdr := r.header()
+		r.signalData(&hdr.dataSeq)
+		r.signalSpace(&hdr.spaceSeq)
+		r.signalContig(&hdr.contigSeq)
+	}
+
+	// NOTE: We intentionally do NOT call dataSegWaker.RewakeLocal()
+	// here. ring.Close() already does it for each registered ring
+	// during the transport-level teardown which happens BEFORE
+	// Segment.Close. Doing it again here would create a race window:
+	// (1) we wake a same-side parker, (2) the parker's outer loop
+	// re-enters waitFor*/header access, (3) the unmap below frees
+	// the header memory mid-access. The dataSegWaker.Close() further
+	// down closes the eventfd which will return ErrClosed to any
+	// final parker through the read syscall path -- that is the
+	// correct teardown route at the segment level.
+
+	// Release the per-data-segment socketpair endpoint (if any).
+	// Closing the *os.File causes the peer's parked Read to return
+	// io.EOF -- our shmDataSegWaker.Wait maps that to ErrRingClosed
+	// so the peer's ring loop exits cleanly. Also drains any
+	// unclaimed stash entry (in case CreateSegment ran but the
+	// matching OpenSegment never happened).
+	//
+	// Order matters: stop the SCM_RIGHTS fd-pass server FIRST so
+	// no further opener can dial in and receive about-to-be-EBADF
+	// fds, then close the waker (which closes the eventfd), then
+	// drop the stash.
+	if s.fdpassStop != nil {
+		s.fdpassStop()
+		s.fdpassStop = nil
+	}
+	if s.dataSegWaker != nil {
+		s.dataSegWaker.Close()
+		s.dataSegWaker = nil
+	}
+	dropShmDataSegWakerStash(s.Path)
 
 	var firstErr error
 
@@ -737,6 +1086,17 @@ func (h *hdrView) MaxStreams() uint32 {
 // A value of 0 indicates no limit.
 func (h *hdrView) SetMaxStreams(max uint32) {
 	h.header().SetMaxStreams(max)
+}
+
+// OpenerWakeReady mirrors SegmentHeader.OpenerWakeReady on the typed
+// view used by Segment helpers.
+func (h *hdrView) OpenerWakeReady() bool {
+	return h.header().OpenerWakeReady()
+}
+
+// SetOpenerWakeReady mirrors SegmentHeader.SetOpenerWakeReady.
+func (h *hdrView) SetOpenerWakeReady(ready bool) {
+	h.header().SetOpenerWakeReady(ready)
 }
 
 // ServerReady returns the server ready flag

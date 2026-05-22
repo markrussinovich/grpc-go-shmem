@@ -26,6 +26,7 @@ import (
 	"strings"
 	"time"
 
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/resolver"
 )
@@ -256,7 +257,23 @@ func MustUseShmForAddress(addr resolver.Address, cfg *ShmServiceConfig) bool {
 //   - onClose: Callback invoked when transport is closed
 //
 // Returns the ClientTransport or an error if connection fails.
-func NewShmClient(connectCtx, _ context.Context, addr resolver.Address, opts ConnectOptions, onClose func(GoAwayReason)) (ClientTransport, error) {
+//
+// Credential gating: the SHM transport does not implement
+// network-style transport security (TLS) because the connection is
+// in-process or on-host shared memory, mutually authenticated via
+// filesystem permissions on /dev/shm / temp-dir and the optional
+// ShmSecurityHandshaker. NewShmClient refuses to dial when
+// non-insecure transport credentials or per-RPC credentials that
+// require transport security are configured, so a caller that
+// configured TLS does not silently end up on an unauthenticated
+// connection. Callers that want TLS MUST keep IsFallbackAllowed
+// true and the dialer will transparently fall back to HTTP/2 via
+// clientconn's RFC-A73 path.
+func NewShmClient(connectCtx, _ context.Context, addr resolver.Address, opts ConnectOptions, onClose func(GoAwayInfo)) (ClientTransport, error) {
+	if err := assertShmCompatibleCredentials(opts); err != nil {
+		return nil, err
+	}
+
 	segmentName := GetSegmentName(addr)
 	if segmentName == "" {
 		return nil, fmt.Errorf("shm: no segment name available for address %q", addr.Addr)
@@ -266,6 +283,17 @@ func NewShmClient(connectCtx, _ context.Context, addr resolver.Address, opts Con
 	dialOpts := DefaultDialOptions()
 	if opts.KeepaliveParams != (keepalive.ClientParameters{}) {
 		dialOpts.KeepaliveParams = opts.KeepaliveParams
+	}
+	// Propagate flow-control window overrides from gRPC dial options
+	// (grpc.WithInitialWindowSize / WithInitialConnWindowSize). These
+	// reach us through ConnectOptions; we just forward them. With the
+	// default zero values the SHM transport keeps its 2 GiB quota
+	// (flow control disabled, ring buffer is backpressure).
+	if opts.InitialWindowSize > 0 {
+		dialOpts.InitialWindowSize = opts.InitialWindowSize
+	}
+	if opts.InitialConnWindowSize > 0 {
+		dialOpts.InitialConnWindowSize = opts.InitialConnWindowSize
 	}
 
 	// Use connect context timeout if available
@@ -285,4 +313,80 @@ func NewShmClient(connectCtx, _ context.Context, addr resolver.Address, opts Con
 	}
 
 	return transport, nil
+}
+
+// assertShmCompatibleCredentials rejects ConnectOptions whose transport
+// credentials or per-RPC credentials would expect transport-level
+// security (TLS, mTLS, ALTS, etc.) that the SHM transport does not
+// provide. Returning an error here causes clientconn's RFC-A73
+// fallback path to retry over HTTP/2 (when allowed), preserving the
+// user's stated security intent.
+//
+// SHM-compatible transport credentials:
+//   - nil TransportCredentials (no transport-level handshake configured)
+//   - non-nil credentials whose Info().SecurityProtocol == "insecure"
+//     (e.g. insecure.NewCredentials()).
+//
+// The publicly exported credentials/shm package reports
+// Info().SecurityProtocol == "shm" but its ClientHandshake is not
+// currently wired through the RFC-A73 NewShmClient path; accepting
+// "shm" here without invoking the verifier would bypass it silently.
+// Until that wiring lands we reject "shm" credentials with the same
+// structured error so users get a clear failure (and HTTP/2 fallback
+// when allowed) instead of an unauthenticated SHM connection. The
+// in-process ShmSecurityHandshaker on DialOptions.Handshaker remains
+// the supported way to add SHM-specific identity verification.
+//
+// Per-RPC credentials are accepted as long as RequireTransportSecurity()
+// returns false. Bundle-wrapped per-RPC credentials are checked the
+// same way; the bundle's TransportCredentials() must satisfy the same
+// gate as a direct one.
+//
+// On rejection a structured ShmError is returned so clientconn.go's
+// RFC-A73 path can drive HTTP/2 fallback when allowed.
+func assertShmCompatibleCredentials(opts ConnectOptions) error {
+	checkTC := func(tc credentials.TransportCredentials) error {
+		if tc == nil {
+			return nil
+		}
+		if tc.Info().SecurityProtocol == "insecure" {
+			return nil
+		}
+		return NewShmError(
+			ShmErrConnectionRefused,
+			fmt.Sprintf("shm transport does not accept transport credentials %q; use insecure.NewCredentials() (with DialOptions.Handshaker for in-process identity verification) or allow HTTP/2 fallback for TLS", tc.Info().SecurityProtocol),
+		)
+	}
+	checkPRC := func(prc credentials.PerRPCCredentials) error {
+		if prc == nil {
+			return nil
+		}
+		if prc.RequireTransportSecurity() {
+			return NewShmError(
+				ShmErrConnectionRefused,
+				"shm transport cannot satisfy PerRPCCredentials that require transport security; either drop the requirement or allow HTTP/2 fallback",
+			)
+		}
+		return nil
+	}
+	if err := checkTC(opts.TransportCredentials); err != nil {
+		return err
+	}
+	if b := opts.CredsBundle; b != nil {
+		if err := checkTC(b.TransportCredentials()); err != nil {
+			return err
+		}
+		// CredsBundle layers PerRPCCredentials separately from
+		// opts.PerRPCCredentials: NewHTTP2Client appends them at the
+		// same gate before enforcing security. We mirror that.
+		if err := checkPRC(b.PerRPCCredentials()); err != nil {
+			return err
+		}
+	}
+	for _, prc := range opts.PerRPCCredentials {
+		if err := checkPRC(prc); err != nil {
+			return err
+		}
+	}
+	return nil
 }

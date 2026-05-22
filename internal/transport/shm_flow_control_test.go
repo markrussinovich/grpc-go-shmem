@@ -1,3 +1,5 @@
+//go:build linux || windows
+
 /*
  *
  * Copyright 2025 gRPC authors.
@@ -33,6 +35,12 @@ import (
 // Test that a client write blocks when the outbound flow-control window is
 // exhausted and resumes when WINDOW_UPDATE frames arrive.
 func TestShmFlowControlBlocksUntilWindowUpdate(t *testing.T) {
+	// This test exercises WINDOW_UPDATE semantics, which are disabled
+	// in the v3.4 default no-WU mode. Opt back into HTTP/2-style WU
+	// flow control for the duration of the test.
+	ConfigureShmNoWindowUpdate(false)
+	t.Cleanup(ResetShmNoWindowUpdateForBench)
+
 	testCtx, testCancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	defer testCancel()
 
@@ -74,7 +82,7 @@ func TestShmFlowControlBlocksUntilWindowUpdate(t *testing.T) {
 		_ = s.WriteStatus(status.New(codes.OK, ""))
 	})
 
-	cs, err := cliTransport.NewStream(ctx, &CallHdr{Method: "/test/FlowControl"})
+	cs, err := cliTransport.NewStream(ctx, &CallHdr{Method: "/test/FlowControl"}, nil)
 	if err != nil {
 		t.Fatalf("NewStream: %v", err)
 	}
@@ -170,7 +178,7 @@ func TestShmFlowControlMultiStreamAccountCheck(t *testing.T) {
 	// Create multiple streams
 	streams := make([]*ClientStream, numStreams)
 	for i := 0; i < numStreams; i++ {
-		s, err := cliTransport.NewStream(testCtx, &CallHdr{Method: fmt.Sprintf("/test/Stream%d", i)})
+		s, err := cliTransport.NewStream(testCtx, &CallHdr{Method: fmt.Sprintf("/test/Stream%d", i)}, nil)
 		if err != nil {
 			t.Fatalf("NewStream %d: %v", i, err)
 		}

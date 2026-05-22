@@ -156,13 +156,22 @@ func futexWaitTimeout(addr *uint32, val uint32, timeoutNs int64) error {
 
 // futexWake wakes up to n threads waiting on addr.
 // Returns the number of threads actually woken up.
+//
+// Uses syscall.RawSyscall6 deliberately: futex_wake never blocks (kernel
+// just marks waiters runnable and returns), so the entersyscall /
+// exitsyscall dance that syscall.Syscall6 performs is pure overhead.
+// On the hot SHM path syscall.Syscall6's exitsyscall was triggering
+// runtime.wakep (~10–30 µs per wake) because it re-acquires a P and
+// the runtime tries to spread the waiting G across cores. RawSyscall6
+// keeps the current M's P attached so the runtime sees the calling G
+// as still runnable and skips wakep. Wire-format remains identical
+// (FUTEX_WAKE_PRIVATE / FUTEX_WAKE op number passed unchanged).
 func futexWake(addr *uint32, n int) (int, error) {
 	if futexDebugEnabled {
 		futexLogf("[FUTEX] futexWake: addr=%p, n=%d, current_val=%d", addr, n, atomic.LoadUint32(addr))
 	}
 
-	// Use syscall.Syscall6 instead of RawSyscall6 for cross-process futex
-	r1, _, errno := syscall.Syscall6(
+	r1, _, errno := syscall.RawSyscall6(
 		syscall.SYS_FUTEX,
 		uintptr(unsafe.Pointer(addr)), // uaddr - address to wake on
 		futexOpWake,                   // futex_op - wake operation (shared, for cross-process)

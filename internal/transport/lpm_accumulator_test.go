@@ -123,13 +123,16 @@ func TestLPMAccumulator_LargeFirstChunkPreallocates(t *testing.T) {
 }
 
 // TestLPMAccumulator_SmallFirstChunkStillDoubles verifies that when the
-// first chunk carries < 1 MiB body bytes (DoS-shape: small chunks
-// against a large declared body), the accumulator falls back to the
-// doubling growth path — NOT pre-allocating expectedTotal. Preserves
-// the bounded-allocation invariant.
+// first chunk carries a body smaller than a typical streaming frame
+// (DoS-shape: small chunks against a large declared body), the
+// accumulator does NOT pre-allocate the full peer-declared
+// expectedTotal — it allocates at most a 64× scaling of the first-
+// chunk size. Preserves the bounded-allocation invariant: a peer
+// declaring N MiB but committing to only k MiB of first-chunk body
+// can only force a 64k-byte allocation, not an N-MiB one.
 func TestLPMAccumulator_SmallFirstChunkStillDoubles(t *testing.T) {
 	const totalBody = 64 * 1024 * 1024 // 64 MiB declared
-	const firstChunkBody = 512 * 1024  // 512 KiB — below 1 MiB threshold
+	const firstChunkBody = 512 * 1024  // 512 KiB first chunk
 	hdr := buildLPMHeaderTest(totalBody)
 
 	acc := &lpmAccumulator{}
@@ -137,10 +140,17 @@ func TestLPMAccumulator_SmallFirstChunkStillDoubles(t *testing.T) {
 	if _, _, err := acc.feed(chunk1, h2MaxLPMBodyBytes); err != nil {
 		t.Fatalf("feed chunk 1: %v", err)
 	}
-	// First-chunk body bytes = 512 KiB < 1 MiB → doubling path, cap =
-	// 5 + 512 KiB body wire size (exact-fit sizing).
-	if got, want := cap(acc.buf), 5+firstChunkBody; got != want {
-		t.Errorf("chunk 1 cap: got %d want %d (small first chunk should NOT pre-allocate expectedTotal)", got, want)
+	// Invariant: cap is bounded by 64 × firstChunkBody and strictly
+	// less than the peer-declared total. The whole point: peer can't
+	// force allocation of declared total just by saying it's big.
+	gotCap := cap(acc.buf)
+	maxAllowed := 64 * firstChunkBody // largeFirstChunkMultiplier × first chunk
+	if gotCap > maxAllowed {
+		t.Errorf("chunk 1 cap: got %d, want ≤ %d (64× multiplier bound)", gotCap, maxAllowed)
+	}
+	if gotCap >= 5+totalBody {
+		t.Errorf("chunk 1 cap: got %d, want < %d (DoS bound: must not pre-alloc peer-declared total)",
+			gotCap, 5+totalBody)
 	}
 }
 

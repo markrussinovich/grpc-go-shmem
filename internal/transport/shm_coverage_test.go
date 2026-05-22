@@ -151,7 +151,7 @@ func TestShmClientWithMisbehavedServer(t *testing.T) {
 		stream, err := clientTransport.NewStream(ctx, &CallHdr{
 			Host:   "localhost",
 			Method: "/test/Misbehaved",
-		})
+		}, nil)
 		if err != nil {
 			t.Fatalf("NewStream failed: %v", err)
 		}
@@ -424,7 +424,7 @@ func TestShmStreamIDExhaustion(t *testing.T) {
 	}
 
 	// First stream should succeed (ID = MaxStreamID - 2)
-	s1, err := ct.NewStream(ctx, callHdr)
+	s1, err := ct.NewStream(ctx, callHdr, nil)
 	if err != nil {
 		t.Fatalf("ct.NewStream() = %v", err)
 	}
@@ -440,7 +440,7 @@ func TestShmStreamIDExhaustion(t *testing.T) {
 
 	// Second stream should succeed (ID = MaxStreamID) and trigger draining
 	// because next ID would be MaxStreamID + 2 > MaxStreamID
-	s2, err := ct.NewStream(ctx, callHdr)
+	s2, err := ct.NewStream(ctx, callHdr, nil)
 	if err != nil {
 		t.Fatalf("ct.NewStream() = %v", err)
 	}
@@ -579,7 +579,7 @@ func TestShmEncodingRequiredStatus(t *testing.T) {
 	stream, err := ct.NewStream(ctx, &CallHdr{
 		Host:   "localhost",
 		Method: "/test/EncodingTest",
-	})
+	}, nil)
 	if err != nil {
 		t.Fatalf("NewStream failed: %v", err)
 	}
@@ -647,7 +647,7 @@ func TestShmClientConnDecoupledFromApplicationRead(t *testing.T) {
 	})
 
 	// Create first stream
-	stream1, err := ct.NewStream(ctx, &CallHdr{Method: "/test/Stream1"})
+	stream1, err := ct.NewStream(ctx, &CallHdr{Method: "/test/Stream1"}, nil)
 	if err != nil {
 		t.Fatalf("Failed to create stream 1: %v", err)
 	}
@@ -660,7 +660,7 @@ func TestShmClientConnDecoupledFromApplicationRead(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 
 	// Create second stream WITHOUT reading from first
-	stream2, err := ct.NewStream(ctx, &CallHdr{Method: "/test/Stream2"})
+	stream2, err := ct.NewStream(ctx, &CallHdr{Method: "/test/Stream2"}, nil)
 	if err != nil {
 		t.Fatalf("Failed to create stream 2 (connection should not be blocked): %v", err)
 	}
@@ -728,7 +728,7 @@ func TestShmServerConnDecoupledFromApplicationRead(t *testing.T) {
 	})
 
 	// Create and send on first stream
-	stream1, err := ct.NewStream(ctx, &CallHdr{Method: "/test/Stream1"})
+	stream1, err := ct.NewStream(ctx, &CallHdr{Method: "/test/Stream1"}, nil)
 	if err != nil {
 		t.Fatalf("Failed to create stream 1: %v", err)
 	}
@@ -748,7 +748,7 @@ func TestShmServerConnDecoupledFromApplicationRead(t *testing.T) {
 	}
 
 	// Create and send on second stream
-	stream2, err := ct.NewStream(ctx, &CallHdr{Method: "/test/Stream2"})
+	stream2, err := ct.NewStream(ctx, &CallHdr{Method: "/test/Stream2"}, nil)
 	if err != nil {
 		t.Fatalf("Failed to create stream 2: %v", err)
 	}
@@ -793,7 +793,7 @@ func TestShmGoAwayDrainingCompletesGracefully(t *testing.T) {
 	})
 
 	// Create a stream
-	stream, err := ct.NewStream(ctx, &CallHdr{Method: "/test/GracefulClose"})
+	stream, err := ct.NewStream(ctx, &CallHdr{Method: "/test/GracefulClose"}, nil)
 	if err != nil {
 		t.Fatalf("Failed to create stream: %v", err)
 	}
@@ -815,7 +815,7 @@ func TestShmGoAwayDrainingCompletesGracefully(t *testing.T) {
 	}
 
 	// New streams should be rejected
-	_, err = ct.NewStream(ctx, &CallHdr{Method: "/test/NewStream"})
+	_, err = ct.NewStream(ctx, &CallHdr{Method: "/test/NewStream"}, nil)
 	if err != nil {
 		t.Logf("New stream correctly rejected after GOAWAY: %v", err)
 	} else {
@@ -995,7 +995,7 @@ func performOneShmRPC(ct *ShmClientTransport) {
 	s, err := ct.NewStream(ctx, &CallHdr{
 		Host:   "localhost",
 		Method: "/test/Small",
-	})
+	}, nil)
 	if err != nil {
 		return
 	}
@@ -1077,7 +1077,7 @@ func TestShmLargeMessageWithDelayRead(t *testing.T) {
 	defer cancel()
 
 	// Create stream
-	s, err := ct.NewStream(ctx, &CallHdr{Host: "localhost", Method: "/test/Large"})
+	s, err := ct.NewStream(ctx, &CallHdr{Host: "localhost", Method: "/test/Large"}, nil)
 	if err != nil {
 		t.Fatalf("NewStream: %v", err)
 	}
@@ -1160,7 +1160,7 @@ func TestShmLargeMessageSuspension(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
 
-	s, err := ct.NewStream(ctx, &CallHdr{Host: "localhost", Method: "/test/Large"})
+	s, err := ct.NewStream(ctx, &CallHdr{Host: "localhost", Method: "/test/Large"}, nil)
 	if err != nil {
 		t.Fatalf("NewStream: %v", err)
 	}
@@ -1226,7 +1226,7 @@ func TestShmReadGivesSameError(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	s, err := ct.NewStream(ctx, &CallHdr{Host: "localhost", Method: "/test/Error"})
+	s, err := ct.NewStream(ctx, &CallHdr{Host: "localhost", Method: "/test/Error"}, nil)
 	if err != nil {
 		t.Fatalf("NewStream: %v", err)
 	}
@@ -1291,7 +1291,7 @@ func TestShmWriteHeaderConnectionError(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 
 	// Try to create a new stream - should fail or succeed initially
-	s, err := ct.NewStream(ctx, &CallHdr{Host: "localhost", Method: "/test/Write"})
+	s, err := ct.NewStream(ctx, &CallHdr{Host: "localhost", Method: "/test/Write"}, nil)
 	if err != nil {
 		// Expected - transport might be closed already
 		t.Logf("NewStream returned expected error: %v", err)

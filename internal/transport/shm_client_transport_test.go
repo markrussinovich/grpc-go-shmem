@@ -57,7 +57,7 @@ func TestClientTransportNewStreamAndWrite(t *testing.T) {
 		Method: "/test.Service/Method",
 	}
 
-	stream, err := transport.NewStream(ctx, callHdr)
+	stream, err := transport.NewStream(ctx, callHdr, nil)
 	if err != nil {
 		t.Fatalf("NewStream failed: %v", err)
 	}

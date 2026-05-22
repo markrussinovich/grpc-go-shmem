@@ -124,6 +124,28 @@ func CreateSegment(name string, ringCapA, ringCapB uint64) (*Segment, error) {
 		segment.B.SetReadIndex(0)
 		segment.B.SetClosed(false)
 
+		// If the eventfd waker is enabled and this is a non-control segment,
+		// allocate a SOCK_STREAM socketpair and stash one endpoint
+		// for the matching OpenSegment to claim. No-op otherwise.
+		setupDataSegWakeForCreator(segment)
+
+		// Close the backing file fd: the mmap holds an independent
+		// inode reference, so the mapped region stays valid for the
+		// segment's lifetime. Saves 1 FD/segment (2 FDs/conn over
+		// control + data segments). Path is preserved in segment.Path
+		// for path-based unlink via RemoveSegment / Segment.Close.
+		//
+		// Phase 2 cross-process: SCM_RIGHTS handshake must complete
+		// BEFORE this close. Phase 1 is single-process / handle-by-
+		// path, so the fd is no longer needed after mmap.
+		if err := file.Close(); err != nil {
+			munmapImpl(mem)
+			os.Remove(tryPath)
+			lastErr = fmt.Errorf("close fd after mmap: %w", err)
+			continue
+		}
+		segment.File = nil
+
 		return segment, nil
 	}
 
@@ -193,9 +215,34 @@ func OpenSegment(name string) (*Segment, error) {
 		B:    &ringView{basePtr: unsafe.Pointer(&mem[0]), offset: ringBOffset},
 	}
 
-	// Set client PID and ready flag
+	// Set client PID. NOTE: we defer SetClientReady until AFTER
+	// setupDataSegWakeForOpener has recorded OpenerWakeReady in the
+	// header, so the creator's WaitForClient gate releases with a
+	// stable wake-mode flag. finalizeDataSegWaker on the creator
+	// side reads OpenerWakeReady to decide whether to keep its own
+	// eventfd waker or release it (avoiding the asymmetric-wake
+	// deadlock when SCM_RIGHTS handoff failed).
 	segment.H.SetClientPID(uint32(os.Getpid()))
+
+	// Claim the stashed per-data-segment socketpair endpoint (same-
+	// process fast path) or receive it via SCM_RIGHTS (cross-process).
+	// No-op for control segments / when the wake mode is off. Sets
+	// OpenerWakeReady on the header as part of its deferred bookkeeping.
+	setupDataSegWakeForOpener(segment)
+
+	// Now that OpenerWakeReady is published, release the creator's
+	// WaitForClient gate.
 	segment.H.SetClientReady(true)
+
+	// Close the backing file fd: the mmap holds an independent
+	// inode reference, so the mapped region stays valid for the
+	// segment's lifetime. Saves 1 FD/segment. See CreateSegment
+	// for the full rationale.
+	if err := file.Close(); err != nil {
+		munmapImpl(mem)
+		return nil, fmt.Errorf("close fd after mmap: %w", err)
+	}
+	segment.File = nil
 
 	return segment, nil
 }

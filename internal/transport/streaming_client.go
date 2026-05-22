@@ -79,10 +79,18 @@ type StreamingClientStream struct {
 
 // NewShmStreamingClient creates a new streaming client over an existing segment.
 func NewShmStreamingClient(seg *Segment) *ShmStreamingClient {
+	tx := NewShmRingFromSegment(seg.A, seg.Mem)
+	rx := NewShmRingFromSegment(seg.B, seg.Mem)
+	// Register rings with the segment so the per-data-segment eventfd
+	// waker (when enabled) propagates to ring.dataSegWaker; without
+	// this, the consumer side parks on eventfd while the producer side
+	// only signals via futex — asymmetric wake -> deadlock.
+	seg.RegisterRing(tx)
+	seg.RegisterRing(rx)
 	c := &ShmStreamingClient{
 		seg:        seg,
-		tx:         NewShmRingFromSegment(seg.A, seg.Mem),
-		rx:         NewShmRingFromSegment(seg.B, seg.Mem),
+		tx:         tx,
+		rx:         rx,
 		nextID:     1,
 		streams:    make(map[uint32]*StreamingClientStream),
 		readerDone: make(chan struct{}),

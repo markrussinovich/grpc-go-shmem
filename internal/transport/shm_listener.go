@@ -24,6 +24,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"net"
 	"sync"
@@ -38,6 +39,20 @@ import (
 type ShmAddr struct {
 	Name string // Segment name/identifier
 }
+
+// clientReadyTimeout bounds how long the listener's Accept loop waits
+// for an accepted client to map its data segment and signal ClientReady.
+// Without a bound, a client that disappears between consuming the
+// listener's ACCEPT frame and signalling readiness (process crash,
+// kill -9, sandbox restart) would wedge the Accept goroutine
+// indefinitely and prevent the listener from serving subsequent
+// CONNECT requests. The handshake is sub-millisecond in the common
+// case (both endpoints are on the same host); 5s is plenty of
+// headroom while still recovering promptly from a dead client.
+//
+// var rather than const so tests can shrink the wait without
+// rebuilding the binary; production code does not mutate it.
+var clientReadyTimeout = 5 * time.Second
 
 // Network returns the network type
 func (a *ShmAddr) Network() string {
@@ -117,6 +132,9 @@ func NewShmListener(addr *ShmAddr, segmentSize, ringASize, ringBSize uint64) (*S
 	if addr == nil {
 		return nil, errors.New("address cannot be nil")
 	}
+	if err := validateSegmentName(addr.Name); err != nil {
+		return nil, err
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -136,9 +154,27 @@ func NewShmListener(addr *ShmAddr, segmentSize, ringASize, ringBSize uint64) (*S
 	// dial-side polling.
 	ctlName := l.baseName + shmControlSuffix
 
-	// Proactively clean up any stale segment from a previous run before creating.
-	// This handles the case where the server crashed without proper cleanup.
+	// If a control segment with this name already exists, probe its
+	// liveness before clobbering it. A simple unconditional unlink
+	// would silently break any listener already serving on this name
+	// (the original /dev/shm inode is unlinked, but the existing
+	// listener keeps its mapping; new clients then map a *different*
+	// inode created by this listener, and the original listener
+	// becomes unreachable). Treat ServerReady=true as "another listener
+	// is active" and refuse to start; treat ServerReady=false (or open
+	// failure) as a stale segment from a crashed previous run and
+	// clean it up.
 	if SegmentExists(ctlName) {
+		existing, openErr := OpenSegment(ctlName)
+		alive := false
+		if openErr == nil {
+			alive = existing.H.ServerReady()
+			existing.Close()
+		}
+		if alive {
+			cancel()
+			return nil, fmt.Errorf("shm: listener %q: control segment %q is already in use by another listener (remove %q manually if the previous server crashed while marked ready)", l.baseName, ctlName, ctlName)
+		}
 		_ = RemoveSegment(ctlName)
 	}
 
@@ -160,6 +196,8 @@ func NewShmListener(addr *ShmAddr, segmentSize, ringASize, ringBSize uint64) (*S
 	l.ctlSegment = ctlSeg
 	l.ctlRx = NewShmRingFromSegment(ctlSeg.A, ctlSeg.Mem)
 	l.ctlTx = NewShmRingFromSegment(ctlSeg.B, ctlSeg.Mem)
+	ctlSeg.RegisterRing(l.ctlRx)
+	ctlSeg.RegisterRing(l.ctlTx)
 
 	// Create events for control rings (Windows). On Linux, these are no-ops.
 	l.ctlRxEvents, _ = CreateRingEvents(ctlEventName, "A")
@@ -198,11 +236,48 @@ func (l *ShmListener) Accept() (net.Conn, error) {
 	defer l.acceptWG.Done()
 
 	// Read a CONNECT request from the control ring.
+	//
+	// A malformed control frame is non-fatal (see errMalformedCtlFrame
+	// handling below), but a hostile or buggy peer can flood the ring
+	// with garbage and make this loop CPU-spin. Bound the damage with
+	// two mitigations:
+	//   * A short context-aware backoff between malformed reads, so
+	//     the listener parks instead of hot-looping when the ring is
+	//     misaligned.
+	//   * A hard cap on consecutive malformed frames, after which we
+	//     give up on this listener. ~320ms × 32 frames is enough to
+	//     ride out a transient burst of garbage but bounds wall-clock
+	//     and CPU spent on a clearly bad peer.
+	const (
+		maxConsecutiveMalformed = 32
+		malformedBackoff        = 10 * time.Millisecond
+	)
+	consecutiveMalformed := 0
 	for {
 		fh, payload, err := readCtlFrame(l.ctx, l.ctlRx)
 		if err != nil {
+			// A malformed frame on the control ring is treated as a
+			// per-frame, non-fatal event: log it and keep accepting.
+			// readCtlFrame has already attempted a bounded drain, so
+			// the ring may briefly be misaligned but well-behaved
+			// clients can still re-establish. Other errors (ring
+			// closed, ctx canceled) are fatal and propagated.
+			if errors.Is(err, errMalformedCtlFrame) {
+				consecutiveMalformed++
+				logger.Warningf("shm listener %q: discarding malformed control frame (%d consecutive): %v", l.baseName, consecutiveMalformed, err)
+				if consecutiveMalformed >= maxConsecutiveMalformed {
+					return nil, fmt.Errorf("shm listener %q: %d consecutive malformed control frames; giving up", l.baseName, consecutiveMalformed)
+				}
+				select {
+				case <-l.ctx.Done():
+					return nil, l.ctx.Err()
+				case <-time.After(malformedBackoff):
+				}
+				continue
+			}
 			return nil, err
 		}
+		consecutiveMalformed = 0
 		if fh.Type != FrameTypeCONNECT {
 			continue
 		}
@@ -235,6 +310,8 @@ func (l *ShmListener) Accept() (net.Conn, error) {
 		// when client opens the segment and creates its transport.
 		readRing := NewShmRingFromSegment(segment.A, segment.Mem)
 		writeRing := NewShmRingFromSegment(segment.B, segment.Mem)
+		segment.RegisterRing(readRing)
+		segment.RegisterRing(writeRing)
 
 		// Create events for this segment. On Linux, these are no-ops.
 		// Must happen before ACCEPT so client's OpenRingEvents finds them.
@@ -252,23 +329,51 @@ func (l *ShmListener) Accept() (net.Conn, error) {
 			if writeEvents != nil {
 				writeEvents.Close()
 			}
+			CloseHandshakeEvents(segmentName)
 			segment.Close()
 			_ = RemoveSegment(segmentName)
 			return nil, err
 		}
 
-		// Wait for client to map the segment.
-		if err := segment.WaitForClient(l.ctx); err != nil {
+		// Wait for client to map the segment. Bound this with a timeout
+		// so a client that disappears between consuming ACCEPT and
+		// signalling ClientReady (process crash, kill -9, network
+		// partition for cross-host setups) cannot wedge the listener's
+		// Accept loop indefinitely. On timeout we clean up this
+		// connection's resources and continue the outer for-loop to
+		// service the next CONNECT.
+		waitCtx, waitCancel := context.WithTimeout(l.ctx, clientReadyTimeout)
+		waitErr := segment.WaitForClient(waitCtx)
+		waitCancel()
+		if waitErr != nil {
 			if readEvents != nil {
 				readEvents.Close()
 			}
 			if writeEvents != nil {
 				writeEvents.Close()
 			}
+			CloseHandshakeEvents(segmentName)
 			segment.Close()
 			_ = RemoveSegment(segmentName)
-			return nil, err
+			// If the listener itself was cancelled, propagate;
+			// otherwise this was a per-client timeout and we move on
+			// to the next CONNECT instead of failing Accept (which
+			// would shut the entire gRPC server down).
+			if l.ctx.Err() != nil {
+				return nil, waitErr
+			}
+			continue
 		}
+
+		// Resolve the eventfd-waker peer state now that OpenerWakeReady
+		// is stably published by the client's setupDataSegWakeForOpener.
+		// When the opener obtained a waker (same-process via the in-
+		// memory stash OR cross-process via SCM_RIGHTS) both sides keep
+		// the eventfd fast path; otherwise the creator drops its waker
+		// so both converge on the futex / Windows-events path, avoiding
+		// the asymmetric-wake deadlock. MUST run before any goroutine
+		// starts using the rings for data-plane reads / writes.
+		segment.finalizeDataSegWaker()
 
 		conn := &shmConn{
 			segment:          segment,
@@ -298,6 +403,7 @@ func (l *ShmListener) Accept() (net.Conn, error) {
 				if writeEvents != nil {
 					writeEvents.Close()
 				}
+				CloseHandshakeEvents(segmentName)
 				segment.Close()
 				_ = RemoveSegment(segmentName)
 				return nil, fmt.Errorf("security handshake failed: %v", err)
@@ -307,9 +413,13 @@ func (l *ShmListener) Accept() (net.Conn, error) {
 
 		serverTransport, err := NewShmServerTransport(segment, l.addr, conn.remoteAddr)
 		if err != nil {
-			l.mu.Lock()
-			delete(l.activeSegments, segmentName)
-			l.mu.Unlock()
+			if readEvents != nil {
+				readEvents.Close()
+			}
+			if writeEvents != nil {
+				writeEvents.Close()
+			}
+			CloseHandshakeEvents(segmentName)
 			segment.Close()
 			_ = RemoveSegment(segmentName)
 			return nil, fmt.Errorf("failed to create server transport: %v", err)
@@ -358,6 +468,24 @@ func (l *ShmListener) Close() error {
 			l.ctlSegment.Close()
 			CloseHandshakeEvents(l.baseName + shmControlSuffix)
 			_ = RemoveSegment(l.baseName + shmControlSuffix)
+			// Unlink the cross-process control lock file (Linux) so a
+			// later listener start does not inherit a stale inode.
+			// No-op on Windows where the named mutex is refcounted.
+			removeControlLock(l.baseName + shmControlSuffix)
+
+			// Release the listener's reference on the control-ring events.
+			// On Linux these are nil; on Windows the refcount in RingEvents
+			// keeps them alive until both this Close and the dialer's
+			// deferred Close have run, so the SetEvent signals issued by
+			// ctlRx.Close above always reach the parked Accept goroutine.
+			if l.ctlRxEvents != nil {
+				l.ctlRxEvents.Close()
+				l.ctlRxEvents = nil
+			}
+			if l.ctlTxEvents != nil {
+				l.ctlTxEvents.Close()
+				l.ctlTxEvents = nil
+			}
 		}
 
 		// Clean up all active connections to ensure rings close before unmapping.
@@ -398,28 +526,30 @@ func (l *ShmListener) SetHandshaker(h *ShmSecurityHandshaker) {
 	l.handshaker = h
 }
 
-// shmConn net.Conn implementation
+// shmConn is the server-side counterpart to the client's shmClientConn
+// shim: it satisfies net.Conn so the SHM listener can return values
+// through gRPC's standard Accept() contract, while the actual frame
+// I/O happens through the embedded ShmServerTransport (accessed via
+// ReadRing/WriteRing). As with shmClientConn, the net.Conn surface
+// MUST NOT be reached on the SHM hot path; Read and Write return
+// io.ErrClosedPipe so any unexpected caller fails fast and visibly.
 
-// Read reads data from the connection
+// Read is intentionally unsupported. See the type doc — callers must
+// use the embedded transport instead of going through net.Conn.
 func (c *shmConn) Read(_ []byte) (n int, err error) {
 	if c.closed.Load() {
-		return 0, errors.New("connection closed")
+		return 0, io.ErrClosedPipe
 	}
-
-	// For shared memory, reading is handled by the transport layer
-	// This is a placeholder implementation
-	return 0, errors.New("direct read not supported, use transport layer")
+	return 0, fmt.Errorf("shmConn.Read: %w (use the embedded ShmServerTransport instead)", io.ErrClosedPipe)
 }
 
-// Write writes data to the connection
+// Write is intentionally unsupported. See the type doc — callers must
+// use the embedded transport instead of going through net.Conn.
 func (c *shmConn) Write(_ []byte) (n int, err error) {
 	if c.closed.Load() {
-		return 0, errors.New("connection closed")
+		return 0, io.ErrClosedPipe
 	}
-
-	// For shared memory, writing is handled by the transport layer
-	// This is a placeholder implementation
-	return 0, errors.New("direct write not supported, use transport layer")
+	return 0, fmt.Errorf("shmConn.Write: %w (use the embedded ShmServerTransport instead)", io.ErrClosedPipe)
 }
 
 // Close closes the connection
@@ -437,6 +567,24 @@ func (c *shmConn) Close() error {
 			c.listener.mu.Lock()
 			delete(c.listener.activeSegments, c.segmentName)
 			c.listener.mu.Unlock()
+		}
+
+		// Release the listener-owned ring event refs. These were
+		// taken in ShmListener.Accept (one ref each from
+		// CreateRingEvents). The server transport holds its own,
+		// independent ref pair via NewShmServerTransport and
+		// releases them in (*ShmServerTransport).Close above. On
+		// Linux these are no-op nil events; on Windows skipping
+		// this leaks named-event handles and registry entries per
+		// accepted connection. See shm_event_windows.go for the
+		// refcount contract.
+		if c.readEvents != nil {
+			_ = c.readEvents.Close()
+			c.readEvents = nil
+		}
+		if c.writeEvents != nil {
+			_ = c.writeEvents.Close()
+			c.writeEvents = nil
 		}
 
 		// Then close and clean up the segment

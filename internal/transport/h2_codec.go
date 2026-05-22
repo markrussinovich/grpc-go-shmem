@@ -1,3 +1,5 @@
+//go:build linux || windows
+
 /*
  *
  * Copyright 2026 gRPC authors.
@@ -26,6 +28,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/net/http2/hpack"
@@ -125,6 +128,24 @@ type hpackDecoderHolder struct {
 	// stream's recv channel) so a HEADERS-only RPC doesn't hang
 	// waiting for a MESSAGE that never arrives.
 	pendingHalfCloseStreamID uint32
+
+	// onDataFrame, when non-nil, is invoked synchronously every time
+	// the codec consumes the body bytes of an H2 DATA frame from the
+	// ring — BEFORE those bytes are handed to the per-stream
+	// lpmAccumulator. The callback runs on the reader goroutine and
+	// MUST NOT block on the producer (e.g., it must not call into
+	// frameWriter.enqueueAndWait); instead it queues WINDOW_UPDATE
+	// frames non-blocking. The transport layer plugs this in to
+	// credit HTTP/2 flow control per-DATA-frame, decoupled from LPM
+	// reassembly — which mirrors http2_client.handleData's "Decouple
+	// connection's flow control from application's read" design and
+	// lets a producer with a small per-stream send window drain a
+	// multi-DATA-frame LPM without deadlocking on a WindowUpdate that
+	// never arrives because the consumer is buffering the partial
+	// LPM. nil is the legacy behaviour (credit only on complete LPM
+	// inside handleMessage / handleMessageBuffer); valid for callers
+	// that pin sendQuota = maxWindowSize.
+	onDataFrame func(streamID uint32, size uint32)
 }
 
 // scratchBytes returns a slice of length n drawn from the holder's
@@ -181,11 +202,31 @@ func (h *hpackDecoderHolder) getLpmAccumulator(sid uint32) *lpmAccumulator {
 		h.lastAcc = a
 		return a
 	}
-	a := &lpmAccumulator{}
+	a := &lpmAccumulator{pool: shmLpmPool}
 	h.lpmAccumulators[sid] = a
 	h.lastSid = sid
 	h.lastAcc = a
 	return a
+}
+
+// notifyDataFrameConsumed invokes the holder's onDataFrame callback
+// if one is set. Called at every site in the codec that has just
+// committed an H2 DATA-frame body from the ring — BEFORE either the
+// lpmAccumulator buffers the bytes (multi-DATA-frame LPM) or the
+// ZC fast path returns a ring-backed slice (single-DATA-frame LPM).
+// The transport plugs in onDataFrame to credit HTTP/2 flow control
+// per DATA frame, mirroring http2_client.handleData's decoupling of
+// connection flow control from message reassembly.
+//
+// streamID is the H2 stream id from the DATA frame header; size is
+// the on-wire payload length (h2fh.Length) — this includes any
+// padding bytes for PADDED frames because the bytes WERE charged
+// against the peer's window on the wire even though the codec will
+// later strip them.
+func (h *hpackDecoderHolder) notifyDataFrameConsumed(streamID uint32, size uint32) {
+	if h.onDataFrame != nil && size > 0 {
+		h.onDataFrame(streamID, size)
+	}
 }
 
 // removeLpmAccumulator drops the accumulator for stream sid (called on
@@ -1003,6 +1044,14 @@ func readFrameH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolder) (
 			// where the per-stream HEADERS state is tracked.
 			return FrameHeader{}, nil, errors.New("h2 CONTINUATION frame received outside a HEADERS sequence (RFC 7540 §6.10)")
 		case H2FrameDATA:
+			// Credit HTTP/2 flow control for the on-wire DATA bytes
+			// at frame-receipt time, decoupled from LPM reassembly.
+			// Mirrors http2_client.handleData. The bytes have already
+			// been committed from the ring above; we credit BEFORE
+			// branching into LPM accumulator / ZC paths so that
+			// multi-DATA-frame LPMs don't starve the producer of
+			// window updates while we buffer partial bytes.
+			holder.notifyDataFrameConsumed(h2fh.StreamID, h2fh.Length)
 			// RFC 7540 §6.1: PADDED DATA carries a 1-byte pad-length
 			// prefix and trailing padding. Strip both before LPM parse.
 			// gRPC peers don't normally pad, but a standards-compliant
@@ -1278,21 +1327,23 @@ func readFrameViewH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolde
 				holder.pendingFrameEndStream = endStream
 			}
 			if msg != nil {
+				atomic.AddUint64(&shmAccReadFire, 1)
 				// MORE flag: see readFrameH2's matching block.
 				msgFlags := MessageFlagMORE
 				if endStream && len(leftover) == 0 {
 					msgFlags = 0
 					holder.removeLpmAccumulator(sid)
 				}
-				// acc.buf is already a heap-owned slice of the exact
-				// LPM size; wrap directly via mem.NewBuffer(&msg, nil)
-				// (no-op Free) instead of pool.Get + memcpy.
+				// acc.buf is the exact LPM size, allocated from acc.pool;
+				// wrap via mem.NewBuffer(&msg, acc.pool) so Buffer.Free()
+				// returns the slice to the pool for reuse on the next RPC,
+				// avoiding the runtime.memclr cost of a fresh make().
 				return FrameHeader{
 					Type:     FrameTypeMESSAGE,
 					StreamID: sid,
 					Length:   uint32(len(msg)),
 					Flags:    msgFlags,
-				}, mem.NewBuffer(&msg, nil), nil
+				}, mem.NewBuffer(&msg, acc.pool), nil
 			}
 			// Truncated LPM at end of stream: connection-fatal.
 			if endStream && len(leftover) == 0 && acc.inProgress() {
@@ -1359,6 +1410,23 @@ func readFrameViewH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolde
 			return FrameHeader{}, nil, errors.New("h2 CONTINUATION frame received outside a HEADERS sequence (RFC 7540 §6.10)")
 
 		case H2FrameDATA:
+			// Credit HTTP/2 flow control for the on-wire DATA bytes
+			// at frame-receipt time, decoupled from LPM reassembly.
+			// Mirrors http2_client.handleData. The bytes have not been
+			// committed from the ring yet at this point (the various
+			// sub-paths below commit lazily), but the peer charged
+			// their send window the moment they wrote the DATA frame
+			// to the wire so we MUST credit it back ASAP — otherwise a
+			// multi-DATA-frame LPM whose total size exceeds the
+			// peer's per-stream window deadlocks (peer waits for
+			// WINDOW_UPDATE; codec waits for the rest of the LPM
+			// before it would have surfaced handleMessage which is
+			// where the legacy per-LPM credit happened).
+			//
+			// h2fh.Length is the on-wire payload size including any
+			// PADDED bytes; we credit the full on-wire size because
+			// that is what was charged against the peer's window.
+			holder.notifyDataFrameConsumed(h2fh.StreamID, h2fh.Length)
 			// PADDED with Length=0 is illegal: the mandatory 1-byte
 			// pad-length prefix can't fit. Per RFC 7540 §6.1
 			// FRAME_SIZE_ERROR. Check this BEFORE the empty-DATA
@@ -1413,6 +1481,7 @@ func readFrameViewH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolde
 				if !acc.inProgress() && len(pSecond) == 0 && len(pFirst) >= 5 {
 					bodyLen := int(binary.BigEndian.Uint32(pFirst[1:5]))
 					if 5+bodyLen == payloadLen && rx.IsSpeculativeZCEligible(payloadLen, true) {
+						atomic.AddUint64(&shmZCReadFire, 1)
 						// Arm the ZC anchor with the post-frame target, then
 						// don't call commitPayload.Commit — the deferred
 						// target already accounts for these bytes.
@@ -1456,6 +1525,17 @@ func readFrameViewH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolde
 				// Single mem.Copy gives us one alloc + one memcpy, matching
 				// readFrameView parity.
 				//
+				// Pool choice: shmLpmPool (dirty, no memclr-on-Get) instead
+				// of mem.DefaultBufferPool. The default pool zero-fills
+				// every returned buffer; under 1000-stream concurrent
+				// ping-pong at 64 KiB the cumulative memclr dominates the
+				// CPU profile (~40% of total cycles, per WSL EPYC pprof)
+				// and crushes shm-tuned single-frame throughput. The
+				// accumulator path (used for chunked frames) was already
+				// on the dirty pool; bringing the single-frame copy path
+				// here onto the same pool gives both code paths matching
+				// allocation cost.
+				//
 				// Reads the 5-byte LPM header from the (possibly split) ring
 				// slice via a small stack array so the fast path applies
 				// even when the body wraps.
@@ -1467,15 +1547,15 @@ func readFrameViewH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolde
 					}
 					bodyLen := int(binary.BigEndian.Uint32(hdr[1:5]))
 					if 5+bodyLen == payloadLen {
+						atomic.AddUint64(&shmCopyReadFire, 1)
 						var buf mem.Buffer
 						if len(pSecond) == 0 {
-							buf = mem.Copy(pFirst[:payloadLen], mem.DefaultBufferPool())
+							buf = mem.Copy(pFirst[:payloadLen], shmLpmPool)
 						} else {
-							pool := mem.DefaultBufferPool()
-							poolBuf := pool.Get(payloadLen)
+							poolBuf := shmLpmPool.Get(payloadLen)
 							cn := copy(*poolBuf, pFirst)
 							copy((*poolBuf)[cn:], pSecond)
-							buf = mem.NewBuffer(poolBuf, pool)
+							buf = mem.NewBuffer(poolBuf, shmLpmPool)
 						}
 						commitPayload.Commit(payloadLen)
 						// MORE flag based on END_STREAM (see ZC fast
@@ -1512,8 +1592,10 @@ func readFrameViewH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolde
 				//     in the same DATA frame).
 				//
 				// Both paths return the accumulator's heap buffer wrapped
-				// via mem.NewBuffer(&msg, nil) (no pool round-trip), saving
-				// one further mem.Copy that the prior code performed.
+				// via mem.NewBuffer(&msg, acc.pool); the wrapping pool is
+				// the same one acc.buf was allocated from, so Buffer.Free()
+				// returns the slice to the pool for reuse on the next RPC
+				// and avoids the runtime.memclr cost of a fresh make().
 				if acc.inProgress() && acc.expectedTotal-acc.pos >= payloadLen {
 					// Mid-chain chunk: route through growBufForChunk to
 					// pick up the explicit 2× doubling rather than Go's
@@ -1557,7 +1639,7 @@ func readFrameViewH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolde
 						StreamID: h2fh.StreamID,
 						Length:   uint32(len(msg)),
 						Flags:    msgFlags,
-					}, mem.NewBuffer(&msg, nil), nil
+					}, mem.NewBuffer(&msg, acc.pool), nil
 				}
 			} // end isPadded fast-path skip
 
@@ -1588,6 +1670,7 @@ func readFrameViewH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolde
 					return FrameHeader{}, nil, ferr
 				}
 				if msg != nil {
+					atomic.AddUint64(&shmAccReadFire, 1)
 					msgFlags := MessageFlagMORE
 					if len(leftover) > 0 {
 						holder.pendingFrame = leftover
@@ -1602,7 +1685,7 @@ func readFrameViewH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolde
 						StreamID: h2fh.StreamID,
 						Length:   uint32(len(msg)),
 						Flags:    msgFlags,
-					}, mem.NewBuffer(&msg, nil), nil
+					}, mem.NewBuffer(&msg, acc.pool), nil
 				}
 				if h2fh.Flags&H2FlagEndStream != 0 && acc.inProgress() {
 					return FrameHeader{}, nil, errors.New("h2: END_STREAM with incomplete LPM in accumulator")
@@ -1636,6 +1719,7 @@ func readFrameViewH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolde
 					return FrameHeader{}, nil, ferr
 				}
 				if msg != nil {
+					atomic.AddUint64(&shmAccReadFire, 1)
 					msgFlags := MessageFlagMORE
 					if len(leftover) > 0 {
 						holder.pendingFrame = leftover
@@ -1650,7 +1734,7 @@ func readFrameViewH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolde
 						StreamID: h2fh.StreamID,
 						Length:   uint32(len(msg)),
 						Flags:    msgFlags,
-					}, mem.NewBuffer(&msg, nil), nil
+					}, mem.NewBuffer(&msg, acc.pool), nil
 				}
 				break
 			}
@@ -1871,11 +1955,13 @@ func writeFrameH2(ctx context.Context, tx *ShmRing, fh FrameHeader, payload []by
 		h2payload = payload
 	}
 
-	// MESSAGE payloads are split into multiple DATA frames in two cases:
+	// MESSAGE payloads are split into multiple DATA frames in three cases:
 	//
-	//  (1) Protocol limit: the payload exceeds the 16 MiB-1 maximum H2
-	//      frame size (mandatory for compliance with peers honoring
-	//      SETTINGS_MAX_FRAME_SIZE).
+	//  (1) Protocol limit: the payload exceeds shmMaxFrameSize. By
+	//      default this equals h2MaxFramePayload (RFC ceiling); under
+	//      a fair-comparison bench profile that matches HTTP/2's
+	//      spec default of 16384 B, this knob is what makes SHM emit
+	//      the same DATA frame cadence as TCP / UDS.
 	//
 	//  (2) Ring capacity: the payload plus the 9-byte H2 header doesn't
 	//      fit in the ring's reserve-write budget. ReserveWrite rejects
@@ -1885,7 +1971,7 @@ func writeFrameH2(ctx context.Context, tx *ShmRing, fh FrameHeader, payload []by
 	//      well-formed and must be transported incrementally. The
 	//      reader's lpmAccumulator reassembles the chunks.
 	if fh.Type == FrameTypeMESSAGE &&
-		(len(h2payload) > h2MaxFramePayload ||
+		(len(h2payload) > shmMaxFrameSize ||
 			uint64(h2FrameHeaderSize+len(h2payload)) > tx.Capacity()) {
 		return writeFrameH2DataChunked(ctx, tx, fh.StreamID, h2payload, h2f)
 	}
@@ -1945,32 +2031,303 @@ func writeH2Single(ctx context.Context, tx *ShmRing, h2t H2FrameType, h2f byte, 
 // lpmAccumulator reassembles the LPM stream; END_STREAM is never set on
 // these intermediate frames (gRPC ends the stream via TRAILERS).
 //
-// Chunk size is bounded by both h2MaxFramePayload (RFC 7540 §4.2) and
-// the ring capacity / 4 — the latter ensures the writer can always
-// place the next chunk while the reader is still consuming the
-// previous, avoiding stall under back-pressure.
+// Chunk size is bounded by all three of: shmMaxFrameSize (the
+// configurable per-DATA-frame ceiling, default h2MaxFramePayload),
+// h2MaxFramePayload (RFC 7540 §4.2 absolute limit) and the ring
+// capacity / 4 — the latter ensures the writer can always place the
+// next chunk while the reader is still consuming the previous,
+// avoiding stall under back-pressure.
 func writeFrameH2DataChunked(ctx context.Context, tx *ShmRing, streamID uint32, body []byte, baseFlags byte) error {
-	maxChunk := h2MaxFramePayload
+	atomic.AddUint64(&shmChunkedWriteFire, 1)
+	maxChunk := shmMaxFrameSize
+	if maxChunk > h2MaxFramePayload {
+		maxChunk = h2MaxFramePayload
+	}
 	if uint64(maxChunk) > tx.Capacity()/4 {
 		maxChunk = int(tx.Capacity() / 4)
 	}
 	if maxChunk == 0 {
 		return fmt.Errorf("h2 chunk: ring capacity %d too small to chunk", tx.Capacity())
 	}
+	// Signal-batch threshold: see emitH2DataFromCursor for design.
+	// Mirrors .NET's RingFrameStream cap/8 chunkSize -- enables
+	// producer / consumer pipelining when the message exceeds ring
+	// capacity instead of locking into a "fill -> drain -> fill"
+	// sequential pattern.
+	signalBatch := int(tx.Capacity() / 8)
+	if signalBatch < maxChunk {
+		signalBatch = maxChunk
+	}
+
+	multi := len(body) > maxChunk
+	batchOpen := false
+	batchBytes := 0
+	closeBatch := func() {
+		if batchOpen {
+			tx.EndBatch()
+			batchOpen = false
+			batchBytes = 0
+		}
+	}
+
 	for off := 0; off < len(body); off += maxChunk {
 		end := off + maxChunk
 		if end > len(body) {
 			end = len(body)
 		}
+		isLast := end == len(body)
+
+		if multi && !batchOpen && !isLast {
+			tx.BeginBatch()
+			batchOpen = true
+			batchBytes = 0
+		}
+
 		// Don't propagate END_STREAM to intermediate chunks — only the
 		// last one (if baseFlags carries it). gRPC SHM never sets
 		// END_STREAM on MESSAGE; TRAILERS ends the stream.
 		flags := byte(0)
-		if end == len(body) {
+		if isLast {
 			flags = baseFlags
 		}
 		if err := writeH2Single(ctx, tx, H2FrameDATA, flags, streamID, body[off:end]); err != nil {
+			closeBatch()
 			return err
+		}
+		batchBytes += end - off
+
+		if batchOpen && (batchBytes >= signalBatch || isLast) {
+			closeBatch()
+		}
+	}
+	return nil
+}
+
+// writeFrameH2DataChunkedVec is the vectored cousin of
+// writeFrameH2DataChunked. It emits a multi-DATA-frame MESSAGE directly
+// from the (lpmHdr + mem.BufferSlice) inputs without first materialising
+// them into one contiguous heap buffer. Each chunk reserves
+// shmMaxFrameSize+9 bytes in the ring and copies straight from the
+// source segments via ringSegWriter, saving one full producer-side
+// memcpy of body bytes per RPC.
+//
+// Constraints mirror writeFrameH2DataChunked: chunk size capped by
+// shmMaxFrameSize, h2MaxFramePayload, and tx.Capacity()/4. END_STREAM
+// flows only onto the final chunk.
+func writeFrameH2DataChunkedVec(
+	ctx context.Context,
+	tx *ShmRing,
+	streamID uint32,
+	lpmHdr []byte,
+	data mem.BufferSlice,
+	baseFlags byte,
+) error {
+	// vecCursor walks the (lpmHdr || data segments) virtual byte
+	// stream a chunk at a time without merging into one slice. Each
+	// chunk consumes from the current segment, advancing across
+	// segment boundaries automatically.
+	cur := vecCursor{lpmHdr: lpmHdr, data: data}
+	return emitH2DataFromCursor(ctx, tx, streamID, &cur, len(lpmHdr)+data.Len(), baseFlags)
+}
+
+// emitH2DataFromCursor emits `length` bytes from cur into the ring as
+// one or more H2 DATA frames (chunked per shmMaxFrameSize / ring
+// capacity). baseFlags is applied to the FINAL emitted DATA frame only
+// (typically used to carry END_STREAM on the last chunk of a logical
+// MESSAGE). The cursor is advanced by exactly `length` bytes on
+// success; on error the cursor's position is undefined and the caller
+// must not reuse it for further emits.
+//
+// Exposed as a primitive so callers that already hold a vecCursor
+// straddling multiple flow-control / window-grant chunks can keep
+// emitting from the same cursor across iterations without
+// materialising the source into one contiguous buffer. The slow-path
+// chunked client write (shm_client_transport.go) uses this to skip a
+// 16-MB-class producer memcpy under fair-default.
+//
+// Pipelining design: emits are grouped into signal-batches of
+// ring.Capacity()/8 bytes each (matching .NET's RingFrameStream
+// chunkSize). Within a signal-batch, per-chunk Commit's wake is
+// suppressed via BeginBatch so the reader gets one wake per ~ring/8
+// of progress instead of one per H2 DATA frame. Between batches the
+// writer pauses to EndBatch (which fires the wake) and immediately
+// re-opens a new batch for the next group. This gives ~8 reader-wake
+// points per ring traversal -- enough to keep the consumer overlapping
+// with the producer when the message exceeds ring capacity, but
+// coarse enough to amortise the futex cost over many H2 frames.
+//
+// The pre-pipelining code wrapped the entire `length` of bytes in a
+// single BeginBatch / EndBatch pair. That collapsed throughput by 2-3x
+// for messages >= ring capacity because the reader could not start
+// draining until the producer finished the whole logical MESSAGE.
+// BenchmarkGRPCShmLargeUnary/size=64MB on a 64-MiB ring went from
+// ~650 MB/s (16 MB message, fits in ring) to ~270 MB/s (64 MB message,
+// exactly fills ring) under that regime.
+func emitH2DataFromCursor(
+	ctx context.Context,
+	tx *ShmRing,
+	streamID uint32,
+	cur *vecCursor,
+	length int,
+	baseFlags byte,
+) error {
+	atomic.AddUint64(&shmChunkedWriteVecFire, 1)
+
+	maxChunk := shmMaxFrameSize
+	if maxChunk > h2MaxFramePayload {
+		maxChunk = h2MaxFramePayload
+	}
+	if uint64(maxChunk) > tx.Capacity()/4 {
+		maxChunk = int(tx.Capacity() / 4)
+	}
+	if maxChunk == 0 {
+		return fmt.Errorf("h2 chunk: ring capacity %d too small to chunk", tx.Capacity())
+	}
+
+	// Signal-batch threshold: how many bytes we let accumulate before
+	// EndBatch fires the reader wake. ring/8 mirrors the .NET
+	// RingFrameStream design (see grpc-dotnet-shm
+	// ShmFrameWriter.WriteInlineDirectMultiFrame). Bound below by
+	// maxChunk so a single H2 DATA frame is always emitted under one
+	// batch, and above by length so we do not over-promise the
+	// caller more pipeline points than there is data for.
+	signalBatch := int(tx.Capacity() / 8)
+	if signalBatch < maxChunk {
+		signalBatch = maxChunk
+	}
+
+	multi := length > maxChunk
+	batchOpen := false
+	batchBytes := 0
+	closeBatch := func() {
+		if batchOpen {
+			tx.EndBatch()
+			batchOpen = false
+			batchBytes = 0
+		}
+	}
+
+	for written := 0; written < length; {
+		chunk := length - written
+		if chunk > maxChunk {
+			chunk = maxChunk
+		}
+		isLast := written+chunk == length
+
+		// Open a fresh signal-batch when we are about to emit more
+		// than one frame in this batch's window. Skip the batch when
+		// the current chunk is the last one (single Commit fires its
+		// own wake anyway).
+		if multi && !batchOpen && !isLast {
+			tx.BeginBatch()
+			batchOpen = true
+			batchBytes = 0
+		}
+
+		flags := byte(0)
+		if isLast {
+			flags = baseFlags
+		}
+		if err := writeH2DataFromCursor(ctx, tx, streamID, flags, chunk, cur); err != nil {
+			closeBatch()
+			return err
+		}
+		written += chunk
+		batchBytes += chunk
+
+		// Close the batch (firing the reader wake) when we have
+		// accumulated enough bytes, or when this was the final chunk.
+		// `isLast` covers the case where the final chunk was emitted
+		// under a still-open batch.
+		if batchOpen && (batchBytes >= signalBatch || isLast) {
+			closeBatch()
+		}
+	}
+	return nil
+}
+
+// writeH2DataFromCursor reserves one H2 DATA frame's worth of ring
+// bytes and writes the 9-byte header plus `payloadLen` bytes pulled
+// from cur (across segment boundaries as needed). Used by
+// writeFrameH2DataChunkedVec.
+func writeH2DataFromCursor(
+	ctx context.Context,
+	tx *ShmRing,
+	streamID uint32,
+	h2flags byte,
+	payloadLen int,
+	cur *vecCursor,
+) error {
+	total := h2FrameHeaderSize + payloadLen
+	res, err := tx.ReserveWrite(ctx, total)
+	if err != nil {
+		return err
+	}
+	var hdr [h2FrameHeaderSize]byte
+	encodeH2FrameHeaderTo(&hdr, H2FrameHeader{
+		Length:   uint32(payloadLen),
+		Type:     H2FrameDATA,
+		Flags:    h2flags,
+		StreamID: streamID,
+	})
+	rw := ringSegWriter{first: res.First, second: res.Second}
+	rw.write(hdr[:])
+	if err := cur.writeTo(&rw, payloadLen); err != nil {
+		_ = res.Commit(0)
+		return err
+	}
+	if rw.err != nil {
+		_ = res.Commit(0)
+		return rw.err
+	}
+	return res.Commit(total)
+}
+
+// vecCursor is a forward-only iterator over (lpmHdr || data.segments).
+// It feeds writeFrameH2DataChunkedVec's per-chunk emitter without
+// materialising the virtual stream into one slice. Total bytes consumed
+// must not exceed len(lpmHdr) + data.Len() — callers compute exact
+// chunk sizes up-front.
+type vecCursor struct {
+	lpmHdr []byte // remaining LPM-header bytes; shrinks as consumed
+	data   mem.BufferSlice
+	segOff int // bytes consumed in data[0]
+}
+
+// writeTo copies the next n bytes from the cursor into rw, advancing
+// the cursor across segment boundaries as needed.
+func (c *vecCursor) writeTo(rw *ringSegWriter, n int) error {
+	for n > 0 {
+		if len(c.lpmHdr) > 0 {
+			take := n
+			if take > len(c.lpmHdr) {
+				take = len(c.lpmHdr)
+			}
+			rw.write(c.lpmHdr[:take])
+			c.lpmHdr = c.lpmHdr[take:]
+			n -= take
+			continue
+		}
+		if len(c.data) == 0 {
+			return fmt.Errorf("vecCursor: out of bytes, %d remaining", n)
+		}
+		seg := c.data[0].ReadOnlyData()
+		if c.segOff >= len(seg) {
+			c.data = c.data[1:]
+			c.segOff = 0
+			continue
+		}
+		avail := len(seg) - c.segOff
+		take := n
+		if take > avail {
+			take = avail
+		}
+		rw.write(seg[c.segOff : c.segOff+take])
+		c.segOff += take
+		n -= take
+		if c.segOff == len(seg) {
+			c.data = c.data[1:]
+			c.segOff = 0
 		}
 	}
 	return nil
@@ -1996,6 +2353,7 @@ func writeFrameH2Message(
 	lpmHdr []byte,
 	data mem.BufferSlice,
 ) error {
+	atomic.AddUint64(&shmVectoredWriteFire, 1)
 	bodyLen := len(lpmHdr) + data.Len()
 	total := h2FrameHeaderSize + bodyLen
 
@@ -2122,14 +2480,27 @@ func writeProtoToRingH2(ctx context.Context, tx *ShmRing, streamID uint32, msg p
 	// Skip ZC for messages that won't fit in a single frame.
 	// cap/3 budget keeps headroom for the chunking-path writer.
 	if uint64(total) > tx.Capacity()/3 {
+		atomic.AddUint64(&shmZCWriteSkipBudget, 1)
 		return false, nil
 	}
 	if uint64(total) > h2MaxFramePayload+h2FrameHeaderSize {
 		// Single H2 DATA frame can't carry more than 16MB-1 of body.
+		atomic.AddUint64(&shmZCWriteSkipBudget, 1)
+		return false, nil
+	}
+	// Honour the configurable shmMaxFrameSize too — under a fair-
+	// comparison bench profile that sets max frame to 16384, ZC
+	// would otherwise emit one giant DATA frame while the codec
+	// chunking path emits 16 KiB frames; return false so the
+	// caller falls back to writeFrameBuffers which respects the
+	// knob via writeFrameH2DataChunked.
+	if total > h2FrameHeaderSize+shmMaxFrameSize {
+		atomic.AddUint64(&shmZCWriteSkipMaxFrame, 1)
 		return false, nil
 	}
 	// Non-blocking contiguous-space check.
 	if tx.ContiguousWriteSpace() < uint64(total) {
+		atomic.AddUint64(&shmZCWriteSkipSpace, 1)
 		return false, nil
 	}
 
@@ -2175,5 +2546,6 @@ func writeProtoToRingH2(ctx context.Context, tx *ShmRing, streamID uint32, msg p
 		return false, fmt.Errorf("writeProtoToRingH2: size mismatch: %d vs %d", pSize, len(out))
 	}
 
+	atomic.AddUint64(&shmZCWriteFire, 1)
 	return true, res.Commit(total)
 }

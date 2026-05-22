@@ -36,6 +36,15 @@ import (
 // These named events enable cross-mapping synchronization since
 // Windows WaitOnAddress/WakeByAddress only work within the same
 // virtual address mapping.
+//
+// In the same-process bench/test scenario the listener (CreateRingEvents)
+// and the dialer (OpenRingEvents) end up sharing the SAME *RingEvents
+// via ringEventsRegistry. To prevent one side's deferred Close from
+// zeroing the other side's event handles -- which silently breaks
+// SetEvent and parks ring waiters forever -- RingEvents is reference
+// counted. refCount is bumped on every Create/Open registry hit and
+// decremented on Close; the handles are only released when the count
+// reaches zero.
 type RingEvents struct {
 	// dataEvent is signaled when new data is available (writer -> reader)
 	dataEvent windows.Handle
@@ -46,6 +55,11 @@ type RingEvents struct {
 
 	// eventName prefix for cleanup
 	namePrefix string
+
+	// refCount counts active references to this RingEvents instance.
+	// Incremented on Create and on every Open registry hit; decremented
+	// on Close. Handles are released when refCount reaches zero.
+	refCount atomic.Int32
 }
 
 // Global registry of ring events by segment+ring name.
@@ -70,14 +84,16 @@ func CreateRingEvents(segmentName string, ringID string) (*RingEvents, error) {
 	prefix := eventNamePrefix(segmentName, ringID)
 	shmDebugf("[DEBUG] CreateRingEvents: segment=%s ring=%s prefix=%s", segmentName, ringID, prefix)
 
-	// Check if already in registry (another goroutine might have created them)
-	ringEventsMu.RLock()
+	// Check if already in registry (another goroutine might have created them).
+	// Bump refCount before returning so a later Close from this caller is balanced.
+	ringEventsMu.Lock()
 	if events, ok := ringEventsRegistry[prefix]; ok {
-		ringEventsMu.RUnlock()
-		shmDebugf("[DEBUG] CreateRingEvents: found existing events in registry")
+		events.refCount.Add(1)
+		ringEventsMu.Unlock()
+		shmDebugf("[DEBUG] CreateRingEvents: found existing events in registry (refCount=%d)", events.refCount.Load())
 		return events, nil
 	}
-	ringEventsMu.RUnlock()
+	ringEventsMu.Unlock()
 
 	// Create or open events - handles race where client created them first
 	dataEvent, err := openOrCreateNamedEvent(prefix + "_data")
@@ -107,9 +123,20 @@ func CreateRingEvents(segmentName string, ringID string) (*RingEvents, error) {
 		contigEvent: contigEvent,
 		namePrefix:  prefix,
 	}
+	events.refCount.Store(1)
 
-	// Register in global registry
+	// Register in global registry. A concurrent Create/Open could have
+	// raced and inserted the same prefix; in that case discard ours and
+	// take a reference on the existing entry.
 	ringEventsMu.Lock()
+	if existing, ok := ringEventsRegistry[prefix]; ok {
+		existing.refCount.Add(1)
+		ringEventsMu.Unlock()
+		windows.CloseHandle(dataEvent)
+		windows.CloseHandle(spaceEvent)
+		windows.CloseHandle(contigEvent)
+		return existing, nil
+	}
 	ringEventsRegistry[prefix] = events
 	ringEventsMu.Unlock()
 
@@ -123,14 +150,16 @@ func OpenRingEvents(segmentName string, ringID string) (*RingEvents, error) {
 	prefix := eventNamePrefix(segmentName, ringID)
 	shmDebugf("[DEBUG] OpenRingEvents: segment=%s ring=%s prefix=%s", segmentName, ringID, prefix)
 
-	// Check if already opened in this process
-	ringEventsMu.RLock()
+	// Check if already opened in this process.
+	// Bump refCount so the caller's eventual Close is balanced.
+	ringEventsMu.Lock()
 	if events, ok := ringEventsRegistry[prefix]; ok {
-		ringEventsMu.RUnlock()
-		shmDebugf("[DEBUG] OpenRingEvents: found existing events in registry")
+		events.refCount.Add(1)
+		ringEventsMu.Unlock()
+		shmDebugf("[DEBUG] OpenRingEvents: found existing events in registry (refCount=%d)", events.refCount.Load())
 		return events, nil
 	}
-	ringEventsMu.RUnlock()
+	ringEventsMu.Unlock()
 
 	// Open or create events (handles race condition where client starts before server)
 	dataEvent, err := openOrCreateNamedEvent(prefix + "_data")
@@ -160,19 +189,58 @@ func OpenRingEvents(segmentName string, ringID string) (*RingEvents, error) {
 		contigEvent: contigEvent,
 		namePrefix:  prefix,
 	}
+	events.refCount.Store(1)
 
-	// Register in global registry
+	// Register in global registry. A concurrent Create/Open could have
+	// raced and inserted the same prefix; in that case discard ours and
+	// take a reference on the existing entry.
 	ringEventsMu.Lock()
+	if existing, ok := ringEventsRegistry[prefix]; ok {
+		existing.refCount.Add(1)
+		ringEventsMu.Unlock()
+		windows.CloseHandle(dataEvent)
+		windows.CloseHandle(spaceEvent)
+		windows.CloseHandle(contigEvent)
+		return existing, nil
+	}
 	ringEventsRegistry[prefix] = events
 	ringEventsMu.Unlock()
 
 	return events, nil
 }
 
-// Close closes all event handles and removes from registry.
+// Close drops one reference on this RingEvents. Handles are only
+// released and the registry entry removed when the reference count
+// reaches zero. This makes Close safe to call from any holder of the
+// pointer -- including the in-process bench harness where both the
+// listener (Create side) and the dialer (Open side) end up sharing
+// the same *RingEvents via the registry.
+//
+// The decrement-to-zero transition AND the registry deletion both
+// happen under ringEventsMu. This is required because
+// CreateRingEvents / OpenRingEvents bump refCount while holding the
+// same mutex; doing the Add(-1) outside the lock would allow a
+// concurrent Create/Open between the decrement and the lock to
+// resurrect a doomed entry, then we would close its handles out
+// from under the new caller.
 func (e *RingEvents) Close() error {
 	ringEventsMu.Lock()
-	delete(ringEventsRegistry, e.namePrefix)
+	n := e.refCount.Add(-1)
+	if n > 0 {
+		ringEventsMu.Unlock()
+		return nil
+	}
+	if n < 0 {
+		// Double Close on the same reference. Don't underflow further
+		// and don't release handles that may already have been freed
+		// by the first decrement-to-zero caller.
+		e.refCount.Add(1)
+		ringEventsMu.Unlock()
+		return nil
+	}
+	if ringEventsRegistry[e.namePrefix] == e {
+		delete(ringEventsRegistry, e.namePrefix)
+	}
 	ringEventsMu.Unlock()
 
 	var firstErr error
@@ -379,6 +447,14 @@ type HandshakeEvents struct {
 	clientReadyEvent windows.Handle
 	serverReadyEvent windows.Handle
 	segmentName      string
+	// refCount tracks how many callers (Create + Open) currently hold a
+	// reference. CloseHandshakeEvents decrements and only releases the
+	// underlying handles when the count reaches zero. This lets the
+	// dialer-side transport clean up its own reference without breaking
+	// the same-process listener (which obtained an alias to the same
+	// registry entry) and without leaking handles in the cross-process
+	// case (where each process maintains its own private registry).
+	refCount int
 }
 
 // Global registry of handshake events by segment name.
@@ -395,6 +471,7 @@ func CreateHandshakeEvents(segmentName string) (*HandshakeEvents, error) {
 
 	// Check if already exists
 	if events, ok := handshakeEventsRegistry[segmentName]; ok {
+		events.refCount++
 		return events, nil
 	}
 
@@ -416,6 +493,7 @@ func CreateHandshakeEvents(segmentName string) (*HandshakeEvents, error) {
 		clientReadyEvent: clientEvent,
 		serverReadyEvent: serverEvent,
 		segmentName:      segmentName,
+		refCount:         1,
 	}
 
 	handshakeEventsRegistry[segmentName] = events
@@ -430,6 +508,7 @@ func OpenHandshakeEvents(segmentName string) (*HandshakeEvents, error) {
 
 	// Check if already exists in registry
 	if events, ok := handshakeEventsRegistry[segmentName]; ok {
+		events.refCount++
 		return events, nil
 	}
 
@@ -451,6 +530,7 @@ func OpenHandshakeEvents(segmentName string) (*HandshakeEvents, error) {
 		clientReadyEvent: clientEvent,
 		serverReadyEvent: serverEvent,
 		segmentName:      segmentName,
+		refCount:         1,
 	}
 
 	handshakeEventsRegistry[segmentName] = events
@@ -485,29 +565,7 @@ func WaitClientReady(ctx context.Context, segmentName string) error {
 	if !ok || events == nil {
 		return fmt.Errorf("no handshake events for segment %s", segmentName)
 	}
-
-	// Calculate timeout
-	var timeout uint32 = windows.INFINITE
-	if dl, ok := ctx.Deadline(); ok {
-		remaining := time.Until(dl)
-		if remaining <= 0 {
-			return context.DeadlineExceeded
-		}
-		timeout = uint32(remaining.Milliseconds())
-	}
-
-	result, err := windows.WaitForSingleObject(events.clientReadyEvent, timeout)
-	if err != nil {
-		return err
-	}
-	switch result {
-	case windows.WAIT_OBJECT_0:
-		return nil
-	case uint32(windows.WAIT_TIMEOUT):
-		return context.DeadlineExceeded
-	default:
-		return fmt.Errorf("WaitForSingleObject returned %d", result)
-	}
+	return waitForHandshakeEvent(ctx, events.clientReadyEvent)
 }
 
 // WaitServerReady waits for the server ready signal with optional timeout.
@@ -518,8 +576,16 @@ func WaitServerReady(ctx context.Context, segmentName string) error {
 	if !ok || events == nil {
 		return fmt.Errorf("no handshake events for segment %s", segmentName)
 	}
+	return waitForHandshakeEvent(ctx, events.serverReadyEvent)
+}
 
-	// Calculate timeout
+func waitForHandshakeEvent(ctx context.Context, event windows.Handle) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+
 	var timeout uint32 = windows.INFINITE
 	if dl, ok := ctx.Deadline(); ok {
 		remaining := time.Until(dl)
@@ -529,35 +595,65 @@ func WaitServerReady(ctx context.Context, segmentName string) error {
 		timeout = uint32(remaining.Milliseconds())
 	}
 
-	result, err := windows.WaitForSingleObject(events.serverReadyEvent, timeout)
+	cancelEvent, err := windows.CreateEvent(nil, 1, 0, nil)
+	if err != nil {
+		return err
+	}
+	done := make(chan struct{})
+	goroutineDone := make(chan struct{})
+	go func() {
+		defer close(goroutineDone)
+		select {
+		case <-ctx.Done():
+			windows.SetEvent(cancelEvent)
+		case <-done:
+		}
+	}()
+	defer func() {
+		close(done)
+		<-goroutineDone
+		windows.CloseHandle(cancelEvent)
+	}()
+
+	result, err := windows.WaitForMultipleObjects([]windows.Handle{event, cancelEvent}, false, timeout)
 	if err != nil {
 		return err
 	}
 	switch result {
 	case windows.WAIT_OBJECT_0:
 		return nil
+	case windows.WAIT_OBJECT_0 + 1:
+		return ctx.Err()
 	case uint32(windows.WAIT_TIMEOUT):
 		return context.DeadlineExceeded
 	default:
-		return fmt.Errorf("WaitForSingleObject returned %d", result)
+		return fmt.Errorf("WaitForMultipleObjects returned %d", result)
 	}
 }
 
-// CloseHandshakeEvents closes and removes handshake events from registry.
+// CloseHandshakeEvents drops one reference held by the caller (Create or
+// Open). The registry entry and the underlying named-event handles are
+// only released when the reference count drops to zero. Safe to call
+// after the entry has already been fully released; no-op in that case.
 func CloseHandshakeEvents(segmentName string) {
 	handshakeEventsMu.Lock()
 	events, ok := handshakeEventsRegistry[segmentName]
-	if ok {
-		delete(handshakeEventsRegistry, segmentName)
+	if !ok {
+		handshakeEventsMu.Unlock()
+		return
 	}
+	events.refCount--
+	if events.refCount > 0 {
+		handshakeEventsMu.Unlock()
+		return
+	}
+	delete(handshakeEventsRegistry, segmentName)
 	handshakeEventsMu.Unlock()
 
-	if events != nil {
-		if events.clientReadyEvent != 0 {
-			windows.CloseHandle(events.clientReadyEvent)
-		}
-		if events.serverReadyEvent != 0 {
-			windows.CloseHandle(events.serverReadyEvent)
-		}
+	if events.clientReadyEvent != 0 {
+		windows.CloseHandle(events.clientReadyEvent)
+	}
+	if events.serverReadyEvent != 0 {
+		windows.CloseHandle(events.serverReadyEvent)
 	}
 }
