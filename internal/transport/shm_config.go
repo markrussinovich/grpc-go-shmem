@@ -41,18 +41,19 @@ import "os"
 //     the production runtime API.
 //
 //   - Programmatic toggles preferred. Deployment-time mode switches
-//     (no-WINDOW_UPDATE, eventfd waker, spin-then-block tuning) are
-//     exposed as exported Configure* functions in the transport
-//     package rather than env vars. This is the same pattern as
+//     (eventfd waker, spin-then-block tuning) are exposed as
+//     exported Configure* functions in the transport package rather
+//     than env vars. This is the same pattern as
 //     ConfigureShmSpinIterations / ConfigureShmFlowControlForBench.
 //     Env vars are reserved for things that genuinely cannot be
 //     expressed as in-process API: cross-process child identity
 //     (set by the parent), and per-process diagnostic logging.
 //
 //   - Defaults are production-safe. A fresh process with none of these
-//     set behaves like the v3.4 production transport: eventfd waker
-//     ON, no-WU flow control ON (Linux only; non-Linux uses the
-//     futex / Windows-event fallback layer).
+//     set runs with the eventfd waker ON (Linux only; non-Linux uses
+//     the futex / Windows-event fallback layer) and the HTTP/2-
+//     compatible flow-control profile (the only profile in the
+//     current transport).
 //
 // Knobs (alphabetical)
 //
@@ -75,13 +76,15 @@ import "os"
 //
 // Removed knobs (do not reintroduce without strong reason)
 //
-//   SHM_DATASEG_WAKE   — was the eventfd-waker opt-in. eventfd is now
+//   SHM_DATASEG_WAKE   - was the eventfd-waker opt-in. eventfd is now
 //                        the default wake primitive on Linux (toggle
 //                        for tests / bench: ConfigureShmEventfdWakerForBench).
-//   SHM_NO_WU          — was the no-WINDOW_UPDATE opt-in. no-WU is now
-//                        the default v3.4 flow control mode (toggle
-//                        for tests / bench: ConfigureShmNoWindowUpdate).
-//   SHM_INPROC_WAKE    — was a same-process bench-only wake registry;
+//   SHM_NO_WU          - was the no-WINDOW_UPDATE opt-in. The NoWU
+//                        mode has been REMOVED; HTTP/2-compatible flow
+//                        control is now the only profile and NoWU-
+//                        equivalent throughput is achieved by setting a
+//                        large initial window (default 32 MiB).
+//   SHM_INPROC_WAKE    - was a same-process bench-only wake registry;
 //                        removed for being unrepresentative of real
 //                        deployments.
 

@@ -146,6 +146,64 @@ type hpackDecoderHolder struct {
 	// inside handleMessage / handleMessageBuffer); valid for callers
 	// that pin sendQuota = maxWindowSize.
 	onDataFrame func(streamID uint32, size uint32)
+
+	// onMessageStart, when non-nil, is invoked synchronously the moment
+	// the codec parses a new gRPC Length-Prefixed Message (LPM) header
+	// for a multi-DATA-frame message — i.e., the 5-byte LPM header has
+	// just been seen and lpmSize (= 5 + body length) is known but the
+	// message has NOT yet been fully assembled in the accumulator. The
+	// transport plugs this in to drive HTTP/2 "receiver-driven pre-
+	// credit" via inFlow.maybeAdjust: when lpmSize exceeds the peer's
+	// per-stream send window, the receiver emits a WINDOW_UPDATE big
+	// enough to admit the rest of the LPM. This matches the stock
+	// http2_client / http2_server behaviour where the app's request to
+	// read a known message length triggers maybeAdjust, but adapted to
+	// SHM where the lpmAccumulator hides the partial LPM from the app
+	// (so the app cannot drive the pre-credit itself).
+	//
+	// Fires once per LPM, at first-feed transition (preExpected==0 →
+	// postExpected>0). NOT fired for the single-DATA-frame fast path:
+	// in that case the sender already had a window large enough to
+	// send the whole LPM, so no pre-credit is needed.
+	onMessageStart func(streamID uint32, lpmSize uint32)
+}
+
+// feedAndObserveHeader wraps acc.feed to fire onMessageStart when the
+// just-completed feed call transitions the accumulator from "no LPM
+// in progress" (expectedTotal == 0) to "new LPM header parsed"
+// (expectedTotal > 0). The hook fires AFTER feed returns but BEFORE
+// the caller inspects the result, so the transport can pre-credit the
+// peer's send window via maybeAdjust before the next DATA frame might
+// arrive. Returns the same (msg, leftover, err) as the underlying
+// feed call.
+func (h *hpackDecoderHolder) feedAndObserveHeader(acc *lpmAccumulator, streamID uint32, data []byte, maxBody int) (msg []byte, leftover []byte, err error) {
+	preExpected := acc.expectedTotal
+	msg, leftover, err = acc.feed(data, maxBody)
+	if err != nil {
+		return
+	}
+	if preExpected == 0 && acc.expectedTotal > 0 && h.onMessageStart != nil {
+		h.onMessageStart(streamID, uint32(acc.expectedTotal))
+	}
+	return
+}
+
+// feedSplitAndObserveHeader is the split-input variant of
+// feedAndObserveHeader: it wraps acc.feedSplit and fires onMessageStart
+// on the same preExpected==0 → expectedTotal>0 transition. The
+// non-padded fast path in readFrameViewH2 uses feedSplit to avoid the
+// intermediate ring→heap copy, so the observer wrapper must cover both
+// codec entry points.
+func (h *hpackDecoderHolder) feedSplitAndObserveHeader(acc *lpmAccumulator, streamID uint32, pFirst, pSecond []byte, maxBody int) (msg []byte, leftover []byte, err error) {
+	preExpected := acc.expectedTotal
+	msg, leftover, err = acc.feedSplit(pFirst, pSecond, maxBody)
+	if err != nil {
+		return
+	}
+	if preExpected == 0 && acc.expectedTotal > 0 && h.onMessageStart != nil {
+		h.onMessageStart(streamID, uint32(acc.expectedTotal))
+	}
+	return
 }
 
 // scratchBytes returns a slice of length n drawn from the holder's
@@ -945,7 +1003,7 @@ func readFrameH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolder) (
 			holder.pendingFrame = nil
 			holder.pendingFrameEndStream = false
 			acc := holder.getLpmAccumulator(sid)
-			msg, leftover, ferr := acc.feed(data, h2MaxLPMBodyBytes)
+			msg, leftover, ferr := holder.feedAndObserveHeader(acc, sid, data, h2MaxLPMBodyBytes)
 			if ferr != nil {
 				return FrameHeader{}, nil, ferr
 			}
@@ -1123,7 +1181,7 @@ func readFrameH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolder) (
 			// Multi-frame / multi-message path: feed the accumulator.
 			data := payload
 			for len(data) > 0 {
-				msg, leftover, ferr := acc.feed(data, h2MaxLPMBodyBytes)
+				msg, leftover, ferr := holder.feedAndObserveHeader(acc, h2fh.StreamID, data, h2MaxLPMBodyBytes)
 				if ferr != nil {
 					return FrameHeader{}, nil, ferr
 				}
@@ -1317,7 +1375,7 @@ func readFrameViewH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolde
 			holder.pendingFrame = nil
 			holder.pendingFrameEndStream = false
 			acc := holder.getLpmAccumulator(sid)
-			msg, leftover, ferr := acc.feed(data, h2MaxLPMBodyBytes)
+			msg, leftover, ferr := holder.feedAndObserveHeader(acc, sid, data, h2MaxLPMBodyBytes)
 			if ferr != nil {
 				return FrameHeader{}, nil, ferr
 			}
@@ -1653,7 +1711,7 @@ func readFrameViewH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolde
 			// one 16 MiB memcpy per first chunk — material at the
 			// upper end of the size range.
 			if h2fh.Flags&H2FlagPadded == 0 {
-				msg, leftover, ferr := acc.feedSplit(pFirst, pSecond, h2MaxLPMBodyBytes)
+				msg, leftover, ferr := holder.feedSplitAndObserveHeader(acc, h2fh.StreamID, pFirst, pSecond, h2MaxLPMBodyBytes)
 				// leftover may alias ring memory (pFirst/pSecond) when
 				// feedSplit consumes only one source slice. Copying to a
 				// heap-owned buffer BEFORE Commit prevents the writer
@@ -1714,7 +1772,7 @@ func readFrameViewH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolde
 
 			data := payload
 			for len(data) > 0 {
-				msg, leftover, ferr := acc.feed(data, h2MaxLPMBodyBytes)
+				msg, leftover, ferr := holder.feedAndObserveHeader(acc, h2fh.StreamID, data, h2MaxLPMBodyBytes)
 				if ferr != nil {
 					return FrameHeader{}, nil, ferr
 				}

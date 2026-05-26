@@ -140,19 +140,25 @@
 //
 // # Flow control
 //
-// Two modes are supported:
-//
-//   - HTTP/2 WINDOW_UPDATE (default). The transport advertises
-//     INITIAL_WINDOW_SIZE in SETTINGS and the standard send-quota +
-//     WINDOW_UPDATE accounting governs how much data each side may
-//     have in flight. This matches the wire behaviour of the HTTP/2
-//     transport and makes SHM/UDS/TCP bench comparisons honest.
-//   - "no-WU" (default in v3.4, toggle via ConfigureShmNoWindowUpdate).
-//     Sender skips acquireSendQuota and does not emit WINDOW_UPDATE;
-//     receiver drops incoming WINDOW_UPDATE. The ring's natural
-//     backpressure becomes the only flow-control limit. This is the
-//     v3.4 baseline described in shm-rfc/. Both peers MUST be in the
-//     same mode.
+// The SHM transport runs the HTTP/2-compatible flow-control profile
+// unconditionally: senders honour the negotiated per-stream and
+// connection windows. Outbound flow-control state for the standard
+// whole-MESSAGE write path is owned by the frame-writer goroutine,
+// which CAS-deducts both quotas per chunk in advanceDeferred. The
+// zero-copy proto fast path (writeProto / writeProtoToRing) still
+// reserves quota outside the writer via acquireSendQuota; it is a
+// single-frame inline-write optimisation for small messages and
+// falls back to the whole-MESSAGE path if the message is too large
+// or inlineMu is busy. Receivers credit WINDOW_UPDATE frames driven
+// by application consumption (with receiver-side pre-credit on LPM
+// header parse, see onMessageStart).
+// "NoWU"-equivalent peak throughput is achieved simply by configuring
+// a large initial window (the SHM-tuned default shmInitialWindowSize
+// of 32 MiB exceeds typical per-message sizes, so WINDOW_UPDATE
+// machinery stays dormant in production). To exercise strict HTTP/2
+// flow control for benchmarking or memory bounding, set
+// `grpc.WithInitialWindowSize` / `DialOptions.InitialWindowSize` to a
+// smaller value such as 65535 (HTTP/2 spec default).
 //
 // # Security
 //

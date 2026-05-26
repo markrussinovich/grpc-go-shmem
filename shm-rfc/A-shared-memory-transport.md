@@ -4,7 +4,7 @@ G3: Shared Memory Transport for gRPC
 * Approver: a11r
 * Status: Draft
 * Implemented in: n/a
-* Last updated: 2026-05-06
+* Last updated: 2026-05-25
 * Discussion at: (TBD)
 
 ## Abstract
@@ -85,10 +85,29 @@ The segment header resides at offset 0 of the mapped region.
 | 0x44 | 4B | ClientReady | Client ready flag (0 or 1) |
 | 0x48 | 4B | Closed | Connection closed flag (0 or 1) |
 | 0x4C | 4B | Pad | Alignment padding |
-| 0x50–0x7F | 48B | Reserved | MUST be 0 |
+| 0x50 | 4B | MaxStreamsHint | Informational pre-SETTINGS hint for maximum concurrent streams. The authoritative limit is `SETTINGS_MAX_CONCURRENT_STREAMS` exchanged during HTTP/2 SETTINGS (per RFC 7540 §6.5.2); this field is provided so clients can size internal state before SETTINGS arrives. A value of 0 means "unspecified". Implementations MAY ignore this field and rely solely on SETTINGS. |
+| 0x54 | 4B | OpenerWakeReady | Set to 1 by the opener (client) AFTER establishing any cross-process wake amplifier (e.g., a Linux eventfd received via SCM_RIGHTS) and BEFORE setting `ClientReady`. A value of 0 indicates the opener fell back to the address-wait/wake primitive only; the creator (server) MUST use the same fallback to avoid an asymmetric park/wake deadlock. See [Linux Cross-Process Wake Amplifier](#linux-cross-process-wake-amplifier). |
+| 0x58–0x7F | 40B | Reserved | MUST be 0 |
 
-Implementations MUST validate Magic and Version after mapping. An
-unrecognized Magic or Version MUST cause the mapping to be discarded.
+Implementations MUST validate the segment header after mapping. The
+following checks MUST be performed before any other field is read or
+any ring is accessed:
+
+- `Magic` matches the expected value and `Version` is recognized;
+  otherwise the mapping MUST be discarded.
+- `RingACapacity` and `RingBCapacity` are each powers of two and at
+  least 4 KiB (see [Ring Sizing](#ring-sizing)).
+- `RingAOffset + RingACapacity + ring-header overhead ≤ TotalSize` and
+  the same for Ring B.
+- The region `[RingAOffset, RingAOffset + ring-header overhead + RingACapacity)`
+  does not overlap the corresponding region of Ring B, nor the segment
+  header at offsets `0x00 .. 0x80`.
+- `TotalSize` matches the size of the mapped file (or, on Windows, the
+  size reported for the mapped section object).
+
+Any failed check MUST cause the mapping to be discarded; the peer MAY
+be notified through the control-plane reject path when validation
+happens during establishment.
 
 **Ready flag rules:**
 
@@ -96,9 +115,11 @@ unrecognized Magic or Version MUST cause the mapping to be discarded.
   The client MUST NOT read any other header field until `ServerReady == 1`.
 - The client sets `ClientReady = 1` after it has mapped the data segment and
   is prepared to receive frames.
-- Both flags transition only from 0 → 1; the reverse is never valid.
+- Each of `ServerReady`, `ClientReady`, and `Closed` transitions only
+  from 0 → 1 within its own lifetime; the reverse transition is
+  never valid. The three flags are independent of one another.
 - `Closed` in the **segment header** transitions only from 0 → 1 and
-  indicates the connection is shutting down. Either side may set it. Once
+  indicates the connection is shutting down. Either side MAY set it. Once
   set, no new streams may be opened. Existing data already written to the
   rings SHOULD be consumed (drained) before unmapping, except when an
   abrupt error condition (such as receipt of GOAWAY with a non-zero error
@@ -168,6 +189,14 @@ metadata on any RPC:
 If the server does not return `shm-ctl`, or if the client fails to open
 the control segment, the client continues using HTTP/2.
 
+The bootstrap connection over which `shm-offer` is exchanged MAY be
+TCP, TCP+TLS, or a Unix domain socket. The negotiation runs as standard
+gRPC metadata on whatever channel is already open between the peers;
+no new URI scheme is introduced for SHM. Either side MAY be deployed
+without SHM support, in which case the missing metadata key causes the
+RPC to complete over the bootstrap channel exactly as if SHM were not
+involved.
+
 The negotiation is backward compatible. A server that does not
 implement this protocol ignores the unknown `shm-offer` key (per standard
 gRPC metadata handling) and never returns `shm-ctl`; the client stays on
@@ -191,13 +220,41 @@ Recommended format:
 <server-id>_<uuid>_ctl
 ```
 
-The server generates the name when it receives `shm-offer` and creates
-the control segment before returning the trailing metadata.
+The control segment is created once by the server, typically at
+listener startup (e.g. when the server invokes the SHM listener API
+with a chosen name). The server does not create a new control segment
+per RPC or per offer; it returns the name of the already-existing
+control segment in the trailing metadata. The same control segment
+name applies to all clients connecting to that server.
 
 ### Same-Host Detection
 
-The server SHOULD verify that the client is on the same host before
-returning `shm-ctl`. The verification method is implementation-defined.
+Servers MUST verify same-host before returning `shm-ctl`. Sufficient
+evidence:
+
+- The peer address is an IPv4/IPv6 loopback address (per the standard
+  `IsLoopback` semantics of the platform's network library).
+- The peer address has network type `unix` or `unixpacket`.
+
+Servers MUST NOT return `shm-ctl` to peers that present a non-loopback
+IP address or whose peer information is unavailable. Implementations
+behind a reverse proxy that rewrites the peer address MUST disable
+`shm-ctl` advertisement entirely or explicitly opt out, since a remote
+peer can otherwise be misidentified as local.
+
+### Client Verify-Ready Timing
+
+After receiving `shm-ctl`, the client opens the announced control
+segment and proceeds with the [Establishment Sequence](#establishment-sequence).
+The client MUST NOT discard the bootstrap channel until the SHM
+transport reaches its connected state (HTTP/2 SETTINGS exchange
+complete, or the implementation's equivalent of the gRPC connectivity
+`Ready` state).
+
+A bounded timeout SHOULD be applied. Reference implementations use 2
+seconds. On timeout the client MUST close the SHM attempt and continue
+on the bootstrap channel; a successful discovery is otherwise permanent
+for the lifetime of the bootstrap connection.
 
 ## Connection Establishment
 
@@ -252,12 +309,27 @@ control segment). Defined Type values:
 
 The payload encodings for each Type are defined below.
 
+The `Length` field is an unsigned 32-bit value, but receivers MUST cap
+the body they are willing to allocate; 4 KiB is sufficient for all
+frame types defined here (the largest legitimate body is an ACCEPT
+carrying a UTF-8 segment name well below 1 KiB). On encountering an
+oversized `Length`, the receiver:
+
+- MUST NOT allocate the advertised buffer.
+- SHOULD attempt a bounded best-effort drain on the ring so subsequent
+  well-formed frames from other clients can still be parsed.
+- MUST NOT tear down the listener immediately. Implementations SHOULD
+  bound CPU spent on consecutive malformed frames (e.g., short backoff
+  plus a maximum consecutive count) before considering the control ring
+  unrecoverable.
+
 ### Control Frame Payloads
 
-#### CONNECT Payload (18 bytes)
+#### CONNECT Payload (variable, minimum 20 bytes)
 
 ```
 Version(1B) | RingACapacity(8B LE) | RingBCapacity(8B LE) | Flags(1B)
+            | WireFormatCount(1B) | WireFormats(count B)
 ```
 
 - Version: control-frame encoding version (current = 1). This is
@@ -271,7 +343,7 @@ Version(1B) | RingACapacity(8B LE) | RingBCapacity(8B LE) | Flags(1B)
   | Bit | Name | Description |
   |-----|------|-------------|
   | 0 | SINGLE_STREAM | Client requests single-stream mode (see below) |
-  | 1–7 | (reserved) | |
+  | 1–7 | (reserved) | MUST be 0 on send; ignored on receive. |
 
   Senders MUST set reserved flag bits to 0. Receivers MUST ignore
   unknown flag bits for forward compatibility.
@@ -285,15 +357,41 @@ Version(1B) | RingACapacity(8B LE) | RingBCapacity(8B LE) | Flags(1B)
   client MUST still emit valid HTTP/2 frames with non-zero StreamID for
   RPCs.
 
-#### ACCEPT Payload (variable)
+  The server MAY decline the hint; in that case it advertises its
+  normal `SETTINGS_MAX_CONCURRENT_STREAMS` value (or omits the
+  setting), and the client MUST accept the negotiated value and use
+  the general multi-stream path.
+
+- WireFormatCount: number of data-plane wire formats advertised by the
+  client. The value MUST be at least 1.
+- WireFormats: list of accepted data-plane wire-format codes, one byte
+  each. Defined codes:
+
+  | Code | Name | Notes |
+  |------|------|-------|
+  | 0x01 | HTTP/2 | The only data-plane wire format defined by this specification. |
+
+  Senders MUST include 0x01 in the list. Receivers that do not find
+  0x01 in the advertised set MUST respond with REJECT. The advertisement
+  is mandatory in this revision; a peer that omits it (zero-length
+  trailing bytes) MUST be treated as protocol-incompatible and rejected
+  at the handshake boundary.
+
+#### ACCEPT Payload (variable, minimum 6 bytes)
 
 ```
-Version(1B) | NameLen(4B LE) | DataSegmentName(var, UTF-8)
+Version(1B) | NameLen(4B LE) | DataSegmentName(var, UTF-8) | SelectedWire(1B)
 ```
 
-Contains the name of the data segment the server has allocated. After
-receiving ACCEPT, the client maps the named segment. The negotiated ring
-capacities are read from the data segment's header.
+Contains the name of the data segment the server has allocated and the
+wire-format the server selected from the client's CONNECT advertisement.
+After receiving ACCEPT, the client maps the named segment. The negotiated
+ring capacities are read from the data segment's header.
+
+`SelectedWire` is the wire-format code the server chose from the
+client's CONNECT advertisement. MUST be 0x01 (HTTP/2). Clients MUST
+treat any other value as a connection failure and continue on the
+bootstrap channel.
 
 #### REJECT Payload (variable)
 
@@ -309,13 +407,32 @@ MUST respond with REJECT (when reading CONNECT) or treat the response as
 a connection failure (when reading ACCEPT or REJECT) and continue using
 HTTP/2.
 
+#### Control-frame payload validation
+
+Receivers MUST validate every control-frame payload before acting on
+it:
+
+- CONNECT: `NameLen > 0`, `NameLen + 6 + WireFormatCount ≤ Length`,
+  `DataSegmentName` is valid UTF-8, `WireFormatCount ≥ 1`, and the
+  WireFormats list fits within the remaining `Length`.
+- ACCEPT: `NameLen > 0`, `NameLen + 6 == Length`, `DataSegmentName` is
+  valid UTF-8, and `SelectedWire` is one of the codes the client
+  advertised in CONNECT.
+- REJECT: `MsgLen + 5 == Length` and `ErrorMessage` is valid UTF-8.
+
+A payload that fails any check MUST be treated as a connection
+failure: the receiver of a malformed CONNECT responds with REJECT and
+drops the offending client; the receiver of a malformed ACCEPT or
+REJECT closes the SHM attempt and continues on the bootstrap channel.
+
 ### Establishment Sequence
 
 ![Connection Establishment](G3_graphics/connection_establishment.png)
 
 1. Server creates the control segment and sets `ServerReady = 1`.
 2. Client opens the control segment. It MUST wait until `ServerReady == 1`
-   and then validate Magic and Version.
+   and then perform full segment-header validation (see
+   [Segment Header](#segment-header-128-bytes)).
 3. Client acquires the control-segment write lock and sends CONNECT on
    Ring A.
 4. Server reads CONNECT, allocates a data segment, and responds with ACCEPT
@@ -327,13 +444,29 @@ HTTP/2.
    starting with each side's initial SETTINGS frame (see
    [Connection Preface](#connection-preface)).
 
+A server MUST refuse to start a listener whose control segment name
+already exists with `ServerReady == 1` in the existing segment,
+returning a clear "address in use" error to the operator. Only when
+the existing segment has `ServerReady == 0` (or cannot be opened at
+all) MAY the implementation clean it up and proceed. This prevents a
+misconfigured restart from silently unlinking the active inode while
+existing clients hold a mapping to it.
+
 ### Security Handshake
 
-The base protocol does not require a security handshake. A future document
-may define one to be performed on the data segment after Connection
-Establishment but before any HTTP/2 frames are exchanged. Implementations
-that do not support such a handshake interoperate with peers that also
-omit it.
+The base protocol does not require a security handshake on the data
+segment. Implementations MAY perform one, in which case it runs on
+the data segment's Ring A and Ring B AFTER `ClientReady == 1` but
+BEFORE the HTTP/2 SETTINGS exchange.
+
+Frame types 0x20–0x2F are RESERVED for security-handshake frames.
+Implementations that do not perform a handshake interoperate with
+peers that also omit it; the first frame on the data segment with a
+type outside this reserved range is treated as the start of HTTP/2
+frame flow.
+
+The wire format of handshake frames is left to a follow-up gRFC. See
+[Open Issues](#open-issues-if-applicable).
 
 ## HTTP/2 Mapping
 
@@ -400,7 +533,7 @@ apply to parameters not explicitly advertised:
 | HEADER_TABLE_SIZE (0x1) | 0 | Disable HPACK dynamic table; MUST be 0 (see [HPACK](#hpack)) |
 | ENABLE_PUSH (0x2) | 0 | Server push is not used; MUST be 0 |
 | MAX_CONCURRENT_STREAMS (0x3) | unlimited | Server-defined; clients MUST honor when advertised |
-| INITIAL_WINDOW_SIZE (0x4) | 2,147,483,647 (2³¹ − 1) | See [Flow Control](#flow-control) |
+| INITIAL_WINDOW_SIZE (0x4) | 33,554,432 (32 MiB, SHM-tuned default) | See [Flow Control](#flow-control). Implementations SHOULD expose configuration knobs for the per-endpoint initial window size (e.g. gRPC-Go's `grpc.WithInitialWindowSize` / `grpc.InitialWindowSize`); both endpoints SHOULD be configured symmetrically. |
 | MAX_FRAME_SIZE (0x5) | 16,777,215 (2²⁴ − 1) | Maximum permitted by RFC 7540 |
 | MAX_HEADER_LIST_SIZE (0x6) | 1,048,576 (1 MiB) | Bound on header list size |
 
@@ -454,33 +587,95 @@ path. Senders SHOULD NOT set PADDED.
 ### Stream Lifecycle
 
 Stream ID allocation, stream states, and state transitions follow
-[RFC 7540 Section 5.1](https://httpwg.org/specs/rfc7540.html#StreamStates),
+[RFC 7540 §5.1](https://httpwg.org/specs/rfc7540.html#StreamStates),
 including the handling of frames received on closed streams.
 
 ### Flow Control
 
-Stream-level flow control follows the HTTP/2 WINDOW_UPDATE model
-(RFC 7540 §6.9) with `INITIAL_WINDOW_SIZE = 2³¹ − 1`. WINDOW_UPDATE
-frames are read and processed per the spec; with the maximum initial
-window, back-pressure is provided by the shared memory ring (writer
-blocks when the ring is full, reader blocks when it is empty, signaled
-via the wait/wake primitives in [Wait/Wake](#waitwake)).
+SHM transports run an HTTP/2-compatible flow-control state machine
+that follows [RFC 7540 §5.2 and §6.9](https://httpwg.org/specs/rfc7540.html#FlowControl)
+wire semantics exactly. Stream-level `WINDOW_UPDATE` is paced by
+application consumption (i.e. driven from the receive side as the
+application reads); connection-level `WINDOW_UPDATE` is paced by
+parse-time accounting; `SETTINGS_INITIAL_WINDOW_SIZE` is honored.
+The `slow Recv → slow Send` migration contract from TCP/UDS holds
+unchanged.
 
-The HTTP/2 connection-level flow-control window starts at 65,535
-(RFC 7540 §6.9.2) and is not affected by `SETTINGS_INITIAL_WINDOW_SIZE`.
-To prevent the connection window from constraining throughput,
-immediately after sending its initial SETTINGS frame each peer MUST
-send a WINDOW_UPDATE frame with stream identifier 0 and an increment of
-`2,147,418,112` (`2³¹ − 1 − 65535`), raising the connection-level
-window to `2³¹ − 1`.
+The remainder of this section specifies the SHM-specific deltas.
 
-Both connection-level and stream-level windows decrement as DATA frames
-are sent. Receivers SHOULD send WINDOW_UPDATE frames as bytes are
-consumed so that neither window becomes the limiting back-pressure
-mechanism; in the steady state, back-pressure is provided by ring
-occupancy via [Wait/Wake](#waitwake), not by HTTP/2 windows.
-Implementations MAY keep both windows near `2³¹ − 1`. WINDOW_UPDATE
-frames are processed per RFC 7540.
+#### Ring is the physical-layer buffer
+
+The SHM ring serves the role that the kernel socket buffer plays in
+stock HTTP/2 over TCP/UDS: bytes leave the ring (advancing
+`ReadIdx`) as the receiver's reader parses each H2 DATA frame, well
+before the application consumes the message. WU emission timing is
+unchanged from stock H2. Ring back-pressure (`SpaceSeq` /
+`DataSeq`, see [Wait/Wake](#waitwake)) is per direction, not per
+stream, and operates strictly below the HTTP/2 FC layer.
+
+#### Ring capacity vs initial window (SHOULD)
+
+The kernel socket buffer grows dynamically; the SHM ring is fixed
+capacity. Implementations SHOULD provision ring capacity ≥
+`SETTINGS_INITIAL_WINDOW_SIZE` per direction so the FC window is
+the binding constraint, not the ring. The reference implementation
+uses ring = 64 MiB and default initial window = 32 MiB.
+
+With ring < window the sender remains correct (data eventually
+arrives) but hits ring back-pressure before exhausting its FC
+credit, introducing implementation-internal stalling that the peer
+cannot observe via WU mechanics.
+
+#### Pre-credit at codec parse time
+
+Stock HTTP/2 emits pre-credit from the receive path as the
+application reads bytes from each DATA frame. The SHM codec
+aggregates DATA frames into a complete MESSAGE before handing it
+to the application, so SHM receivers SHOULD emit the
+stream-level (and, with bookkeeping, connection-level) credit
+increments for the full LPM payload at LPM-header parse time,
+bypassing the regular `limit/4` drip threshold for the announced
+message. The wire effect is identical to stock H2 pre-credit;
+only the trigger location differs.
+
+For connection-level pre-credit, the receiver records the
+parse-time increment as outstanding debt; subsequent per-DATA-frame
+accounting MUST repay the debt before counting bytes toward the
+regular drip threshold, so total credit emitted over a message's
+lifetime equals exactly the bytes consumed.
+
+#### Implementation choices (MAY)
+
+Implementations MAY merge adjacent connection-level `WINDOW_UPDATE`
+frames within a single drain pass (HTTP/2 increments are additive,
+so the merged frame is wire-equivalent; this reduces ring-write
+count under high stream concurrency).
+
+Per [RFC 7540 §5.2.2](https://httpwg.org/specs/rfc7540.html#StreamErrorHandler)
+receivers MUST treat over-window inbound DATA as `STREAM_ERROR`
+with `FLOW_CONTROL_ERROR`. Compliant senders never produce this
+condition, but receivers cannot assume the peer is compliant and
+MUST enforce the check.
+
+#### Window configuration
+
+`SETTINGS_INITIAL_WINDOW_SIZE` is exchanged via the standard HTTP/2
+SETTINGS frame (see [SETTINGS](#settings)). Each peer advertises its
+own receive window; senders MUST honor the peer's advertised value
+per [RFC 7540 §6.9.2](https://httpwg.org/specs/rfc7540.html#InitialWindowSize).
+Because the setting is directional, deployments do not require
+symmetric configuration for correctness, but configuring both
+endpoints with the same value is RECOMMENDED for predictable
+resource use.
+
+### Receiver Back-Pressure
+
+To bound the memory a single misbehaving stream can consume, receivers
+SHOULD apply a per-stream inbound-queue cap. On exceeding the cap the
+receiver MUST emit `RST_STREAM` with a non-OK error code and drop the
+offending stream. The exact cap value and error code are
+implementation-defined. Reference implementations apply a hard cap on
+the unconsumed message bytes per stream.
 
 ## Synchronization
 
@@ -496,8 +691,9 @@ frames are processed per RFC 7540.
 
 ### Wait/Wake
 
-When the ring is empty or full, the protocol uses address-wait primitives
-provided by the OS to avoid busy-waiting. The portable abstraction is:
+When the ring is empty or full, the protocol uses an OS-provided
+cross-process wait/wake primitive to avoid busy-waiting. The portable
+abstraction is:
 
 - **WaitOnAddress(addr, expected)**: block until `*addr != expected`.
 - **WakeByAddress(addr)**: unblock one thread waiting on `addr`.
@@ -506,8 +702,13 @@ Concrete mappings:
 
 | Operation | Linux | Windows |
 |-----------|-------|---------|
-| Wait | `futex(addr, FUTEX_WAIT, expected)` | `WaitOnAddress(addr, expected, 4)` |
-| Wake | `futex(addr, FUTEX_WAKE, 1)` | `WakeByAddressSingle(addr)` |
+| Wait | `futex(addr, FUTEX_WAIT, expected)` | An equivalent cross-process wait primitive (e.g. `WaitOnAddress` where the OS guarantees cross-process semantics on the same mapped section, or a named event keyed to `addr`). |
+| Wake | `futex(addr, FUTEX_WAKE, 1)` | The matching wake primitive (e.g. `WakeByAddressSingle`, or signaling the named event). |
+
+The primitive on each OS MUST be one whose wait and wake operate on
+the shared physical backing of the segment (not per-process virtual
+addresses); independent processes mapping the same segment MUST be
+able to wake each other through this primitive.
 
 The `DataSeq` and `SpaceSeq` fields are the primary wait/wake target
 addresses. After writing data, the producer increments `DataSeq` and wakes
@@ -523,17 +724,28 @@ the ring condition before entering the wait syscall.
 
 ### Adaptive Spin-Then-Block
 
-Before falling back to a kernel wait, implementations SHOULD spin for a
-bounded number of iterations.
+Before falling back to a kernel wait, implementations MAY apply a
+bounded spin on the wait-target address. Reference implementations
+default to no spin (zero iterations) to avoid burning CPU on idle
+connections; operators MAY enable a non-zero spin budget at deployment
+time. Measured impact at the time of writing (reference
+implementations, x86-64 Linux): about 2× streaming-latency improvement
+at payload ≤ 4 KiB; neutral or slightly negative at payload ≥ 64 MiB.
+Spin SHOULD be opt-in for latency-sensitive workloads rather than a
+global default.
 
 ## Ring Sizing
 
-Ring capacity SHOULD be sized to the expected concurrency and frame rate,
-not to the maximum message size; correctness across ring sizes is
-guaranteed by [Framing on the Ring](#framing-on-the-ring). Capacities in
-the 64 KiB to 4 MiB range are sufficient for typical gRPC workloads;
-larger rings help with concurrent stream count rather than per-stream
-throughput.
+Ring capacities MUST be powers of two and MUST be at least 4 KiB.
+Reference implementations default to 64 MiB rings per direction
+(136 MiB total mapped segment, including both rings and headers).
+Smaller rings (~64 KiB) suit low-stream-count deployments; larger rings
+primarily increase the number of in-flight streams the transport can
+sustain without producer stalls, rather than per-stream throughput.
+
+Implementations exposing a user-facing `SegmentSize` knob MUST validate
+`SegmentSize ≥ RingACapacity + RingBCapacity + header overhead` and
+reject under-sized configurations at the API boundary.
 
 ## Security Considerations
 
@@ -581,23 +793,97 @@ timeout when acquiring the lock. A malicious peer may also fill the ring
 without reading, causing the other side to block on writes; ring-level
 backpressure is inherent to the protocol.
 
+A server MUST also bound CPU and memory spent on malformed control-plane
+frames: the receiver MUST cap accepted `Length` values (4 KiB is
+sufficient for currently defined frame types), SHOULD bound the number
+of consecutive malformed frames it tolerates before tearing the listener
+down, and SHOULD insert a short backoff between recovery attempts so a
+hostile peer flooding the ring cannot drive the listener thread to
+consume a full CPU core. See [Control Frame Envelope](#control-frame-envelope)
+for the per-frame cap.
+
+A new listener attempting to bind to a name whose control segment is
+already in use (i.e., the existing segment opens successfully and reports
+`ServerReady == 1`) MUST refuse rather than silently unlinking the
+existing segment; see [Establishment Sequence](#establishment-sequence).
+
 ## Implementation
 
 The protocol requires a platform that supports:
 
 - Memory-mapped files shared between processes.
-- An address-wait/wake primitive (e.g. Linux `futex`, Windows
-  `WaitOnAddress`).
+- A cross-process wait/wake primitive operating on the shared
+  physical backing (e.g. Linux `futex`, or a Windows primitive
+  that provides equivalent cross-process semantics on a mapped
+  section). See [Wait/Wake](#waitwake).
+- (optional) A cross-process file-descriptor passing mechanism for
+  eventfd-based wake amplification on Linux (`SCM_RIGHTS` over
+  `AF_UNIX`). Without this mechanism, cross-process wakes fall back to
+  the address-wait/wake primitive.
+
+## Linux Cross-Process Wake Amplifier
+
+On Linux, an implementation MAY reduce cross-process wake latency
+using `eventfd(2)` instances exchanged via `SCM_RIGHTS` over a sibling
+`AF_UNIX` socket. This section defines the wire format so independent
+implementations interoperate.
+
+### Socket Path
+
+For a data segment whose backing file is at path `<seg>`, the
+fd-passing socket is at `<seg>.fds.sock`. The server (creator) binds
+and listens on this socket as part of creating the segment; the client
+(opener) connects to it after mapping the segment but before setting
+`ClientReady`.
+
+### Wire Payload
+
+The server sends a single message containing:
+
+- A 4-byte ASCII token `"FDS\n"` (0x46 0x44 0x53 0x0A) as the ordinary
+  `sendmsg(2)` payload, so the client can detect a wrong-protocol
+  partner on a stale socket.
+- An `SCM_RIGHTS` ancillary message carrying exactly two file
+  descriptors:
+  - `fd[0]`: client-to-server direction eventfd. The client writes a 1
+    (`u64` write) to wake the server.
+  - `fd[1]`: server-to-client direction eventfd. The server writes a 1
+    to wake the client.
+
+The client MUST verify the token before consuming the file descriptors
+and MUST close any extra descriptors it receives.
+
+### Peer-UID Check
+
+The server MUST consult `SO_PEERCRED` (or equivalent) on the accepted
+connection and serve file descriptors only when the peer's UID matches
+the server's own UID. This prevents an unrelated local user from
+hijacking the cross-process wake channel.
+
+### OpenerWakeReady Coordination
+
+After the client successfully receives and arms its eventfd pair, it
+MUST set `OpenerWakeReady = 1` in the segment header BEFORE setting
+`ClientReady`. If fd-passing fails (socket unavailable, token mismatch,
+UID mismatch, recvmsg error, etc.), the client MUST leave
+`OpenerWakeReady` at 0 and proceed with the address-wait/wake path
+only. The server reads this flag immediately after the client signals
+`ClientReady` and uses it to decide whether to retain its own eventfd
+waker or release it (preventing an asymmetric park-on-eventfd /
+wake-on-futex deadlock).
 
 ## Open issues (if applicable)
 
-* **macOS support.** macOS does not provide `futex`. Possible alternatives
-  include `os_unfair_lock`, `pthread` condition variables, and
-  `dispatch_semaphore`; their suitability has not yet been evaluated.
+* **macOS support.** macOS does not provide `futex`. Plausible
+  candidates include `EVFILT_USER` on `kqueue` for cross-process wake
+  amplification and `os_unfair_lock` / `dispatch_semaphore` for the
+  in-process spin/park primitive. None has yet been validated.
 
-* **ARM64 memory ordering.** The protocol specifies acquire/release semantics.
-  On x86-64 these are implicit under TSO, but ARM64 implementations need
-  explicit barriers.
+* **Security handshake wire format.** Frame types 0x20–0x2F are
+  reserved (see [Security Handshake](#security-handshake)). The
+  reference implementations carry an experimental nonce-based handshake
+  whose wire format will be normative in a follow-up gRFC after
+  cross-implementation interop has been demonstrated.
 
 * **Cross-container IPC.** Containers isolate IPC namespaces by default.
   Shared memory between containers requires either a shared IPC namespace or

@@ -22,6 +22,7 @@
 package transport
 
 import (
+	"container/list"
 	"context"
 	"errors"
 	"fmt"
@@ -341,6 +342,56 @@ type Stream struct {
 	trReader transportReader
 	fc       inFlow
 	wq       writeQuota
+
+	// pendingWU accumulates inbound flow-control credit (in bytes) that
+	// the receiver owes the peer as a WINDOW_UPDATE on this stream.
+	// Atomic so producers (reader pre-credit callbacks AND application
+	// drip-credit reads) can update it without taking a transport-wide
+	// mutex. Used by the SHM transport's lockless WU path; unused (and
+	// remains 0) for the stock TCP/UDS HTTP/2 transports, which keep
+	// pending stream-WU state inside inFlow.pendingUpdate.
+	pendingWU atomic.Uint32
+
+	// connWaiterElem is the stream's entry in the SHM transport's
+	// connection-level quota waiter FIFO (transport.connWaiters), or
+	// nil if the stream is not currently parked waiting for conn
+	// send-quota. Protected by transport.sendQuotaMu — the same
+	// mutex that guards the connWaiters list itself.
+	//
+	// This enables the SC-Aware Quota Dispatch path: when an inbound
+	// connection-level WINDOW_UPDATE arrives, the (single) reader
+	// goroutine walks the waiter FIFO and signals only those streams
+	// whose `wanted` byte count can be satisfied by the just-credited
+	// conn quota — eliminating the thundering-herd wake of all
+	// parked stream goroutines that the previous broadcast-on-
+	// connQuotaSignal path caused. The doubly-linked container/list
+	// gives O(1) park/unlink without scanning the list per cycle.
+	//
+	// Unused (remains nil) on the TCP/UDS HTTP/2 transports, which
+	// use the controlBuf / loopyWriter scheduling model instead.
+	connWaiterElem *list.Element
+
+	// sendQuota is the per-stream outbound flow-control window (in
+	// bytes) on the SHM transport, replacing the legacy
+	// `ShmClientTransport.streamSendQuota map[uint32]int64` that was
+	// guarded by sendQuotaMu. Atomic so the hot path of
+	// acquireSendQuota / acquireUpToSendQuota can reserve quota via
+	// a CAS loop without taking any transport-wide mutex — pairing
+	// with the connection-level atomic.Int64 connSendQuota on the
+	// transport for a fully lockless quota reservation path.
+	//
+	// Initialized at NewStream time to the transport's initial
+	// stream window; mutated by:
+	//   - sender CAS deduction in acquireSendQuota /
+	//     acquireUpToSendQuota
+	//   - addSendQuota(streamID=K).Add(delta) on inbound
+	//     stream-level WINDOW_UPDATE
+	//   - rollback Add(grant) when a two-resource CAS races and the
+	//     conn-quota CAS fails after the stream-quota CAS succeeded
+	//
+	// Unused (remains 0) on the TCP/UDS HTTP/2 transports, which
+	// keep send-quota state inside loopyWriter / controlBuf.
+	sendQuota atomic.Int64
 }
 
 // readRequester is used to state application's intentions to read data. This

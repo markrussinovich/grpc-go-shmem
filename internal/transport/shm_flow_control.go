@@ -146,6 +146,44 @@ func ConfigureShmFlowControlForBench(initialWindow int) {
 	shmWindowUpdateThreshold = threshold
 }
 
+// computeWUThreshold returns the per-transport WindowUpdate emission
+// threshold for the given effective initial window. Mirrors the
+// math in ConfigureShmFlowControlForBench but as a pure helper that
+// can be called per-transport after a grpc.WithInitialWindowSize
+// override updates the transport's effective window.
+//
+// Bounds:
+//   - 1 KiB floor: avoid emitting a WU per byte under tiny windows
+//   - window/2 ceiling: the sender must be able to refill at least
+//     once before exhausting its window, otherwise it parks forever
+//   - window/4 default: matches HTTP/2 spec heuristic and pipelines
+//     well under streaming
+//
+// initialWindow <= 0 falls back to the package-global default (set
+// by ConfigureShmFlowControlForBench or the build-time constant).
+// This is the correctness fix for a real deadlock: previously,
+// sendWindowUpdate used `shmWindowUpdateThreshold` directly, so a
+// transport dialed with grpc.WithInitialWindowSize(65535) inherited
+// the 8 MiB threshold from the package global (computed from the
+// 32 MiB shm-tuned default). The receiver's onRead would emit
+// 16 KiB credits, sendWindowUpdate would accumulate them, but the
+// 8 MiB threshold would never be reached because the sender had
+// already exhausted its 64 KiB window and was parked. Result:
+// permanent hang under any small-window deployment.
+func computeWUThreshold(initialWindow int32) uint32 {
+	if initialWindow <= 0 {
+		return uint32(shmWindowUpdateThreshold)
+	}
+	t := initialWindow / 4
+	if t < 1024 {
+		t = 1024
+	}
+	if int64(t) >= int64(initialWindow) {
+		t = initialWindow / 2
+	}
+	return uint32(t)
+}
+
 // ConfigureShmMaxFrameSizeForBench overrides shmMaxFrameSize so the SHM
 // producer chunks H2 DATA frames at the given body size, matching the
 // HTTP/2 spec default of 16384 used by TCP / UDS in this codebase

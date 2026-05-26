@@ -160,8 +160,8 @@ func TestShmSmallWindowMultiFrameMessage(t *testing.T) {
 	// write call exercises the flow-control path.
 	const fairWindow = 64 * 1024
 	cliTransport.sendQuotaMu.Lock()
-	cliTransport.connSendQuota = fairWindow
-	cliTransport.streamSendQuota[cs.id] = fairWindow
+	cliTransport.connSendQuota.Store(fairWindow)
+	cs.sendQuota.Store(fairWindow)
 	cliTransport.sendQuotaMu.Unlock()
 
 	// 256 KiB payload — 4× the 64 KiB initial window. Forces at least
