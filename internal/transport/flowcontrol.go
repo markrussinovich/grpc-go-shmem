@@ -78,37 +78,188 @@ func (w *writeQuota) realReplenish(n int) {
 	}
 }
 
+// trInFlow is the connection-level inbound flow controller. In addition
+// to the standard HTTP/2 (limit, unacked) book-keeping it also carries a
+// `delta` field that records WINDOW_UPDATE credit promised to the peer
+// by maybeAdjust but not yet repaid by inbound DATA. This mirrors the
+// stream-level inFlow.delta mechanism and lets the SHM receiver
+// pre-credit the sender for an entire LPM at parse-time, so a large
+// message larger than the fair conn window does not stall the sender
+// for one round-trip per `limit/4` bytes.
+//
+// Invariants (all reads / writes under `mu`):
+//
+//	estimatedPeerConnQuota = limit + delta - unacked
+//
+// The estimated peer quota is what the peer believes its conn window
+// is, summing the baseline limit plus every WU we have emitted minus
+// the bytes we have observed in DATA. maybeAdjust(n) ensures
+// estimatedPeerConnQuota >= n by emitting a WINDOW_UPDATE for the
+// shortfall. The emitted increment is recorded in delta so that
+// subsequent onData(n) calls first repay this debt before counting
+// towards the ordinary unacked tally; without this, the same bytes
+// would later trigger a second WindowUpdate via the limit/4 threshold
+// path and silently inflate the peer's conn window indefinitely.
 type trInFlow struct {
+	mu                  sync.Mutex
 	limit               uint32
 	unacked             uint32
+	delta               uint32
 	effectiveWindowSize uint32
 }
 
+// newLimit updates the baseline conn-level limit (e.g. on BDP-driven
+// window growth). Returns the delta that must be advertised to the
+// peer as a WINDOW_UPDATE.
 func (f *trInFlow) newLimit(n uint32) uint32 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	d := n - f.limit
 	f.limit = n
-	f.updateEffectiveWindowSize()
+	f.updateEffectiveWindowSizeLocked()
 	return d
 }
 
-func (f *trInFlow) onData(n uint32) uint32 {
-	f.unacked += n
-	if f.unacked < f.limit/4 {
-		f.updateEffectiveWindowSize()
+// maybeAdjust returns the conn-level WINDOW_UPDATE delta to emit when
+// the receiver expects an inbound message of n bytes that does not fit
+// within the peer's current conn quota. Caller is expected to emit
+// the returned increment as a streamID=0 WINDOW_UPDATE BEFORE the
+// inbound DATA can drain the peer's window past zero, and the
+// emission MUST bypass the WindowUpdate batching threshold (this is
+// pre-credit needed RIGHT NOW, not drip credit).
+//
+// Algorithm (all in uint64 to avoid wrap near 2 GiB):
+//
+//   - est = limit + delta - unacked          (peer's view of conn quota)
+//   - if n <= est: return 0 (peer already has enough conn quota)
+//   - needed = n - est, capped at maxWindowSize - est so we never push
+//     the peer's view of conn quota past the HTTP/2 31-bit ceiling
+//   - delta += needed
+//
+// The returned value is also added to delta; subsequent onData(n)
+// repays this debt first (see comment on trInFlow).
+func (f *trInFlow) maybeAdjust(n uint32) uint32 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	est := uint64(f.limit) + uint64(f.delta) - uint64(f.unacked)
+	if uint64(n) <= est {
 		return 0
 	}
-	return f.reset()
+	needed := uint64(n) - est
+	room := uint64(maxWindowSize) - est
+	if needed > room {
+		needed = room
+	}
+	if needed == 0 {
+		return 0
+	}
+	f.delta = uint32(uint64(f.delta) + needed)
+	f.updateEffectiveWindowSizeLocked()
+	return uint32(needed)
 }
 
+// onData is called when an inbound DATA frame is parsed. Stock
+// HTTP/2 conn-level path (http2_client.go / http2_server.go) uses
+// the result to decide when to emit a WindowUpdate based on the
+// limit/4 drip threshold. SHM does NOT call this on the data path
+// anymore (it would conflict with the SHM-specific wuThreshold
+// batching). SHM instead uses settleDebt + sendWindowUpdate.
+//
+// For TCP/UDS callers this method still observes the limit/4
+// threshold and returns the WU increment to emit. Pre-credit debt
+// (set by maybeAdjust on the SHM path) is repaid here for safety —
+// it should always be zero in TCP/UDS deployment since no caller
+// invokes maybeAdjust on a trInFlow used by the TCP/UDS path.
+func (f *trInFlow) onData(n uint32) uint32 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.delta > 0 {
+		c := f.delta
+		if c > n {
+			c = n
+		}
+		f.delta -= c
+		n -= c
+	}
+	if n == 0 {
+		f.updateEffectiveWindowSizeLocked()
+		return 0
+	}
+	f.unacked += n
+	if f.unacked < f.limit/4 {
+		f.updateEffectiveWindowSizeLocked()
+		return 0
+	}
+	return f.resetLocked()
+}
+
+// settleDebt repays outstanding pre-credit debt with the n bytes
+// just received in an inbound DATA frame and returns the bytes that
+// were NOT absorbed by debt. The SHM transport routes those
+// residual bytes into its own batched WindowUpdate emission path
+// (sendWindowUpdate, gated by per-transport wuThreshold rather
+// than limit/4).
+//
+// This split exists because the SHM transport batches WU emission
+// based on a SHM-tuned threshold that can differ from the conn-level
+// inFlow's limit/4 (e.g. when the user clamps the stream window via
+// grpc.WithInitialWindowSize but leaves the conn limit at the
+// default maxWindowSize). Routing SHM through trInFlow.onData would
+// either never emit (limit/4 of maxWindowSize is ~512 MiB) or emit
+// at the wrong granularity. settleDebt isolates the debt-repayment
+// concern so SHM can keep its own emission cadence.
+func (f *trInFlow) settleDebt(n uint32) uint32 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.delta > 0 {
+		c := f.delta
+		if c > n {
+			c = n
+		}
+		f.delta -= c
+		n -= c
+	}
+	f.updateEffectiveWindowSizeLocked()
+	return n
+}
+
+// reset returns the current unacked bytes and zeroes the counter.
+// Public method kept for callers that already hold equivalent
+// invariants externally (none currently). Internal implementation
+// uses resetLocked.
 func (f *trInFlow) reset() uint32 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.resetLocked()
+}
+
+func (f *trInFlow) resetLocked() uint32 {
 	w := f.unacked
 	f.unacked = 0
-	f.updateEffectiveWindowSize()
+	f.updateEffectiveWindowSizeLocked()
 	return w
 }
 
 func (f *trInFlow) updateEffectiveWindowSize() {
-	atomic.StoreUint32(&f.effectiveWindowSize, f.limit-f.unacked)
+	f.mu.Lock()
+	f.updateEffectiveWindowSizeLocked()
+	f.mu.Unlock()
+}
+
+func (f *trInFlow) updateEffectiveWindowSizeLocked() {
+	// Saturating subtraction in uint64 to avoid underflow when delta
+	// is briefly larger than what limit-unacked represents (does not
+	// happen with current callers, but kept defensive).
+	available := uint64(f.limit) + uint64(f.delta)
+	if available > uint64(f.unacked) {
+		available -= uint64(f.unacked)
+	} else {
+		available = 0
+	}
+	if available > uint64(maxWindowSize) {
+		available = uint64(maxWindowSize)
+	}
+	atomic.StoreUint32(&f.effectiveWindowSize, uint32(available))
 }
 
 func (f *trInFlow) getSize() uint32 {

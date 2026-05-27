@@ -149,6 +149,20 @@ type ServerTransportProvider interface {
 	GetServerTransport() ServerTransport
 }
 
+// serverConfigApplier is an internal optional hook implemented by
+// ServerTransport types whose flow-control / connection-level parameters
+// can be reconfigured at provider-time from the grpc-level ServerConfig.
+//
+// The ShmServerTransport implements this so grpc.ServerOption values such
+// as grpc.InitialWindowSize, grpc.InitialConnWindowSize and
+// grpc.MaxConcurrentStreams flow into the SHM transport's flow-control
+// state machine without changing the (already-published) constructor
+// signature. The method is invoked from NewServerTransport's provider
+// fast path, before any stream has been accepted on the transport.
+type serverConfigApplier interface {
+	ApplyServerConfig(*ServerConfig)
+}
+
 // NewServerTransport creates a http2 transport with conn and configuration
 // options from config.
 //
@@ -160,7 +174,25 @@ func NewServerTransport(conn net.Conn, config *ServerConfig) (_ ServerTransport,
 	// Check if the connection provides its own server transport
 	if provider, ok := conn.(ServerTransportProvider); ok {
 		shmDebugf("[DEBUG] NewServerTransport: using ServerTransportProvider from conn type %T", conn)
-		return provider.GetServerTransport(), nil
+		st := provider.GetServerTransport()
+		// If the provider's transport accepts a ServerConfig override (the SHM
+		// transport does — see ShmServerTransport.ApplyServerConfig), apply
+		// it here BEFORE streams start so grpc.InitialWindowSize /
+		// grpc.InitialConnWindowSize / grpc.MaxStreams supplied as
+		// grpc.ServerOption actually take effect on the SHM data plane.
+		//
+		// Previously SHM transports were constructed in Accept() with no
+		// access to ServerConfig, so any grpc-level server option that maps
+		// to flow-control was silently ignored. With a client dialing
+		// grpc.WithInitialWindowSize(65535) but the server still running at
+		// shm-tuned 32 MiB receive window / 8 MiB WU threshold, the small
+		// client window combined with the large server WU emission threshold
+		// led to a permanent deadlock — the receiver accumulated drip credit
+		// far below threshold and never emitted a WINDOW_UPDATE.
+		if applier, ok := st.(serverConfigApplier); ok && config != nil {
+			applier.ApplyServerConfig(config)
+		}
+		return st, nil
 	}
 	shmDebugf("[DEBUG] NewServerTransport: conn type %T does not implement ServerTransportProvider, using HTTP/2", conn)
 

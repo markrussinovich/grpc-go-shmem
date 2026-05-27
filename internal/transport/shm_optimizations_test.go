@@ -205,10 +205,6 @@ func TestShmFrameWriterConcurrentCloseNoPanic(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestShmWindowUpdateBatching(t *testing.T) {
-	// Exercises WINDOW_UPDATE semantics; opt out of no-WU default.
-	ConfigureShmNoWindowUpdate(false)
-	t.Cleanup(ResetShmNoWindowUpdateForBench)
-
 	segName := testSegName("test_wu_batch")
 	defer RemoveSegment(segName)
 
@@ -234,39 +230,34 @@ func TestShmWindowUpdateBatching(t *testing.T) {
 	defer ct.Close(nil)
 
 	// Send small WindowUpdates that should be batched (below threshold).
-	smallDelta := uint32(1024) // 1KB - well below 8MB threshold
+	smallDelta := uint32(1024) // 1KB - well below threshold
 	for i := 0; i < 100; i++ {
 		ct.sendWindowUpdate(0, smallDelta)
 	}
 
-	// Accumulated = 100KB, still below 8MB, so no frame should have been sent.
-	ct.sendQuotaMu.Lock()
-	pending := ct.pendingConnWU
-	ct.sendQuotaMu.Unlock()
-
+	// Under the WU Lockless Path: drip producers Add into pendingConnWU
+	// (atomic) without taking sendQuotaMu. Until a producer crosses the
+	// per-transport wuThreshold, the accumulator just grows.
+	pending := ct.pendingConnWU.Load()
 	if pending != 100*smallDelta {
 		t.Errorf("pendingConnWU = %d, want %d (should batch without sending)", pending, 100*smallDelta)
 	}
 
-	// Now send a large delta that pushes past the threshold.
-	ct.sendWindowUpdate(0, uint32(shmWindowUpdateThreshold))
-
-	ct.sendQuotaMu.Lock()
-	pendingAfter := ct.pendingConnWU
-	ct.sendQuotaMu.Unlock()
-
+	// Now send a large delta that pushes past the threshold; emit Swaps
+	// the accumulator to zero.
+	ct.sendWindowUpdate(0, ct.wuThreshold.Load())
+	pendingAfter := ct.pendingConnWU.Load()
 	if pendingAfter != 0 {
 		t.Errorf("pendingConnWU after flush = %d, want 0", pendingAfter)
 	}
 }
 
 func TestShmWindowUpdateStreamCleanup(t *testing.T) {
-	// Exercises WINDOW_UPDATE semantics; opt out of no-WU default.
-	ConfigureShmNoWindowUpdate(false)
-	t.Cleanup(ResetShmNoWindowUpdateForBench)
-
-	// Verify that pendingStreamWU entries are cleaned up via the real
-	// closeStream path (not manual delete).
+	// Verify that per-stream pending WU credit is cleared via the real
+	// closeStream path. Under the WU Lockless Path, per-stream pending
+	// lives on Stream.pendingWU (atomic.Uint32) instead of a transport
+	// map; closeStream calls s.pendingWU.Store(0) explicitly so a late
+	// drip producer cannot resurrect a stale value.
 	segName := testSegName("test_wu_cleanup")
 	defer RemoveSegment(segName)
 
@@ -298,37 +289,27 @@ func TestShmWindowUpdateStreamCleanup(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewStream: %v", err)
 	}
-	streamID := s.id
 
-	// Accumulate per-stream WU below threshold.
-	ct.sendWindowUpdate(streamID, 4096)
-	ct.sendWindowUpdate(streamID, 4096)
+	// Accumulate per-stream WU below threshold so it sits in s.pendingWU.
+	ct.sendWindowUpdate(s.id, 4096)
+	ct.sendWindowUpdate(s.id, 4096)
 
-	ct.sendQuotaMu.Lock()
-	_, exists := ct.pendingStreamWU[streamID]
-	ct.sendQuotaMu.Unlock()
-	if !exists {
-		t.Fatal("pendingStreamWU should have entry for stream after sendWindowUpdate")
+	if got := s.pendingWU.Load(); got == 0 {
+		t.Fatal("s.pendingWU should be > 0 after sub-threshold sendWindowUpdate")
 	}
 
 	// Close the stream via the real transport path.
 	ct.closeStream(s, nil, true, 0, nil, nil, false)
 
-	ct.sendQuotaMu.Lock()
-	_, exists = ct.pendingStreamWU[streamID]
-	ct.sendQuotaMu.Unlock()
-	if exists {
-		t.Error("pendingStreamWU entry should be cleaned up after closeStream")
+	if got := s.pendingWU.Load(); got != 0 {
+		t.Errorf("s.pendingWU after closeStream = %d, want 0", got)
 	}
 }
 
 func TestShmWindowUpdateServerStreamCleanup(t *testing.T) {
-	// Exercises WINDOW_UPDATE semantics; opt out of no-WU default.
-	ConfigureShmNoWindowUpdate(false)
-	t.Cleanup(ResetShmNoWindowUpdateForBench)
-
-	// Verify that pendingStreamWU entries are cleaned up on the server side
-	// when a stream is terminated via handleTrailers or handleCancel.
+	// Verify that per-stream pending WU credit is cleared on the server
+	// side when a stream is terminated via handleTrailers or handleCancel.
+	// Mirror of the client-side cleanup test above.
 	segName := testSegName("test_wu_srv_cleanup")
 	defer RemoveSegment(segName)
 
@@ -345,51 +326,39 @@ func TestShmWindowUpdateServerStreamCleanup(t *testing.T) {
 	}
 	defer st.Close(nil)
 
-	// Simulate two streams with pending (sub-threshold) WindowUpdate deltas.
+	// Simulate two streams. Register them so lookupStream + the close
+	// paths can find them.
 	streamA := uint32(1)
 	streamB := uint32(3)
-
-	st.sendWindowUpdate(streamA, 4096)
-	st.sendWindowUpdate(streamB, 4096)
-
-	st.sendQuotaMu.Lock()
-	_, existsA := st.pendingStreamWU[streamA]
-	_, existsB := st.pendingStreamWU[streamB]
-	st.sendQuotaMu.Unlock()
-	if !existsA || !existsB {
-		t.Fatal("pendingStreamWU should have entries after sendWindowUpdate")
-	}
-
-	// handleTrailers should clean up streamA's entry.
-	// Build a minimal valid trailers payload.
-	trailers := encodeTrailers(TrailersV1{Version: 1, GRPCStatusCode: 0, GRPCStatusMsg: "OK"})
-	// Register a fake stream so handleTrailers doesn't bail early.
-	st.mu.Lock()
-	st.streams[streamA] = &ServerStream{Stream: Stream{id: streamA, ctx: context.Background()}}
-	st.mu.Unlock()
-	st.handleTrailers(streamA, trailers)
-
-	st.sendQuotaMu.Lock()
-	_, existsA = st.pendingStreamWU[streamA]
-	st.sendQuotaMu.Unlock()
-	if existsA {
-		t.Error("pendingStreamWU[streamA] should be cleaned up after handleTrailers")
-	}
-
-	// handleCancel should clean up streamB's entry.
+	sA := &ServerStream{Stream: Stream{id: streamA, ctx: context.Background()}}
 	cancelCtx, cancelFn := context.WithCancel(context.Background())
 	sB := &ServerStream{Stream: Stream{id: streamB, ctx: cancelCtx}}
 	sB.cancel = cancelFn
 	st.mu.Lock()
+	st.streams[streamA] = sA
 	st.streams[streamB] = sB
 	st.mu.Unlock()
+
+	st.sendWindowUpdate(streamA, 4096)
+	st.sendWindowUpdate(streamB, 4096)
+
+	if sA.pendingWU.Load() == 0 || sB.pendingWU.Load() == 0 {
+		t.Fatal("pendingWU should be > 0 after sub-threshold sendWindowUpdate")
+	}
+
+	// handleTrailers should clean up streamA's entry.
+	trailers := encodeTrailers(TrailersV1{Version: 1, GRPCStatusCode: 0, GRPCStatusMsg: "OK"})
+	st.handleTrailers(streamA, trailers)
+
+	if got := sA.pendingWU.Load(); got != 0 {
+		t.Errorf("sA.pendingWU after handleTrailers = %d, want 0", got)
+	}
+
+	// handleCancel should clean up streamB's entry.
 	st.handleCancel(streamB)
 
-	st.sendQuotaMu.Lock()
-	_, existsB = st.pendingStreamWU[streamB]
-	st.sendQuotaMu.Unlock()
-	if existsB {
-		t.Error("pendingStreamWU[streamB] should be cleaned up after handleCancel")
+	if got := sB.pendingWU.Load(); got != 0 {
+		t.Errorf("sB.pendingWU after handleCancel = %d, want 0", got)
 	}
 }
 

@@ -62,14 +62,14 @@ type DialOptions struct {
 
 	// InitialWindowSize overrides the per-stream HTTP/2 send / receive
 	// window for the SHM transport. When <= 0 the SHM-tuned default
-	// (maxWindowSize, ~2 GiB, i.e. flow control effectively disabled
-	// and the ring buffer is the only backpressure signal) is used.
-	// Set non-zero to make grpc.WithInitialWindowSize take effect on
-	// the SHM transport — primarily useful for benchmarks that need
-	// apples-to-apples comparison against HTTP/2 over TCP / UDS at
-	// matched settings. With non-default values the SHM transport
-	// behaves like HTTP/2: producer chunks writes under the window;
-	// receiver credits WINDOW_UPDATE per DATA frame.
+	// (shmInitialWindowSize, currently 32 MiB) is used. With the SHM-
+	// tuned default window comfortably exceeds the per-message size of
+	// typical workloads, so WINDOW_UPDATE machinery is dormant in
+	// production and SHM behaves like an unconstrained transport.
+	// Set this to a smaller value (e.g. 65535 to match the HTTP/2 spec
+	// default used by TCP / UDS) to exercise HTTP/2-compatible flow
+	// control: the producer chunks writes under the window and the
+	// receiver credits WINDOW_UPDATE per consumed bytes.
 	InitialWindowSize int32
 
 	// InitialConnWindowSize overrides the connection-level HTTP/2
@@ -346,9 +346,7 @@ func DialShm(ctx context.Context, addr string, opts *DialOptions) (ClientTranspo
 		// of this commit's machinery) actually exercise the HTTP/2
 		// flow-control state machine.
 		if opts.InitialConnWindowSize > 0 {
-			clientTransport.sendQuotaMu.Lock()
-			clientTransport.connSendQuota = int64(opts.InitialConnWindowSize)
-			clientTransport.sendQuotaMu.Unlock()
+			clientTransport.connSendQuota.Store(int64(opts.InitialConnWindowSize))
 			clientTransport.connInFlow = trInFlow{limit: uint32(opts.InitialConnWindowSize)}
 			clientTransport.connInFlow.updateEffectiveWindowSize()
 		}
@@ -358,6 +356,14 @@ func DialShm(ctx context.Context, addr string, opts *DialOptions) (ClientTranspo
 			// so each new stream picks it up.
 			clientTransport.initialStreamWindow = int64(opts.InitialWindowSize)
 			clientTransport.initialWindowSize = opts.InitialWindowSize
+			// Recompute the per-transport WU emission threshold so the
+			// (potentially much smaller) user-requested window doesn't
+			// inherit the 8 MiB package-global default and cause the
+			// receiver's onRead credits to accumulate forever without
+			// emitting a WU frame (a real deadlock under tiny windows).
+			// wuThreshold is atomic — lockless WU emit path reads via
+			// Load(), so a plain Store is sufficient.
+			clientTransport.wuThreshold.Store(computeWUThreshold(opts.InitialWindowSize))
 		}
 		// Store auth info on transport
 		if authInfo != nil {

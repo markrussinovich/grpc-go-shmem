@@ -219,14 +219,27 @@ func logBenchEnvOnce(b *testing.B) {
 		if bProf == "" {
 			bProf = "shm-tuned (SHM keeps 2 GiB quota, TCP/UDS HTTP/2 defaults)"
 		}
-		// Note: no-WU flow control and eventfd waker are now ON by
-		// default (v3.4 baseline). Tests that want to compare against
-		// the futex / HTTP/2-WU path can call
-		// transport.ConfigureShmNoWindowUpdate(false) or
-		// transport.ConfigureShmEventfdWakerForBench(false).
-		b.Logf("SHM bench env: BENCH_PROFILE=%s BENCH_DIRTY_DEFAULT_POOL=%s SHM_SPIN_ITERS=%s initialWindowSize=%d maxFrameSize=%d applyToShm=%v",
+		// Resolve effective maxFrameSize: SHM_MAX_FRAME_SIZE env var
+		// overrides whatever BENCH_PROFILE sets. Report the resolved
+		// value so reviewers see what's actually in effect.
+		maxFrameSize := prof.maxFrameSize
+		var maxFrameSource string
+		if v := os.Getenv("SHM_MAX_FRAME_SIZE"); v != "" {
+			if n, perr := strconv.Atoi(v); perr == nil && n > 0 {
+				maxFrameSize = n
+				maxFrameSource = " (overridden by SHM_MAX_FRAME_SIZE)"
+			}
+		}
+		if maxFrameSize == 0 {
+			maxFrameSource = " (SHM default, h2MaxFramePayload)"
+		}
+		// SHM transport unconditionally uses HTTP/2-compatible flow
+		// control. With the SHM-tuned default initial window (32 MiB)
+		// the WINDOW_UPDATE machinery stays dormant; with a smaller
+		// window (set via grpc.WithInitialWindowSize) it engages.
+		b.Logf("SHM bench env: BENCH_PROFILE=%s BENCH_DIRTY_DEFAULT_POOL=%s SHM_SPIN_ITERS=%s initialWindowSize=%d maxFrameSize=%d%s applyToShm=%v",
 			bProf, dirtyPool, spin,
-			prof.initialWindowSize, prof.maxFrameSize, prof.applyToShm,
+			prof.initialWindowSize, maxFrameSize, maxFrameSource, prof.applyToShm,
 		)
 	})
 }

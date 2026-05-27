@@ -29,25 +29,37 @@ import (
 const (
 	shmControlSuffix = "_ctl"
 	// controlWireVersion is the version byte emitted at the start of
-	// every control-plane frame. The handshake protocol is wire-format
-	// compatible with the .NET peer (grpc-dotnet-shm):
+	// every control-plane frame. v2 introduces per-connection flow-
+	// control negotiation: CONNECT carries a Flags byte (existing
+	// SINGLE_STREAM bit 0 plus new HTTP2_FC bit 1), and ACCEPT echoes
+	// a Flags byte after the selected-wire byte so the server can
+	// confirm or override the client's mode preference.
 	//
-	//   - CONNECT carries a mandatory wire-format advertisement
-	//     (count, formats[]) at byte 18+; the peer MUST advertise H2.
-	//   - ACCEPT carries a mandatory selected-wire byte after the
-	//     segment name; the server MUST select H2.
-	//
-	// Peers that omit the advertisement (legacy Custom16-only) or
-	// advertise non-H2 formats are rejected at the handshake boundary;
-	// the data plane is HTTP/2-only and the handshake makes that
-	// explicit so a stale peer cannot silently mismatch the data-plane
-	// frame format.
-	controlWireVersion = uint8(1)
+	// v1 (legacy) peers without the ACCEPT Flags byte are rejected
+	// at the handshake boundary because the bumped version forces a
+	// matched-version handshake. The grpc-go and grpc-dotnet
+	// implementations are still pre-1.0 so a breaking wire change is
+	// acceptable to land the flow-control negotiation cleanly.
+	controlWireVersion = uint8(2)
 
 	// wireFormatH2 is the on-wire byte for the HTTP/2 data plane.
 	// Matches grpc-dotnet-shm's ControlWire.ProtocolWireHttp2. The
 	// historical 0x00 byte (Custom16) is rejected.
 	wireFormatH2 = uint8(1)
+
+	// CONNECT / ACCEPT Flags bits.
+	//
+	// Bit 0 (SINGLE_STREAM) is a CONNECT-only hint that the client
+	// will not open more than one concurrent stream; the server may
+	// optimise scheduling state.
+	//
+	// Bit 0 (SINGLE_STREAM_MODE) opts the connection into the
+	// single-stream fast path on both sides (inline writes, writer-
+	// loop bypass via inlineMu.TryLock, cachedStream MRU dispatch).
+	// Bit 1 is RESERVED (must be 0): earlier drafts used it to opt
+	// into HTTP/2-compatible flow control, but that mode is now the
+	// only profile and the bit no longer carries semantics.
+	connectFlagSingleStream uint8 = 1 << 0
 )
 
 // Control-plane frame types (used only on the control segment).
@@ -82,9 +94,11 @@ func encodeConnectRequest(req connectRequest) []byte {
 	b[0] = controlWireVersion
 	binary.LittleEndian.PutUint64(b[1:9], req.ringA)
 	binary.LittleEndian.PutUint64(b[9:17], req.ringB)
+	var flags uint8
 	if req.singleStreamMode {
-		b[17] = 1
+		flags |= connectFlagSingleStream
 	}
+	b[17] = flags
 	b[18] = 1            // wireFormatCount
 	b[19] = wireFormatH2 // only H2 is advertised
 	return b
@@ -95,7 +109,7 @@ func decodeConnectRequest(b []byte) (connectRequest, error) {
 		return connectRequest{}, errors.New("connect request too short")
 	}
 	if b[0] != controlWireVersion {
-		return connectRequest{}, fmt.Errorf("unsupported connect request version %d", b[0])
+		return connectRequest{}, fmt.Errorf("unsupported connect request version %d (this peer speaks v%d)", b[0], controlWireVersion)
 	}
 	if len(b) < 1+8+8 {
 		return connectRequest{}, fmt.Errorf("connect request invalid length %d (need >= 17)", len(b))
@@ -105,7 +119,8 @@ func decodeConnectRequest(b []byte) (connectRequest, error) {
 		ringB: binary.LittleEndian.Uint64(b[9:17]),
 	}
 	if len(b) > 17 {
-		req.singleStreamMode = b[17]&1 != 0
+		flags := b[17]
+		req.singleStreamMode = flags&connectFlagSingleStream != 0
 	}
 
 	// Wire-format advertisement is mandatory: the peer must explicitly
@@ -142,14 +157,19 @@ func decodeConnectRequest(b []byte) (connectRequest, error) {
 
 func encodeConnectResponse(resp connectResponse) []byte {
 	name := []byte(resp.segmentName)
-	// version(1) + nameLen(4) + name(N) + selectedWire(1)=H2.
-	// The trailing selected-wire byte is mandatory; the .NET peer
-	// rejects responses that omit it (legacy Custom16 selection).
-	b := make([]byte, 1+4+len(name)+1)
+	// version(1) + nameLen(4) + name(N) + selectedWire(1)=H2 + flags(1).
+	//
+	// The selected-wire byte and Flags byte are both mandatory in v2
+	// of the control wire format. Flags is currently always zero; bit 1
+	// was reserved earlier for the HTTP/2 flow-control mode flag, which
+	// has been removed (HTTP/2-compatible flow control is the only
+	// profile and is unconditional).
+	b := make([]byte, 1+4+len(name)+1+1)
 	b[0] = controlWireVersion
 	binary.LittleEndian.PutUint32(b[1:5], uint32(len(name)))
 	copy(b[5:5+len(name)], name)
 	b[5+len(name)] = wireFormatH2
+	b[5+len(name)+1] = 0 // reserved flags byte
 	return b
 }
 
@@ -158,7 +178,7 @@ func decodeConnectResponse(b []byte) (connectResponse, error) {
 		return connectResponse{}, errors.New("connect response too short")
 	}
 	if b[0] != controlWireVersion {
-		return connectResponse{}, fmt.Errorf("unsupported connect response version %d", b[0])
+		return connectResponse{}, fmt.Errorf("unsupported connect response version %d (this peer speaks v%d)", b[0], controlWireVersion)
 	}
 	nameLen := int(binary.LittleEndian.Uint32(b[1:5]))
 	if nameLen < 0 || len(b[5:]) < nameLen {
@@ -176,6 +196,13 @@ func decodeConnectResponse(b []byte) (connectResponse, error) {
 			"connect response selects wire format 0x%02x, expected HTTP/2 (0x%02x)",
 			selected, wireFormatH2)
 	}
+	// Flags byte is mandatory in v2.
+	if len(b) <= 5+nameLen+1 {
+		return connectResponse{}, errors.New(
+			"connect response missing flags byte; v2 servers MUST include the reserved flags byte")
+	}
+	// Flags bit 1 was the HTTP/2 flow-control mode flag in earlier drafts;
+	// it is now reserved and ignored.
 	return connectResponse{
 		segmentName: string(b[5 : 5+nameLen]),
 	}, nil
