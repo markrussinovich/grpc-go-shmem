@@ -763,7 +763,16 @@ func (t *ShmServerTransport) processIncomingData(ctx context.Context) {
 		// Dispatch frames based on type
 		switch fh.Type {
 		case FrameTypeHEADERS:
-			if err := t.handleHeaders(ctx, fh.StreamID, payload); err != nil {
+			// PR #10 (Headers Hot Path Cleanup): the codec stashed the
+			// decoded HeadersV1 struct on the holder; takeOrDecodeHeaders
+			// picks it up, skipping the encodeHeaders → decodeHeaders
+			// round-trip that pre-PR-#10 ran on every HEADERS frame.
+			hdr, decErr := takeOrDecodeHeaders(t.clientToServer.h2Decoder(), payload)
+			if decErr != nil {
+				release()
+				continue
+			}
+			if err := t.handleHeaders(ctx, fh.StreamID, hdr); err != nil {
 				// Log error but continue processing
 				release()
 				continue
@@ -841,7 +850,22 @@ func (t *ShmServerTransport) processIncomingData(ctx context.Context) {
 			t.handleHalfClose(fh.StreamID)
 			release()
 		case FrameTypeTRAILERS:
-			t.handleTrailers(fh.StreamID, payload)
+			// PR #10: see HEADERS branch above.
+			tr, decErr := takeOrDecodeTrailers(t.clientToServer.h2Decoder(), payload)
+			if decErr != nil {
+				// Surface decode failure to the stream so its recv
+				// loop returns the error rather than hanging waiting
+				// for TRAILERS that never arrive.
+				t.mu.RLock()
+				s, exists := t.streams[fh.StreamID]
+				t.mu.RUnlock()
+				if exists {
+					s.write(recvMsg{err: decErr})
+				}
+				release()
+				continue
+			}
+			t.handleTrailers(fh.StreamID, tr)
 			release()
 		case FrameTypeCANCEL:
 			t.handleCancel(fh.StreamID)
@@ -878,7 +902,7 @@ func (t *ShmServerTransport) processIncomingData(ctx context.Context) {
 }
 
 // handleHeaders processes a HEADERS frame and creates a new ServerStream
-func (t *ShmServerTransport) handleHeaders(ctx context.Context, streamID uint32, payload []byte) error {
+func (t *ShmServerTransport) handleHeaders(ctx context.Context, streamID uint32, hdr HeadersV1) error {
 	// Fast-path checks under lock.
 	t.mu.Lock()
 	if t.closed.Load() {
@@ -908,20 +932,23 @@ func (t *ShmServerTransport) handleHeaders(ctx context.Context, streamID uint32,
 	}
 	t.mu.Unlock()
 
-	// Decode headers using the proper frame format.
-	hdr, err := decodeHeaders(payload)
-	if err != nil {
-		return err
-	}
-
-	// Convert KV metadata to metadata.MD
-	md := make(metadata.MD)
-	for _, kv := range hdr.Metadata {
-		var vals []string
-		for _, v := range kv.Values {
-			vals = append(vals, string(v))
+	// PR #10 (Headers Hot Path Cleanup, C2): skip metadata.MD
+	// construction when no metadata is present (the common case for
+	// stock gRPC unary RPCs). Pre-PR-#10 a fresh map + per-KV slice
+	// were allocated on every HEADERS frame regardless. nil is the
+	// canonical "no metadata" sentinel for metadata.MD (it's a
+	// map[string][]string under the hood — nil and empty iterate the
+	// same way for downstream consumers).
+	var md metadata.MD
+	if len(hdr.Metadata) > 0 {
+		md = make(metadata.MD, len(hdr.Metadata))
+		for _, kv := range hdr.Metadata {
+			vals := make([]string, len(kv.Values))
+			for i, v := range kv.Values {
+				vals[i] = string(v)
+			}
+			md[kv.Key] = vals
 		}
-		md[kv.Key] = vals
 	}
 
 	// Create the ServerStream
@@ -1219,21 +1246,16 @@ func (t *ShmServerTransport) handlePing(ctx context.Context, payload []byte) {
 	}
 }
 
-// handleTrailers processes a TRAILERS frame
-func (t *ShmServerTransport) handleTrailers(streamID uint32, payload []byte) {
+// handleTrailers processes a TRAILERS frame. PR #10 (Headers Hot Path
+// Cleanup): trailers are decoded at the dispatch site via
+// takeOrDecodeTrailers (which prefers the holder-stashed struct over
+// re-parsing the wire payload).
+func (t *ShmServerTransport) handleTrailers(streamID uint32, trailers TrailersV1) {
 	t.mu.RLock()
 	s, exists := t.streams[streamID]
 	t.mu.RUnlock()
 
 	if !exists {
-		return
-	}
-
-	// Decode trailers using the proper frame format
-	trailers, err := decodeTrailers(payload)
-	if err != nil {
-		// Send error to stream
-		s.write(recvMsg{err: err})
 		return
 	}
 

@@ -347,7 +347,10 @@ func TestShmWindowUpdateServerStreamCleanup(t *testing.T) {
 	}
 
 	// handleTrailers should clean up streamA's entry.
-	trailers := encodeTrailers(TrailersV1{Version: 1, GRPCStatusCode: 0, GRPCStatusMsg: "OK"})
+	// PR #10 (Headers Hot Path Cleanup): handleTrailers now takes a
+	// TrailersV1 struct directly; the dispatch site is responsible for
+	// decoding from the wire payload.
+	trailers := TrailersV1{Version: 1, GRPCStatusCode: 0, GRPCStatusMsg: "OK"}
 	st.handleTrailers(streamA, trailers)
 
 	if got := sA.pendingWU.Load(); got != 0 {
@@ -1087,14 +1090,24 @@ func TestShmZeroCopyNonMessageCopies(t *testing.T) {
 	if fh.Type != FrameTypeHEADERS {
 		t.Fatalf("type = %d, want HEADERS", fh.Type)
 	}
-	gotHv, derr := decodeHeaders(buf.ReadOnlyData())
+	// PR #10: HEADERS frames now return a nil mem.Buffer; the decoded
+	// HeadersV1 is stashed on the holder and consumed via
+	// takeOrDecodeHeaders. Pass a nil payload because there is no
+	// wire body to fall back to.
+	var pl []byte
+	if buf != nil {
+		pl = buf.ReadOnlyData()
+	}
+	gotHv, derr := takeOrDecodeHeaders(rx.h2Decoder(), pl)
 	if derr != nil {
 		t.Fatalf("decodeHeaders: %v", derr)
 	}
 	if gotHv.Method != hv.Method || gotHv.Authority != hv.Authority {
 		t.Fatalf("HeadersV1 mismatch: got %+v, want %+v", gotHv, hv)
 	}
-	buf.Free()
+	if buf != nil {
+		buf.Free()
+	}
 }
 
 func TestShmZeroCopyMultiStreamCorrectness(t *testing.T) {

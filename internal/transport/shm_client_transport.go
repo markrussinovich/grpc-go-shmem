@@ -1037,6 +1037,25 @@ func (t *ShmClientTransport) processIncomingData(ctx context.Context) {
 			stream, ok = t.streams[fh.StreamID]
 			t.mu.RUnlock()
 			if !ok {
+				// PR #10 (Headers Hot Path Cleanup): orphan-stream frame
+				// (a locally-cancelled stream whose server HEADERS or
+				// TRAILERS are still in flight). The codec may have
+				// stashed a HeadersV1 / TrailersV1 struct on the holder
+				// for this frame; the documented contract is "consumer
+				// MUST take before the next read". Clear the slots
+				// defensively so a future refactor that adds another
+				// dispatch branch doesn't surface a stale prior-frame
+				// struct, and so the byte slices inside the struct are
+				// not pinned past their use.
+				h := t.serverToClient.h2Decoder()
+				if h.decodedHeaderSet {
+					h.decodedHeader = HeadersV1{}
+					h.decodedHeaderSet = false
+				}
+				if h.decodedTrailerSet {
+					h.decodedTrailer = TrailersV1{}
+					h.decodedTrailerSet = false
+				}
 				release()
 				continue
 			}
@@ -1046,7 +1065,11 @@ func (t *ShmClientTransport) processIncomingData(ctx context.Context) {
 		switch fh.Type {
 		case FrameTypeHEADERS:
 			// Server sent headers (response headers)
-			h, err := decodeHeaders(payload)
+			// PR #10 (Headers Hot Path Cleanup): takeOrDecodeHeaders picks
+			// up the HeadersV1 struct that the codec stashed on the holder,
+			// skipping the encodeHeaders → decodeHeaders round-trip that
+			// pre-PR-#10 ran per HEADERS frame.
+			h, err := takeOrDecodeHeaders(t.serverToClient.h2Decoder(), payload)
 			if err != nil {
 				release()
 				stream.write(recvMsg{err: err})
@@ -1054,13 +1077,19 @@ func (t *ShmClientTransport) processIncomingData(ctx context.Context) {
 			}
 
 			// Populate the received header metadata.
-			md := make(metadata.MD)
-			for _, kv := range h.Metadata {
-				vals := make([]string, 0, len(kv.Values))
-				for _, v := range kv.Values {
-					vals = append(vals, string(v))
+			// PR #10 (C2): skip metadata.MD construction when no metadata
+			// is present (common case). Pre-PR-#10 a fresh map + per-KV
+			// slice were allocated per HEADERS frame regardless.
+			var md metadata.MD
+			if len(h.Metadata) > 0 {
+				md = make(metadata.MD, len(h.Metadata))
+				for _, kv := range h.Metadata {
+					vals := make([]string, 0, len(kv.Values))
+					for _, v := range kv.Values {
+						vals = append(vals, string(v))
+					}
+					md[kv.Key] = vals
 				}
-				md[kv.Key] = vals
 			}
 			if v := md.Get("grpc-encoding"); len(v) > 0 {
 				stream.recvCompress = v[0]
@@ -1190,7 +1219,8 @@ func (t *ShmClientTransport) processIncomingData(ctx context.Context) {
 
 		case FrameTypeTRAILERS:
 			// Server sent trailers (end of stream)
-			tr, err := decodeTrailers(payload)
+			// PR #10: see HEADERS branch above.
+			tr, err := takeOrDecodeTrailers(t.serverToClient.h2Decoder(), payload)
 			if err != nil {
 				release()
 				t.closeStream(stream, err, false, 0, nil, nil, false)

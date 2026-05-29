@@ -143,7 +143,7 @@ func TestShmDial_E2E(t *testing.T) {
 				t.Errorf("echo mismatch: got %q want %q", body, payload)
 			}
 		case FrameTypeTRAILERS:
-			tr, err := decodeTrailers(body)
+			tr, err := takeOrDecodeTrailers(ct.serverToClient.h2Decoder(), body)
 			if err != nil {
 				t.Fatalf("decodeTrailers: %v", err)
 			}

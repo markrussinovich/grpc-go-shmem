@@ -145,7 +145,8 @@ func (c *ShmUnaryClient) startReader() {
 				switch fh.Type {
 				case FrameTypeHEADERS:
 					log.Printf("Client: reader dispatching HEADERS for stream %d", fh.StreamID)
-					hdr, err := decodeHeaders(payload)
+					// PR #10: prefer the codec-stashed HeadersV1 struct.
+					hdr, err := takeOrDecodeHeaders(c.rx.h2Decoder(), payload)
 					c.dispatchHeaders(fh.StreamID, hdr, err)
 				case FrameTypeMESSAGE:
 					log.Printf("Client: reader dispatching MESSAGE for stream %d", fh.StreamID)
@@ -153,7 +154,7 @@ func (c *ShmUnaryClient) startReader() {
 					c.dispatchMessage(fh.StreamID, payload)
 				case FrameTypeTRAILERS:
 					log.Printf("Client: reader dispatching TRAILERS for stream %d", fh.StreamID)
-					tr, err := decodeTrailers(payload)
+					tr, err := takeOrDecodeTrailers(c.rx.h2Decoder(), payload)
 					c.dispatchTrailers(fh.StreamID, tr, err)
 				case FrameTypePING:
 					log.Printf("Client: reader handling PING for stream %d", fh.StreamID)

@@ -287,7 +287,7 @@ func TestH2WriteReadFrame_Headers(t *testing.T) {
 	if fh.Type != FrameTypeHEADERS {
 		t.Errorf("type mismatch: got %d want %d", fh.Type, FrameTypeHEADERS)
 	}
-	decoded, err := decodeHeaders(got)
+	decoded, err := takeOrDecodeHeaders(rx.h2Decoder(), got)
 	if err != nil {
 		t.Fatalf("decodeHeaders: %v", err)
 	}
@@ -330,7 +330,7 @@ func TestH2WriteReadFrame_Trailers(t *testing.T) {
 	if fh.Type != FrameTypeTRAILERS {
 		t.Errorf("type mismatch: got %d want TRAILERS", fh.Type)
 	}
-	decoded, err := decodeTrailers(got)
+	decoded, err := takeOrDecodeTrailers(rx.h2Decoder(), got)
 	if err != nil {
 		t.Fatalf("decodeTrailers: %v", err)
 	}
@@ -390,7 +390,7 @@ func TestH2BinaryMetadata_HeaderRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("readFrame: %v", err)
 	}
-	decoded, err := decodeHeaders(got)
+	decoded, err := takeOrDecodeHeaders(rx.h2Decoder(), got)
 	if err != nil {
 		t.Fatalf("decodeHeaders: %v", err)
 	}
@@ -460,7 +460,7 @@ func TestH2BinaryMetadata_TrailerRoundTrip(t *testing.T) {
 	if fh.Type != FrameTypeTRAILERS {
 		t.Fatalf("type: got %d want TRAILERS", fh.Type)
 	}
-	dec, err := decodeTrailers(got)
+	dec, err := takeOrDecodeTrailers(rx.h2Decoder(), got)
 	if err != nil {
 		t.Fatalf("decodeTrailers: %v", err)
 	}
@@ -842,7 +842,7 @@ func TestH2Continuation_TwoFragments_RoundTrip(t *testing.T) {
 	if fh.Type != FrameTypeHEADERS {
 		t.Fatalf("type: got %d want HEADERS", fh.Type)
 	}
-	hv, derr := decodeHeaders(payload)
+	hv, derr := takeOrDecodeHeaders(rx.h2Decoder(), payload)
 	if derr != nil {
 		t.Fatalf("decodeHeaders: %v", derr)
 	}
@@ -969,7 +969,7 @@ func TestH2BinaryMetadata_MixedCaseKey(t *testing.T) {
 	if err != nil {
 		t.Fatalf("readFrame: %v", err)
 	}
-	dec, err := decodeHeaders(got)
+	dec, err := takeOrDecodeHeaders(rx.h2Decoder(), got)
 	if err != nil {
 		t.Fatalf("decodeHeaders: %v", err)
 	}
@@ -1087,7 +1087,7 @@ func TestH2GrpcMessage_PercentEncoded(t *testing.T) {
 	if fh.Type != FrameTypeTRAILERS {
 		t.Fatalf("type: got %d want TRAILERS", fh.Type)
 	}
-	dec, err := decodeTrailers(got)
+	dec, err := takeOrDecodeTrailers(rx.h2Decoder(), got)
 	if err != nil {
 		t.Fatalf("decodeTrailers: %v", err)
 	}
@@ -1221,7 +1221,7 @@ func TestH2HeadersPriority_RoundTrip(t *testing.T) {
 	if fh.Type != FrameTypeHEADERS {
 		t.Fatalf("type: got %d want HEADERS", fh.Type)
 	}
-	dec, err := decodeHeaders(payload)
+	dec, err := takeOrDecodeHeaders(rx.h2Decoder(), payload)
 	if err != nil {
 		t.Fatalf("decodeHeaders: %v", err)
 	}
@@ -1252,7 +1252,7 @@ func TestH2HeadersPadded_RoundTrip(t *testing.T) {
 	if fh.Type != FrameTypeHEADERS {
 		t.Fatalf("type: got %d want HEADERS", fh.Type)
 	}
-	dec, err := decodeHeaders(payload)
+	dec, err := takeOrDecodeHeaders(rx.h2Decoder(), payload)
 	if err != nil {
 		t.Fatalf("decodeHeaders: %v", err)
 	}

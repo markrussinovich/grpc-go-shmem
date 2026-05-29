@@ -166,6 +166,76 @@ type hpackDecoderHolder struct {
 	// in that case the sender already had a window large enough to
 	// send the whole LPM, so no pre-credit is needed.
 	onMessageStart func(streamID uint32, lpmSize uint32)
+
+	// decodedHeader / decodedTrailer carry the HeadersV1 / TrailersV1
+	// struct produced by h2DecodeHeaders so the dispatch loop can pick
+	// it up directly via takeOrDecodeHeaders / takeOrDecodeTrailers
+	// instead of paying the encodeHeaders(...) → decodeHeaders(...)
+	// round-trip per HEADERS / TRAILERS frame. Pre-PR-#10 every header
+	// frame ran an alloc + serialize on the read path and a matching
+	// alloc + parse on the dispatch path; for a unary RPC's ~3-4
+	// header frames that adds up to a measurable fraction of total
+	// wall time at small payloads (.NET sibling implementation
+	// measured -2.07 µs / -312 B per Unary RPC for the read-side fix
+	// alone). The reader goroutine is single-threaded so plain
+	// (non-atomic) fields are race-free: the codec stashes the struct
+	// before returning the FrameHeader and the dispatch site consumes
+	// it before the next read.
+	//
+	// Convention when set: the codec returns Length=0 and a nil/empty
+	// payload buffer; consumers MUST call takeOrDecodeHeaders /
+	// takeOrDecodeTrailers (which clears the slot) rather than calling
+	// decodeHeaders(payload) / decodeTrailers(payload) directly.
+	// Defensive fallback: if the slot is unset (e.g., test helpers
+	// that hand-craft a HEADERS payload), the takeOrDecode* helpers
+	// decode the wire bytes as before.
+	decodedHeader     HeadersV1
+	decodedTrailer    TrailersV1
+	decodedHeaderSet  bool
+	decodedTrailerSet bool
+}
+
+// stashDecodedHeader records the HeadersV1 struct produced by
+// h2DecodeHeaders so the dispatch loop can consume it via
+// takeOrDecodeHeaders without re-parsing the wire bytes. The reader is
+// single-goroutine so the slot is owned exclusively until consumed.
+func (h *hpackDecoderHolder) stashDecodedHeader(hdr HeadersV1) {
+	h.decodedHeader = hdr
+	h.decodedHeaderSet = true
+}
+
+// stashDecodedTrailer records the TrailersV1 struct produced by
+// h2DecodeHeaders. Same single-reader-goroutine ownership as
+// stashDecodedHeader.
+func (h *hpackDecoderHolder) stashDecodedTrailer(tr TrailersV1) {
+	h.decodedTrailer = tr
+	h.decodedTrailerSet = true
+}
+
+// takeOrDecodeHeaders returns the HeadersV1 struct stashed by the
+// codec's HPACK decode pass (the fast path), clearing the slot. If the
+// slot is empty (defensive fallback for non-codec callers such as
+// hand-crafted test frames), it falls back to decoding the wire
+// payload via decodeHeaders.
+func takeOrDecodeHeaders(holder *hpackDecoderHolder, payload []byte) (HeadersV1, error) {
+	if holder != nil && holder.decodedHeaderSet {
+		h := holder.decodedHeader
+		holder.decodedHeader = HeadersV1{}
+		holder.decodedHeaderSet = false
+		return h, nil
+	}
+	return decodeHeaders(payload)
+}
+
+// takeOrDecodeTrailers is the TRAILERS analogue of takeOrDecodeHeaders.
+func takeOrDecodeTrailers(holder *hpackDecoderHolder, payload []byte) (TrailersV1, error) {
+	if holder != nil && holder.decodedTrailerSet {
+		t := holder.decodedTrailer
+		holder.decodedTrailer = TrailersV1{}
+		holder.decodedTrailerSet = false
+		return t, nil
+	}
+	return decodeTrailers(payload)
 }
 
 // feedAndObserveHeader wraps acc.feed to fire onMessageStart when the
@@ -1280,15 +1350,24 @@ func readFrameH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolder) (
 					return FrameHeader{}, nil, errors.New("h2: TRAILERS with incomplete LPM in accumulator")
 				}
 				holder.removeLpmAccumulator(h2fh.StreamID)
-				out := encodeTrailers(t)
+				// PR #10 (Headers Hot Path Cleanup): stash the decoded
+				// TrailersV1 struct on the holder instead of running
+				// encodeTrailers(t) and letting the dispatch site re-
+				// parse it with decodeTrailers. Saves one alloc +
+				// serialize + parse round-trip per TRAILERS frame.
+				// Length=0 + nil payload signals the consumer to call
+				// takeOrDecodeTrailers(holder, payload).
+				holder.stashDecodedTrailer(t)
 				return FrameHeader{
 					Type:     FrameTypeTRAILERS,
 					StreamID: h2fh.StreamID,
-					Length:   uint32(len(out)),
+					Length:   0,
 					Flags:    TrailersFlagEndStream,
-				}, out, nil
+				}, nil, nil
 			}
-			out := encodeHeaders(h)
+			// PR #10: stash HeadersV1 instead of round-tripping through
+			// encodeHeaders/decodeHeaders. See takeOrDecodeHeaders.
+			holder.stashDecodedHeader(h)
 			// Initial HEADERS may carry END_STREAM (zero-message
 			// client stream). Defer a synthetic HALFCLOSE so the
 			// next read fires the upper-layer client-half-close
@@ -1301,9 +1380,9 @@ func readFrameH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolder) (
 			return FrameHeader{
 				Type:     FrameTypeHEADERS,
 				StreamID: h2fh.StreamID,
-				Length:   uint32(len(out)),
+				Length:   0,
 				Flags:    HeadersFlagINITIAL,
-			}, out, nil
+			}, nil, nil
 		case H2FrameRSTSTREAM:
 			// Stream cancelled — drop accumulator state.
 			holder.removeLpmAccumulator(h2fh.StreamID)
@@ -1921,15 +2000,17 @@ func readFrameViewH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolde
 					return FrameHeader{}, nil, errors.New("h2: TRAILERS with incomplete LPM in accumulator")
 				}
 				holder.removeLpmAccumulator(h2fh.StreamID)
-				out := encodeTrailers(t)
+				// PR #10: see matching block in readFrameH2.
+				holder.stashDecodedTrailer(t)
 				return FrameHeader{
 					Type:     FrameTypeTRAILERS,
 					StreamID: h2fh.StreamID,
-					Length:   uint32(len(out)),
+					Length:   0,
 					Flags:    TrailersFlagEndStream,
-				}, mem.Copy(out, mem.DefaultBufferPool()), nil
+				}, nil, nil
 			}
-			out := encodeHeaders(h)
+			// PR #10: stash HeadersV1 struct; see takeOrDecodeHeaders.
+			holder.stashDecodedHeader(h)
 			// Initial HEADERS may carry END_STREAM (zero-message
 			// client stream). Defer a synthetic HALFCLOSE; see the
 			// matching block in readFrameH2.
@@ -1939,9 +2020,9 @@ func readFrameViewH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolde
 			return FrameHeader{
 				Type:     FrameTypeHEADERS,
 				StreamID: h2fh.StreamID,
-				Length:   uint32(len(out)),
+				Length:   0,
 				Flags:    HeadersFlagINITIAL,
-			}, mem.Copy(out, mem.DefaultBufferPool()), nil
+			}, nil, nil
 
 		case H2FrameRSTSTREAM:
 			// mem.Copy directly from the ring when contiguous — saves
