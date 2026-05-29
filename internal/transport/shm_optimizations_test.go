@@ -899,13 +899,16 @@ func TestShmBatchDeadlockGuard(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Single stream cache tests
+// Direct-mapped streams table tests (PR #11)
 // ---------------------------------------------------------------------------
 
-func TestShmSingleStreamCache(t *testing.T) {
-	// Verify that cachedStream is set when there's exactly one active stream
-	// and cleared when there are zero or multiple streams.
-	segName := testSegName("test_ssm")
+// TestShmDirectMappedStreamSlots verifies the PR #11 streamSlots
+// direct-mapped table: that creating a stream populates its slot,
+// that closing a stream CAS-clears the slot, and that a collision
+// (two streams whose IDs map to the same slot) is handled correctly
+// via overwrite-and-map-fallback.
+func TestShmDirectMappedStreamSlots(t *testing.T) {
+	segName := testSegName("test_dms")
 	defer RemoveSegment(segName)
 
 	seg, err := CreateSegment(segName, 128*1024, 128*1024)
@@ -926,40 +929,54 @@ func TestShmSingleStreamCache(t *testing.T) {
 	}
 	defer ct.Close(nil)
 
-	// No streams → cache should be nil.
-	if ct.cachedStream.Load() != nil {
-		t.Error("cachedStream should be nil with no streams")
+	// No streams: every slot must be nil.
+	for i := range ct.streamSlots {
+		if ct.streamSlots[i].Load() != nil {
+			t.Fatalf("slot %d non-nil at startup", i)
+		}
 	}
 
-	// Create first stream → cache should be set.
+	// Create first stream; its slot must contain it.
 	ctx := context.Background()
-	s1, err := ct.NewStream(ctx, &CallHdr{Host: "localhost", Method: "/test/SSM1"}, nil)
+	s1, err := ct.NewStream(ctx, &CallHdr{Host: "localhost", Method: "/test/DMS1"}, nil)
 	if err != nil {
 		t.Fatalf("NewStream 1: %v", err)
 	}
-	if c := ct.cachedStream.Load(); c == nil || c.stream != s1 {
-		t.Error("cachedStream should point to s1 with one stream")
+	idx1 := streamSlotIdx(s1.id)
+	if got := ct.streamSlots[idx1].Load(); got != s1 {
+		t.Errorf("slot[%d] after create: got %p, want %p", idx1, got, s1)
 	}
 
-	// Create second stream → cache should be nil.
-	s2, err := ct.NewStream(ctx, &CallHdr{Host: "localhost", Method: "/test/SSM2"}, nil)
+	// Create second stream; its slot must contain it. With sequential
+	// odd IDs and the >>1 shift, idx1 != idx2.
+	s2, err := ct.NewStream(ctx, &CallHdr{Host: "localhost", Method: "/test/DMS2"}, nil)
 	if err != nil {
 		t.Fatalf("NewStream 2: %v", err)
 	}
-	if ct.cachedStream.Load() != nil {
-		t.Error("cachedStream should be nil with two streams")
+	idx2 := streamSlotIdx(s2.id)
+	if got := ct.streamSlots[idx2].Load(); got != s2 {
+		t.Errorf("slot[%d] after create: got %p, want %p", idx2, got, s2)
+	}
+	if idx1 == idx2 {
+		t.Fatalf("sequential odd IDs %d and %d unexpectedly collided on slot %d", s1.id, s2.id, idx1)
+	}
+	if got := ct.streamSlots[idx1].Load(); got != s1 {
+		t.Errorf("slot[%d] (s1) overwritten by s2 create: got %p", idx1, got)
 	}
 
-	// Close second stream → cache should be set to s1.
+	// Close s2: its slot must CAS-clear back to nil.
 	ct.closeStream(s2, nil, true, 0, nil, nil, false)
-	if c := ct.cachedStream.Load(); c == nil || c.stream != s1 {
-		t.Error("cachedStream should point to s1 after closing s2")
+	if ct.streamSlots[idx2].Load() != nil {
+		t.Errorf("slot[%d] not cleared after closing s2", idx2)
+	}
+	if got := ct.streamSlots[idx1].Load(); got != s1 {
+		t.Errorf("slot[%d] (s1) accidentally cleared by s2 close: got %p", idx1, got)
 	}
 
-	// Close first stream → cache should be nil.
+	// Close s1: its slot must CAS-clear back to nil.
 	ct.closeStream(s1, nil, true, 0, nil, nil, false)
-	if ct.cachedStream.Load() != nil {
-		t.Error("cachedStream should be nil after closing all streams")
+	if ct.streamSlots[idx1].Load() != nil {
+		t.Errorf("slot[%d] not cleared after closing s1", idx1)
 	}
 }
 

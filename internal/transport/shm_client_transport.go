@@ -45,12 +45,9 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-// clientStreamCache holds a cached stream pointer and its ID for lock-free
-// lookup in the frame dispatch hot path. Loaded/stored atomically.
-type clientStreamCache struct {
-	stream   *ClientStream
-	streamID uint32
-}
+// PR #11 (Direct-Mapped Streams Table) removed the single-entry MRU
+// `clientStreamCache` / `cachedStream` field. Stream resolution now
+// goes through a fixed-size direct-mapped table; see shm_stream_table.go.
 
 // ShmClientTransport implements the gRPC ClientTransport interface
 // for shared memory communication.
@@ -86,16 +83,19 @@ type ShmClientTransport struct {
 	streams  map[uint32]*ClientStream
 	streamID uint32 // next stream ID to assign
 
-	// cachedStream caches the only active stream for single-stream connections,
-	// allowing frame dispatch to skip the map lookup + RLock.
+	// streamSlots is a direct-mapped table (PR #11) that resolves a
+	// stream ID to its *ClientStream without taking t.mu.RLock in
+	// the per-frame dispatch hot path. Slot index is streamSlotIdx
+	// (= (streamID>>1) & (shmStreamSlotCount-1)); see
+	// shm_stream_table.go for the design contract.
 	//
-	// Loaded atomically without t.mu in the frame dispatch hot path.
-	// Stored atomically under t.mu when the stream set changes.
-	cachedStream atomic.Pointer[clientStreamCache]
+	// Replaces the pre-PR-#11 single-entry MRU `cachedStream` field,
+	// which only worked for the 1-stream-at-a-time case.
+	streamSlots [shmStreamSlotCount]atomic.Pointer[ClientStream]
 
 	// singleStreamMode is negotiated via the CONNECT frame. When true,
 	// the client requested single-stream optimizations and the transport
-	// uses inline writes via inlineMu.TryLock and cachedStream fast path.
+	// uses inline writes via inlineMu.TryLock and direct-mapped slots.
 	singleStreamMode bool
 
 	// Flow control (outbound send windows)
@@ -1026,15 +1026,21 @@ func (t *ShmClientTransport) processIncomingData(ctx context.Context) {
 			continue
 		}
 
-		// Dispatch frame to appropriate stream.
-		// Fast path: if we have a cached single stream, skip map lookup + RLock.
+		// Dispatch frame to appropriate stream via the direct-mapped
+		// table (PR #11). On slot miss fall back to the streams map
+		// under RLock and republish under the same RLock to avoid the
+		// stale-publish race (see lookupStream's docstring).
 		var stream *ClientStream
-		if c := t.cachedStream.Load(); c != nil && c.streamID == fh.StreamID {
-			stream = c.stream
+		if s := t.streamSlots[streamSlotIdx(fh.StreamID)].Load(); s != nil &&
+			s.id == fh.StreamID && s.getState() != streamDone {
+			stream = s
 		} else {
 			t.mu.RLock()
 			var ok bool
 			stream, ok = t.streams[fh.StreamID]
+			if ok {
+				t.streamSlots[streamSlotIdx(fh.StreamID)].Store(stream)
+			}
 			t.mu.RUnlock()
 			if !ok {
 				// PR #10 (Headers Hot Path Cleanup): orphan-stream frame
@@ -1540,12 +1546,10 @@ func (t *ShmClientTransport) NewStream(ctx context.Context, callHdr *CallHdr, ha
 
 		// Register the stream
 		t.streams[streamID] = s
-		// Update single-stream cache.
-		if len(t.streams) == 1 {
-			t.cachedStream.Store(&clientStreamCache{stream: s, streamID: streamID})
-		} else {
-			t.cachedStream.Store(nil)
-		}
+		// PR #11: publish into direct-mapped slot. Collision policy
+		// is overwrite — the displaced occupant stays fully correct
+		// via the map fallback path in lookupStream.
+		t.streamSlots[streamSlotIdx(streamID)].Store(s)
 		streamWindow := int64(t.initialWindowSize)
 		if t.initialStreamWindow > 0 {
 			streamWindow = t.initialStreamWindow
@@ -1651,6 +1655,10 @@ func (t *ShmClientTransport) NewStream(ctx context.Context, callHdr *CallHdr, ha
 	}); err != nil {
 		t.mu.Lock()
 		delete(t.streams, streamID)
+		// PR #11: clear the direct-mapped slot for the rolled-back
+		// stream so a later stream with a colliding slot index can
+		// claim it cleanly (and so this dead pointer is not pinned).
+		t.clearStreamSlot(s)
 		t.streamQuota++
 		if t.streamQuota > 0 && t.waitingStreams > 0 {
 			select {
@@ -1758,18 +1766,43 @@ func (t *ShmClientTransport) updateWindow(s *ClientStream, n uint32) {
 	}
 }
 
-// lookupStream resolves a stream id to its ClientStream. Uses the
-// cachedStream MRU fast path for single-stream connections (the
-// common case for unary RPC ping-pong); falls back to the streams
-// map under RLock otherwise. Returns nil for unknown ids.
+// lookupStream resolves a stream id to its ClientStream via the
+// direct-mapped table (PR #11). On slot miss it falls back to the
+// streams map under RLock and republishes into the slot WHILE STILL
+// HOLDING THE RLOCK (avoids a stale-publish race: post-unlock
+// publishing could race with a close that already cleared the slot,
+// resurrecting a dead pointer with no future close to clean it).
+// Returns nil for unknown ids and for streams that have already
+// transitioned to streamDone.
 func (t *ShmClientTransport) lookupStream(streamID uint32) *ClientStream {
-	if c := t.cachedStream.Load(); c != nil && c.streamID == streamID {
-		return c.stream
+	if s := t.streamSlots[streamSlotIdx(streamID)].Load(); s != nil &&
+		s.id == streamID && s.getState() != streamDone {
+		return s
 	}
 	t.mu.RLock()
 	s := t.streams[streamID]
+	if s != nil {
+		// Republish while still under RLock: a close path needs
+		// t.mu.Lock to remove the entry, so it cannot run between
+		// our snapshot and Store. After RUnlock our Store reflects
+		// a state that was true at some point during the RLock
+		// window; any later close will CAS-clear the slot.
+		t.streamSlots[streamSlotIdx(streamID)].Store(s)
+	}
 	t.mu.RUnlock()
 	return s
+}
+
+// clearStreamSlot atomically clears the direct-mapped slot for the
+// given stream IFF the slot still points to it. Required because a
+// later stream with a colliding slot index may have already
+// overwritten this slot via Store; we must not wipe the newer
+// occupant.
+func (t *ShmClientTransport) clearStreamSlot(s *ClientStream) {
+	slot := &t.streamSlots[streamSlotIdx(s.id)]
+	if slot.Load() == s {
+		slot.CompareAndSwap(s, nil)
+	}
 }
 
 // onMessageStart is invoked by the h2 codec the moment it parses a
@@ -1934,15 +1967,10 @@ func (t *ShmClientTransport) closeStream(s *ClientStream, err error, rst bool, _
 	var shouldClose bool
 	t.mu.Lock()
 	delete(t.streams, s.id)
-	// Update single-stream cache.
-	if len(t.streams) == 1 {
-		for id, cs := range t.streams {
-			t.cachedStream.Store(&clientStreamCache{stream: cs, streamID: id})
-			break
-		}
-	} else {
-		t.cachedStream.Store(nil)
-	}
+	// PR #11: CAS-clear the direct-mapped slot — only clear if it
+	// still points to this stream (a later stream may have won the
+	// slot via overwrite policy and must not be wiped).
+	t.clearStreamSlot(s)
 	// Per-stream send quota lives on the Stream itself
 	// (s.sendQuota atomic.Int64); no map deletion needed. The
 	// detached Stream remains GC-rooted only via the in-flight

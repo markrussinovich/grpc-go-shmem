@@ -43,12 +43,9 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-// serverStreamCache holds a cached stream pointer and its ID for lock-free
-// lookup in the frame dispatch hot path. Loaded/stored atomically.
-type serverStreamCache struct {
-	stream   *ServerStream
-	streamID uint32
-}
+// PR #11 (Direct-Mapped Streams Table) removed the single-entry MRU
+// `serverStreamCache` / `cachedStream` field. Stream resolution now
+// goes through a fixed-size direct-mapped table; see shm_stream_table.go.
 
 // ShmServerTransport implements the gRPC ServerTransport interface
 // for shared memory communication.
@@ -86,17 +83,19 @@ type ShmServerTransport struct {
 	handleFunc func(*ServerStream)
 	maxStreams uint32
 
-	// cachedStream caches the only active stream pointer for single-stream
-	// connections, allowing frame dispatch to skip the map lookup + RLock.
-	// Reset to nil when stream count changes (0 or >1).
+	// streamSlots is a direct-mapped table (PR #11) that resolves a
+	// stream ID to its *ServerStream without taking t.mu.RLock in
+	// the per-frame dispatch hot path. Slot index is streamSlotIdx
+	// (= (streamID>>1) & (shmStreamSlotCount-1)); see
+	// shm_stream_table.go for the design contract.
 	//
-	// Loaded atomically without t.mu in the frame dispatch hot path.
-	// Stored atomically under t.mu in updateStreamCache.
-	cachedStream atomic.Pointer[serverStreamCache]
+	// Replaces the pre-PR-#11 single-entry MRU `cachedStream` field,
+	// which only worked for the 1-stream-at-a-time case.
+	streamSlots [shmStreamSlotCount]atomic.Pointer[ServerStream]
 
 	// singleStreamMode is negotiated via the CONNECT frame. When true,
 	// both sides agree to use single-stream optimizations (inline writes,
-	// writer loop bypass via inlineMu.TryLock, cachedStream fast path).
+	// writer loop bypass via inlineMu.TryLock, direct-mapped slot lookup).
 	// Automatically disabled when more than one stream is active.
 	singleStreamMode bool
 
@@ -167,17 +166,15 @@ type ShmServerTransport struct {
 	pingStrikes uint8
 }
 
-// updateStreamCache updates the single-stream cache. Must be called with
-// t.mu held (Lock or RLock). When exactly one stream is active, cache it
-// for lock-free lookup in the frame dispatch hot path.
-func (t *ShmServerTransport) updateStreamCache() {
-	if len(t.streams) == 1 {
-		for id, s := range t.streams {
-			t.cachedStream.Store(&serverStreamCache{stream: s, streamID: id})
-			break
-		}
-	} else {
-		t.cachedStream.Store(nil)
+// clearStreamSlot atomically clears the direct-mapped slot for the
+// given stream IFF the slot still points to it. Required because a
+// later stream with a colliding slot index may have already
+// overwritten this slot via Store; we must not wipe the newer
+// occupant.
+func (t *ShmServerTransport) clearStreamSlot(s *ServerStream) {
+	slot := &t.streamSlots[streamSlotIdx(s.id)]
+	if slot.Load() == s {
+		slot.CompareAndSwap(s, nil)
 	}
 }
 
@@ -1032,12 +1029,10 @@ func (t *ShmServerTransport) handleHeaders(ctx context.Context, streamID uint32,
 	}
 	t.streams[streamID] = s
 	t.streamInFlow[streamID] = &s.fc
-	// Update single-stream cache.
-	if len(t.streams) == 1 {
-		t.cachedStream.Store(&serverStreamCache{stream: s, streamID: streamID})
-	} else {
-		t.cachedStream.Store(nil)
-	}
+	// PR #11: publish into direct-mapped slot. Collision policy is
+	// overwrite — the displaced occupant stays fully correct via
+	// the map fallback path in lookupStream.
+	t.streamSlots[streamSlotIdx(streamID)].Store(s)
 	// Clear idle time when we have active streams.
 	t.idle = time.Time{}
 	// Reset ping strikes when streams become active.
@@ -1078,12 +1073,16 @@ func (t *ShmServerTransport) handleHeaders(ctx context.Context, streamID uint32,
 // handleMessage and is unaffected.
 func (t *ShmServerTransport) handleHalfClose(streamID uint32) {
 	var s *ServerStream
-	if c := t.cachedStream.Load(); c != nil && c.streamID == streamID {
-		s = c.stream
+	if cand := t.streamSlots[streamSlotIdx(streamID)].Load(); cand != nil &&
+		cand.id == streamID && cand.getState() != streamDone {
+		s = cand
 	} else {
 		t.mu.RLock()
 		var exists bool
 		s, exists = t.streams[streamID]
+		if exists {
+			t.streamSlots[streamSlotIdx(streamID)].Store(s)
+		}
 		t.mu.RUnlock()
 		if !exists {
 			return
@@ -1093,14 +1092,18 @@ func (t *ShmServerTransport) handleHalfClose(streamID uint32) {
 }
 
 func (t *ShmServerTransport) handleMessage(streamID uint32, flags uint8, payload []byte) (uint32, bool) {
-	// Fast path: if we have a cached single stream, skip map lookup + RLock.
+	// PR #11: direct-mapped slot fast path; publish under RLock on miss.
 	var s *ServerStream
-	if c := t.cachedStream.Load(); c != nil && c.streamID == streamID {
-		s = c.stream
+	if cand := t.streamSlots[streamSlotIdx(streamID)].Load(); cand != nil &&
+		cand.id == streamID && cand.getState() != streamDone {
+		s = cand
 	} else {
 		t.mu.RLock()
 		var exists bool
 		s, exists = t.streams[streamID]
+		if exists {
+			t.streamSlots[streamSlotIdx(streamID)].Store(s)
+		}
 		t.mu.RUnlock()
 		if !exists {
 			return 0, false
@@ -1149,14 +1152,18 @@ func (t *ShmServerTransport) handleMessageBuffer(streamID uint32, flags uint8, b
 		return 0, false
 	}
 	payload := buf.ReadOnlyData()
-	// Fast path: if we have a cached single stream, skip map lookup + RLock.
+	// PR #11: direct-mapped slot fast path; publish under RLock on miss.
 	var s *ServerStream
-	if c := t.cachedStream.Load(); c != nil && c.streamID == streamID {
-		s = c.stream
+	if cand := t.streamSlots[streamSlotIdx(streamID)].Load(); cand != nil &&
+		cand.id == streamID && cand.getState() != streamDone {
+		s = cand
 	} else {
 		var exists bool
 		t.mu.RLock()
 		s, exists = t.streams[streamID]
+		if exists {
+			t.streamSlots[streamSlotIdx(streamID)].Store(s)
+		}
 		t.mu.RUnlock()
 		if !exists {
 			buf.Free()
@@ -1294,7 +1301,10 @@ func (t *ShmServerTransport) handleTrailers(streamID uint32, trailers TrailersV1
 	t.mu.Lock()
 	delete(t.streams, streamID)
 	delete(t.streamInFlow, streamID)
-	t.updateStreamCache()
+	// PR #11: CAS-clear the direct-mapped slot only if it still
+	// points to this stream (a later collision-owner must not be
+	// wiped).
+	t.clearStreamSlot(s)
 	// Mark idle when no more active streams.
 	if len(t.streams) == 0 {
 		t.idle = time.Now()
@@ -1341,7 +1351,9 @@ func (t *ShmServerTransport) handleCancel(streamID uint32) {
 	t.mu.Lock()
 	delete(t.streams, streamID)
 	delete(t.streamInFlow, streamID)
-	t.updateStreamCache()
+	// PR #11: CAS-clear the direct-mapped slot only if it still
+	// points to this stream.
+	t.clearStreamSlot(s)
 	// Mark idle when no more active streams.
 	if len(t.streams) == 0 {
 		t.idle = time.Now()
@@ -1859,7 +1871,9 @@ func (t *ShmServerTransport) writeStatus(s *ServerStream, st *status.Status) err
 	t.mu.Lock()
 	delete(t.streams, s.id)
 	delete(t.streamInFlow, s.id)
-	t.updateStreamCache()
+	// PR #11: CAS-clear the direct-mapped slot only if it still
+	// points to this stream.
+	t.clearStreamSlot(s)
 	// Mark idle when no more active streams.
 	if len(t.streams) == 0 {
 		t.idle = time.Now()
@@ -1903,15 +1917,29 @@ func (t *ShmServerTransport) updateWindow(s *ServerStream, n uint32) {
 	}
 }
 
-// lookupStream resolves a stream id to its ServerStream using the
-// cachedStream MRU fast path then falling back to the streams map
-// under RLock.
+// lookupStream resolves a stream id to its ServerStream via the
+// direct-mapped table (PR #11). On slot miss it falls back to the
+// streams map under RLock and republishes into the slot WHILE STILL
+// HOLDING THE RLOCK (avoids a stale-publish race: post-unlock
+// publishing could race with a close that already cleared the slot,
+// resurrecting a dead pointer with no future close to clean it).
+// Returns nil for unknown ids and for streams that have already
+// transitioned to streamDone.
 func (t *ShmServerTransport) lookupStream(streamID uint32) *ServerStream {
-	if c := t.cachedStream.Load(); c != nil && c.streamID == streamID {
-		return c.stream
+	if s := t.streamSlots[streamSlotIdx(streamID)].Load(); s != nil &&
+		s.id == streamID && s.getState() != streamDone {
+		return s
 	}
 	t.mu.RLock()
 	s := t.streams[streamID]
+	if s != nil {
+		// Republish while still under RLock: a close path needs
+		// t.mu.Lock to remove the entry, so it cannot run between
+		// our snapshot and Store. After RUnlock our Store reflects
+		// a state that was true at some point during the RLock
+		// window; any later close will CAS-clear the slot.
+		t.streamSlots[streamSlotIdx(streamID)].Store(s)
+	}
 	t.mu.RUnlock()
 	return s
 }
