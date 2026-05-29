@@ -21,10 +21,10 @@
 package transport
 
 import (
-	"container/list"
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"math"
 	"net"
@@ -102,30 +102,16 @@ type ShmServerTransport struct {
 
 	// Flow control
 	//
-	// connSendQuota and per-stream Stream.sendQuota are atomic.Int64;
-	// the acquireSendQuota hot path reserves via two-resource CAS
-	// with rollback on conn-CAS failure. sendQuotaMu now guards
-	// only the connWaiters FIFO + streamQuotaSignals map (cold
-	// register/dispatch path). See ShmClientTransport for the full
-	// design rationale.
-	sendQuotaMu   sync.Mutex
+	// connSendQuota and per-stream Stream.sendQuota are atomic.Int64.
+	// writeProto's inline ZC path does a two-resource lock-free CAS
+	// reservation; on CAS-fail or TryLock-fail the sender enqueues
+	// a fire-and-forget proto entry to the writer chan and the
+	// writer goroutine handles FC reservation + defer-on-stall.
+	// Mirror of ShmClientTransport — see that struct for the design
+	// rationale. The legacy slow path (sendQuotaMu + connWaiters +
+	// streamQuotaSignals + SC-Aware Dispatch) was retired in the
+	// async-on-CAS-fail PR.
 	connSendQuota atomic.Int64
-	// connQuotaSignal is a buffered channel used to BROADCAST conn-level
-	// WU credits. notifyQuotaChangeLocked(0) pushes `quotaWaiters` tokens
-	// at once so every parked sender wakes in parallel and races for the
-	// mutex, avoiding chain-wake serialization through a single slot.
-	connQuotaSignal chan struct{}
-	// streamQuotaSignals: per-stream wakeup channel (buffer=1) allocated
-	// in NewStream-equivalent path and released in closeStream. Stream
-	// WU credits a SPECIFIC stream; this guarantees the wakeup reaches
-	// the credited stream's writer.
-	streamQuotaSignals map[uint32]chan struct{}
-
-	// connWaiters is the FIFO list of streams parked waiting for
-	// connection-level send-quota. Mirror of ShmClientTransport's
-	// connWaiters; see that field's comment for the SC-Aware Quota
-	// Dispatch design. Protected by sendQuotaMu.
-	connWaiters *list.List
 
 	connInFlow   trInFlow
 	streamInFlow map[uint32]*inFlow
@@ -149,6 +135,16 @@ type ShmServerTransport struct {
 	// Stream.pendingWU. See ShmClientTransport for the full design
 	// rationale ("WU Lockless Path").
 	pendingConnWU atomic.Uint32
+
+	// wuDirty is the per-stream restore-WU dirty list — see
+	// ShmClientTransport.wuDirty for the full design rationale
+	// (ping-pong double buffer, lost-WU prevention invariant,
+	// always-drain conn-level Swap). This is the server-side
+	// mirror.
+	wuDirtyMu sync.Mutex
+	wuDirty   [2][]*ServerStream
+	wuLiveIdx int
+	wuBuf     [4]byte
 
 	// Error handling
 	closeOnce sync.Once
@@ -228,7 +224,6 @@ func (t *ShmServerTransport) ApplyServerConfig(config *ServerConfig) {
 		t.wuThreshold.Store(computeWUThreshold(config.InitialWindowSize))
 	}
 	if config.InitialConnWindowSize > 0 {
-		t.sendQuotaMu.Lock()
 		t.connInFlow = trInFlow{limit: uint32(config.InitialConnWindowSize)}
 		t.connInFlow.updateEffectiveWindowSize()
 		// Keep connSendQuota at its construction default (maxWindowSize).
@@ -239,7 +234,6 @@ func (t *ShmServerTransport) ApplyServerConfig(config *ServerConfig) {
 		// independent in our current model; clamping connSendQuota would
 		// affect server-to-client direction only, which is not what
 		// InitialConnWindowSize implies on the receive side.
-		t.sendQuotaMu.Unlock()
 	}
 	if config.MaxStreams > 0 {
 		// maxStreams gates new-stream admission via rejectNewStream; pre-
@@ -262,87 +256,11 @@ func (t *ShmServerTransport) sendGoAway(flags uint8, debugData string) {
 	})
 }
 
-// notifyQuotaChangeLocked wakes waiters that may benefit from the
-// just-credited quota. Caller MUST hold sendQuotaMu.
-//
-// connSendQuota / s.sendQuota are atomic.Int64; the lock here
-// guards only the connWaiters FIFO and the per-stream signal-channel
-// map.
-//
-// streamID == 0 (connection-level credit) — SC-Aware Dispatch:
-// Walk the connWaiters FIFO; for each waiter w, signal its per-stream
-// channel only when atomic conn AND stream quotas both meet w.wanted.
-// Stop at the first unsatisfiable head waiter (strict FIFO fairness).
-//
-// streamID != 0 (stream-level credit): signal only that stream's
-// per-stream channel. See ShmClientTransport for full rationale.
-func (t *ShmServerTransport) notifyQuotaChangeLocked(streamID uint32) {
-	if streamID == 0 {
-		connQ := t.connSendQuota.Load()
-		for e := t.connWaiters.Front(); e != nil; {
-			w := e.Value.(*connWaiter)
-			s, sok := t.streams[w.streamID]
-			if !sok {
-				next := e.Next()
-				t.connWaiters.Remove(e)
-				e = next
-				continue
-			}
-			streamQ := s.sendQuota.Load()
-			if connQ >= w.wanted && streamQ >= w.wanted {
-				next := e.Next()
-				t.connWaiters.Remove(e)
-				if s.connWaiterElem == e {
-					s.connWaiterElem = nil
-				}
-				select {
-				case w.signal <- struct{}{}:
-				default:
-				}
-				e = next
-				continue
-			}
-			break
-		}
-		return
-	}
-	if ch, ok := t.streamQuotaSignals[streamID]; ok {
-		select {
-		case ch <- struct{}{}:
-		default:
-		}
-	}
-}
-
-// unregisterConnWaiterLocked removes the given stream from connWaiters
-// if registered. Caller MUST hold sendQuotaMu. Idempotent.
-func (t *ShmServerTransport) unregisterConnWaiterLocked(s *ServerStream) {
-	if s == nil || s.connWaiterElem == nil {
-		return
-	}
-	t.connWaiters.Remove(s.connWaiterElem)
-	s.connWaiterElem = nil
-}
-
-// registerConnWaiterLocked adds (or updates wanted on) the given
-// stream's conn-quota waiter entry. Caller MUST hold sendQuotaMu.
-func (t *ShmServerTransport) registerConnWaiterLocked(s *ServerStream, wanted int64) {
-	if s.connWaiterElem != nil {
-		w := s.connWaiterElem.Value.(*connWaiter)
-		w.wanted = wanted
-		return
-	}
-	w := &connWaiter{
-		streamID: s.id,
-		wanted:   wanted,
-		signal:   t.streamQuotaSignals[s.id],
-	}
-	s.connWaiterElem = t.connWaiters.PushBack(w)
-}
-
-// addSendQuota credits outbound send-quota and wakes parked senders.
-// Atomic credit; always takes sendQuotaMu for dispatch to close the
-// lost-wakeup race against acquireSendQuota's slow path — see
+// addSendQuota credits outbound send-quota and pings the writer
+// goroutine to retry any deferred entries. Atomic credit only — the
+// legacy slow-path dispatch (sendQuotaMu + connWaiters FIFO + SC-
+// Aware signal) was retired in favour of the async-on-CAS-fail
+// design where the writer owns FC reservation + defer + retry. See
 // ShmClientTransport.addSendQuota for the full rationale.
 func (t *ShmServerTransport) addSendQuota(streamID uint32, delta uint32) {
 	if delta == 0 {
@@ -357,69 +275,17 @@ func (t *ShmServerTransport) addSendQuota(streamID uint32, delta uint32) {
 			return
 		}
 	}
-	// Wake WL to revisit deferred whole-message entries. Mirror of
-	// client addSendQuota.
+	// Wake the writer goroutine so it revisits both deferred maps
+	// (whole-message AND ZC proto) under inlineMu. Level-triggered
+	// semantics: multiple WU arrivals coalesce into one wake.
 	select {
 	case t.frameWriter.wuRetryWake <- struct{}{}:
 	default:
 	}
-	// Stream-quota dispatch through the connWaiters FIFO. The
-	// whole-MESSAGE write path (frameWriter.enqueueMessageAndWait)
-	// does NOT register on this FIFO; the zero-copy single-frame
-	// proto fast path (writeProto / writeProtoToRing) still uses
-	// acquireSendQuota whose slow path parks on
-	// streamQuotaSignals, so this dispatch is required whenever a
-	// sender is parked there. Near-noop when the FIFO is empty.
-	t.sendQuotaMu.Lock()
-	t.notifyQuotaChangeLocked(streamID)
-	t.sendQuotaMu.Unlock()
 }
 
-func (t *ShmServerTransport) acquireSendQuota(ctx context.Context, streamID uint32, n int) error {
-	if n == 0 {
-		return nil
-	}
-	s := t.lookupStream(streamID)
-	if s == nil {
-		return errStreamDone
-	}
-	want := int64(n)
-	for {
-		if t.closed.Load() {
-			return ErrConnClosing
-		}
-		// Fast path: lock-free two-resource CAS reservation.
-		if tryReserveSendQuota(&t.connSendQuota, &s.sendQuota, want) {
-			return nil
-		}
-		// Slow path: take waiter-list lock, re-check, register or retry.
-		t.sendQuotaMu.Lock()
-		if t.closed.Load() {
-			t.sendQuotaMu.Unlock()
-			return ErrConnClosing
-		}
-		if s.sendQuota.Load() >= want && t.connSendQuota.Load() >= want {
-			t.sendQuotaMu.Unlock()
-			continue
-		}
-		t.registerConnWaiterLocked(s, want)
-		streamCh := t.streamQuotaSignals[streamID]
-		t.sendQuotaMu.Unlock()
-		select {
-		case <-streamCh:
-		case <-ctx.Done():
-			t.sendQuotaMu.Lock()
-			t.unregisterConnWaiterLocked(s)
-			t.sendQuotaMu.Unlock()
-			return ContextErr(ctx.Err())
-		case <-t.ctx.Done():
-			t.sendQuotaMu.Lock()
-			t.unregisterConnWaiterLocked(s)
-			t.sendQuotaMu.Unlock()
-			return ErrConnClosing
-		}
-	}
-}
+// acquireSendQuota was retired in favour of the async-on-CAS-fail
+// path; see writeProto for the new flow.
 
 // acquireUpToSendQuota was retired when chunked-DATA flow-control
 // state ownership moved into the writer goroutine. The current
@@ -439,14 +305,12 @@ func (t *ShmServerTransport) sendWindowUpdate(streamID uint32, delta uint32) {
 }
 
 // sendWindowUpdateForce mirrors the client-side method: bypass the
-// shmWindowUpdateThreshold drip batching for maybeAdjust-style
-// pre-credit which MUST go out at parse time, otherwise the LPM
-// cannot complete under small windows.
+// shmWindowUpdateThreshold drip batching for stream-level
+// maybeAdjust-style pre-credit which MUST go out at parse time,
+// otherwise the LPM cannot complete under small windows. Conn-level
+// force-emit is not used by this transport; if a future caller
+// needs one, route through sendConnWindowUpdate(delta, true).
 func (t *ShmServerTransport) sendWindowUpdateForce(streamID uint32, delta uint32) {
-	if streamID == 0 {
-		t.sendConnWindowUpdate(delta, true)
-		return
-	}
 	s := t.lookupStream(streamID)
 	if s == nil {
 		return
@@ -517,8 +381,18 @@ func (t *ShmServerTransport) emitWindowUpdateFrame(streamID uint32, v uint32, s 
 		shmWUFramesBackpressured.Add(1)
 		if streamID == 0 {
 			t.pendingConnWU.Add(v)
+			// Conn-level: no dirty flag. drainPendingWUForWriter
+			// always Swaps unconditionally — see client mirror for
+			// the design rationale.
 		} else if s != nil && s.getState() != streamDone {
 			s.pendingWU.Add(v)
+			// Per-stream dirty enqueue: CAS-dedup. See client mirror
+			// for the lost-WU prevention proof.
+			if s.pendingWUDirty.CompareAndSwap(false, true) {
+				t.wuDirtyMu.Lock()
+				t.wuDirty[t.wuLiveIdx] = append(t.wuDirty[t.wuLiveIdx], s)
+				t.wuDirtyMu.Unlock()
+			}
 		}
 		select {
 		case t.frameWriter.wuRetryWake <- struct{}{}:
@@ -529,40 +403,51 @@ func (t *ShmServerTransport) emitWindowUpdateFrame(streamID uint32, v uint32, s 
 
 // drainPendingWUForWriter is the writer-loop callback registered via
 // frameWriter.setDrainPendingWUFn. See client-side
-// drainPendingWUForWriter for the full contract; this is the
-// server-side mirror.
+// drainPendingWUForWriter for the full contract, lost-WU prevention
+// invariant proof, and complexity rationale (O(D=dirty count) vs
+// the legacy O(N=streams) walk). This is the server-side mirror.
 func (t *ShmServerTransport) drainPendingWUForWriter() {
 	if t.closed.Load() {
 		return
 	}
+	// CONN-LEVEL: unconditional Swap.
 	if v := t.pendingConnWU.Swap(0); v > 0 {
-		buf := make([]byte, 4)
-		binary.BigEndian.PutUint32(buf, v)
+		binary.BigEndian.PutUint32(t.wuBuf[:], v)
 		_ = writeFrame(context.Background(), t.frameWriter.tx,
-			FrameHeader{Type: FrameTypeWindowUpdate, StreamID: 0}, buf)
+			FrameHeader{Type: FrameTypeWindowUpdate, StreamID: 0}, t.wuBuf[:])
 	}
-	t.mu.RLock()
-	if len(t.streams) == 0 {
-		t.mu.RUnlock()
+	// PER-STREAM: ping-pong rotate.
+	t.wuDirtyMu.Lock()
+	if len(t.wuDirty[t.wuLiveIdx]) == 0 {
+		t.wuDirtyMu.Unlock()
 		return
 	}
-	snapshot := make([]*ServerStream, 0, len(t.streams))
-	for _, s := range t.streams {
-		snapshot = append(snapshot, s)
-	}
-	t.mu.RUnlock()
-	for _, s := range snapshot {
+	dirty := t.wuDirty[t.wuLiveIdx]
+	t.wuLiveIdx ^= 1
+	t.wuDirtyMu.Unlock()
+
+	for _, s := range dirty {
+		// Clear dirty BEFORE Swap pending — lost-WU prevention.
+		s.pendingWUDirty.Store(false)
 		if s.getState() == streamDone {
 			s.pendingWU.Store(0)
 			continue
 		}
 		if v := s.pendingWU.Swap(0); v > 0 {
-			buf := make([]byte, 4)
-			binary.BigEndian.PutUint32(buf, v)
+			binary.BigEndian.PutUint32(t.wuBuf[:], v)
 			_ = writeFrame(context.Background(), t.frameWriter.tx,
-				FrameHeader{Type: FrameTypeWindowUpdate, StreamID: s.id}, buf)
+				FrameHeader{Type: FrameTypeWindowUpdate, StreamID: s.id}, t.wuBuf[:])
 		}
 	}
+
+	// Recycle snapshot array back into spare slot, keeping the
+	// larger array if it grew (rare).
+	t.wuDirtyMu.Lock()
+	spareIdx := t.wuLiveIdx ^ 1
+	if cap(dirty) > cap(t.wuDirty[spareIdx]) {
+		t.wuDirty[spareIdx] = dirty[:0]
+	}
+	t.wuDirtyMu.Unlock()
 }
 
 // piggybackWUForWriter is the per-chunk piggyback callback for the
@@ -692,14 +577,32 @@ func NewShmServerTransport(segment *Segment, localAddr, remoteAddr net.Addr) (*S
 		streams:            make(map[uint32]*ServerStream),
 		streamInFlow:       make(map[uint32]*inFlow),
 		errCh:              make(chan struct{}),
-		connQuotaSignal:    make(chan struct{}, 1024),
-		connWaiters:        list.New(),
-		streamQuotaSignals: make(map[uint32]chan struct{}),
 		done:               make(chan struct{}),
 		keepaliveDone:      make(chan struct{}),
 	}
 	// Start the dedicated frame writer goroutine for the server→client ring.
 	t.frameWriter = newShmFrameWriter(serverToClient)
+	// Surface async write failures (fire-and-forget control frames
+	// such as TRAILERS / GOAWAY) by tearing down the transport.
+	// Mirrors the client-side handler: without this hook the writer
+	// goroutine would silently drop a failure and the peer would
+	// wait forever for a frame that was never sent. The handler runs
+	// in a fresh goroutine so it can safely call Close (which waits
+	// for the writer goroutine that is currently invoking the
+	// callback). Close is guarded by closeOnce so concurrent
+	// invocations are idempotent.
+	t.frameWriter.setAsyncErrorHandler(func(err error) {
+		// Benign causes: per-stream ctx cancel (peer gave up on that
+		// stream, our bytes are no longer needed) or the transport
+		// already closing.
+		if err == context.Canceled || err == context.DeadlineExceeded {
+			return
+		}
+		if t.closed.Load() {
+			return
+		}
+		go t.Close(fmt.Errorf("shm server: async write failed: %w", err))
+	})
 	// Register the lockless WU drain callback. See client-side
 	// drainPendingWUForWriter for the contract. Must be installed
 	// BEFORE any reader/sender goroutine can call sendWindowUpdate
@@ -1115,7 +1018,7 @@ func (t *ShmServerTransport) handleHeaders(ctx context.Context, streamID uint32,
 	h := t.handleFunc
 	t.mu.Unlock()
 
-	// Initialize send quota for this stream (protected by sendQuotaMu, not mu).
+	// Initialize send quota for this stream.
 	//
 	// Clamp to t.initialWindowSize. The writer goroutine chunks
 	// outbound bytes by per-grant CAS (advanceDeferred), so a MESSAGE
@@ -1124,14 +1027,10 @@ func (t *ShmServerTransport) handleHeaders(ctx context.Context, streamID uint32,
 	// remainder is deferred until WINDOW_UPDATE credit arrives. An
 	// atomic reservation of the full `5 + bodyLen` would deadlock
 	// when the window is smaller than that total (e.g. body == window).
-	t.sendQuotaMu.Lock()
+	//
 	// Per-stream send quota lives on the Stream as atomic.Int64
 	// (s.sendQuota via embedded Stream).
 	s.sendQuota.Store(int64(ws))
-	// Per-stream wakeup channel: see the client-side mirror in
-	// shm_client_transport.go for the design rationale.
-	t.streamQuotaSignals[streamID] = make(chan struct{}, 1)
-	t.sendQuotaMu.Unlock()
 
 	// Call the handler in a new goroutine.
 	if h != nil {
@@ -1358,19 +1257,14 @@ func (t *ShmServerTransport) handleTrailers(streamID uint32, payload []byte) {
 	// state below. Storing 0 here makes the cleanup observable.
 	s.pendingWU.Store(0)
 
-	// Remove stream send quota (protected by sendQuotaMu).
 	// Per-stream quota lives on s.sendQuota; no map cleanup needed.
-	// The lock guards only the signal channel + waiter list.
-	t.sendQuotaMu.Lock()
-	t.unregisterConnWaiterLocked(s)
-	if ch, ok := t.streamQuotaSignals[streamID]; ok {
-		select {
-		case ch <- struct{}{}:
-		default:
-		}
-		delete(t.streamQuotaSignals, streamID)
+	// Wake the writer so any deferred entry pinned to this stream
+	// observes streamDone on its next retryDeferred pass and is
+	// drained out (decrementing protoInFlight in the process).
+	select {
+	case t.frameWriter.wuRetryWake <- struct{}{}:
+	default:
 	}
-	t.sendQuotaMu.Unlock()
 
 	// Remove stream from active streams and finish draining if needed.
 	var shouldClose bool
@@ -1410,21 +1304,10 @@ func (t *ShmServerTransport) handleCancel(streamID uint32) {
 	// stream below.
 	s.pendingWU.Store(0)
 
-	// Remove stream send quota (protected by sendQuotaMu).
-	// Per-stream quota lives on s.sendQuota; no map cleanup.
-	t.sendQuotaMu.Lock()
-	t.unregisterConnWaiterLocked(s)
-	if ch, ok := t.streamQuotaSignals[streamID]; ok {
-		select {
-		case ch <- struct{}{}:
-		default:
-		}
-		delete(t.streamQuotaSignals, streamID)
-	}
-	t.sendQuotaMu.Unlock()
+	// Per-stream quota lives on s.sendQuota; no map cleanup needed.
 	// Wake the writer so any deferred message pinned to this stream
 	// sees ctx cancellation (s.cancel() above) on the next
-	// retryDeferred and is drained out.
+	// retryDeferred and is drained out (decrementing protoInFlight).
 	select {
 	case t.frameWriter.wuRetryWake <- struct{}{}:
 	default:
@@ -1472,11 +1355,14 @@ func (t *ShmServerTransport) Close(err error) {
 		// raced this Close path), avoid touching unmapped memory in the rings.
 		segClosed := t.segment != nil && t.segment.closed.Load()
 
-		t.sendQuotaMu.Lock()
-		// Broadcast: wake every parked waiter so they observe `closed`
-		// and return ErrConnClosing instead of sleeping forever.
-		t.notifyQuotaChangeLocked(0)
-		t.sendQuotaMu.Unlock()
+		// Ping wuRetryWake so the writer drains any pending deferred
+		// entries on its next pass; close() then walks deferredProto
+		// and decrements protoInFlight for each in-flight async
+		// proto entry. Mirror of client-side Close behaviour.
+		select {
+		case t.frameWriter.wuRetryWake <- struct{}{}:
+		default:
+		}
 
 		// Best-effort GOAWAY before tearing down rings.
 		// Non-blocking: if the channel is full (writer stuck on ring write),
@@ -1701,24 +1587,32 @@ func (t *ShmServerTransport) writeProto(s *ServerStream, msg any, _ *WriteOption
 		return false, nil
 	}
 
-	// Skip ZC when the message exceeds the current send window —
-	// acquireSendQuota is atomic on quotaSize and deadlocks when the
-	// stream window is smaller. The fallback write() path hands the
-	// whole MESSAGE to the writer goroutine, which chunks under
-	// flow control via advanceDeferred.
+	// Skip ZC when the LPM body exceeds shmMaxFrameSize. See the
+	// matching client-side comment in shm_client_transport.go.writeProto:
+	// both ZC paths emit the LPM as a single H2 DATA frame regardless
+	// of the chunking knob, so a fair-mode 64 KiB response would emit
+	// a 65549 B frame that triggers the receiver's stream-level
+	// fc.onData violation before onMessageStart's pre-credit can fire.
+	if quotaSize > shmMaxFrameSize {
+		atomic.AddUint64(&shmZCWriteSkipMaxFrame, 1)
+		return false, nil
+	}
+
+	// Skip ZC when the message exceeds the current send window. The
+	// fallback write() path hands the whole MESSAGE to the writer
+	// goroutine, which chunks under flow control via advanceDeferred.
+	// Advisory only — the real CAS happens under inlineMu below
+	// (inline fast path) or by the writer goroutine (async fallback).
 	//
-	// Lockless quota inspect via atomic Loads. Advisory —
-	// acquireSendQuota below does the actual reservation.
+	// Lockless quota inspect via atomic Loads.
 	if s.sendQuota.Load() < int64(quotaSize) || t.connSendQuota.Load() < int64(quotaSize) {
 		atomic.AddUint64(&shmZCWriteSkipQuota, 1)
 		return false, nil
 	}
 
-	// Flow control: account only the gRPC payload (5-byte LPM + proto body).
-	// The 9-byte H2 frame header is NOT included in WINDOW_UPDATE.
-	if err := t.acquireSendQuota(s.ctx, s.id, quotaSize); err != nil {
-		return false, err
-	}
+	// Server-side MESSAGE frames never carry the HTTP/2 END_STREAM bit;
+	// end-of-stream is communicated via TRAILERS (writeStatus). Flags=0
+	// on every DATA frame the inline writeProtoToRing emits below.
 
 	// Acquire the frame writer's inline mutex to serialize with writeLoop.
 	// writeProtoToRing writes directly to the ring, bypassing the frame
@@ -1732,44 +1626,73 @@ func (t *ShmServerTransport) writeProto(s *ServerStream, msg any, _ *WriteOption
 		t.frameWriter.closeMu.RUnlock()
 		return true, ErrConnClosing
 	}
-	if !t.frameWriter.inlineMu.TryLock() {
-		t.frameWriter.closeMu.RUnlock()
+	if t.frameWriter.inlineMu.TryLock() {
+		// Per-stream FIFO check. Mirror of client writeProto — see
+		// that comment for ordering rationale.
+		if s.protoInFlight.Load() == 0 {
+			if tryReserveSendQuota(&t.connSendQuota, &s.sendQuota, int64(quotaSize)) {
+				ok2, err := writeProtoToRing(s.ctx, t.serverToClient, s.id, pm, pSize, 0)
+				t.frameWriter.inlineMu.Unlock()
+				t.frameWriter.closeMu.RUnlock()
+				if !ok2 {
+					// Insufficient contiguous ring space — refund and
+					// fall back to chunked path.
+					t.connSendQuota.Add(int64(quotaSize))
+					s.sendQuota.Add(int64(quotaSize))
+					select {
+					case t.frameWriter.wuRetryWake <- struct{}{}:
+					default:
+					}
+					return false, err
+				}
+				if err != nil {
+					// Ring write failed after CAS reservation — bytes
+					// did NOT land on the wire (writeProtoToRingH2Core
+					// returns BEFORE Commit on error). Refund.
+					t.connSendQuota.Add(int64(quotaSize))
+					s.sendQuota.Add(int64(quotaSize))
+					select {
+					case t.frameWriter.wuRetryWake <- struct{}{}:
+					default:
+					}
+				}
+				return true, err
+			}
+			// CAS-fail → drop through to async (was: bail to sync).
+			// The trailer-sentinel in writeStatus + processTrailerEntry
+			// guarantees DATA-before-TRAILERS even when async DATA is
+			// still draining when writeStatus arrives. See
+			// grpc-go-shm-server-async-trailer-sentinel-design memo.
+			atomic.AddUint64(&shmZCWriteSkipQuota, 1)
+		}
+		t.frameWriter.inlineMu.Unlock()
+	} else {
+		// TryLock-fail → drop through to async. See CAS-fail comment.
 		atomic.AddUint64(&shmZCWriteSkipInlineBusy, 1)
-		// Atomic refund; always dispatch under the mutex to close
-		// the lost-wakeup race vs acquireSendQuota. Also wake WL
-		// to revisit deferred whole-message senders whose quota gap
-		// may now be satisfiable.
-		t.connSendQuota.Add(int64(quotaSize))
-		s.sendQuota.Add(int64(quotaSize))
-		select {
-		case t.frameWriter.wuRetryWake <- struct{}{}:
-		default:
-		}
-		t.sendQuotaMu.Lock()
-		t.notifyQuotaChangeLocked(0)
-		t.sendQuotaMu.Unlock()
-		return false, nil
 	}
-	ok2, err := writeProtoToRing(s.ctx, t.serverToClient, s.id, pm, pSize, 0)
-	t.frameWriter.inlineMu.Unlock()
 	t.frameWriter.closeMu.RUnlock()
-	if !ok2 {
-		// ZC didn't handle — release quota for fallback path.
-		// Always dispatch under the mutex. Also wake WL to revisit
-		// deferred whole-message senders whose quota gap may now be
-		// satisfiable.
-		t.connSendQuota.Add(int64(quotaSize))
-		s.sendQuota.Add(int64(quotaSize))
-		select {
-		case t.frameWriter.wuRetryWake <- struct{}{}:
-		default:
-		}
-		t.sendQuotaMu.Lock()
-		t.notifyQuotaChangeLocked(0)
-		t.sendQuotaMu.Unlock()
-		return false, err
+
+	// Async path (re-enabled May 2026): writer goroutine owns FC
+	// reservation. The writeStatus trailer sentinel synchronises
+	// DATA-before-TRAILERS via writer-FIFO + deferredTrailers, so
+	// the cardinality bug at BenchmarkGRPCShmUnary/size={64,256,
+	// 1024,4096} 2026-05-28 cannot recur.
+	//
+	// CRITICAL: build fh with Flags = 0. Server-side MESSAGE frames
+	// NEVER carry HTTP/2 END_STREAM — end-of-stream is signalled by
+	// TRAILERS. A non-zero flag here would cause the client to see
+	// a half-close on DATA before TRAILERS → protocol violation.
+	fh := FrameHeader{
+		Type:     FrameTypeMESSAGE,
+		StreamID: s.id,
+		Flags:    0,
 	}
-	return true, err
+	s.protoInFlight.Add(1)
+	if err := t.frameWriter.enqueueProtoAsync(s.ctx, &s.Stream, fh, pm, pSize); err != nil {
+		s.protoInFlight.Add(-1)
+		return true, err
+	}
+	return true, nil
 }
 
 // write writes header and data for a stream.
@@ -1798,16 +1721,25 @@ func (t *ShmServerTransport) writeStatus(s *ServerStream, st *status.Status) err
 	if t.closed.Load() {
 		return ErrConnClosing
 	}
-	// Ensure idempotence: gRPC may race multiple WriteStatus calls.
-	if s.swapState(streamDone) == streamDone {
+	// Idempotence: gRPC may race multiple WriteStatus calls. Use a
+	// dedicated atomic flag instead of swapState(streamDone) so the
+	// state swap can happen INSIDE the writer goroutine at the moment
+	// it actually emits TRAILERS, AFTER any in-flight async DATA on
+	// this stream has drained through deferredProto + the writer's
+	// chan. Without this decoupling, swapState here would force
+	// processProtoEntry to drop pending async DATA and produce a
+	// cardinality violation on the client (the original reason
+	// server writeProto was banned from the async path; resolved by
+	// the trailer-sentinel design — see grpc-go-shm-server-async-
+	// trailer-sentinel-design memo).
+	if !s.statusSent.CompareAndSwap(false, true) {
 		return nil
 	}
-	// Clear any pending stream-level WU credit. After swapState the emit
-	// paths drop further restores; this prevents a late producer from
-	// re-adding credit and leaving a stale value in the atomic when
-	// the stream is removed from t.streams below.
-	s.pendingWU.Store(0)
 	if err := t.maybeWriteHeader(s); err != nil {
+		// Idempotence flag was consumed; the stream is in a
+		// terminal error state. State will get swapped by the
+		// caller's higher-level teardown (closeStream from
+		// HandleStreams err propagation) or transport.Close.
 		return err
 	}
 
@@ -1839,7 +1771,6 @@ func (t *ShmServerTransport) writeStatus(s *ServerStream, st *status.Status) err
 
 	payload := encodeTrailers(trailers)
 
-	// Create frame header
 	fh := FrameHeader{
 		Type:     FrameTypeTRAILERS,
 		StreamID: s.id,
@@ -1850,40 +1781,54 @@ func (t *ShmServerTransport) writeStatus(s *ServerStream, st *status.Status) err
 		shmDebugf("[DEBUG] ShmServerTransport.writeStatus: Writing TRAILERS frame, streamID=%d, length=%d", s.id, fh.Length)
 	}
 
-	// Write frame via the dedicated writer goroutine.
-	if err := t.frameWriter.enqueueAndWait(frameEntry{
-		ctx:     context.Background(),
-		fh:      fh,
-		payload: payload,
-	}); err != nil {
-		if shmDebugEnabled {
-			shmDebugf("[ERROR] ShmServerTransport.writeStatus: Failed to write frame: %v", err)
-		}
-		return err
+	// Trailer sentinel through the writer chan (NOT enqueueAndWait —
+	// that uses an inline-emit fast path which would overtake DATA
+	// still parked in deferredProto). The writer's processTrailerEntry
+	// stashes into deferredTrailers when DATA is still queued for this
+	// stream; the DATA-drain terminals flush the sentinel when the
+	// queue empties. State swap to streamDone happens INSIDE
+	// emitTrailerEntry at the moment of the actual ring write, so
+	// processProtoEntry's streamDone drop check happens-after every
+	// DATA we drained.
+	doneCh := getDoneCh()
+	entry := frameEntry{
+		ctx:       context.Background(),
+		fh:        fh,
+		payload:   payload,
+		doneCh:    doneCh,
+		streamPtr: &s.Stream,
 	}
-
-	if shmDebugEnabled {
-		shmDebugf("[DEBUG] ShmServerTransport.writeStatus: Successfully wrote TRAILERS frame")
+	if !t.frameWriter.trySend(entry) {
+		putDoneCh(doneCh)
+		// Writer closed mid-enqueue. Mirror the earlier behaviour
+		// of swapping state ourselves so closeStream / removeStream
+		// observe the right terminal state.
+		s.compareAndSwapState(streamActive, streamDone)
+		s.pendingWU.Store(0)
+		return ErrConnClosing
 	}
-
-	// Remove stream send quota (protected by sendQuotaMu).
-	// Per-stream quota lives on s.sendQuota; no map cleanup.
-	t.sendQuotaMu.Lock()
-	t.unregisterConnWaiterLocked(s)
-	if ch, ok := t.streamQuotaSignals[s.id]; ok {
-		select {
-		case ch <- struct{}{}:
-		default:
-		}
-		delete(t.streamQuotaSignals, s.id)
-	}
-	t.sendQuotaMu.Unlock()
-	// Wake the writer goroutine so any deferred whole-message entry
-	// pinned to this stream observes streamDone on its next
-	// retryDeferred pass and is drained out with errStreamDone.
+	// Wake the writer goroutine so any deferred entry pinned to
+	// this stream is revisited; ensures the trailer sentinel
+	// actually fires once FC arrives. This mirrors the wuRetryWake
+	// poke writeStatus did historically.
 	select {
 	case t.frameWriter.wuRetryWake <- struct{}{}:
 	default:
+	}
+	werr := <-doneCh
+	putDoneCh(doneCh)
+	if werr != nil {
+		// Writer either failed the ring write or surfaced
+		// errStreamDone (stream RST'd mid-defer). State has been
+		// swapped inside emitTrailerEntry's compareAndSwapState (or
+		// was already streamDone). Surface to caller.
+		if shmDebugEnabled {
+			shmDebugf("[ERROR] ShmServerTransport.writeStatus: Failed to write TRAILERS frame: %v", werr)
+		}
+		// Still proceed with stream cleanup below so map entries
+		// don't leak; gRPC infrastructure will surface the err.
+	} else if shmDebugEnabled {
+		shmDebugf("[DEBUG] ShmServerTransport.writeStatus: Successfully wrote TRAILERS frame")
 	}
 
 	// Remove stream from active streams and finish draining if needed.
@@ -1906,7 +1851,7 @@ func (t *ShmServerTransport) writeStatus(s *ServerStream, st *status.Status) err
 		go t.Close(errors.New("transport drained: " + dbg))
 	}
 
-	return nil
+	return werr
 }
 
 // incrMsgRecv increments the message received counter
@@ -1952,18 +1897,16 @@ func (t *ShmServerTransport) lookupStream(streamID uint32) *ServerStream {
 // onMessageStart is invoked by the h2 codec the moment it parses a
 // new gRPC LPM's 5-byte header (multi-DATA-frame case only). lpmSize
 // is `5 + bodyLen`; the message is NOT yet fully assembled in the
-// accumulator. The transport asks both inFlow.maybeAdjust (stream
-// pre-credit) and trInFlow.maybeAdjust (conn pre-credit) whether the
-// peer needs an upfront WINDOW_UPDATE to admit the rest of the LPM
-// and, if so, emits each via the force path (bypassing the limit/4
-// drip-credit batching threshold).
+// accumulator. The transport asks inFlow.maybeAdjust whether the
+// peer needs an upfront stream-level WINDOW_UPDATE to admit the rest
+// of the LPM and, if so, emits it via the force path (bypassing the
+// limit/4 drip-credit batching threshold).
 //
 // See ShmClientTransport.onMessageStart for the full design rationale.
-// Server-side rationale is identical: SHM's lpmAccumulator hides the
-// partial LPM from the app, so the receiver drives pre-credit on
-// both stream and conn windows. Conn pre-credit is required to avoid
-// the 64-cycle conn-quota refill stall when an LPM (e.g. 1 MiB) is
-// larger than fair-default's 65535-byte conn window.
+// Server-side is identical: SHM's lpmAccumulator hides the partial
+// LPM from the app, so the receiver drives the stream pre-credit.
+// Conn-level WindowUpdate is emitted on-receive via
+// onDataFrameReceived (matching stock HTTP/2 conn FC behaviour).
 //
 // Runs on the reader goroutine; MUST NOT block on the producer.
 func (t *ShmServerTransport) onMessageStart(streamID uint32, lpmSize uint32) {
@@ -1974,36 +1917,44 @@ func (t *ShmServerTransport) onMessageStart(streamID uint32, lpmSize uint32) {
 	if s == nil {
 		return
 	}
-	if w := s.fc.maybeAdjust(lpmSize); w > 0 {
+	// Use the additive variant; see ShmClientTransport.onMessageStart
+	// for the full rationale (SHM pipelines multiple in-flight LPMs
+	// per stream so the stock SET-based maybeAdjust would lose
+	// outstanding pre-credit debt).
+	if w := s.fc.maybeAdjustAdditive(lpmSize); w > 0 {
 		shmStreamPreCreditEmitted.Add(uint64(w))
 		t.sendWindowUpdateForce(streamID, w)
 	}
-	if cw := t.connInFlow.maybeAdjust(lpmSize); cw > 0 {
-		shmConnPreCreditEmitted.Add(uint64(cw))
-		t.sendWindowUpdateForce(0, cw)
+	// Conn-level pre-credit. See ShmClientTransport.onMessageStart
+	// for the full rationale; the symmetric fix is required on the
+	// server side because a CLIENT sending a 1 MiB+ request to the
+	// server under jumbo (SHM_MAX_FRAME_SIZE >= LPM) deadlocks on
+	// the server's conn window in exactly the same way.
+	if connEff := t.connInFlow.getSize(); lpmSize > connEff {
+		t.sendConnWindowUpdate(lpmSize-connEff, true)
 	}
 }
 
 // onDataFrameReceived runs at parse-time for each H2 DATA frame
 // (BEFORE the body is fed to lpmAccumulator). It performs:
 //
-//   - Connection-level accounting via trInFlow.onData: bytes first
-//     repay any pre-credit debt left by onMessageStart, then
-//     accumulate towards the limit/4 drip threshold. Returns the WU
-//     delta to emit (already netted against debt).
-//   - Stream-level inFlow.onData accounting; NO stream WU here.
-//     Stream credit is driven by onMessageStart (pre-credit once
-//     LPM size is known) and updateWindow (drip credit as app
-//     consumes).
+//   - Connection-level WU drip on-receive at the per-transport
+//     wuThreshold; this matches stock HTTP/2's "decouple conn FC
+//     from app reads" design (see http2_server.go handleData).
+//   - Stream-level inFlow.onData accounting + RFC 7540 §5.2.2 /
+//     §6.9.1 enforcement (cancel stream on over-window receive).
 //
 // Runs on the reader goroutine; MUST NOT block on the producer.
 func (t *ShmServerTransport) onDataFrameReceived(streamID uint32, size uint32) {
 	if size == 0 {
 		return
 	}
-	if residual := t.connInFlow.settleDebt(size); residual > 0 {
-		t.sendWindowUpdate(0, residual)
-	}
+	// Connection-level: update unacked/effectiveWindowSize via
+	// connInFlow.onData (return value ignored — SHM emits via its
+	// own batched wuThreshold path below) and emit drip-credit on
+	// the SHM cadence.
+	t.connInFlow.onData(size)
+	t.sendWindowUpdate(0, size)
 	s := t.lookupStream(streamID)
 	if s == nil {
 		return
@@ -2021,7 +1972,12 @@ func (t *ShmServerTransport) onDataFrameReceived(streamID uint32, size uint32) {
 	// http2.ErrCodeFlowControl; the SHM equivalent is the
 	// cancellation path below.
 	if err := s.fc.onData(size); err != nil {
-		shmDebugf("[ERROR] ShmServerTransport.onDataFrameReceived: stream=%d flow-control violation (%v); cancelling stream", streamID, err)
+		lim, pd, pu, d := s.fc.snapshot()
+		cLim, cUnacked, cEff := t.connInFlow.snapshot()
+		shmDebugf("[FC-VIOLATION] server stream=%d frameSize=%d err=%v"+
+			" | stream{limit=%d pendingData=%d pendingUpdate=%d delta=%d}"+
+			" | conn{limit=%d unacked=%d effective=%d} cancelling stream",
+			streamID, size, err, lim, pd, pu, d, cLim, cUnacked, cEff)
 		s.cancel()
 	}
 }

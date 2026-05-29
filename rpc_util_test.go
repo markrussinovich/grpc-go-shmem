@@ -265,7 +265,7 @@ func (s) TestEncode(t *testing.T) {
 	}{
 		{nil, []byte{0, 0, 0, 0, 0}, []byte{}, nil},
 	} {
-		data, err := encode(getCodec(protoenc.Name), test.msg)
+		data, err := encode(getCodec(protoenc.Name), test.msg, nil)
 		if err != test.err || !bytes.Equal(data.Materialize(), test.data) {
 			t.Errorf("encode(_, %v) = %v, %v; want %v, %v", test.msg, data, err, test.data, test.err)
 			continue
@@ -348,12 +348,12 @@ func (s) TestToRPCErr(t *testing.T) {
 func bmEncode(b *testing.B, mSize int) {
 	cdc := getCodec(protoenc.Name)
 	msg := &perfpb.Buffer{Body: make([]byte, mSize)}
-	encodeData, _ := encode(cdc, msg)
-	encodedSz := int64(len(encodeData))
+	encodeData, _ := encode(cdc, msg, nil)
+	encodedSz := int64(encodeData.Len())
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		encode(cdc, msg)
+		encode(cdc, msg, nil)
 	}
 	b.SetBytes(encodedSz)
 }

@@ -150,8 +150,10 @@
 // single-frame inline-write optimisation for small messages and
 // falls back to the whole-MESSAGE path if the message is too large
 // or inlineMu is busy. Receivers credit WINDOW_UPDATE frames driven
-// by application consumption (with receiver-side pre-credit on LPM
-// header parse, see onMessageStart).
+// by application consumption, with receiver-side stream-level
+// pre-credit emitted on LPM header parse (see onMessageStart);
+// connection-level WINDOW_UPDATE drips on inbound DATA receive,
+// matching stock HTTP/2 conn FC behaviour.
 // "NoWU"-equivalent peak throughput is achieved simply by configuring
 // a large initial window (the SHM-tuned default shmInitialWindowSize
 // of 32 MiB exceeds typical per-message sizes, so WINDOW_UPDATE

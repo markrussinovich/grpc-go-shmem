@@ -37,14 +37,25 @@ import (
 // pre-alloc + cross-RPC pooling fixes showed memclr at ~20% of total
 // CPU; switching to a dirty pool eliminates it.
 //
-// Size tiers match mem.DefaultBufferPool: 256 B, 4 KiB, 16 KiB,
-// 32 KiB, 1 MiB. Requests above 1 MiB fall back to the dirty simple
-// pool which does sync.Pool reuse without the size-bucketing.
+// The tier set is sourced from mem.DefaultBufferPoolSizeExponents()
+// to keep this dirty variant in lock-step with the default pool
+// (currently 256 B, 4 KiB, 16 KiB, 32 KiB, 128 KiB, 512 KiB, 1 MiB).
+// The 128 KiB / 512 KiB intermediate tiers are particularly relevant
+// for the SHM lpmAccumulator because it allocates ONE contiguous
+// buffer sized to the full LPM length: a 64 KiB LPM (65541 bytes)
+// without those tiers would land in the 1 MiB tier (16× over-
+// allocation) and inflate live heap during the receive window,
+// driving GC scan cost. UDS's recv path is not as sensitive because
+// it keeps each H2 DATA frame as a separate 16 KiB-tier buffer
+// instead of assembling into one contiguous LPM.
+//
+// Requests above the largest tier fall back to the dirty simple pool
+// which does sync.Pool reuse without size-bucketing.
 var shmLpmPool = func() mem.BufferPool {
-	p, err := imem.NewDirtyBinaryTieredBufferPool(8, 12, 14, 15, 20)
+	p, err := imem.NewDirtyBinaryTieredBufferPool(mem.DefaultBufferPoolSizeExponents()...)
 	if err != nil {
-		// Argument list is hardcoded above; failure here implies a
-		// programming error in imem itself.
+		// Argument list comes from mem.DefaultBufferPoolSizeExponents();
+		// a failure here implies a programming error in imem itself.
 		panic(fmt.Sprintf("shmLpmPool: NewDirtyBinaryTieredBufferPool failed: %v", err))
 	}
 	return p

@@ -1531,21 +1531,55 @@ func readFrameViewH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolde
 				//   - accumulator empty (no in-progress chain)
 				//   - body contiguous (no ring wrap)
 				//   - body fully contains exactly one LPM
-				//   - rx.IsSpeculativeZCEligible (large enough ring/payload,
-				//     at-most-one-ZC, not under back-pressure)
+				//   - rx.IsMultiAnchorZCEligible (large enough ring/payload,
+				//     not under back-pressure)
+				//
+				// Multi-anchor protocol (see ring_zc_multi.go): up to
+				// zcAnchorBudgetCount in-flight ZC buffers per ring,
+				// released in arrival order via a lock-free FIFO. Replaces
+				// the legacy single-anchor zcActive gate that serialized
+				// concurrent receivers.
 				//
 				// The body bytes returned to the caller include the gRPC LPM
 				// 5-byte prefix.
-				if !acc.inProgress() && len(pSecond) == 0 && len(pFirst) >= 5 {
+				//
+				// Diagnostic counters attribute every fall-through to
+				// the precise guard that rejected ZC. Sum of these
+				// (per op) + ZCReadFire (per op) ≈ per-op DATA frame
+				// count. See ring_zc_multi.go shmZCFail* vars.
+				zcEligible := true
+				if acc.inProgress() {
+					atomic.AddUint64(&shmZCFailAccInProgress, 1)
+					zcEligible = false
+				} else if len(pSecond) != 0 {
+					atomic.AddUint64(&shmZCFailPSecondNonzero, 1)
+					zcEligible = false
+				} else if len(pFirst) < 5 {
+					atomic.AddUint64(&shmZCFailPFirstShort, 1)
+					zcEligible = false
+				}
+				if zcEligible {
 					bodyLen := int(binary.BigEndian.Uint32(pFirst[1:5]))
-					if 5+bodyLen == payloadLen && rx.IsSpeculativeZCEligible(payloadLen, true) {
+					if 5+bodyLen != payloadLen {
+						atomic.AddUint64(&shmZCFailLpmMismatch, 1)
+						zcEligible = false
+					} else if !rx.IsMultiAnchorZCEligible(payloadLen, true) {
+						atomic.AddUint64(&shmZCFailIneligible, 1)
+						zcEligible = false
+					}
+				}
+				if zcEligible {
+					// Body's actual ring offset is bodyEndIdx-payloadLen.
+					// We cannot use commitReadIdx (= shared header.ReadIdx
+					// captured by ReadSlices) — that value is FROZEN
+					// while zcActive=1, so consecutive anchors would
+					// claim overlapping ranges and drainPrefix would
+					// publish header.ReadIdx past header.WriteIndex
+					// (uint64 underflow in the writer's back-pressure
+					// calculation, observed as zc-elig-bp 99.9% reject).
+					bodyStartIdx := commitPayload.bodyEndIdx - uint64(payloadLen)
+					if seq, ok := rx.BeginMultiAnchor(bodyStartIdx, payloadLen); ok {
 						atomic.AddUint64(&shmZCReadFire, 1)
-						// Arm the ZC anchor with the post-frame target, then
-						// don't call commitPayload.Commit — the deferred
-						// target already accounts for these bytes.
-						baseIdx := commitPayload.commitReadIdx
-						rx.BeginSingleFrameZcCommit(baseIdx, payloadLen)
-						rx.AddChainZcInFlight()
 
 						// Set MORE flag based on END_STREAM. MORE=0
 						// signals client half-close to the server
@@ -1560,9 +1594,13 @@ func readFrameViewH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolde
 							holder.removeLpmAccumulator(h2fh.StreamID)
 						}
 
-						ringSlice := pFirst[:payloadLen:payloadLen]
-						pool := &zcChainReleasePool{ring: rx}
-						buf := mem.NewBuffer(&ringSlice, pool)
+						// Inline ringSlice into the pool struct so
+						// mem.NewBuffer's &slice does not force a
+						// per-frame slice-header heap alloc (the
+						// pool is sync.Pool'd; the slice header
+						// lives inside the recycled struct).
+						pool := newZcMultiAnchorReleasePool(rx, seq, pFirst[:payloadLen:payloadLen])
+						buf := mem.NewBuffer(&pool.ringSlice, pool)
 						return FrameHeader{
 							Type:     FrameTypeMESSAGE,
 							StreamID: h2fh.StreamID,
@@ -1570,6 +1608,8 @@ func readFrameViewH2(ctx context.Context, rx *ShmRing, holder *hpackDecoderHolde
 							Flags:    msgFlags,
 						}, buf, nil
 					}
+					// Budget exhausted: counter incremented inside
+					// BeginMultiAnchor. Fall through to the copy path.
 				}
 
 				// === Single-frame copy fast path ===
@@ -2185,7 +2225,8 @@ func writeFrameH2DataChunkedVec(
 	// chunk consumes from the current segment, advancing across
 	// segment boundaries automatically.
 	cur := vecCursor{lpmHdr: lpmHdr, data: data}
-	return emitH2DataFromCursor(ctx, tx, streamID, &cur, len(lpmHdr)+data.Len(), baseFlags)
+	_, err := emitH2DataFromCursor(ctx, tx, streamID, &cur, len(lpmHdr)+data.Len(), baseFlags)
+	return err
 }
 
 // emitH2DataFromCursor emits `length` bytes from cur into the ring as
@@ -2221,6 +2262,30 @@ func writeFrameH2DataChunkedVec(
 // BenchmarkGRPCShmLargeUnary/size=64MB on a 64-MiB ring went from
 // ~650 MB/s (16 MB message, fits in ring) to ~270 MB/s (64 MB message,
 // exactly fills ring) under that regime.
+// emitH2DataFromCursor emits `length` bytes from cur into the ring as
+// one or more H2 DATA frames (chunked per shmMaxFrameSize / ring
+// capacity). baseFlags is applied to the FINAL emitted DATA frame only
+// (typically used to carry END_STREAM on the last chunk of a logical
+// MESSAGE). The cursor is advanced by exactly `length` bytes on
+// success.
+//
+// Returns (committedBytes, err). On success committedBytes == length.
+// On error, committedBytes is the prefix that was successfully
+// committed to the ring (the peer has received those bytes and will
+// charge them against its inbound window); the caller MUST refund
+// only `length - committedBytes` worth of outbound send quota. Earlier
+// versions returned only `error` and the sole multi-chunk caller
+// (advanceDeferred) refunded the FULL `length` on any failure, which
+// over-credited stream / conn send quota by the prefix the peer had
+// already received. That manifests as receiver-side onData rejection
+// on a subsequent send from a different stream over the same conn
+// (the inflated conn quota lets the sender overshoot the receiver's
+// actual window), surfacing as an H2-protocol "received N-bytes data
+// exceeding the limit M bytes" error — flaky and load-dependent.
+//
+// All-or-nothing single-chunk callers (writeFrameH2DataChunkedVec,
+// tryInlineWrite) ignore committedBytes and just propagate err; the
+// committedBytes return is only consulted by advanceDeferred.
 func emitH2DataFromCursor(
 	ctx context.Context,
 	tx *ShmRing,
@@ -2228,7 +2293,7 @@ func emitH2DataFromCursor(
 	cur *vecCursor,
 	length int,
 	baseFlags byte,
-) error {
+) (int, error) {
 	atomic.AddUint64(&shmChunkedWriteVecFire, 1)
 
 	maxChunk := shmMaxFrameSize
@@ -2239,7 +2304,7 @@ func emitH2DataFromCursor(
 		maxChunk = int(tx.Capacity() / 4)
 	}
 	if maxChunk == 0 {
-		return fmt.Errorf("h2 chunk: ring capacity %d too small to chunk", tx.Capacity())
+		return 0, fmt.Errorf("h2 chunk: ring capacity %d too small to chunk", tx.Capacity())
 	}
 
 	// Signal-batch threshold: how many bytes we let accumulate before
@@ -2265,7 +2330,8 @@ func emitH2DataFromCursor(
 		}
 	}
 
-	for written := 0; written < length; {
+	written := 0
+	for written < length {
 		chunk := length - written
 		if chunk > maxChunk {
 			chunk = maxChunk
@@ -2288,7 +2354,12 @@ func emitH2DataFromCursor(
 		}
 		if err := writeH2DataFromCursor(ctx, tx, streamID, flags, chunk, cur); err != nil {
 			closeBatch()
-			return err
+			// `written` here is the prefix successfully committed
+			// BEFORE this chunk. writeH2DataFromCursor either fully
+			// commits its `chunk` bytes or fails before any Commit
+			// (ReserveWrite returns err before producing a slice),
+			// so partial-chunk commits are impossible.
+			return written, err
 		}
 		written += chunk
 		batchBytes += chunk
@@ -2301,7 +2372,7 @@ func emitH2DataFromCursor(
 			closeBatch()
 		}
 	}
-	return nil
+	return written, nil
 }
 
 // writeH2DataFromCursor reserves one H2 DATA frame's worth of ring
@@ -2562,9 +2633,105 @@ func writeProtoToRingH2(ctx context.Context, tx *ShmRing, streamID uint32, msg p
 		return false, nil
 	}
 
+	if err := writeProtoToRingH2Core(ctx, tx, streamID, msg, pSize, total, flags); err != nil {
+		return true, err
+	}
+	return true, nil
+}
+
+// writeProtoToRingH2Blocking is the writeLoop variant of
+// writeProtoToRingH2: it skips the non-blocking ContiguousWriteSpace
+// short-circuit so ReserveWrite blocks when the ring is tight (the
+// inline path bails instead so the sender goroutine doesn't hold
+// inlineMu while waiting).
+//
+// Handles the ring-wrap case CORRECTLY: when the reservation
+// straddles the wrap boundary (len(res.First) < total), the proto
+// is marshalled into a pooled scratch buffer and split-copied across
+// res.First + res.Second. The inline path's contiguous-only path
+// (writeProtoToRingH2Core) would silently corrupt the body region
+// in this case because proto.MarshalAppend reallocates internally
+// when cap(dst) < pSize, leaving the ring bytes uninitialised.
+//
+// Size bounds (Capacity/3, h2MaxFramePayload, shmMaxFrameSize) MUST
+// be pre-validated by the caller — they cannot be soft-rejected
+// from the writeLoop context (the entry is already in flight and
+// the sender is blocked on doneCh).
+func writeProtoToRingH2Blocking(ctx context.Context, tx *ShmRing, streamID uint32, msg proto.Message, pSize int, flags uint8) error {
+	total := h2FrameHeaderSize + 5 + pSize
 	res, err := tx.ReserveWrite(ctx, total)
 	if err != nil {
-		return false, err
+		return err
+	}
+
+	// Build the 14-byte preamble (H2 frame header + gRPC LPM header)
+	// on the stack so neither path allocates here.
+	var hdr14 [h2FrameHeaderSize + 5]byte
+	var h2flags byte
+	if flags&MessageFlagEndStream != 0 {
+		h2flags = H2FlagEndStream
+	}
+	var h2hdr [h2FrameHeaderSize]byte
+	encodeH2FrameHeaderTo(&h2hdr, H2FrameHeader{
+		Length:   uint32(5 + pSize),
+		Type:     H2FrameDATA,
+		Flags:    h2flags,
+		StreamID: streamID,
+	})
+	copy(hdr14[0:h2FrameHeaderSize], h2hdr[:])
+	hdr14[h2FrameHeaderSize] = 0 // gRPC LPM compressed flag = 0
+	binary.BigEndian.PutUint32(hdr14[h2FrameHeaderSize+1:h2FrameHeaderSize+5], uint32(pSize))
+
+	if len(res.Second) == 0 {
+		// Contiguous fast path: marshal directly into ring memory.
+		// res.First has cap == total here; dst's cap == pSize so
+		// proto.MarshalAppend can write in-place without realloc.
+		copy(res.First[0:h2FrameHeaderSize+5], hdr14[:])
+		dst := res.First[h2FrameHeaderSize+5 : h2FrameHeaderSize+5]
+		out, err := protoMarshalAppend(dst, msg)
+		if err != nil {
+			return err
+		}
+		if len(out) != pSize {
+			return fmt.Errorf("writeProtoToRingH2Blocking: size mismatch: %d vs %d", pSize, len(out))
+		}
+	} else {
+		// Wrap path: marshal into pooled scratch sized to total, then
+		// split-copy across res.First + res.Second. Heap allocation is
+		// amortised via sync.Pool — fires only when reservation
+		// straddles the ring wrap boundary (< 0.1 % of writes on a
+		// 64 MiB ring with ≤ 64 KiB messages).
+		scratch := getZcMarshalScratch(total)
+		copy(scratch[0:h2FrameHeaderSize+5], hdr14[:])
+		// proto.MarshalAppend(scratch[:14], msg) writes at index 14
+		// onward; cap(scratch) == total guarantees no realloc.
+		out, err := protoMarshalAppend(scratch[:h2FrameHeaderSize+5], msg)
+		if err != nil {
+			putZcMarshalScratch(scratch)
+			return err
+		}
+		if len(out) != total {
+			putZcMarshalScratch(scratch)
+			return fmt.Errorf("writeProtoToRingH2Blocking: total mismatch: %d vs %d", total, len(out))
+		}
+		firstLen := len(res.First)
+		copy(res.First, out[:firstLen])
+		copy(res.Second, out[firstLen:])
+		putZcMarshalScratch(scratch)
+	}
+
+	atomic.AddUint64(&shmZCWriteFire, 1)
+	return res.Commit(total)
+}
+
+// writeProtoToRingH2Core is the shared body of writeProtoToRingH2 and
+// writeProtoToRingH2Blocking: reserve, lay out H2 header + gRPC LPM
+// header, marshal the proto body directly into the ring slice,
+// commit. The two outer functions differ only in their pre-checks.
+func writeProtoToRingH2Core(ctx context.Context, tx *ShmRing, streamID uint32, msg proto.Message, pSize, total int, flags uint8) error {
+	res, err := tx.ReserveWrite(ctx, total)
+	if err != nil {
+		return err
 	}
 
 	// H2 DATA frame header (9 bytes).
@@ -2598,12 +2765,12 @@ func writeProtoToRingH2(ctx context.Context, tx *ShmRing, streamID uint32, msg p
 	dst := res.First[h2FrameHeaderSize+5 : h2FrameHeaderSize+5]
 	out, err := protoMarshalAppend(dst, msg)
 	if err != nil {
-		return false, err
+		return err
 	}
 	if len(out) != pSize {
-		return false, fmt.Errorf("writeProtoToRingH2: size mismatch: %d vs %d", pSize, len(out))
+		return fmt.Errorf("writeProtoToRingH2: size mismatch: %d vs %d", pSize, len(out))
 	}
 
 	atomic.AddUint64(&shmZCWriteFire, 1)
-	return true, res.Commit(total)
+	return res.Commit(total)
 }

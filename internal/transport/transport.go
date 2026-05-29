@@ -352,24 +352,106 @@ type Stream struct {
 	// pending stream-WU state inside inFlow.pendingUpdate.
 	pendingWU atomic.Uint32
 
-	// connWaiterElem is the stream's entry in the SHM transport's
-	// connection-level quota waiter FIFO (transport.connWaiters), or
-	// nil if the stream is not currently parked waiting for conn
-	// send-quota. Protected by transport.sendQuotaMu — the same
-	// mutex that guards the connWaiters list itself.
+	// pendingWUDirty is the dirty-list membership flag for the SHM
+	// transport's drainPendingWUForWriter restore path. When an
+	// emitWindowUpdateFrame call returns errFrameWriterFull (writer
+	// chan full at WU emit time), the producer Adds the captured
+	// credit back to pendingWU and then CAS-sets pendingWUDirty
+	// 0→1. The single producer that wins the CAS appends this stream
+	// pointer to the transport's wuDirty[] live slice; concurrent
+	// late producers' CAS attempts fail (atomic dedup, single
+	// enqueue per dirty cycle).
 	//
-	// This enables the SC-Aware Quota Dispatch path: when an inbound
-	// connection-level WINDOW_UPDATE arrives, the (single) reader
-	// goroutine walks the waiter FIFO and signals only those streams
-	// whose `wanted` byte count can be satisfied by the just-credited
-	// conn quota — eliminating the thundering-herd wake of all
-	// parked stream goroutines that the previous broadcast-on-
-	// connQuotaSignal path caused. The doubly-linked container/list
-	// gives O(1) park/unlink without scanning the list per cycle.
+	// The writer goroutine's drainPendingWUForWriter swaps the
+	// live slice out under wuDirtyMu, then for each entry: clears
+	// pendingWUDirty 1→0 BEFORE Swap'ing pendingWU. The clear-first
+	// ordering is the lost-WU prevention invariant — see
+	// drainPendingWUForWriter for the full proof.
 	//
-	// Unused (remains nil) on the TCP/UDS HTTP/2 transports, which
-	// use the controlBuf / loopyWriter scheduling model instead.
+	// Unused (and remains false) for the stock TCP/UDS transports.
+	pendingWUDirty atomic.Bool
+
+	// shmDeferred is the inline-allocated state for an in-flight
+	// whole-message DATA emit on the SHM transport. gRPC's stream
+	// contract enforces one SendMsg at a time per stream per
+	// direction, so a single slot per Stream suffices (the
+	// "at-most-one-whole-message-per-stream" invariant).
+	//
+	// `shmFrameWriter.processWholeMessage` populates this slot and
+	// installs `&s.shmDeferred` in `shmFrameWriter.deferred` map.
+	// `shmFrameWriter.tryInlineWrite` reuses `shmDeferred.cur` as
+	// scratch (writer-goroutine-mutually-exclusive via post-lock
+	// `len(w.deferred) > 0` check).
+	//
+	// Embedding by value avoids ~8M sync.Pool/heap allocs/sec at
+	// Jumbo32 1000/4K (~12% of all allocs in profile 2026-05-29).
+	// Cost: ~80 bytes/Stream. Trivial.
+	//
+	// On terminal paths (success, error, ctx-done, stream-done,
+	// transport close), the writer goroutine clears
+	// `shmDeferred.cur.data` and `shmDeferred.cur.lpmHdr` to nil
+	// after `Free()` so the GC can release the underlying mem.Buffer
+	// pointers. The rest of the struct stays allocated for the next
+	// SendMsg's reuse.
+	//
+	// Unused (zero-valued) on TCP/UDS transports.
+	shmDeferred deferredMessage
+
+	// connWaiterElem is retained for binary-compat with stream.go's
+	// general Stream layout (used by other transports if they ever
+	// add similar machinery). The SHM transport's legacy connWaiters
+	// FIFO + sendQuotaMu slow path has been removed in favour of the
+	// async-on-CAS-fail design where the writer goroutine owns FC
+	// reservation + defer + retry; nothing references this field on
+	// the SHM path now, but removing it would touch stream.go and
+	// risk merge churn for no benefit. Reserved for future use.
 	connWaiterElem *list.Element
+
+	// protoInFlight counts the number of ZC proto entries (writeProto's
+	// async fire-and-forget path) currently pending for this stream —
+	// either queued on the writer chan or sitting in
+	// shmFrameWriter.deferredProto. Incremented by the sender BEFORE
+	// enqueueProtoAsync; decremented by the writer goroutine after
+	// processProtoEntry / retryDeferredProto fully resolves an entry
+	// (successful write / refund / silent drop on close).
+	//
+	// Used by writeProto's inline TryLock path to enforce per-stream
+	// message order: if `protoInFlight.Load() > 0` while the sender
+	// holds inlineMu, an async entry for this stream is already in
+	// the pipeline AHEAD of the current write; the sender MUST also
+	// enqueue async (instead of doing an inline CAS + emit) so the
+	// new entry queues behind the existing one. Without this check
+	// the inline path could overtake a chan-pending or deferred
+	// entry on the same stream, violating gRPC's per-stream message
+	// order invariant.
+	//
+	// Reads outside inlineMu (the sender's pre-TryLock advisory
+	// check) are best-effort: a false negative just means we do one
+	// extra inline attempt that might race; a false positive
+	// triggers a redundant async hop. Both are correctness-neutral.
+	// The authoritative check happens under inlineMu after TryLock.
+	//
+	// Unused (remains 0) on the TCP/UDS HTTP/2 transports.
+	protoInFlight atomic.Int32
+
+	// statusSent is the idempotence guard for the SHM server's
+	// writeStatus path. Previously writeStatus called
+	// `swapState(streamDone)` at function entry as both idempotence
+	// guard AND drop-signal-to-writer, which forced the writer's
+	// processProtoEntry to drop any async DATA still in its queue
+	// for this stream (cardinality violation at
+	// BenchmarkGRPCShmUnary/size={64,256,1024,4096} 2026-05-28).
+	//
+	// The trailer-sentinel design (May 2026) decouples the two:
+	//   - statusSent.CompareAndSwap(false, true) guards idempotence
+	//     in writeStatus (cheap, no peer-visible effect).
+	//   - State swap to streamDone happens INSIDE the writer
+	//     goroutine at the moment it actually emits TRAILERS, AFTER
+	//     all in-flight async DATA for this stream has drained
+	//     through deferredProto + the writer's chan.
+	//
+	// Unused (remains false) on TCP/UDS HTTP/2 transports.
+	statusSent atomic.Bool
 
 	// sendQuota is the per-stream outbound flow-control window (in
 	// bytes) on the SHM transport, replacing the legacy

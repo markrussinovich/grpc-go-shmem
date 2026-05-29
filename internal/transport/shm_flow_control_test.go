@@ -24,6 +24,8 @@ import (
 	"context"
 	"fmt"
 	"runtime"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -85,12 +87,8 @@ func TestShmFlowControlBlocksUntilWindowUpdate(t *testing.T) {
 	}
 
 	// Exhaust both connection and stream send windows to force a block.
-	cliTransport.sendQuotaMu.Lock()
 	cliTransport.connSendQuota.Store(0)
 	cs.sendQuota.Store(0)
-	cliTransport.notifyQuotaChangeLocked(0)
-	cliTransport.sendQuotaMu.Unlock()
-
 	msg := mem.BufferSlice{mem.Copy([]byte("hello"), mem.DefaultBufferPool())}
 	writeErr := make(chan error, 1)
 	go func() {
@@ -290,11 +288,8 @@ func TestShmFlowControl_SlowConsumer_SenderBlocks(t *testing.T) {
 	// Force conn + stream quotas down to one window so the test does not
 	// inadvertently start with a 32 MiB SHM-tuned quota that would let
 	// the sender finish many messages before noticing the back-pressure.
-	cliTransport.sendQuotaMu.Lock()
 	cliTransport.connSendQuota.Store(window)
 	cs.sendQuota.Store(window)
-	cliTransport.sendQuotaMu.Unlock()
-
 	// Wait for the server's handler to enter so the stream is fully set
 	// up on both sides before we begin observing back-pressure timing.
 	select {
@@ -405,12 +400,8 @@ func TestShmFlowControl_SlowConsumer_UnblocksOnAppRead(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewStream: %v", err)
 	}
-
-	cliTransport.sendQuotaMu.Lock()
 	cliTransport.connSendQuota.Store(window)
 	cs.sendQuota.Store(window)
-	cliTransport.sendQuotaMu.Unlock()
-
 	bodyLen := window - 5
 	payload := make([]byte, bodyLen)
 	hdr := make([]byte, 5)
@@ -509,13 +500,10 @@ func TestShmFlowControl_MemoryBoundedByWindow(t *testing.T) {
 
 	// Clamp quotas to a single window each on the sender so each stream
 	// can push at most W bytes before back-pressure kicks in.
-	cliTransport.sendQuotaMu.Lock()
 	cliTransport.connSendQuota.Store(numStreams * int64(window)) // ample conn budget
 	for _, cs := range clientStreams {
 		cs.sendQuota.Store(window)
 	}
-	cliTransport.sendQuotaMu.Unlock()
-
 	bodyLen := window - 5
 	payload := make([]byte, bodyLen)
 	hdr := make([]byte, 5)
@@ -658,10 +646,8 @@ func TestShmFlowControl_RealOptionPath_NoDeadlock(t *testing.T) {
 	// Simulate the dialer applying grpc.WithInitialWindowSize(64 KiB).
 	// This is exactly what shm_dialer.go does at the
 	// `opts.InitialWindowSize > 0` branch.
-	cli.sendQuotaMu.Lock()
 	cli.initialStreamWindow = int64(userWindow)
 	cli.initialWindowSize = int32(userWindow)
-	cli.sendQuotaMu.Unlock()
 	cli.wuThreshold.Store(computeWUThreshold(int32(userWindow)))
 
 	gotThreshold := cli.wuThreshold.Load()
@@ -681,9 +667,7 @@ func TestShmFlowControl_RealOptionPath_NoDeadlock(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewStream: %v", err)
 	}
-	cli.sendQuotaMu.Lock()
 	gotQuota := cs.sendQuota.Load()
-	cli.sendQuotaMu.Unlock()
 	if gotQuota != int64(userWindow) {
 		t.Errorf("Bug 1 regression: NewStream stream send quota=%d, want %d (pre-fix would fall back to maxWindowSize=%d, silently violating HTTP/2 stream-window semantics)",
 			gotQuota, userWindow, maxWindowSize)
@@ -722,9 +706,7 @@ func TestShmFlowControl_RealOptionPath_NoDeadlock(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewStream 2: %v", err)
 	}
-	cli2.sendQuotaMu.Lock()
 	gotFallback := cs2.sendQuota.Load()
-	cli2.sendQuotaMu.Unlock()
 	wantFallback := int64(cli2.initialWindowSize)
 	if gotFallback != wantFallback {
 		t.Errorf("Bug 1 fallback: NewStream stream send quota=%d, want %d (= t.initialWindowSize). maxWindowSize fallback regressed.",
@@ -769,9 +751,7 @@ func TestShmServerTransport_ApplyServerConfig(t *testing.T) {
 	defer srv.Close(nil)
 
 	// Capture pre-Apply state: defaults from shmInitialWindowSize.
-	srv.sendQuotaMu.Lock()
 	preWindow := srv.initialWindowSize
-	srv.sendQuotaMu.Unlock()
 	preThreshold := srv.wuThreshold.Load()
 	if preWindow != int32(shmInitialWindowSize) {
 		t.Fatalf("pre-Apply initialWindowSize=%d, want shm-tuned default %d", preWindow, shmInitialWindowSize)
@@ -787,11 +767,8 @@ func TestShmServerTransport_ApplyServerConfig(t *testing.T) {
 		MaxStreams:            userMaxStreams,
 	}
 	srv.ApplyServerConfig(cfg)
-
-	srv.sendQuotaMu.Lock()
 	postWindow := srv.initialWindowSize
 	postConnLimit := srv.connInFlow.limit
-	srv.sendQuotaMu.Unlock()
 	postThreshold := srv.wuThreshold.Load()
 	postMaxStreams := srv.maxStreams
 
@@ -820,157 +797,11 @@ func TestShmServerTransport_ApplyServerConfig(t *testing.T) {
 	srv2.ApplyServerConfig(&ServerConfig{
 		InitialWindowSize: defaultWindowSize - 1, // below gate
 	})
-	srv2.sendQuotaMu.Lock()
 	gateWindow := srv2.initialWindowSize
-	srv2.sendQuotaMu.Unlock()
 	if gateWindow != int32(shmInitialWindowSize) {
 		t.Errorf("sub-default InitialWindowSize=%d incorrectly applied (should be ignored, expected default %d)",
 			gateWindow, shmInitialWindowSize)
 	}
-}
-
-// TestShmConnPreCredit_LargeMessageFairWindow_NoStalls validates that
-// when a single message larger than the conn window is streamed under
-// fair-default flow-control settings, the receiver's onMessageStart
-// pre-credit pathway fires for the connection layer (via
-// trInFlow.maybeAdjust) and the sender completes without parking on
-// conn quota for each limit/4 drip-credit refill.
-//
-// Pre-fix the 256 KiB write under a 64 KiB window required ~16
-// conn-quota refill round-trips (256K / 16K wuThreshold), each
-// costing ~25 us of frame-writer / ring-write / scheduler overhead.
-// Post-fix, onMessageStart sees the full 256 KiB LPM and emits a
-// single conn WINDOW_UPDATE pre-credit covering 256K - 65535 bytes,
-// letting the sender complete the message in one round.
-//
-// The assertion is twofold:
-//
-//   - shmConnPreCreditEmitted must be non-zero after the write
-//     (proving the pre-credit pathway fired);
-//   - the write completes within the test timeout (proving the
-//     pre-credit was enough to unstall the sender, i.e. it really
-//     reached the peer and was applied to its conn send quota).
-//
-// Unlike TestShmSmallWindowMultiFrameMessage which asserts only
-// completion, this test specifically guards the new code path so a
-// future regression that disables conn pre-credit (e.g. via
-// accidental NoWU reintroduction) is caught even if the write still
-// completes through fallback drip-credit.
-func TestShmConnPreCredit_LargeMessageFairWindow_NoStalls(t *testing.T) {
-	const fairWindow = 64 * 1024
-	ConfigureShmFlowControlForBench(fairWindow)
-	defer ResetShmFlowControlForBench()
-
-	preEmitted := shmConnPreCreditEmitted.Load()
-	preStream := shmStreamPreCreditEmitted.Load()
-
-	testCtx, testCancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer testCancel()
-
-	segName := fmt.Sprintf("test-conn-precredit-%d", time.Now().UnixNano())
-	defer RemoveSegment(segName)
-	srvSeg, err := CreateSegment(segName, 4*1024*1024, 4*1024*1024)
-	if err != nil {
-		t.Fatalf("create segment: %v", err)
-	}
-	srvSeg.H.SetServerReady(true)
-	defer srvSeg.Close()
-	cliSeg, err := OpenSegment(segName)
-	if err != nil {
-		t.Fatalf("open segment: %v", err)
-	}
-	cliSeg.H.SetClientReady(true)
-	defer cliSeg.Close()
-
-	srv, err := NewShmServerTransport(srvSeg, testAddr{"shm", "server"}, testAddr{"shm", "client"})
-	if err != nil {
-		t.Fatalf("server transport: %v", err)
-	}
-	defer srv.Close(nil)
-	// Server-side conn limit must be clamped to the fair window so
-	// trInFlow.maybeAdjust returns non-zero pre-credit when the LPM
-	// exceeds the (clamped) conn-level baseline. Production wires
-	// this via ApplyServerConfig + grpc.InitialConnWindowSize.
-	srv.sendQuotaMu.Lock()
-	srv.connInFlow = trInFlow{limit: uint32(fairWindow)}
-	srv.connInFlow.updateEffectiveWindowSize()
-	srv.sendQuotaMu.Unlock()
-
-	cli, err := NewShmClientTransport(cliSeg, testAddr{"shm", "client"}, testAddr{"shm", "server"})
-	if err != nil {
-		t.Fatalf("client transport: %v", err)
-	}
-	defer cli.Close(nil)
-
-	go srv.HandleStreams(testCtx, func(s *ServerStream) {
-		const chunk = 4096
-		for {
-			buf, rerr := s.Read(chunk)
-			if rerr != nil {
-				return
-			}
-			buf.Free()
-		}
-	})
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	cs, err := cli.NewStream(ctx, &CallHdr{Method: "/test/ConnPreCredit"}, nil)
-	if err != nil {
-		t.Fatalf("NewStream: %v", err)
-	}
-
-	// Clamp client outbound quotas to the fair window so the sender
-	// actually parks on conn quota and exercises the pre-credit path.
-	// (NewStream just initialised stream.sendQuota; we trim it down.)
-	cli.sendQuotaMu.Lock()
-	cli.connSendQuota.Store(int64(fairWindow))
-	cs.sendQuota.Store(int64(fairWindow))
-	cli.sendQuotaMu.Unlock()
-
-	const msgSize = 256 * 1024
-	payload := make([]byte, msgSize)
-	for i := range payload {
-		payload[i] = byte(i & 0xFF)
-	}
-	hdr := make([]byte, 5)
-	hdr[1] = byte((msgSize >> 24) & 0xff)
-	hdr[2] = byte((msgSize >> 16) & 0xff)
-	hdr[3] = byte((msgSize >> 8) & 0xff)
-	hdr[4] = byte(msgSize & 0xff)
-
-	writeDone := make(chan error, 1)
-	go func() {
-		writeDone <- cs.Write(hdr, mem.BufferSlice{mem.Copy(payload, mem.DefaultBufferPool())}, &WriteOptions{Last: true})
-	}()
-	select {
-	case err := <-writeDone:
-		if err != nil {
-			t.Fatalf("write: %v", err)
-		}
-	case <-time.After(4 * time.Second):
-		t.Fatal("write did not complete within 4s — conn pre-credit pathway likely broken")
-	}
-
-	postEmitted := shmConnPreCreditEmitted.Load()
-	postStream := shmStreamPreCreditEmitted.Load()
-	connDelta := postEmitted - preEmitted
-	streamDelta := postStream - preStream
-
-	// Stream pre-credit must fire: 256 KiB LPM > 64 KiB stream window.
-	if streamDelta == 0 {
-		t.Errorf("shmStreamPreCreditEmitted did not advance; stream pre-credit pathway did not fire for 256 KiB LPM on %d-byte window", fairWindow)
-	}
-	// Conn pre-credit must fire: 256 KiB LPM > 64 KiB conn window
-	// (we clamped server connInFlow.limit above). If this is zero,
-	// trInFlow.maybeAdjust was either never called or returned zero
-	// — that is the regression we want to catch.
-	if connDelta == 0 {
-		t.Errorf("shmConnPreCreditEmitted did not advance; trInFlow.maybeAdjust did not fire for 256 KiB LPM on %d-byte conn window — conn pre-credit pathway broken",
-			fairWindow)
-	}
-	t.Logf("pre-credit delta: stream=%d conn=%d (LPM=%d window=%d)",
-		streamDelta, connDelta, msgSize, fairWindow)
 }
 
 // TestShmFlowControl_StreamCloseUnblocksDeferredWrite verifies that
@@ -1236,3 +1067,344 @@ func TestShmFlowControl_ConcurrentWholeMessageWrites(t *testing.T) {
 	}
 	t.Logf("completed %d concurrent whole-message writes", completed)
 }
+
+// TestInFlow_MaybeAdjustAdditive_PipelinedLargeLPMs is a regression
+// test for a real correctness bug discovered in PR-level review:
+// the SHM codec-driven pre-credit path (onMessageStart) fires per
+// LPM at parse time, not per app-Read. When two large LPMs are
+// pipelined on a single stream and the application has not yet
+// drained the recvBuffer of the first one, the second LPM's
+// pre-credit hook would call stock inFlow.maybeAdjust which SETs
+// f.delta = n — overwriting the previously emitted pre-credit
+// debt. Subsequent onData accumulation for the second LPM would
+// then exceed (limit + delta) and falsely trip FLOW_CONTROL_ERROR.
+//
+// maybeAdjustAdditive fixes this by ADDing the incremental credit
+// needed on top of any outstanding delta, so the credit ledger
+// stays balanced across pipelined LPMs.
+//
+// Test scenario: limit = 64 KiB, two back-to-back 1 MiB messages
+// with no onRead in between (slow reader). The buggy
+// maybeAdjust-based path would reject the second onData; the
+// additive path accepts both.
+func TestInFlow_MaybeAdjustAdditive_PipelinedLargeLPMs(t *testing.T) {
+	const (
+		limit   uint32 = 65535      // 64 KiB-ish stream window
+		lpmSize uint32 = 1024 * 1024 // 1 MiB LPM
+	)
+
+	// Baseline: confirm the bug exists with stock maybeAdjust.
+	t.Run("maybeAdjust_overwrites_delta_and_rejects", func(t *testing.T) {
+		var f inFlow
+		f.limit = limit
+
+		// LPM 1: pre-credit fires.
+		w1 := f.maybeAdjust(lpmSize)
+		if w1 == 0 {
+			t.Fatalf("expected pre-credit for LPM 1, got 0")
+		}
+		// All DATA for LPM 1 arrives.
+		if err := f.onData(lpmSize); err != nil {
+			t.Fatalf("LPM 1 onData rejected unexpectedly: %v", err)
+		}
+		// Slow reader: app has NOT called onRead yet.
+
+		// LPM 2: pre-credit fires while pendingData is still inflated
+		// from LPM 1. maybeAdjust will SET f.delta = lpmSize (or 0),
+		// overwriting the previous pre-credit debt.
+		_ = f.maybeAdjust(lpmSize)
+
+		// DATA for LPM 2 arrives. Stock semantics: this should reject.
+		err := f.onData(lpmSize)
+		if err == nil {
+			t.Fatalf("baseline: expected onData to reject LPM 2 (pendingData=%d > limit+delta=%d), but it accepted; bug may be fixed elsewhere",
+				f.pendingData, uint64(f.limit)+uint64(f.delta))
+		}
+	})
+
+	// Fix: confirm maybeAdjustAdditive admits both LPMs correctly.
+	t.Run("maybeAdjustAdditive_accumulates_and_admits", func(t *testing.T) {
+		var f inFlow
+		f.limit = limit
+
+		// LPM 1: additive pre-credit.
+		w1 := f.maybeAdjustAdditive(lpmSize)
+		if w1 == 0 {
+			t.Fatalf("expected pre-credit for LPM 1, got 0")
+		}
+		if err := f.onData(lpmSize); err != nil {
+			t.Fatalf("LPM 1 onData rejected: %v (limit=%d, delta=%d, pendingData=%d)",
+				err, f.limit, f.delta, f.pendingData)
+		}
+		// Slow reader: no onRead.
+
+		// LPM 2: additive pre-credit, on top of LPM 1's outstanding delta.
+		w2 := f.maybeAdjustAdditive(lpmSize)
+		if w2 == 0 {
+			t.Fatalf("expected additive pre-credit for LPM 2, got 0 (delta=%d, pendingData=%d)",
+				f.delta, f.pendingData)
+		}
+		// DATA for LPM 2 arrives. Must NOT reject.
+		if err := f.onData(lpmSize); err != nil {
+			t.Fatalf("LPM 2 onData rejected after additive pre-credit: %v (limit=%d, delta=%d, pendingData=%d)",
+				err, f.limit, f.delta, f.pendingData)
+		}
+
+		// Now app drains both messages: onRead must repay the full
+		// outstanding delta debt before crediting WU.
+		_ = f.onRead(lpmSize)
+		_ = f.onRead(lpmSize)
+		// After both reads, delta and pendingData should be 0 (or near 0).
+		if f.pendingData != 0 {
+			t.Errorf("after draining: pendingData=%d, want 0", f.pendingData)
+		}
+		if f.delta != 0 {
+			t.Errorf("after draining: delta=%d, want 0", f.delta)
+		}
+	})
+
+	// maybeAdjustAdditive returns 0 when existing capacity already
+	// admits the LPM (no double-credit).
+	t.Run("maybeAdjustAdditive_no_credit_when_fits", func(t *testing.T) {
+		var f inFlow
+		f.limit = 1024 * 1024 * 2 // 2 MiB
+		w := f.maybeAdjustAdditive(lpmSize)
+		if w != 0 {
+			t.Errorf("expected 0 additive credit (LPM fits in limit), got %d", w)
+		}
+		if f.delta != 0 {
+			t.Errorf("delta should remain 0 when LPM fits, got %d", f.delta)
+		}
+	})
+
+	// maybeAdjustAdditive caps at maxWindowSize.
+	t.Run("maybeAdjustAdditive_caps_at_maxWindowSize", func(t *testing.T) {
+		var f inFlow
+		f.limit = 100
+		// Request an LPM near maxWindowSize.
+		big := uint32(1) << 30 // 1 GiB
+		w := f.maybeAdjustAdditive(big)
+		if uint64(f.limit)+uint64(f.delta) > uint64(maxWindowSize) {
+			t.Errorf("limit+delta=%d exceeded maxWindowSize=%d after additive call",
+				uint64(f.limit)+uint64(f.delta), maxWindowSize)
+		}
+		_ = w
+	})
+}
+
+// TestShmFrameWriter_EnqueueMessageAndWait_CtxCancelRace stresses
+// the lifecycle contract between enqueueMessageAndWait's ctx.Done
+// select branch and the writer goroutine's ongoing chunk emission
+// (reading from the caller's BufferSlice via vecCursor).
+//
+// Race scenario (per /memories/repo/grpc-go-shm-enqueue-msg-ctx-race-may27.md):
+//  1. Sender pushes whole-message entry; writer starts emitH2DataFromCursor
+//     which reads bytes from data.
+//  2. Sender's ctx cancels (short timeout / explicit cancel); the ctx.Done
+//     branch fires, sender returns ContextErr.
+//  3. Caller Free()s the BufferSlice on Write's early return.
+//  4. Writer is STILL reading from data — use-after-free / data race.
+//
+// This test drives many concurrent writes with very short ctx
+// timeouts, explicitly Free()s the BufferSlice after Write returns,
+// and relies on the -race detector to flag any concurrent
+// read-vs-Free on the underlying buffer memory.
+//
+// Without the fix (data.Ref() in enqueueMessageAndWait + Free in
+// writer at every exit), the race detector fires on the writer's
+// memcpy reading from a buffer the caller already returned to its
+// pool. With the fix, the buffer's refcount keeps it alive until
+// the writer's matching Free balances the additional Ref.
+func TestShmFrameWriter_EnqueueMessageAndWait_CtxCancelRace(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping ctx-cancel race stress in -short mode")
+	}
+	testCtx, testCancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer testCancel()
+
+	segName := fmt.Sprintf("test-ctxcancel-race-%d", time.Now().UnixNano())
+	defer RemoveSegment(segName)
+
+	// Generous ring so writes don't block on ring-full back-pressure.
+	serverSeg, _ := CreateSegment(segName, 4*1024*1024, 4*1024*1024)
+	serverSeg.H.SetServerReady(true)
+	defer serverSeg.Close()
+	clientSeg, _ := OpenSegment(segName)
+	clientSeg.H.SetClientReady(true)
+	defer clientSeg.Close()
+
+	srvTransport, _ := NewShmServerTransport(serverSeg, testAddr{"shm", "server"}, testAddr{"shm", "client"})
+	defer srvTransport.Close(nil)
+	cliTransport, _ := NewShmClientTransport(clientSeg, testAddr{"shm", "client"}, testAddr{"shm", "server"})
+	defer cliTransport.Close(nil)
+
+	go srvTransport.HandleStreams(testCtx, func(s *ServerStream) {
+		// Drain inbound but never reply — keeps streams open so
+		// sender's ctx cancellation is the only exit path.
+		<-testCtx.Done()
+	})
+
+	// Large enough that emitH2DataFromCursor's memcpy takes a
+	// non-trivial slice of time per chunk, widening the race window.
+	const payloadSize = 256 * 1024 // 256 KiB
+	body := make([]byte, payloadSize)
+	hdr := []byte{0, 0, 0x04, 0x00, 0x00} // 5-byte LPM hdr; body decoded as length-prefixed
+
+	const iterations = 200
+	const concurrency = 8
+
+	var wg sync.WaitGroup
+	for w := 0; w < concurrency; w++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				ctx, cancel := context.WithTimeout(context.Background(), time.Duration(50+i%100)*time.Microsecond)
+
+				cs, err := cliTransport.NewStream(ctx, &CallHdr{Method: "/test/CtxCancelRace"}, nil)
+				if err != nil {
+					cancel()
+					continue
+				}
+
+				// Allocate a fresh buffer from the pool every iteration.
+				// The Free below returns it to the pool; if the writer
+				// is still reading from it, the race detector will flag.
+				buf := mem.Copy(body, mem.DefaultBufferPool())
+				data := mem.BufferSlice{buf}
+
+				_ = cs.Write(hdr, data, &WriteOptions{Last: true})
+				// Immediately Free on return, matching the lifecycle
+				// contract that callers own the buffer. If ctx cancelled
+				// Write while the writer was mid-emit, this Free races
+				// with the writer's memcpy without the Ref/Release fix.
+				data.Free()
+				cancel()
+			}
+		}(w)
+	}
+	wg.Wait()
+}
+
+// TestTryReserveSendQuota_CASRollbackUnderContention is a focused,
+// deterministic test for the two-resource CAS rollback path in
+// tryReserveSendQuota. The path is hard to trigger from black-box
+// integration tests (it requires conn-CAS to lose a race after
+// stream-CAS succeeded), so this test stresses it directly:
+//
+//  1. Initialize conn + stream send-quota atomics with comfortable
+//     headroom.
+//  2. Spawn one "mutator" goroutine that continuously credits the
+//     connQuota atomic via Add(+/-). This forces conn-CAS to lose
+//     the race for a fraction of concurrent reservation attempts.
+//  3. Spawn N "reserver" goroutines that loop calling
+//     tryReserveSendQuota with random byte counts. Each tracks
+//     successful vs failed reservations.
+//  4. After a fixed duration, stop all goroutines. Verify:
+//     - shmCASRollback counter incremented at least once (proves
+//       the rollback path was exercised).
+//     - Quota invariant: streamQ.Load() == initialStream -
+//       sum(successful reservations) + reverts. Conn similarly.
+//
+// Without the rollback Add(grant), stream quota would drift down
+// every time conn-CAS lost, eventually starving the reserver.
+// With correct rollback, stream quota balance is restored after
+// every failed reservation.
+func TestTryReserveSendQuota_CASRollbackUnderContention(t *testing.T) {
+	const (
+		initialConn   int64 = 1 << 30 // 1 GiB
+		initialStream int64 = 1 << 30
+		reservers           = 8
+		duration            = 200 * time.Millisecond
+	)
+
+	var connQ, streamQ atomic.Int64
+	connQ.Store(initialConn)
+	streamQ.Store(initialStream)
+
+	// Capture baseline counter (other tests may have run).
+	baseline := shmCASRollback.Load()
+
+	stop := make(chan struct{})
+	var totalSuccess int64
+	var totalAttempt int64
+
+	var wg sync.WaitGroup
+
+	// Mutator: hammer connQ with churning credits so conn-CAS
+	// races land between Load and CAS of concurrent reservers.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			// Each iteration: credit then debit the same amount so
+			// the conn pool's running balance is preserved overall
+			// but the witnessed value changes between any given
+			// CAS Load and CAS attempt of a reserver.
+			connQ.Add(1024)
+			connQ.Add(-1024)
+		}
+	}()
+
+	for r := 0; r < reservers; r++ {
+		wg.Add(1)
+		go func(seed int) {
+			defer wg.Done()
+			var localSuccess, localAttempt int64
+			n := int64(64 + (seed * 11)) // small per-call ask, well within headroom
+			for {
+				select {
+				case <-stop:
+					atomic.AddInt64(&totalSuccess, localSuccess)
+					atomic.AddInt64(&totalAttempt, localAttempt)
+					return
+				default:
+				}
+				localAttempt++
+				if tryReserveSendQuota(&connQ, &streamQ, n) {
+					localSuccess++
+					// Immediately give the reserved quota back to
+					// keep the pool stable and concentrate test
+					// pressure on the CAS sequence itself.
+					connQ.Add(n)
+					streamQ.Add(n)
+				}
+			}
+		}(r)
+	}
+
+	time.Sleep(duration)
+	close(stop)
+	wg.Wait()
+
+	delta := shmCASRollback.Load() - baseline
+	if delta == 0 {
+		t.Fatalf("rollback path was not exercised under contention "+
+			"(reservers=%d, attempts=%d, successes=%d): "+
+			"shmCASRollback did not increment from %d",
+			reservers, totalAttempt, totalSuccess, baseline)
+	}
+
+	// Quota invariant: after all give-backs, balances must equal
+	// initial. Any rollback that forgot to restore stream quota
+	// would manifest as streamQ < initialStream.
+	if got := streamQ.Load(); got != initialStream {
+		t.Errorf("stream quota drift: got %d, want %d (delta=%d) — "+
+			"rollback path likely failed to restore stream side",
+			got, initialStream, initialStream-got)
+	}
+	if got := connQ.Load(); got != initialConn {
+		t.Errorf("conn quota drift: got %d, want %d (delta=%d)",
+			got, initialConn, initialConn-got)
+	}
+
+	t.Logf("rollbacks observed: %d (attempts=%d, successes=%d)",
+		delta, totalAttempt, totalSuccess)
+}
+
+

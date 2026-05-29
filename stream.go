@@ -931,7 +931,12 @@ func (cs *clientStream) bufferForRetryLocked(sz int, op func(a *csAttempt) error
 	cs.replayBufferSize += sz
 	if cs.replayBufferSize > cs.callInfo.maxRetryRPCBufferSize {
 		cs.commitAttemptLocked()
-		cleanup()
+		// cleanup may be nil for callers (e.g. the ZC fast path in
+		// SendMsg) that own buffer lifetime themselves and have
+		// nothing to free here.
+		if cleanup != nil {
+			cleanup()
+		}
 		return
 	}
 	cs.replayBuffer = append(cs.replayBuffer, replayOp{op: op, cleanup: cleanup})
@@ -956,94 +961,290 @@ func (cs *clientStream) SendMsg(m any) (err error) {
 	}
 
 	// Zero-copy fast path: when codec is proto and no compression is
-	// configured, try to marshal directly into the ring buffer. This
-	// avoids the prepareMsg heap allocation + memcpy.
+	// configured, marshal directly into the ring buffer via WriteProto.
+	// This avoids prepareMsg's heap allocation + codec.Marshal — which
+	// for the SHM transport is otherwise pure waste, since
+	// (*ShmClientTransport).writeProto always re-marshals the message
+	// directly into ring memory either inline (TryLock success) or
+	// queued via enqueueProtoAndWait (TryLock bail). Pre-encoding
+	// upfront meant SHM marshalled every message TWICE — once into
+	// tightBufferPool then thrown away, once into the ring.
+	//
+	// The server-side SendMsg (this file) and Server.sendResponse
+	// (server.go) already follow the lean pattern:
+	//   1. proto.Size for cheap max-message check
+	//   2. try WriteProto
+	//   3. fall back to encode + sendMsg only on bail
+	// This block brings the client-stream SendMsg into the same shape.
 	//
 	// Guards:
-	//  - proto codec only (adapted/v1 messages return pSize=0 → skip)
+	//  - proto codec only
 	//  - no compression
-	//  - message is proto.Message (protoSize > 0)
-	//  - message fits in maxSendMessageSize
-	//  - retry buffer NOT needed: we pre-encode to hdr+payload for the
-	//    retry buffer (immutable bytes), and use ZC only for the first
-	//    attempt's transport write. If WriteProto returns false, we fall
-	//    through to the standard a.sendMsg with the pre-encoded bytes.
+	//  - message is proto.Message (needed for proto.Size + WriteProto)
+	//  - payload fits in maxSendMessageSize
+	//
+	// Retry / binlog handling: prepareMsg is deferred until the first
+	// WriteProto bail OR until the retry buffer wants to capture OR
+	// until binlogs need to materialize. Encoding is idempotent via
+	// ensureEncoded; cleanup tracks whether the buffers ever
+	// materialised.
 	canZC := cs.compressorV0 == nil && cs.compressorV1 == nil
 	if canZC {
-		// Require an explicit Name() == "proto" match: codecs that do not
-		// implement Name() (an unusual baseCodec) fall through to the
-		// standard sendMsg path so their semantics are preserved.
+		// Two gates:
+		//   1. Name() == "proto" — names the codec class.
+		//   2. Implements bufferPoolMarshaler — identifies the built-
+		//      in gRPC proto codec (which is the only codec for which
+		//      the SHM transport's WriteProto path is wire-compatible,
+		//      because that path calls protobuf marshal directly,
+		//      bypassing cs.codec entirely). A user-registered
+		//      "proto"-named v1 codec is rejected here because the
+		//      codecV1Bridge does NOT implement bufferPoolMarshaler;
+		//      the standard sendMsg path preserves that codec's
+		//      marshal semantics. A user-registered v2 codec named
+		//      "proto" that DOES implement bufferPoolMarshaler is
+		//      opting into the SHM-direct-marshal contract and is
+		//      their responsibility.
 		nc, ok := cs.codec.(interface{ Name() string })
 		canZC = ok && nc.Name() == "proto"
+		if canZC {
+			_, isBuiltin := cs.codec.(bufferPoolMarshaler)
+			canZC = isBuiltin
+		}
 	}
 	if canZC {
-		// Pre-encode for max-size check and retry buffer.
-		hdr, data, payload, pf, err := prepareMsg(m, cs.codec, cs.compressorV0, cs.compressorV1, cs.cc.dopts.copts.BufferPool)
-		if err != nil {
+		pm, isProtoMsg := m.(proto.Message)
+		if isProtoMsg {
+			pSize := proto.Size(pm)
+			if pSize > *cs.callInfo.maxSendMessageSize {
+				return status.Errorf(codes.ResourceExhausted, "trying to send message larger than max (%d vs. %d)", pSize, *cs.callInfo.maxSendMessageSize)
+			}
+			opts := &transport.WriteOptions{Last: !cs.desc.ClientStreams}
+
+			// Committed fast-bypass (P3): when cs.committed is already
+			// true (the steady-state for streaming after the retry
+			// buffer commits), the closure-based withRetry path's op
+			// closure is pure overhead — it captures
+			// m/opts/pSize/cs and the four lazy-encode vars, all of
+			// which Go's escape analysis cannot prove stay on the
+			// stack, so every Send heap-allocates the closure plus
+			// each captured non-interface field. Under N=1000 4 KiB
+			// concurrent ping-pong this was ~14 small objs / SendMsg
+			// dominating GC (40 %+ of CPU) once the buffer-leak fix
+			// stopped masking it.
+			//
+			// The bypass calls WriteProto / encode-then-sendMsg
+			// directly without a closure or withRetry call, returning
+			// immediately. Eligibility requires no binlog
+			// materialisation (binlog needs encData kept alive after
+			// sendMsg returns) and no per-attempt trace info (the
+			// LazyLog path needs the attempt.mu / trInfo dance kept
+			// in the canonical op body). The slow path below covers
+			// the first sends of a stream (committed == false), all
+			// binlog-enabled streams, and all traced streams — the
+			// full semantics, byte-for-byte identical to before.
+			cs.mu.Lock()
+			isCommitted := cs.committed
+			fastAttempt := cs.attempt
+			cs.mu.Unlock()
+			if isCommitted && fastAttempt != nil && fastAttempt.trInfo == nil && len(cs.binlogs) == 0 {
+				if handled, werr := fastAttempt.transportStream.WriteProto(m, opts); handled {
+					if werr != nil {
+						if !cs.desc.ClientStreams {
+							return nil
+						}
+						return io.EOF
+					}
+					if fastAttempt.statsHandler != nil {
+						// canZC requires no compression (see the guard
+						// above), so uncompressed proto bytes == wire
+						// bytes == pSize; passing pSize for both length
+						// and wireLength is correct here. If the canZC
+						// guard is ever relaxed to allow compression,
+						// wire length would diverge from uncompressed
+						// length and this pSize/pSize pair becomes wrong.
+						fastAttempt.statsHandler.HandleRPC(fastAttempt.ctx, outPayload(true, m, pSize, pSize, time.Now()))
+					}
+					return nil
+				}
+				// ZC bailed — encode inline (no closure capture).
+				hdr, data, payload, pf, encErr := prepareMsg(m, cs.codec, cs.compressorV0, cs.compressorV1, cs.cc.dopts.copts.BufferPool)
+				if encErr != nil {
+					return encErr
+				}
+				sErr := fastAttempt.sendMsg(m, hdr, payload, data.Len(), payload.Len())
+				data.Free()
+				if pf.isCompressed() {
+					payload.Free()
+				}
+				return sErr
+			}
+
+			// Lazy-encode state. Populated only on WriteProto bail or
+			// binlog materialise. NOT populated for onSuccess: replay
+			// closures re-execute op on a new attempt which re-runs
+			// the WriteProto/encode decision. bufferForRetryLocked
+			// uses the upfront 5+pSize size hint for replay-budget
+			// tracking; no payload to capture and free.
+			//
+			// ensureEncoded is inlined at both call sites (op +
+			// binlog) to avoid a third closure escape — the closure
+			// alone added ~3 M small heap allocs/5s under
+			// N=1000/4 K pprof, which fully erased the marshal
+			// savings at high concurrency.
+			var encHdr []byte
+			var encData mem.BufferSlice
+			var encPayload mem.BufferSlice
+			var encPf payloadFormat
+
+			op := func(a *csAttempt) error {
+				if a.trInfo != nil {
+					a.mu.Lock()
+					if a.trInfo.tr != nil {
+						a.trInfo.tr.LazyLog(&fmtStringer{"%v", []any{m}}, true)
+					}
+					a.mu.Unlock()
+				}
+				if handled, err := a.transportStream.WriteProto(m, opts); handled {
+					if err != nil {
+						if !cs.desc.ClientStreams {
+							return nil
+						}
+						return io.EOF
+					}
+					if a.statsHandler != nil {
+						// pSize/pSize is correct only because canZC
+						// requires no compression (see guard above).
+						a.statsHandler.HandleRPC(a.ctx, outPayload(true, m, pSize, pSize, time.Now()))
+					}
+					return nil
+				}
+				// ZC bailed — encode now (inline; only happens for
+				// non-SHM transport or SHM-decline). Idempotent across
+				// replay attempts: each retry re-executes op and
+				// re-checks encHdr; if a prior attempt already
+				// encoded, we reuse.
+				if encHdr == nil {
+					hdr, data, payload, pf, err := prepareMsg(m, cs.codec, cs.compressorV0, cs.compressorV1, cs.cc.dopts.copts.BufferPool)
+					if err != nil {
+						return err
+					}
+					encHdr = hdr
+					encData = data
+					encPayload = payload
+					encPf = pf
+				}
+				return a.sendMsg(m, encHdr, encPayload, encData.Len(), encPayload.Len())
+			}
+
+			// Track whether the replay buffer captured op + a free
+			// closure for encData/encPayload. If so, the captured
+			// closure frees on commit (commitAttemptLocked), so the
+			// tail must NOT free. If NOT captured (replay buffer
+			// overflowed), bufferForRetryLocked invoked the free
+			// closure synchronously and committed the attempt — in
+			// that case the tail also must not free (closure already
+			// did). Either way, the tail only frees when the replay
+			// buffer was never reached (e.g. binlog-only path with
+			// committed=true … which is excluded by the bypass guard
+			// above, so this is effectively "never" today; the
+			// !onSuccessCalled branch below is a safety net).
+			//
+			// CRITICAL: the previous shape (cleanup=nil + unconditional
+			// tail-free) was a use-after-free — the replay buffer's
+			// stored op captures encHdr/encData/encPayload by reference,
+			// and later retry (via Header()/Recv()-triggered
+			// replayBufferLocked) re-invokes op against already-freed
+			// buffers. The fix is to make the replay buffer's cleanup
+			// hook own the free, so buffers stay alive until the stream
+			// commits (after which no replay is possible).
+			onSuccessCalled := false
+			err = cs.withRetry(op, func() {
+				cs.bufferForRetryLocked(5+pSize, op, func() {
+					// nil-out the captured pointers AFTER Free so the
+					// binlog block below (and the !onSuccessCalled
+					// tail-free) skips them — this cleanup may be
+					// invoked SYNCHRONOUSLY by bufferForRetryLocked's
+					// size-overflow path (replayBufferSize >
+					// maxRetryRPCBufferSize), in which case it runs
+					// BEFORE the binlog block; without the nil, the
+					// binlog Materialize would read freed pooled
+					// memory. In the normal capture path the closure
+					// fires later via commitAttemptLocked, well after
+					// SendMsg returned — the nil is harmless there.
+					// Closures capture by reference, so nilling
+					// propagates back to the local vars.
+					if encData != nil {
+						encData.Free()
+						encData = nil
+					}
+					if encPf.isCompressed() && encPayload != nil {
+						encPayload.Free()
+						encPayload = nil
+					}
+				})
+				onSuccessCalled = true
+			})
+
+			if len(cs.binlogs) != 0 && err == nil {
+				// Binlogs need the materialised proto bytes. Three
+				// sub-cases:
+				//
+				//   1. Bail path was taken on some attempt → encData
+				//      is non-nil and still alive (replay-cleanup
+				//      closure has not fired yet — that happens on
+				//      commitAttemptLocked). Materialise here while
+				//      buffers are valid.
+				//   2. ZC succeeded on every attempt → encData is nil.
+				//      Encode once just for the binlog, free locally
+				//      after the log entries are emitted.
+				if encData != nil {
+					cm := &binarylog.ClientMessage{
+						OnClientSide: true,
+						Message:      encData.Materialize(),
+					}
+					for _, binlog := range cs.binlogs {
+						binlog.Log(cs.ctx, cm)
+					}
+				} else {
+					hdr, data, payload, pf, encErr := prepareMsg(m, cs.codec, cs.compressorV0, cs.compressorV1, cs.cc.dopts.copts.BufferPool)
+					if encErr == nil {
+						_ = hdr
+						cm := &binarylog.ClientMessage{
+							OnClientSide: true,
+							Message:      data.Materialize(),
+						}
+						for _, binlog := range cs.binlogs {
+							binlog.Log(cs.ctx, cm)
+						}
+						data.Free()
+						if pf.isCompressed() {
+							payload.Free()
+						}
+					}
+				}
+			}
+
+			// Tail free: only when withRetry returned a terminal error
+			// (replay exhausted). In that case onSuccess was never
+			// invoked, so the replay buffer never captured op +
+			// cleanup for this SendMsg call. If op had set encData on
+			// a bail path during any attempt, the buffers are still
+			// alive and need explicit Free here. On the success path
+			// onSuccessCalled is true and the replay-buffer cleanup
+			// owns the lifetime (fires on commitAttemptLocked, OR
+			// synchronously inside bufferForRetryLocked on
+			// size-overflow rejection — either way the tail must NOT
+			// double-free).
+			if !onSuccessCalled {
+				if encData != nil {
+					encData.Free()
+				}
+				if encPf.isCompressed() && encPayload != nil {
+					encPayload.Free()
+				}
+			}
 			return err
 		}
-		defer func() {
-			data.Free()
-			if pf.isCompressed() {
-				payload.Free()
-			}
-		}()
-
-		dataLen := data.Len()
-		payloadLen := payload.Len()
-		if payloadLen > *cs.callInfo.maxSendMessageSize {
-			return status.Errorf(codes.ResourceExhausted, "trying to send message larger than max (%d vs. %d)", payloadLen, *cs.callInfo.maxSendMessageSize)
-		}
-
-		payload.Ref()
-		// The op tries ZC first; if not handled, falls back to standard write
-		// using the pre-encoded bytes.
-		opts := &transport.WriteOptions{Last: !cs.desc.ClientStreams}
-		op := func(a *csAttempt) error {
-			if a.trInfo != nil {
-				a.mu.Lock()
-				if a.trInfo.tr != nil {
-					a.trInfo.tr.LazyLog(&fmtStringer{"%v", []any{m}}, true)
-				}
-				a.mu.Unlock()
-			}
-			// Try ZC write.
-			if handled, err := a.transportStream.WriteProto(m, opts); handled {
-				if err != nil {
-					if !cs.desc.ClientStreams {
-						return nil
-					}
-					return io.EOF
-				}
-				if a.statsHandler != nil {
-					a.statsHandler.HandleRPC(a.ctx, outPayload(true, m, dataLen, payloadLen, time.Now()))
-				}
-				return nil
-			}
-			// ZC not handled (non-SHM transport on retry) — use pre-encoded bytes.
-			return a.sendMsg(m, hdr, payload, dataLen, payloadLen)
-		}
-		// Retry buffer uses the pre-encoded bytes (immutable).
-		// The op closure captures m for ZC but also hdr/payload for fallback,
-		// so replay always has stable bytes.
-		onSuccessCalled := false
-		err = cs.withRetry(op, func() {
-			cs.bufferForRetryLocked(len(hdr)+payloadLen, op, payload.Free)
-			onSuccessCalled = true
-		})
-		if !onSuccessCalled {
-			payload.Free()
-		}
-		if len(cs.binlogs) != 0 && err == nil {
-			cm := &binarylog.ClientMessage{
-				OnClientSide: true,
-				Message:      data.Materialize(),
-			}
-			for _, binlog := range cs.binlogs {
-				binlog.Log(cs.ctx, cm)
-			}
-		}
-		return err
 	}
 
 	// Standard path: encode first, then write.
@@ -1841,11 +2042,18 @@ func (ss *serverStream) SendMsg(m any) (err error) {
 	// message is a native proto.Message, serialize directly into the ring.
 	// No retry concerns on the server side.
 	if ss.compressorV0 == nil && ss.compressorV1 == nil {
-		// Require an explicit Name() == "proto" match: codecs that do not
-		// implement Name() (an unusual baseCodec) fall through to the
-		// standard send path so their semantics are preserved.
+		// Two-gate codec check (see client SendMsg above for rationale):
+		// Name()=="proto" plus implements bufferPoolMarshaler identifies
+		// the built-in v2 proto codec. The v1 codec bridge does not
+		// implement bufferPoolMarshaler, so a custom v1 codec named
+		// "proto" falls through to the standard send path and keeps its
+		// own marshal semantics.
 		nc, hasName := ss.codec.(interface{ Name() string })
 		isProtoCodec := hasName && nc.Name() == "proto"
+		if isProtoCodec {
+			_, isBuiltin := ss.codec.(bufferPoolMarshaler)
+			isProtoCodec = isBuiltin
+		}
 		if isProtoCodec {
 			if pm, ok := m.(proto.Message); ok {
 				pSize := proto.Size(pm)
@@ -1865,7 +2073,7 @@ func (ss *serverStream) SendMsg(m any) (err error) {
 								binlog.Log(ss.ctx, sh)
 							}
 						}
-						binData, encErr := encode(ss.codec, m)
+						binData, encErr := encode(ss.codec, m, ss.p.bufferPool)
 						if encErr == nil {
 							sm := &binarylog.ServerMessage{Message: binData.Materialize()}
 							binData.Free()
@@ -2027,13 +2235,21 @@ func MethodFromServerStream(stream ServerStream) (string, bool) {
 // compression was made and therefore whether the payload needs to be freed in
 // addition to the returned data. Freeing the payload if the returned boolean is
 // false can lead to undefined behavior.
+//
+// pool is the channel-scoped mem.BufferPool from dial / server options.
+// It is forwarded to encode so that pool-aware codecs (proto codec
+// implements bufferPoolMarshaler) marshal directly into the channel
+// pool instead of falling back to mem.DefaultBufferPool. The shared
+// memory transport uses this hook to install a tightly sized pool that
+// eliminates the per-Get overshoot the default tiered pool incurs on
+// payloads just above a tier boundary (e.g. 4 KiB → 16 KiB).
 func prepareMsg(m any, codec baseCodec, cp Compressor, comp encoding.Compressor, pool mem.BufferPool) (hdr []byte, data, payload mem.BufferSlice, pf payloadFormat, err error) {
 	if preparedMsg, ok := m.(*PreparedMsg); ok {
 		return preparedMsg.hdr, preparedMsg.encodedData, preparedMsg.payload, preparedMsg.pf, nil
 	}
 	// The input interface is not a prepared msg.
 	// Marshal and Compress the data at this point
-	data, err = encode(codec, m)
+	data, err = encode(codec, m, pool)
 	if err != nil {
 		return nil, nil, nil, 0, err
 	}

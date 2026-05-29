@@ -44,18 +44,31 @@ import (
 var logger = grpclog.Component("benchmark")
 
 // Allows reuse of the same testpb.Payload object.
+//
+// Reuses p.Body's existing capacity when the request size fits, avoiding
+// per-call allocation. The benchmark harness's testServer.StreamingCall
+// invokes setPayload on every round of a long-lived stream with a constant
+// ResponseSize per stream, so the steady-state path is the reuse branch.
+// Without this reuse, a fair-conc bench (e.g. 1000 streams x 4 KiB ping-pong)
+// allocates ~720 MB/s of response payloads, dominating the GC profile and
+// throttling EVERY transport's measured throughput (SHM, UDS, TCP).
+// Allocation cost is paid only when a stream's ResponseSize exceeds the
+// previously seen size (capacity-grow path); steady state is zero-alloc.
 func setPayload(p *testpb.Payload, t testpb.PayloadType, size int) {
 	if size < 0 {
 		logger.Fatalf("Requested a response with invalid length %d", size)
 	}
-	body := make([]byte, size)
+	if cap(p.Body) >= size {
+		p.Body = p.Body[:size]
+	} else {
+		p.Body = make([]byte, size)
+	}
 	switch t {
 	case testpb.PayloadType_COMPRESSABLE:
 	default:
 		logger.Fatalf("Unsupported payload type: %d", t)
 	}
 	p.Type = t
-	p.Body = body
 }
 
 // NewPayload creates a payload with the given type and size.

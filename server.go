@@ -1186,15 +1186,22 @@ func (s *Server) incrCallsFailed() {
 
 func (s *Server) sendResponse(ctx context.Context, stream *transport.ServerStream, msg any, cp Compressor, opts *transport.WriteOptions, comp encoding.Compressor) error {
 	// Zero-copy fast path: when no compression is configured, the codec is
-	// the default proto codec, and the message is a proto.Message (not an
-	// adapted v1 message), try to serialize directly into the ring buffer.
-	// Require an explicit Name() == "proto" match on the codec so a custom
-	// codec registered under a non-empty content subtype is not silently
-	// bypassed.
+	// the built-in gRPC proto codec, and the message is a proto.Message
+	// (not an adapted v1 message), serialize directly into the ring buffer.
+	// Two-gate codec check:
+	//   1. Name() == "proto" — names the codec class.
+	//   2. Implements bufferPoolMarshaler — identifies the built-in v2
+	//      proto codec; SHM's WriteProto path calls protobuf marshal
+	//      directly, so any custom codec with different semantics must
+	//      not silently take this path.
 	if cp == nil && comp == nil {
 		codec := s.getCodec(stream.ContentSubtype())
 		nc, hasName := codec.(interface{ Name() string })
 		isProtoCodec := hasName && nc.Name() == "proto"
+		if isProtoCodec {
+			_, isBuiltin := codec.(bufferPoolMarshaler)
+			isProtoCodec = isBuiltin
+		}
 		if isProtoCodec {
 			if pm, ok := msg.(protobuf.Message); ok {
 				pSize := protobuf.Size(pm)
@@ -1214,7 +1221,7 @@ func (s *Server) sendResponse(ctx context.Context, stream *transport.ServerStrea
 		}
 	}
 
-	data, err := encode(s.getCodec(stream.ContentSubtype()), msg)
+	data, err := encode(s.getCodec(stream.ContentSubtype()), msg, s.opts.bufferPool)
 	if err != nil {
 		channelz.Error(logger, s.channelz, "grpc: server failed to encode response: ", err)
 		return err

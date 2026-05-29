@@ -30,12 +30,6 @@ import (
 //
 // Counters below are kept for bench/metrics visibility.
 var (
-	// shmWUFramesIgnored historically counted WU frames a NoWU receiver
-	// dropped. With the unified path, receivers always honor WU, so this
-	// counter is no longer incremented. Retained to keep the metric
-	// surface stable for tooling that already reads it.
-	shmWUFramesIgnored atomic.Uint64
-
 	// shmWUFramesBackpressured counts WU emissions that the frame writer
 	// was too busy to accept synchronously (channel full + inlineMu
 	// busy). On such failure the sender restores the captured delta
@@ -46,32 +40,38 @@ var (
 	// signal for tuning frameWriter contention.
 	shmWUFramesBackpressured atomic.Uint64
 
-	// shmConnPreCreditEmitted counts the bytes of connection-level
-	// WINDOW_UPDATE issued via trInFlow.maybeAdjust on a parse-time
-	// onMessageStart trigger. This separates "pre-credit emitted to
-	// admit a large LPM" from ordinary drip-credit traffic counted
-	// elsewhere. Useful both as an observability signal (large value
-	// = small-window scenarios where pre-credit is doing real work)
-	// and as a regression guard (if zero in a fair-default bench
-	// matrix, the pre-credit pathway is not being exercised).
-	shmConnPreCreditEmitted atomic.Uint64
-
 	// shmStreamPreCreditEmitted counts the bytes of stream-level
 	// WINDOW_UPDATE issued via inFlow.maybeAdjust on onMessageStart.
 	// Stream-level pre-credit is the SHM analogue of stock grpc-go's
-	// "app.Read(length) triggers maybeAdjust" path; it has always
-	// fired on multi-frame LPMs, this counter just makes the metric
-	// visible alongside the new conn-level counter.
+	// "app.Read(length) triggers maybeAdjust" path: it fires on
+	// multi-frame LPMs to admit the rest of the message without
+	// stalling the sender on stream-window refill.
 	shmStreamPreCreditEmitted atomic.Uint64
 
 	// shmConnWUCoalesced counts the number of times the frame writer
 	// merged two or more adjacent connection-level WINDOW_UPDATE
 	// frames into a single frame within one drain pass. Non-zero
 	// values indicate the coalescer is paying its keep; expected to
-	// rise sharply at high stream concurrency where many onMessageStart
-	// callbacks emit conn pre-credit WUs back-to-back. Each unit is
-	// "one flush" (which may have absorbed N input entries), not "N
-	// frames saved" — see writeLoop for the absorb/flush semantics.
+	// rise sharply at high stream concurrency where many
+	// onDataFrameReceived callbacks emit drip-credit WUs back-to-back.
+	// Each unit is "one flush" (which may have absorbed N input
+	// entries), not "N frames saved" — see writeLoop for the
+	// absorb/flush semantics.
 	shmConnWUCoalesced atomic.Uint64
+
+	// shmCASRollback counts two-resource CAS reservation rollbacks:
+	// the stream-side sendQuota CAS succeeded but the conn-side
+	// sendQuota CAS lost a race with a concurrent producer (most
+	// commonly the reader's addSendQuota crediting inbound
+	// WINDOW_UPDATE). Both tryReserveSendQuota and
+	// advanceDeferred increment this counter when they Add(grant)
+	// back to the stream side and retry. Non-zero values indicate
+	// CAS contention on the conn-quota atomic; large absolute
+	// values suggest the WU emission cadence or stream concurrency
+	// is high enough to make the two-CAS sequence a contention
+	// point. The counter is also referenced by the focused unit
+	// test that verifies the rollback path is reached under
+	// concurrent connQuota mutation.
+	shmCASRollback atomic.Uint64
 )
 

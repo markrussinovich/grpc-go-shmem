@@ -55,6 +55,7 @@ import (
 	"google.golang.org/grpc/experimental/shm"
 	imem "google.golang.org/grpc/internal/mem"
 	"google.golang.org/grpc/internal/transport"
+	"google.golang.org/grpc/mem"
 	testgrpc "google.golang.org/grpc/interop/grpc_testing"
 	testpb "google.golang.org/grpc/interop/grpc_testing"
 )
@@ -128,10 +129,12 @@ func TestMain(m *testing.M) {
 	// to A/B compare and observe that the speedup is cross-transport,
 	// not SHM-only.
 	if os.Getenv("BENCH_DIRTY_DEFAULT_POOL") == "1" {
-		// Mirror grpc-go's default pool tier list (256 B, 4 KiB,
-		// 16 KiB, 32 KiB, 1 MiB) but on the dirty constructor so
-		// per-Get clear() is skipped.
-		dirty, err := imem.NewDirtyBinaryTieredBufferPool(8, 12, 14, 15, 20)
+		// Build the dirty variant from the same tier list the stock
+		// mem.DefaultBufferPool() uses, so the A/B comparison isolates
+		// just the per-Get memclr cost (dirty skips it). The tier list
+		// is sourced from mem.DefaultBufferPoolSizeExponents() to avoid
+		// drift between this bench and the production pool definition.
+		dirty, err := imem.NewDirtyBinaryTieredBufferPool(mem.DefaultBufferPoolSizeExponents()...)
 		if err != nil {
 			panic(fmt.Sprintf("BENCH_DIRTY_DEFAULT_POOL init failed: %v", err))
 		}
@@ -297,16 +300,17 @@ type benchProfile struct {
 }
 
 func loadBenchProfile() benchProfile {
+	var p benchProfile
 	switch os.Getenv("BENCH_PROFILE") {
 	case "fair-default":
-		return benchProfile{
+		p = benchProfile{
 			initialWindowSize:     65535,
 			initialConnWindowSize: 65535,
 			maxFrameSize:          16384,
 			applyToShm:            true,
 		}
 	case "fair-32mb":
-		return benchProfile{
+		p = benchProfile{
 			initialWindowSize:     32 * 1024 * 1024,
 			initialConnWindowSize: 32 * 1024 * 1024,
 			// 32 MiB profile leaves frame size at the SHM default
@@ -316,12 +320,40 @@ func loadBenchProfile() benchProfile {
 			applyToShm: true,
 		}
 	case "", "shm-tuned":
-		return benchProfile{}
+		p = benchProfile{}
 	default:
 		panic(fmt.Sprintf("BENCH_PROFILE %q not recognised; use shm-tuned | fair-default | fair-32mb",
 			os.Getenv("BENCH_PROFILE")))
 	}
+	// SHM_INITIAL_WINDOW env override lets a reviewer isolate the
+	// FC-window variable without writing a new profile. Applied on
+	// TOP of the profile's window value, AFFECTING ALL THREE
+	// TRANSPORTS symmetrically (via dialOpts / serverOpts which
+	// both read initialWindowSize). Useful for probes like "is the
+	// 64K-message slowdown caused by 65535 window saturation?"
+	// Frame size is NOT changed by this knob — pair with
+	// SHM_MAX_FRAME_SIZE if frame-side experiments are also desired.
+	// The SHM-specific WU emission threshold is reconfigured inside
+	// newShmEnv when applyToShm is true.
+	if v := os.Getenv("SHM_INITIAL_WINDOW"); v != "" {
+		n, perr := strconv.Atoi(v)
+		if perr != nil || n <= 0 {
+			panic(fmt.Sprintf("SHM_INITIAL_WINDOW=%q invalid: %v", v, perr))
+		}
+		p.initialWindowSize = int32(n)
+		p.initialConnWindowSize = int32(n)
+		if p.applyToShm {
+			// Force apply even for shm-tuned (which normally leaves
+			// applyToShm=false) — the user is explicitly opting in
+			// to a window override, so propagate to SHM too.
+			// (No-op when already true.)
+		} else {
+			p.applyToShm = true
+		}
+	}
+	return p
 }
+
 
 func (p benchProfile) dialOpts(transport string) []grpc.DialOption {
 	apply := true
@@ -411,6 +443,13 @@ func newShmEnv(b *testing.B) *grpcBenchEnv {
 	srvOpts := []grpc.ServerOption{
 		grpc.MaxRecvMsgSize(benchMaxMsg),
 		grpc.MaxSendMsgSize(benchMaxMsg),
+		// Channel-scoped exact-size buffer pool. Eliminates the per-Get
+		// overshoot the default tiered pool incurs when codec.Marshal
+		// asks for a buffer that lands just above a tier boundary (a
+		// 4 KiB payload snapping to the 16 KiB tier accounted for ~64 %
+		// of allocation bytes in the master baseline). Per-bench
+		// instance so cross-test pool state never leaks.
+		experimental.BufferPool(experimental.TightBufferPool()),
 	}
 	srvOpts = append(srvOpts, profile.serverOpts("shm")...)
 	stop := benchmark.StartServer(benchmark.ServerInfo{Type: "protobuf", Listener: lis}, srvOpts...)
@@ -422,6 +461,11 @@ func newShmEnv(b *testing.B) *grpcBenchEnv {
 			grpc.MaxCallRecvMsgSize(benchMaxMsg),
 			grpc.MaxCallSendMsgSize(benchMaxMsg),
 		),
+		// See server-side rationale above. Per-channel pool instance
+		// matches the production wiring: a server pool serves all of
+		// its inbound streams' marshal calls; a client pool serves all
+		// of its outbound streams' marshal calls. The two never share.
+		experimental.WithBufferPool(experimental.TightBufferPool()),
 	}
 	dialOpts = append(dialOpts, profile.dialOpts("shm")...)
 	conn, err := grpc.NewClient("shm://"+name, dialOpts...)

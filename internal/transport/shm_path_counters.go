@@ -109,6 +109,90 @@ var (
 	// per chunk). Used when the LPM spans multiple DATA frames or
 	// when the candidate frame failed the ZC / single-copy guards.
 	shmAccReadFire uint64
+
+	// shmZCAnchorBudgetExceeded: BeginMultiAnchor returned nil because
+	// the FIFO slot for the next sequence was still in use. The caller
+	// falls back to the single-frame copy path. A high value vs
+	// ZCReadFire signals the budget needs tuning (zcAnchorBudgetCount
+	// in ring_zc_multi.go).
+	// Note: defined as a package-level var in ring_zc_multi.go; this
+	// field is the snapshot exported via ShmPathCounters.
+
+	// Inline-write fast-path counters (anchored at
+	// (*shmFrameWriter).tryInlineWrite). The inline path emits a
+	// single-frame whole-message DATA frame directly from the sender
+	// goroutine, bypassing the channel + writer-goroutine handoff.
+	// Targets low-concurrency latency: when the writer goroutine
+	// can't amortise its wake cost across a batch, the channel
+	// handoff dominates the per-message wall time. At high
+	// concurrency the existing channel path's batched drain is
+	// strictly better, so the inline path bails immediately when
+	// any pending work is observable.
+
+	// shmInlineWriteFire: tryInlineWrite emitted the whole message
+	// directly into the ring without going through the writer
+	// goroutine. The sender returned immediately (no doneCh wait).
+	shmInlineWriteFire uint64
+
+	// shmInlineWriteBailLocked: TryLock(inlineMu) failed — the writer
+	// goroutine is currently draining a batch. Forces channel path.
+	// This is the only "Bail*" bucket that reflects real lock
+	// contention; the other post-lock bails (Closed / StreamDone /
+	// CtxDone) are bucketed separately so a dirty Locked count
+	// doesn't shadow contention diagnosis.
+	shmInlineWriteBailLocked uint64
+
+	// shmInlineWriteBailClosed: TryLock succeeded but w.closed was
+	// already set by close(). The inline path observes the closed
+	// flag after the lock and bails to the channel path which
+	// returns ErrConnClosing via trySend. Should be near-zero
+	// outside shutdown windows.
+	shmInlineWriteBailClosed uint64
+
+	// shmInlineWriteBailStreamDone: TryLock succeeded but
+	// streamPtr.getState() == streamDone — the stream was cancelled
+	// or completed (e.g. server-side WriteStatus already ran)
+	// between the caller's pre-checks and this point. Forces
+	// channel path so processWholeMessage produces the canonical
+	// errStreamDone result.
+	shmInlineWriteBailStreamDone uint64
+
+	// shmInlineWriteBailCtxDone: TryLock succeeded but ctx.Err()
+	// became non-nil after the lock. The channel path also returns
+	// ctx.Err() in this case; bucketing it separately keeps the
+	// Locked counter pure.
+	shmInlineWriteBailCtxDone uint64
+
+	// shmInlineWriteBailQueued: w.ch had pending entries OR
+	// w.deferred had blocked messages. Forces channel path so the
+	// writer goroutine can preserve batch + FC-retry ordering.
+	shmInlineWriteBailQueued uint64
+
+	// shmInlineWriteBailQuota: stream / conn outbound flow-control
+	// quota was insufficient for the whole message in one frame.
+	// Forces channel path so the writer goroutine's chunking +
+	// deferred-retry machinery can handle the partial credit.
+	shmInlineWriteBailQuota uint64
+
+	// shmInlineWriteBailFrameSize: payloadLen exceeded the negotiated
+	// H2 max frame size — must chunk via the channel path.
+	shmInlineWriteBailFrameSize uint64
+
+	// shmInlineWriteBailZeroLen: zero-length payload (e.g. client
+	// half-close). The channel path's specialised zero-length
+	// MESSAGE handling stays canonical for this rare case.
+	shmInlineWriteBailZeroLen uint64
+
+	// shmInlinePiggybackDrain: count of frames a tryInlineWrite
+	// success-path holder drained from the writer chan (w.ch) BEFORE
+	// releasing inlineMu, amortising the writer-goroutine cycle for
+	// those frames. Bounded at maxInlinePiggyback (8) entries per
+	// inline success. High value at high concurrency = piggyback
+	// working as designed; near-zero at low concurrency = chan was
+	// empty (no work to amortise — which is also expected).
+	// Counter shape: increments by 1 per drained entry, NOT by 1
+	// per inline-write success.
+	shmInlinePiggybackDrain uint64
 )
 
 // LoadShmPathCounters returns a snapshot of the SHM write/read path
@@ -127,9 +211,31 @@ type ShmPathCounters struct {
 	VectoredWriteFire     uint64
 	ChunkedWriteFire      uint64
 	ChunkedWriteVecFire   uint64
-	ZCReadFire            uint64
-	CopyReadFire          uint64
-	AccReadFire           uint64
+	ZCReadFire             uint64
+	CopyReadFire           uint64
+	AccReadFire            uint64
+	ZCAnchorBudgetExceeded uint64
+	ZCFailPSecondNonzero   uint64
+	ZCFailPFirstShort      uint64
+	ZCFailAccInProgress    uint64
+	ZCFailLpmMismatch      uint64
+	ZCFailIneligible       uint64
+	ZCEligNotContig        uint64
+	ZCEligRingTooSmall     uint64
+	ZCEligPayloadSmall     uint64
+	ZCEligBackPressure     uint64
+
+	InlineWriteFire              uint64
+	InlineWriteBailLocked        uint64
+	InlineWriteBailClosed        uint64
+	InlineWriteBailStreamDone    uint64
+	InlineWriteBailCtxDone       uint64
+	InlineWriteBailQueued        uint64
+	InlineWriteBailQuota         uint64
+	InlineWriteBailFrameSize     uint64
+	InlineWriteBailZeroLen       uint64
+
+	InlinePiggybackDrain uint64
 }
 
 // LoadShmPathCounters returns a snapshot. Safe to call concurrently
@@ -145,9 +251,31 @@ func LoadShmPathCounters() ShmPathCounters {
 		VectoredWriteFire:     atomic.LoadUint64(&shmVectoredWriteFire),
 		ChunkedWriteFire:      atomic.LoadUint64(&shmChunkedWriteFire),
 		ChunkedWriteVecFire:   atomic.LoadUint64(&shmChunkedWriteVecFire),
-		ZCReadFire:            atomic.LoadUint64(&shmZCReadFire),
-		CopyReadFire:          atomic.LoadUint64(&shmCopyReadFire),
-		AccReadFire:           atomic.LoadUint64(&shmAccReadFire),
+		ZCReadFire:             atomic.LoadUint64(&shmZCReadFire),
+		CopyReadFire:           atomic.LoadUint64(&shmCopyReadFire),
+		AccReadFire:            atomic.LoadUint64(&shmAccReadFire),
+		ZCAnchorBudgetExceeded: atomic.LoadUint64(&shmZCAnchorBudgetExceeded),
+		ZCFailPSecondNonzero:   atomic.LoadUint64(&shmZCFailPSecondNonzero),
+		ZCFailPFirstShort:      atomic.LoadUint64(&shmZCFailPFirstShort),
+		ZCFailAccInProgress:    atomic.LoadUint64(&shmZCFailAccInProgress),
+		ZCFailLpmMismatch:      atomic.LoadUint64(&shmZCFailLpmMismatch),
+		ZCFailIneligible:       atomic.LoadUint64(&shmZCFailIneligible),
+		ZCEligNotContig:        atomic.LoadUint64(&shmZCElig_NotContig),
+		ZCEligRingTooSmall:     atomic.LoadUint64(&shmZCElig_RingTooSmall),
+		ZCEligPayloadSmall:     atomic.LoadUint64(&shmZCElig_PayloadSmall),
+		ZCEligBackPressure:     atomic.LoadUint64(&shmZCElig_BackPressure),
+
+		InlineWriteFire:              atomic.LoadUint64(&shmInlineWriteFire),
+		InlineWriteBailLocked:        atomic.LoadUint64(&shmInlineWriteBailLocked),
+		InlineWriteBailClosed:        atomic.LoadUint64(&shmInlineWriteBailClosed),
+		InlineWriteBailStreamDone:    atomic.LoadUint64(&shmInlineWriteBailStreamDone),
+		InlineWriteBailCtxDone:       atomic.LoadUint64(&shmInlineWriteBailCtxDone),
+		InlineWriteBailQueued:        atomic.LoadUint64(&shmInlineWriteBailQueued),
+		InlineWriteBailQuota:         atomic.LoadUint64(&shmInlineWriteBailQuota),
+		InlineWriteBailFrameSize:     atomic.LoadUint64(&shmInlineWriteBailFrameSize),
+		InlineWriteBailZeroLen:       atomic.LoadUint64(&shmInlineWriteBailZeroLen),
+
+		InlinePiggybackDrain: atomic.LoadUint64(&shmInlinePiggybackDrain),
 	}
 }
 
@@ -164,8 +292,30 @@ func (a ShmPathCounters) Sub(before ShmPathCounters) ShmPathCounters {
 		VectoredWriteFire:     a.VectoredWriteFire - before.VectoredWriteFire,
 		ChunkedWriteFire:      a.ChunkedWriteFire - before.ChunkedWriteFire,
 		ChunkedWriteVecFire:   a.ChunkedWriteVecFire - before.ChunkedWriteVecFire,
-		ZCReadFire:            a.ZCReadFire - before.ZCReadFire,
-		CopyReadFire:          a.CopyReadFire - before.CopyReadFire,
-		AccReadFire:           a.AccReadFire - before.AccReadFire,
+		ZCReadFire:             a.ZCReadFire - before.ZCReadFire,
+		CopyReadFire:           a.CopyReadFire - before.CopyReadFire,
+		AccReadFire:            a.AccReadFire - before.AccReadFire,
+		ZCAnchorBudgetExceeded: a.ZCAnchorBudgetExceeded - before.ZCAnchorBudgetExceeded,
+		ZCFailPSecondNonzero:   a.ZCFailPSecondNonzero - before.ZCFailPSecondNonzero,
+		ZCFailPFirstShort:      a.ZCFailPFirstShort - before.ZCFailPFirstShort,
+		ZCFailAccInProgress:    a.ZCFailAccInProgress - before.ZCFailAccInProgress,
+		ZCFailLpmMismatch:      a.ZCFailLpmMismatch - before.ZCFailLpmMismatch,
+		ZCFailIneligible:       a.ZCFailIneligible - before.ZCFailIneligible,
+		ZCEligNotContig:        a.ZCEligNotContig - before.ZCEligNotContig,
+		ZCEligRingTooSmall:     a.ZCEligRingTooSmall - before.ZCEligRingTooSmall,
+		ZCEligPayloadSmall:     a.ZCEligPayloadSmall - before.ZCEligPayloadSmall,
+		ZCEligBackPressure:     a.ZCEligBackPressure - before.ZCEligBackPressure,
+
+		InlineWriteFire:              a.InlineWriteFire - before.InlineWriteFire,
+		InlineWriteBailLocked:        a.InlineWriteBailLocked - before.InlineWriteBailLocked,
+		InlineWriteBailClosed:        a.InlineWriteBailClosed - before.InlineWriteBailClosed,
+		InlineWriteBailStreamDone:    a.InlineWriteBailStreamDone - before.InlineWriteBailStreamDone,
+		InlineWriteBailCtxDone:       a.InlineWriteBailCtxDone - before.InlineWriteBailCtxDone,
+		InlineWriteBailQueued:        a.InlineWriteBailQueued - before.InlineWriteBailQueued,
+		InlineWriteBailQuota:         a.InlineWriteBailQuota - before.InlineWriteBailQuota,
+		InlineWriteBailFrameSize:     a.InlineWriteBailFrameSize - before.InlineWriteBailFrameSize,
+		InlineWriteBailZeroLen:       a.InlineWriteBailZeroLen - before.InlineWriteBailZeroLen,
+
+		InlinePiggybackDrain: a.InlinePiggybackDrain - before.InlinePiggybackDrain,
 	}
 }

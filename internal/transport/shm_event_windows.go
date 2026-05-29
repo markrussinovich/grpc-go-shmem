@@ -45,13 +45,26 @@ import (
 // counted. refCount is bumped on every Create/Open registry hit and
 // decremented on Close; the handles are only released when the count
 // reaches zero.
+//
+// The three handle fields are atomic.Uintptr to allow lock-free Signal*
+// / Wait* accesses to race safely against the final Close (which Swaps
+// each handle to 0 before calling CloseHandle). At the Go memory model
+// level a concurrent Signal sees either the original handle or the
+// zero sentinel; the in-flight CloseHandle on the kernel side may race
+// with the SetEvent call, but the worst observable outcome is
+// ERROR_INVALID_HANDLE returned from SetEvent which is silently dropped
+// (the reader side observes the close path's separate value-change
+// notification anyway). Storing as uintptr (the underlying type of
+// windows.Handle) requires only a windows.Handle(...) cast at each
+// use site.
 type RingEvents struct {
-	// dataEvent is signaled when new data is available (writer -> reader)
-	dataEvent windows.Handle
-	// spaceEvent is signaled when space becomes available (reader -> writer)
-	spaceEvent windows.Handle
-	// contigEvent is signaled when contiguous space improves
-	contigEvent windows.Handle
+	// dataEvent is signaled when new data is available (writer -> reader).
+	// Atomic to allow Signal*/Wait* to race safely with Close. See type doc.
+	dataEvent atomic.Uintptr
+	// spaceEvent is signaled when space becomes available (reader -> writer).
+	spaceEvent atomic.Uintptr
+	// contigEvent is signaled when contiguous space improves.
+	contigEvent atomic.Uintptr
 
 	// eventName prefix for cleanup
 	namePrefix string
@@ -118,11 +131,11 @@ func CreateRingEvents(segmentName string, ringID string) (*RingEvents, error) {
 	shmDebugf("[DEBUG] CreateRingEvents: created/opened events data=%v space=%v contig=%v", dataEvent, spaceEvent, contigEvent)
 
 	events := &RingEvents{
-		dataEvent:   dataEvent,
-		spaceEvent:  spaceEvent,
-		contigEvent: contigEvent,
-		namePrefix:  prefix,
+		namePrefix: prefix,
 	}
+	events.dataEvent.Store(uintptr(dataEvent))
+	events.spaceEvent.Store(uintptr(spaceEvent))
+	events.contigEvent.Store(uintptr(contigEvent))
 	events.refCount.Store(1)
 
 	// Register in global registry. A concurrent Create/Open could have
@@ -184,11 +197,11 @@ func OpenRingEvents(segmentName string, ringID string) (*RingEvents, error) {
 	shmDebugf("[DEBUG] OpenRingEvents: opened/created events data=%v space=%v contig=%v", dataEvent, spaceEvent, contigEvent)
 
 	events := &RingEvents{
-		dataEvent:   dataEvent,
-		spaceEvent:  spaceEvent,
-		contigEvent: contigEvent,
-		namePrefix:  prefix,
+		namePrefix: prefix,
 	}
+	events.dataEvent.Store(uintptr(dataEvent))
+	events.spaceEvent.Store(uintptr(spaceEvent))
+	events.contigEvent.Store(uintptr(contigEvent))
 	events.refCount.Store(1)
 
 	// Register in global registry. A concurrent Create/Open could have
@@ -244,63 +257,68 @@ func (e *RingEvents) Close() error {
 	ringEventsMu.Unlock()
 
 	var firstErr error
-	if e.dataEvent != 0 {
-		if err := windows.CloseHandle(e.dataEvent); err != nil && firstErr == nil {
+	// Atomic swap-then-close pattern: each Swap(0) hands us the
+	// previous handle exactly once and guarantees concurrent
+	// Signal*/Wait* observe either the original handle or 0 (and
+	// then bail with the != 0 check). The OS-level race between an
+	// in-flight SetEvent and CloseHandle is benign — SetEvent on a
+	// closed handle returns ERROR_INVALID_HANDLE which we silently
+	// drop. The ring-side waiters already observe the value-change
+	// notification path the close fired separately.
+	if h := windows.Handle(e.dataEvent.Swap(0)); h != 0 {
+		if err := windows.CloseHandle(h); err != nil && firstErr == nil {
 			firstErr = err
 		}
-		e.dataEvent = 0
 	}
-	if e.spaceEvent != 0 {
-		if err := windows.CloseHandle(e.spaceEvent); err != nil && firstErr == nil {
+	if h := windows.Handle(e.spaceEvent.Swap(0)); h != 0 {
+		if err := windows.CloseHandle(h); err != nil && firstErr == nil {
 			firstErr = err
 		}
-		e.spaceEvent = 0
 	}
-	if e.contigEvent != 0 {
-		if err := windows.CloseHandle(e.contigEvent); err != nil && firstErr == nil {
+	if h := windows.Handle(e.contigEvent.Swap(0)); h != 0 {
+		if err := windows.CloseHandle(h); err != nil && firstErr == nil {
 			firstErr = err
 		}
-		e.contigEvent = 0
 	}
 	return firstErr
 }
 
 // SignalData signals that new data is available in the ring.
 func (e *RingEvents) SignalData() {
-	if e.dataEvent != 0 {
-		shmDebugf("[DEBUG] SignalData: setting event=%v", e.dataEvent)
-		windows.SetEvent(e.dataEvent)
+	if h := windows.Handle(e.dataEvent.Load()); h != 0 {
+		shmDebugf("[DEBUG] SignalData: setting event=%v", h)
+		windows.SetEvent(h)
 	}
 }
 
 // SignalSpace signals that space has become available in the ring.
 func (e *RingEvents) SignalSpace() {
-	if e.spaceEvent != 0 {
-		windows.SetEvent(e.spaceEvent)
+	if h := windows.Handle(e.spaceEvent.Load()); h != 0 {
+		windows.SetEvent(h)
 	}
 }
 
 // SignalContig signals that contiguous space has improved.
 func (e *RingEvents) SignalContig() {
-	if e.contigEvent != 0 {
-		windows.SetEvent(e.contigEvent)
+	if h := windows.Handle(e.contigEvent.Load()); h != 0 {
+		windows.SetEvent(h)
 	}
 }
 
 // WaitData waits for the data event or value change.
 // Returns nil if val changed, ErrFutexTimeout on timeout.
 func (e *RingEvents) WaitData(addr *uint32, val uint32, timeout time.Duration) error {
-	return waitOnEventWithValue(e.dataEvent, addr, val, timeout)
+	return waitOnEventWithValue(windows.Handle(e.dataEvent.Load()), addr, val, timeout)
 }
 
 // WaitSpace waits for the space event or value change.
 func (e *RingEvents) WaitSpace(addr *uint32, val uint32, timeout time.Duration) error {
-	return waitOnEventWithValue(e.spaceEvent, addr, val, timeout)
+	return waitOnEventWithValue(windows.Handle(e.spaceEvent.Load()), addr, val, timeout)
 }
 
 // WaitContig waits for the contig event or value change.
 func (e *RingEvents) WaitContig(addr *uint32, val uint32, timeout time.Duration) error {
-	return waitOnEventWithValue(e.contigEvent, addr, val, timeout)
+	return waitOnEventWithValue(windows.Handle(e.contigEvent.Load()), addr, val, timeout)
 }
 
 // waitOnEventWithValue waits on an event handle while checking if the atomic value changed.

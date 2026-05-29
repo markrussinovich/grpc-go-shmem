@@ -29,6 +29,7 @@ import (
 	"sync/atomic"
 
 	"google.golang.org/grpc/mem"
+	"google.golang.org/protobuf/proto"
 )
 
 // shmFrameWriter provides a dedicated writer goroutine with an MPSC queue for
@@ -43,8 +44,16 @@ import (
 //
 // Shutdown safety:
 //   - close() marks the writer as closed and closes the channel.
-//   - enqueue/enqueueAndWait use closeMu.RLock to coordinate with close(),
-//     ensuring the channel is never sent to after being closed.
+//   - Channel-send paths (trySend, enqueueOrInlineNonBlocking,
+//     enqueueAndWait, enqueueMessageAndWait) hold closeMu.RLock
+//     around the closed check + chan send so the channel is never
+//     sent to after close.
+//   - The inline-write path (tryInlineWrite) does NOT hold closeMu;
+//     it relies on inlineMu + the post-lock closed.Load() check.
+//     close() drains inlineMu (drainInline barrier) after wg.Wait,
+//     so any inline writer that already TryLocked inlineMu before
+//     close set the closed flag runs to completion against a still-
+//     mapped ring before close proceeds to teardown.
 type shmFrameWriter struct {
 	tx     *ShmRing
 	ch     chan frameEntry // data + control frames from app goroutines
@@ -149,12 +158,54 @@ type shmFrameWriter struct {
 	// CAS fails; on incoming WU credit (signalled via wuRetryWake)
 	// WL walks the map and retries each deferred entry.
 	//
-	// Both fields are accessed only from the writer goroutine; no
-	// mutex is needed. setConnQuotaPtr publishes the connQuota
-	// pointer via happens-before-channel-send before any sender
-	// enqueueMessageAndWait can race here.
-	connQuota *atomic.Int64
-	deferred  map[uint32]*deferredMessage
+	// deferredProto maps streamID -> FIFO slice of ZC proto entries
+	// (writeProto's async fire-and-forget path) whose CAS attempt
+	// at processProtoEntry time failed for lack of outbound send
+	// quota. Each slice preserves the original chan-arrival order so
+	// retryDeferred drains in FIFO. The sender's inline TryLock path
+	// inspects `len(deferredProto[streamID]) > 0` under inlineMu and
+	// re-routes to async if non-empty, guaranteeing that no inline
+	// write for stream X overtakes an already-deferred async entry
+	// for stream X. Empty / absent slices have zero overhead in the
+	// map (a single hash lookup) — the common case under non-stalled
+	// FC.
+	//
+	// All three fields are accessed only from the writer goroutine
+	// (plus the sender under inlineMu for the deferredProto peek);
+	// no extra mutex is needed. setConnQuotaPtr publishes the
+	// connQuota pointer via happens-before-channel-send before any
+	// sender enqueueMessageAndWait can race here.
+	connQuota     *atomic.Int64
+	deferred      map[uint32]*deferredMessage
+	deferredProto map[uint32][]frameEntry
+
+	// deferredTrailers stashes a TRAILERS frameEntry (server-side
+	// writeStatus) that arrived through the writer chan while DATA
+	// for the same stream was still queued in deferred[sid] or
+	// deferredProto[sid]. The writer's processTrailerEntry stashes
+	// here instead of emitting immediately; the DATA-drain terminals
+	// in retryDeferredProto / advanceDeferred / processProtoEntry
+	// call either flushDeferredTrailer (DATA landed on ring → emit
+	// trailer) or discardDeferredTrailer (DATA dropped on
+	// streamDone / ctx-cancel / ring-write-err → signal errStreamDone
+	// to writeStatus sender, do NOT emit trailer; emitting OK-status
+	// after dropping DATA would put the peer in a cardinality
+	// violation, which is exactly the bug the original synchronous
+	// server writeProto path was carved out to avoid).
+	//
+	// This replaces the previous server-side restriction (no async
+	// writeProto path on the server) which forced server sends to
+	// take the sync chunked-vec path and park ~660 doneCh-waits/op
+	// on the N=1000/4 KiB bench. With the trailer-sentinel, server
+	// writeProto can use async + the writer's FIFO chan naturally
+	// orders DATA-before-TRAILERS without busy-spinning in
+	// writeStatus. See grpc-go-shm-server-async-trailer-sentinel-
+	// design memo for the full rationale.
+	//
+	// At most ONE pending TRAILERS per stream (gRPC's serial
+	// writeStatus contract). map zero-value is acceptable; lazy-
+	// allocated in newShmFrameWriter.
+	deferredTrailers map[uint32]frameEntry
 }
 
 // deferredMessage holds the partial state of a whole-message entry
@@ -176,10 +227,32 @@ type deferredMessage struct {
 	ctx       context.Context
 	streamPtr *Stream
 	fh        FrameHeader
-	cur       *vecCursor
+	cur       vecCursor // embedded by value (was *vecCursor) — see Stream.shmDeferred
+	// origData preserves the original BufferSlice header captured at
+	// processWholeMessage time. cur.data is destructively re-sliced
+	// by vecCursor.writeTo (each emitted segment is dropped via
+	// `c.data = c.data[1:]`), so by the time release() runs cur.data
+	// is typically the empty tail. Freeing cur.data would be a no-op
+	// and the Ref taken in enqueueMessageAndWait would never get
+	// balanced — leaking pooled buffers. Free origData instead.
+	origData  mem.BufferSlice
 	remaining int
 	isLast    bool
 	doneCh    chan error
+}
+
+// release frees the BufferSlice ref AND nulls the cur slices so that
+// the underlying *mem.Buffer pointers and lpmHdr byte slice can be
+// reclaimed by GC. Used by every terminal path in advanceDeferred /
+// processWholeMessage / close-drain. Frees d.origData (the original
+// caller-supplied BufferSlice header) NOT d.cur.data, because
+// vecCursor.writeTo destructively re-slices cur.data as it emits —
+// see the origData field doc on deferredMessage.
+func (d *deferredMessage) release() {
+	d.origData.Free()
+	d.origData = nil
+	d.cur.data = nil
+	d.cur.lpmHdr = nil
 }
 
 // frameEntry represents a single frame to be written to the ring.
@@ -208,6 +281,24 @@ type frameEntry struct {
 	wholeMsg  bool
 	streamPtr *Stream
 	isLast    bool
+
+	// ZC marshal in writeLoop.
+	//
+	// When `protoMsg != nil`, this entry carries an UNMARSHALLED
+	// proto.Message that writeLoop should marshal DIRECTLY into a
+	// ring reservation (via writeProtoToRingH2Blocking), bypassing
+	// the upper-layer codec.Marshal allocation. Used as the queued
+	// fallback when (*ShmClientTransport|ShmServerTransport).writeProto's
+	// inlineMu.TryLock fails — even bailed senders still get ZC
+	// marshal via the writer goroutine instead of the
+	// tightBufferPool + chunked-write-vec copy path.
+	//
+	// Caller MUST pre-validate single-frame size bounds AND must
+	// have already acquired send quota for (5 + protoSize) bytes
+	// before pushing — writeLoop cannot soft-reject these from its
+	// drain context. fh.Flags carries MessageFlagEndStream / MORE.
+	protoMsg  proto.Message
+	protoSize int
 }
 
 const (
@@ -217,15 +308,25 @@ const (
 	// channel full. 2048 absorbs typical fanout without back-pressure on
 	// the async fire-and-forget path.
 	frameWriterQueueSize = 2048
+
+	// maxDrainPerPass caps the greedy drain in writeLoop per outer-select
+	// trip. Bounds inlineMu hold time and ensures the outer select can
+	// observe wuRetryWake signals in a timely manner. Matches .NET's
+	// 512-frame BeginBatch/EndBatch drain. Large enough that high-conc
+	// 4 KiB cells (where ~1000 producers contend on chan-send) coalesce
+	// many late arrivals into one writev+SignalData cycle.
+	maxDrainPerPass = 512
 )
 
 // newShmFrameWriter creates and starts a frame writer for the given ring.
 func newShmFrameWriter(tx *ShmRing) *shmFrameWriter {
 	w := &shmFrameWriter{
-		tx:          tx,
-		ch:          make(chan frameEntry, frameWriterQueueSize),
-		wuRetryWake: make(chan struct{}, 1),
-		deferred:    make(map[uint32]*deferredMessage),
+		tx:               tx,
+		ch:               make(chan frameEntry, frameWriterQueueSize),
+		wuRetryWake:      make(chan struct{}, 1),
+		deferred:         make(map[uint32]*deferredMessage),
+		deferredProto:    make(map[uint32][]frameEntry),
+		deferredTrailers: make(map[uint32]frameEntry),
 	}
 	w.wg.Add(1)
 	go w.writeLoop()
@@ -375,8 +476,12 @@ func (w *shmFrameWriter) writeLoop() {
 			continue
 		}
 		// Check if more frames are queued behind this one.
-		pending := len(w.ch)
-		if pending > 0 {
+		// Greedy non-blocking drain: bundles late arrivals that hit
+		// the chan during processEntry into the same writev+SignalData
+		// cycle (snapshot-then-drain would defer them to the next
+		// outer-select trip). Capped at maxDrainPerPass so inlineMu
+		// hold is bounded and wuRetryWake can be observed promptly.
+		if len(w.ch) > 0 {
 			signalBatchBytes := int(w.tx.Capacity() / 8)
 			batchBytes := 0
 			w.tx.BeginBatch()
@@ -392,10 +497,19 @@ func (w *shmFrameWriter) writeLoop() {
 				w.processEntry(entry)
 				batchBytes += eb
 			}
-			for i := 0; i < pending; i++ {
-				next, ok := <-w.ch
-				if !ok {
-					break
+		Drain:
+			for drained := 1; drained < maxDrainPerPass; drained++ {
+				var (
+					next frameEntry
+					ok   bool
+				)
+				select {
+				case next, ok = <-w.ch:
+					if !ok {
+						break Drain
+					}
+				default:
+					break Drain
 				}
 				if coalescer.absorb(next) {
 					// 4-byte WU frame contributes a fixed minor cost
@@ -414,9 +528,10 @@ func (w *shmFrameWriter) writeLoop() {
 				}
 				// Periodically release the batch so the reader gets a
 				// wake mid-burst and can drain in parallel with the
-				// next group's writes, instead of waiting for the
-				// entire pending queue to complete.
-				if batchBytes >= signalBatchBytes && i < pending-1 {
+				// next group's writes. Skip when chan is already empty
+				// to avoid wasted BeginBatch+EndBatch oscillation on
+				// the final iteration.
+				if batchBytes >= signalBatchBytes && len(w.ch) > 0 {
 					// Flush any pending WU coalesce before signal so
 					// the reader sees credits in this signal cycle,
 					// not the next.
@@ -473,8 +588,10 @@ func entryBytes(e frameEntry) int {
 // incoming increment would overflow, the accumulator first flushes
 // (emitting the existing pending as one WU) and then absorbs the new
 // entry into a fresh accumulator. In practice this never happens
-// for SHM workloads (1000 streams × 1 MiB pre-credit = 1 GiB total
-// << 2 GiB cap) but the guard is necessary for spec compliance.
+// for SHM workloads (a single drain pass sees drip-on-receive WUs
+// at limit/4 cadence whose sum is bounded by the negotiated conn
+// window, well under the 2 GiB cap) but the guard is necessary
+// for spec compliance.
 type connWUCoalescer struct {
 	w       *shmFrameWriter
 	pending uint64
@@ -556,6 +673,30 @@ func (w *shmFrameWriter) processEntry(entry frameEntry) {
 		w.processWholeMessage(entry)
 		return
 	}
+	// ZC marshal entries: marshal the proto.Message DIRECTLY into a
+	// ring reservation here (under inlineMu), bypassing the upper-
+	// layer codec.Marshal + tightBufferPool allocation that the
+	// sender would otherwise pay. See enqueueProtoAndWait for the
+	// caller-side contract.
+	if entry.protoMsg != nil {
+		w.processProtoEntry(entry)
+		return
+	}
+	// TRAILERS frames carry the server-side end-of-stream + status
+	// payload (per gRPC HTTP/2 mapping). They MUST be emitted strictly
+	// AFTER any DATA already queued for the same stream — the server's
+	// re-enabled async writeProto path puts DATA in deferredProto[sid]
+	// or w.deferred[sid], and a naive emit here would overtake that
+	// DATA and cause cardinality violation on the client. Route via
+	// processTrailerEntry which defers into deferredTrailers when DATA
+	// is still pending; the DATA-drain terminals call
+	// maybeFlushDeferredTrailer to fire the pending TRAILERS once the
+	// stream's DATA queue is empty. See grpc-go-shm-server-async-
+	// trailer-sentinel-design memo.
+	if entry.fh.Type == FrameTypeTRAILERS {
+		w.processTrailerEntry(entry)
+		return
+	}
 	var err error
 	switch {
 	case entry.data != nil:
@@ -570,6 +711,367 @@ func (w *shmFrameWriter) processEntry(entry frameEntry) {
 	if err != nil && w.onAsyncError != nil && w.errReported.CompareAndSwap(false, true) {
 		w.onAsyncError(err)
 	}
+}
+
+// processProtoEntry handles a ZC marshal request: the sender supplied
+// an unmarshalled proto.Message; we marshal it directly into a ring
+// reservation here under writeLoop's inlineMu. This is the queued
+// fallback for senders whose writeProto fast path could not commit
+// inline — either inlineMu.TryLock failed OR the inline lock-free
+// CAS for outbound send-quota failed (window depleted / lost a race
+// with a concurrent reservation). Instead of parking the sender on a
+// per-stream signal under sendQuotaMu (the legacy slow path) the
+// sender enqueues a fire-and-forget ZC entry and writeLoop owns FC
+// reservation + defer + retry symmetrically with the chunked whole-
+// message path.
+//
+// Caller MUST have:
+//   - Pre-validated single-frame size bounds (Capacity/3,
+//     h2MaxFramePayload, shmMaxFrameSize) — writeProto does this
+//     before TryLock, so by the time the bail enqueue happens, the
+//     entry is guaranteed to fit a single H2 DATA frame.
+//
+// Flow control: the writer goroutine owns the CAS reservation. On
+// CAS failure the entry is appended to w.deferredProto[streamID]
+// (per-stream FIFO slice — see field comment for ordering rationale)
+// and retried on the next wuRetryWake via retryDeferred. On stream-
+// local close (closeStream flips state to streamDone and fires
+// wuRetryWake) the deferred entry is discarded silently — the upper
+// layer already observed write success at enqueue time, so there is
+// no caller to notify; downstream Send/Recv calls will observe
+// errStreamDone via the stream state machine.
+//
+// Fire-and-forget semantics: entries arrive with doneCh == nil. Ring
+// write errors surface through onAsyncError exactly as for other
+// fire-and-forget control frame paths (HEADERS / GOAWAY senders).
+// The transport tears down on a single failure; subsequent senders
+// observe ErrConnClosing via t.closed.Load().
+func (w *shmFrameWriter) processProtoEntry(entry frameEntry) {
+	if w.closed.Load() {
+		// Drop silently; sender already returned success. The
+		// protoInFlight counter still needs to drain so future
+		// transport.Close-time test assertions hold; on close all
+		// streams go to streamDone anyway, so the counter value
+		// becomes irrelevant.
+		if entry.streamPtr != nil {
+			entry.streamPtr.protoInFlight.Add(-1)
+		}
+		return
+	}
+	s := entry.streamPtr
+	if s == nil || w.connQuota == nil {
+		// Misuse: ZC entry pushed without the required stream
+		// pointer or before setConnQuotaPtr was wired up. Surface
+		// via onAsyncError so the transport tears down.
+		//
+		// If s != nil (only connQuota wiring is missing), still
+		// drain its in-flight counter so the upper layer's
+		// resource-teardown invariants hold even on this
+		// construction-order misuse path.
+		if s != nil {
+			s.protoInFlight.Add(-1)
+		}
+		if w.onAsyncError != nil && w.errReported.CompareAndSwap(false, true) {
+			w.onAsyncError(ErrConnClosing)
+		}
+		return
+	}
+	if s.getState() == streamDone {
+		s.protoInFlight.Add(-1)
+		// Stream gone; discard any TRAILERS sentinel parked for it
+		// (NOT flush — emitting OK-status after dropping DATA
+		// would put the peer in a cardinality-violation state).
+		// writeStatus sender will surface errStreamDone.
+		w.discardDeferredTrailer(entry.fh.StreamID, s)
+		return
+	}
+	// Drop on ctx cancel before quota reservation — mirror the early
+	// drop retryDeferredProto already does on its head entries.
+	// Without this, a late cancel races into quota CAS + ring write
+	// (ReserveWrite usually returns ctx err and the error path
+	// classifies it as benign, but it still burns writer cycles).
+	if entry.ctx.Err() != nil {
+		s.protoInFlight.Add(-1)
+		// DATA dropped on ctx cancel — discard parked TRAILERS
+		// rather than flush (same cardinality argument as
+		// streamDone branch above).
+		w.discardDeferredTrailer(entry.fh.StreamID, s)
+		return
+	}
+	sid := entry.fh.StreamID
+	// FIFO order preservation: if this stream already has deferred
+	// proto entries, append rather than attempt CAS. The sender's
+	// inline path also checks s.protoInFlight under inlineMu before
+	// doing its inline CAS — between the sender's check and now no
+	// new entry for this stream can have raced past us via the
+	// inline path (inlineMu serialises both). Within the writer
+	// goroutine the chan-arrival order is FIFO and matches the
+	// sender's call order; appending preserves the gRPC per-stream
+	// message order invariant.
+	if existing := w.deferredProto[sid]; len(existing) > 0 {
+		w.deferredProto[sid] = append(existing, entry)
+		// protoInFlight stays at its incremented value — entry
+		// remains in flight until retryDeferredProto drains it.
+		return
+	}
+	n := int64(5 + entry.protoSize)
+	if !tryReserveSendQuota(w.connQuota, &s.sendQuota, n) {
+		// Stalled on FC — defer for retry. Single-slot allocation
+		// optimised for the common case (only one pending per
+		// stream); slice growth covers back-to-back streaming sends.
+		w.deferredProto[sid] = []frameEntry{entry}
+		return
+	}
+	err := writeProtoToRingH2Blocking(entry.ctx, w.tx, sid,
+		entry.protoMsg, entry.protoSize, entry.fh.Flags)
+	if err != nil {
+		// Refund the quota we just reserved — these bytes did not
+		// land on the wire. ReserveWrite returns BEFORE Commit on
+		// error, so the receiver never sees / charges them.
+		w.connQuota.Add(n)
+		s.sendQuota.Add(n)
+		if w.onAsyncError != nil && w.errReported.CompareAndSwap(false, true) {
+			w.onAsyncError(err)
+		}
+	}
+	s.protoInFlight.Add(-1)
+	// After this proto entry resolves the per-stream DATA queue may
+	// now be empty. Choose flush vs discard by whether DATA landed:
+	// success → emit parked TRAILERS; failure → discard (peer would
+	// see TRAILERS without the missing DATA, cardinality violation).
+	if err != nil {
+		w.discardDeferredTrailer(sid, s)
+	} else {
+		w.flushDeferredTrailer(sid)
+	}
+}
+
+// processTrailerEntry handles a TRAILERS frame entry submitted by the
+// server-side writeStatus. If the stream still has DATA queued in
+// w.deferred[sid] or w.deferredProto[sid], stash the entry in
+// w.deferredTrailers[sid] (single-slot per stream; gRPC's one-
+// writeStatus-per-stream contract guarantees no overlap). When the
+// last pending DATA resolves at a DATA-drain terminal, that terminal
+// calls flushDeferredTrailer (DATA landed on ring → emit trailer) or
+// discardDeferredTrailer (DATA dropped → signal errStreamDone, skip
+// wire write to avoid cardinality violation).
+//
+// If the stream has already transitioned to streamDone (RST_STREAM /
+// closeStream / transport teardown raced ahead), the TRAILERS would
+// be wire-noise to a peer that already saw the cancel; signal the
+// sender with errStreamDone so its writeStatus surfaces the right
+// error and skip the ring write.
+//
+// Runs under writeLoop's inlineMu — same context as every other
+// w.processEntry dispatch — so accesses to w.deferred / w.deferredProto
+// / w.deferredTrailers are race-free.
+func (w *shmFrameWriter) processTrailerEntry(entry frameEntry) {
+	sid := entry.fh.StreamID
+	if entry.streamPtr != nil && entry.streamPtr.getState() == streamDone {
+		// Stream forcibly closed before we got here; don't emit
+		// TRAILERS to a peer that already saw RST.
+		if entry.doneCh != nil {
+			entry.doneCh <- errStreamDone
+		}
+		return
+	}
+	// FIFO with same-stream DATA: if DATA is queued, defer.
+	if _, ok := w.deferred[sid]; ok {
+		w.deferredTrailers[sid] = entry
+		return
+	}
+	if len(w.deferredProto[sid]) > 0 {
+		w.deferredTrailers[sid] = entry
+		return
+	}
+	w.emitTrailerEntry(entry)
+}
+
+// emitTrailerEntry writes the TRAILERS frame to the ring, transitions
+// the stream's state to streamDone (the drop-signal for any later
+// stray DATA — though by construction there should be none after
+// writeStatus), clears late-credit, and signals the writeStatus
+// sender's doneCh. Caller MUST have already verified no DATA is
+// pending for this stream.
+func (w *shmFrameWriter) emitTrailerEntry(entry frameEntry) {
+	err := writeFrame(entry.ctx, w.tx, entry.fh, entry.payload)
+	if entry.streamPtr != nil {
+		// Swap state inside the writer at TRAILERS-emit time so
+		// processProtoEntry's streamDone drop check happens-after
+		// every DATA we just drained. compareAndSwapState is no-op
+		// if state already advanced (close raced).
+		entry.streamPtr.compareAndSwapState(streamActive, streamDone)
+		// Match the previous writeStatus behaviour: clear pending
+		// stream-level WU credit so a late producer's restore does
+		// not leak into the next stream id reuse.
+		entry.streamPtr.pendingWU.Store(0)
+	}
+	if entry.doneCh != nil {
+		entry.doneCh <- err
+	} else if err != nil && w.onAsyncError != nil && w.errReported.CompareAndSwap(false, true) {
+		// Defensive: writeStatus always supplies doneCh; this branch
+		// keeps parity with other fire-and-forget control frames.
+		w.onAsyncError(err)
+	}
+}
+
+// flushDeferredTrailer is called at every DATA-drain terminal where
+// the DATA was successfully committed to the ring. If a TRAILERS
+// entry is parked behind the just-drained DATA for stream `sid` AND
+// no other DATA is still queued, emit the TRAILERS now.
+//
+// Cheap fast path: bare map probe on w.deferredTrailers[sid]. The
+// map is typically empty (TRAILERS hit much less frequently than
+// DATA), so the average cost is one hash lookup. When the entry
+// exists we re-validate the deferral guards: another DATA queue may
+// still hold entries for this stream (sibling map drains
+// independently), in which case the trailer stays parked and the
+// sibling's drain terminal will fire this helper again.
+//
+// Runs under writeLoop's inlineMu (same context as every DATA-drain
+// terminal); accesses to w.deferred / w.deferredProto /
+// w.deferredTrailers are race-free.
+func (w *shmFrameWriter) flushDeferredTrailer(sid uint32) {
+	entry, ok := w.deferredTrailers[sid]
+	if !ok {
+		return
+	}
+	if _, hasWhole := w.deferred[sid]; hasWhole {
+		return
+	}
+	if len(w.deferredProto[sid]) > 0 {
+		return
+	}
+	delete(w.deferredTrailers, sid)
+	// streamDone gate: if a prior DATA-drop terminal already
+	// tombstoned this stream (via discardDeferredTrailer's
+	// unconditional CAS), do NOT emit OK trailers — that drop
+	// means the peer is missing at least one DATA frame, and
+	// emitting OK trailers here would produce the cardinality
+	// violation the trailer-sentinel design exists to prevent.
+	// This branch is reached only in the rare sibling-pending
+	// interleave: one DATA queue dropped (tombstoned) while the
+	// other queue's drain eventually succeeded and called flush.
+	// In the common case the stream is still streamActive here.
+	if entry.streamPtr != nil && entry.streamPtr.getState() == streamDone {
+		if entry.doneCh != nil {
+			entry.doneCh <- errStreamDone
+		}
+		return
+	}
+	w.emitTrailerEntry(entry)
+}
+
+// discardDeferredTrailer is called at every DATA-drain terminal
+// where the DATA was DISCARDED (stream went streamDone, ctx
+// cancelled, ring write errored mid-emission, partial-commit). If a
+// TRAILERS entry is parked behind that DATA, emitting it now would
+// put the peer in a cardinality-violation state (it sees TRAILERS
+// with one or more missing DATA messages — exactly the bug that the
+// original synchronous server writeProto path was carved out to
+// avoid). Instead, signal errStreamDone to the writeStatus sender
+// and SKIP the ring write.
+//
+// CRITICAL — TOCTOU close: the `s *Stream` parameter is the stream
+// whose DATA was just dropped. We unconditionally CAS it to
+// streamDone BEFORE inspecting the parked trailer. This closes the
+// race where:
+//
+//   1. async DATA enqueued by server writeProto
+//   2. async DATA drops at this terminal (ctx.Err / ring-write-err /
+//      already-streamDone)
+//   3. writeStatus has NOT yet enqueued the trailer when we get here
+//      → w.deferredTrailers[sid] absent → the parked-trailer check
+//      below early-returns
+//   4. writeStatus later enqueues the trailer
+//   5. processTrailerEntry sees no deferred DATA AND streamActive
+//      (the old bug: state was never transitioned because no trailer
+//      was parked to swap on) → emits OK trailers on the wire →
+//      peer cardinality violation
+//
+// Doing the CAS first makes processTrailerEntry's existing
+// streamDone check (at the top of that function) fire on the
+// late-arriving trailer, signalling errStreamDone to the
+// writeStatus sender and skipping the wire write.
+//
+// Sibling-queue guard: if the OTHER DATA queue still has entries
+// for this stream, the parked trailer (if any) stays parked until
+// the sibling drains. The stream-state CAS is still applied so
+// processTrailerEntry's check would also catch a fresh
+// late-arriving trailer — but in this branch a trailer was
+// already parked at trailer-enqueue time, so processTrailerEntry
+// already deferred it correctly; this path is just the cleanup
+// when the sibling's drain terminal eventually fires.
+//
+// Idempotent (the CAS and the delete are the only state-mutating
+// steps; both are no-ops on repeat).
+//
+// Runs under writeLoop's inlineMu (see flushDeferredTrailer comment).
+func (w *shmFrameWriter) discardDeferredTrailer(sid uint32, s *Stream) {
+	if s != nil {
+		// Tombstone the stream FIRST so a late-arriving trailer
+		// (writeStatus called AFTER us) is rejected by
+		// processTrailerEntry's streamDone check rather than
+		// emitted on the wire.
+		s.compareAndSwapState(streamActive, streamDone)
+		s.pendingWU.Store(0)
+	}
+	entry, ok := w.deferredTrailers[sid]
+	if !ok {
+		return
+	}
+	if _, hasWhole := w.deferred[sid]; hasWhole {
+		return
+	}
+	if len(w.deferredProto[sid]) > 0 {
+		return
+	}
+	delete(w.deferredTrailers, sid)
+	if entry.doneCh != nil {
+		entry.doneCh <- errStreamDone
+	}
+}
+
+// enqueueProtoAsync pushes a ZC marshal request onto the writer
+// channel fire-and-forget. The sender does NOT block on completion.
+//
+// Used by (*ShmClientTransport|ShmServerTransport).writeProto when
+// either the inline TryLock fails OR the inline lock-free CAS for
+// outbound send-quota fails. Replaces the legacy slow path
+// (acquireSendQuota park on per-stream signal under sendQuotaMu +
+// connWaiters FIFO + register/unregister/notifyQuotaChangeLocked
+// dispatch) with a single chan-hop: the writer goroutine owns FC
+// reservation + defer + retry symmetrically with the chunked whole-
+// message path, eliminating the parallel slow-path machinery that
+// previously parked ~10% of senders at fair-default 1000/4K.
+//
+// Pre-conditions (caller MUST satisfy):
+//   - Single-frame size bounds pre-validated.
+//   - opts.Last → stream state already CAS'd to streamWriteDone
+//     (semantic transition happens-before the upper-layer return).
+//   - NO send-quota pre-reserved. The writer's processProtoEntry
+//     does the CAS reservation under its own context.
+//
+// Errors: returns ErrConnClosing if the chan is full or the writer
+// is closed. The frameWriterQueueSize=2048 buffer makes "full"
+// extremely rare under realistic 1000-stream workloads; if it does
+// occur the transport is so backed up that returning an error to
+// the caller is the correct semantics. On success the entry is
+// guaranteed to be processed (or silently dropped on stream/
+// transport close, both of which the upper layer observes via the
+// stream state machine).
+func (w *shmFrameWriter) enqueueProtoAsync(ctx context.Context, streamPtr *Stream, fh FrameHeader, msg proto.Message, pSize int) error {
+	entry := frameEntry{
+		ctx:       ctx,
+		fh:        fh,
+		streamPtr: streamPtr,
+		protoMsg:  msg,
+		protoSize: pSize,
+	}
+	if !w.trySend(entry) {
+		return ErrConnClosing
+	}
+	return nil
 }
 
 // processWholeMessage handles a whole-message entry. The caller
@@ -595,6 +1097,8 @@ func (w *shmFrameWriter) processWholeMessage(entry frameEntry) {
 		if entry.doneCh != nil {
 			entry.doneCh <- ErrConnClosing
 		}
+		// Balance the Ref taken in enqueueMessageAndWait.
+		entry.data.Free()
 		return
 	}
 	payloadLen := len(entry.hdr) + entry.data.Len()
@@ -615,17 +1119,40 @@ func (w *shmFrameWriter) processWholeMessage(entry frameEntry) {
 			w.piggybackWUFn(fh.StreamID)
 		}
 		entry.doneCh <- err
+		// Balance the Ref taken in enqueueMessageAndWait.
+		entry.data.Free()
 		return
 	}
-	cur := &vecCursor{lpmHdr: entry.hdr, data: entry.data}
-	d := &deferredMessage{
-		ctx:       entry.ctx,
-		streamPtr: entry.streamPtr,
-		fh:        entry.fh,
-		cur:       cur,
-		remaining: payloadLen,
-		isLast:    entry.isLast,
-		doneCh:    entry.doneCh,
+	// PR-B: reuse Stream's inline-allocated deferred slot instead of
+	// fresh heap alloc. gRPC's one-SendMsg-per-stream invariant
+	// guarantees s.shmDeferred is not currently held by another
+	// in-flight Send (any previous SendMsg has already signalled
+	// its doneCh and the caller-blocking sender returned, releasing
+	// the slot back to us logically). The writer's
+	// w.deferred[streamID] map still owns the lifecycle pointer.
+	d := &entry.streamPtr.shmDeferred
+	d.ctx = entry.ctx
+	d.streamPtr = entry.streamPtr
+	d.fh = entry.fh
+	d.cur = vecCursor{lpmHdr: entry.hdr, data: entry.data}
+	d.origData = entry.data
+	d.remaining = payloadLen
+	d.isLast = entry.isLast
+	d.doneCh = entry.doneCh
+	// Per-stream FIFO vs the async ZC proto path. If this stream
+	// already has deferred proto entries waiting on FC, the chan
+	// arrival order put those entries BEFORE this whole-message
+	// (the sender's inline path bails when len(w.ch) > 0 OR when
+	// any stream has deferred proto pending — see tryInlineWrite).
+	// Emitting this whole-message before retryDeferredProto drains
+	// the proto queue would violate gRPC per-stream message order.
+	// Install in w.deferred[sid] (sender already holds doneCh; the
+	// at-most-one-whole-message-per-stream invariant guarantees no
+	// pre-existing entry is overwritten — write() callers block on
+	// doneCh until resolution).
+	if len(w.deferredProto[entry.fh.StreamID]) > 0 {
+		w.deferred[entry.fh.StreamID] = d
+		return
 	}
 	w.advanceDeferred(entry.fh.StreamID, d)
 }
@@ -660,6 +1187,13 @@ func (w *shmFrameWriter) advanceDeferred(streamID uint32, d *deferredMessage) {
 			default:
 			}
 			delete(w.deferred, streamID)
+			// Balance the Ref taken in enqueueMessageAndWait.
+			d.release()
+			// DATA dropped on stream-local close — if a TRAILERS
+			// sentinel is parked behind it, discard rather than
+			// emit. Emitting OK-status TRAILERS after dropping DATA
+			// would put the peer in a cardinality-violation state.
+			w.discardDeferredTrailer(streamID, d.streamPtr)
 			return
 		}
 		// Observe ctx cancellation — the sender goroutine in
@@ -674,6 +1208,12 @@ func (w *shmFrameWriter) advanceDeferred(streamID uint32, d *deferredMessage) {
 			default:
 			}
 			delete(w.deferred, streamID)
+			// Balance the Ref taken in enqueueMessageAndWait.
+			d.release()
+			// DATA dropped on ctx cancellation — discard the
+			// parked TRAILERS sentinel rather than emit (see
+			// streamDone branch above for rationale).
+			w.discardDeferredTrailer(streamID, d.streamPtr)
 			return
 		}
 		streamQ := d.streamPtr.sendQuota.Load()
@@ -693,11 +1233,34 @@ func (w *shmFrameWriter) advanceDeferred(streamID uint32, d *deferredMessage) {
 		if connQ < grant {
 			grant = connQ
 		}
+		// LPM-header atomicity. The 5-byte gRPC LPM header MUST be
+		// delivered to the receiver in a contiguous DATA-frame body
+		// because the receive-side lpmAccumulator can only set its
+		// expectedTotal (which gates the onMessageStart stream-FC
+		// pre-credit hook) AFTER the full 5-byte header is parsed
+		// in a single feed() call. If the sender emits a chunk
+		// shorter than the remaining LPM-header bytes, the receiver
+		// sees a partial header, expectedTotal stays 0, the
+		// onMessageStart hook does not fire, no stream-level
+		// pre-credit is emitted, and the receiver's onData check on
+		// the NEXT chunk trips because pendingData crosses the
+		// per-stream limit while delta is still 0. This produces
+		// the 1 MiB-jumbo `Send: EOF` bench failure (rounds 0-31
+		// depending on concurrency) — confirmed by GRPC_SHM_DEBUG=1
+		// reproducer showing `delta=0` at the violation site.
+		//
+		// Defer until conn / stream credit can cover at least the
+		// remaining header bytes.
+		if hdrRemaining := int64(len(d.cur.lpmHdr)); hdrRemaining > 0 && grant < hdrRemaining {
+			w.deferred[streamID] = d
+			return
+		}
 		if !d.streamPtr.sendQuota.CompareAndSwap(streamQ, streamQ-grant) {
 			continue // CAS lost — retry
 		}
 		if !w.connQuota.CompareAndSwap(connQ, connQ-grant) {
 			d.streamPtr.sendQuota.Add(grant) // rollback
+			shmCASRollback.Add(1)
 			continue
 		}
 		// Determine the last-chunk flag: END_STREAM only fires when
@@ -710,13 +1273,30 @@ func (w *shmFrameWriter) advanceDeferred(streamID uint32, d *deferredMessage) {
 			fh.Flags = MessageFlagMORE
 		}
 		_, h2f := translateCustomToH2(fh)
-		if err := emitH2DataFromCursor(d.ctx, w.tx, streamID, d.cur, int(grant), h2f); err != nil {
-			// Refund the reserved quota — these bytes were not
-			// delivered and the stream is about to error out.
-			d.streamPtr.sendQuota.Add(grant)
-			w.connQuota.Add(grant)
+		committed, err := emitH2DataFromCursor(d.ctx, w.tx, streamID, &d.cur, int(grant), h2f)
+		if err != nil {
+			// Partial-commit-aware refund. emitH2DataFromCursor may
+			// have committed `committed` bytes to the ring BEFORE
+			// failing (the peer has those bytes and will charge them
+			// against its inbound window). Refund only the uncommitted
+			// remainder; refunding the full grant would inflate the
+			// conn-level send quota by `committed` bytes and let a
+			// later send on a different stream overshoot the receiver's
+			// actual window. Track stream send quota the same way.
+			refund := grant - int64(committed)
+			if refund > 0 {
+				d.streamPtr.sendQuota.Add(refund)
+				w.connQuota.Add(refund)
+			}
 			d.doneCh <- err
 			delete(w.deferred, streamID)
+			// Balance the Ref taken in enqueueMessageAndWait.
+			d.release()
+			// Ring write errored mid-emission — peer may have a
+			// partial LPM on the wire already. Discard the parked
+			// TRAILERS sentinel; emitting OK-status now would
+			// compound the protocol violation.
+			w.discardDeferredTrailer(streamID, d.streamPtr)
 			return
 		}
 		d.remaining -= int(grant)
@@ -727,26 +1307,178 @@ func (w *shmFrameWriter) advanceDeferred(streamID uint32, d *deferredMessage) {
 	// Fully sent.
 	d.doneCh <- nil
 	delete(w.deferred, streamID)
+	// Balance the Ref taken in enqueueMessageAndWait.
+	d.release()
+	// DATA successfully on the ring — fire any parked TRAILERS
+	// sentinel for this stream.
+	w.flushDeferredTrailer(streamID)
 }
 
 // retryDeferred is called by the writeLoop on every wuRetryWake.
-// It walks the deferred map and attempts to make progress on each
-// stalled message. Runs under inlineMu.
+// It walks the deferred maps and attempts to make progress on each
+// stalled entry. Runs under inlineMu.
 //
-// Iteration order is map-random — for fairness under high
-// concurrency we don't try to preserve FIFO. A starving stream will
-// eventually be reached as WU credits accumulate; in practice the
-// receiver-side WU emitter drives wuRetryWake at sub-millisecond
-// cadence so the latency cost of map-random is negligible.
+// Two maps are walked:
+//
+//   - w.deferred (whole-message chunked path): iteration is map-
+//     random; advanceDeferred may delete sid during the loop, which
+//     Go's spec permits during range.
+//   - w.deferredProto (ZC proto fire-and-forget path): for each
+//     stream's FIFO slice, pop entries from the head as long as CAS
+//     succeeds. On first CAS failure for a stream, stop and leave
+//     the rest of the slice for the next wuRetryWake — preserving
+//     per-stream message order. If a stream's slice empties, delete
+//     the map entry.
+//
+// Iteration across streams is map-random for fairness under high
+// concurrency. A starving stream will eventually be reached as WU
+// credits accumulate; in practice the receiver-side WU emitter
+// drives wuRetryWake at sub-millisecond cadence so the latency
+// cost of map-random is negligible.
+//
+// Ordering invariant: process w.deferredProto FIRST. Any whole-
+// message entry sitting in w.deferred[sid] was queued AFTER the
+// proto entries that landed in deferredProto[sid] (processWholeMessage
+// installs the whole-message in w.deferred[sid] when it observes a
+// non-empty deferredProto[sid] head). Emitting the whole-message
+// before the proto queue drains would violate gRPC per-stream
+// message order.
 func (w *shmFrameWriter) retryDeferred() {
-	if len(w.deferred) == 0 {
+	if len(w.deferredProto) > 0 {
+		for sid, queue := range w.deferredProto {
+			w.retryDeferredProto(sid, queue)
+		}
+	}
+	if len(w.deferred) > 0 {
+		for sid, d := range w.deferred {
+			// Skip if this stream still has pending async proto
+			// entries — they must drain first to preserve FIFO.
+			// retryDeferredProto above may have left some entries
+			// in deferredProto[sid] if FC was insufficient; revisit
+			// on the next wuRetryWake.
+			if len(w.deferredProto[sid]) > 0 {
+				continue
+			}
+			// advanceDeferred may delete sid from the map; Go's
+			// spec guarantees this is safe during a range loop
+			// (the iterator observes the new state going forward).
+			w.advanceDeferred(sid, d)
+		}
+	}
+}
+
+// retryDeferredProto drains as many head entries of queue as the
+// current outbound FC window permits, preserving per-stream FIFO.
+// Stops at the first head whose CAS fails (insufficient credit) or
+// whose stream has closed in the interim. Updates / deletes the
+// map entry as needed. Runs under inlineMu (caller's invariant).
+//
+// Each "resolved" entry (written, errored, dropped on close, dropped
+// on ctx cancel) decrements its stream's protoInFlight counter so
+// that subsequent senders can resume the inline fast path once the
+// async pipeline drains.
+func (w *shmFrameWriter) retryDeferredProto(sid uint32, queue []frameEntry) {
+	emitted := 0
+	dropped := false
+	// dropStream tracks the Stream object whose entries we drop so
+	// that discardDeferredTrailer below can tombstone it to
+	// streamDone for the TOCTOU close (late-arriving writeStatus on
+	// a stream whose async DATA was dropped must NOT emit OK
+	// trailers). All entries for a given sid share the same Stream
+	// pointer, so the first non-nil one observed at a drop site is
+	// authoritative.
+	var dropStream *Stream
+	for emitted < len(queue) {
+		entry := queue[emitted]
+		s := entry.streamPtr
+		// Stream-local close → drop remaining entries silently;
+		// upper layer sees errStreamDone via stream state machine
+		// the next time it touches the stream.
+		if s == nil || s.getState() == streamDone {
+			// Decrement protoInFlight for every drained entry —
+			// the count must drain to zero so the stream's resource
+			// teardown can complete without a leaked debit.
+			for j := emitted; j < len(queue); j++ {
+				if queue[j].streamPtr != nil {
+					queue[j].streamPtr.protoInFlight.Add(-1)
+					if dropStream == nil {
+						dropStream = queue[j].streamPtr
+					}
+				}
+			}
+			emitted = len(queue)
+			dropped = true
+			break
+		}
+		if entry.ctx.Err() != nil {
+			// Context cancellation: same as stream close — drop and
+			// move to the next head. Upper layer's deadline already
+			// fired and surfaced via ctx.Err() on the recv side.
+			s.protoInFlight.Add(-1)
+			emitted++
+			dropped = true
+			if dropStream == nil {
+				dropStream = s
+			}
+			continue
+		}
+		n := int64(5 + entry.protoSize)
+		if !tryReserveSendQuota(w.connQuota, &s.sendQuota, n) {
+			// Still stalled at this head; leave the queue alone and
+			// revisit on the next wuRetryWake.
+			break
+		}
+		err := writeProtoToRingH2Blocking(entry.ctx, w.tx, sid,
+			entry.protoMsg, entry.protoSize, entry.fh.Flags)
+		if err != nil {
+			// Refund and tear down; subsequent senders see
+			// ErrConnClosing via t.closed.Load(). Break out: a
+			// ring-write error means the transport is dying;
+			// retrying the next queued entry will hit the same
+			// failure and just burn writer cycles. The remaining
+			// entries are accounted for at the if-emitted-not-
+			// equal-len-queue tail-compaction branch below; on the
+			// next wuRetryWake the transport-close path will drain
+			// them via the close-time deferredProto walk.
+			w.connQuota.Add(n)
+			s.sendQuota.Add(n)
+			if w.onAsyncError != nil && w.errReported.CompareAndSwap(false, true) {
+				w.onAsyncError(err)
+			}
+			dropped = true
+			if dropStream == nil {
+				dropStream = s
+			}
+			s.protoInFlight.Add(-1)
+			emitted++
+			break
+		}
+		s.protoInFlight.Add(-1)
+		emitted++
+	}
+	if emitted >= len(queue) {
+		delete(w.deferredProto, sid)
+		// If ANY entry was dropped (streamDone, ctx-cancel, ring
+		// write err), the parked TRAILERS sentinel must NOT fire on
+		// the wire — emitting OK-status TRAILERS after dropping one
+		// or more DATA messages would put the peer in a cardinality
+		// violation. discardDeferredTrailer signals errStreamDone
+		// to the writeStatus sender and skips the wire write. Only
+		// the all-success path flushes (emits) the trailer.
+		if dropped {
+			w.discardDeferredTrailer(sid, dropStream)
+		} else {
+			w.flushDeferredTrailer(sid)
+		}
 		return
 	}
-	for sid, d := range w.deferred {
-		// advanceDeferred may delete sid from the map; Go's spec
-		// guarantees this is safe during a range loop (the iterator
-		// observes the new state going forward).
-		w.advanceDeferred(sid, d)
+	if emitted > 0 {
+		// Compact: drop the drained prefix. Re-slice keeps the
+		// backing array; under steady-state the queue rarely grows
+		// beyond 1-2 entries so the wasted prefix capacity is
+		// negligible. A fresh allocation here would be measurable
+		// at high CAS-fail rates.
+		w.deferredProto[sid] = append(queue[:0], queue[emitted:]...)
 	}
 }
 
@@ -762,45 +1494,6 @@ func (w *shmFrameWriter) trySend(entry frameEntry) bool {
 	return true
 }
 
-// enqueueOrInline writes the frame inline if the writer goroutine is idle
-// (inlineMu available), otherwise enqueues to the channel for asynchronous
-// processing. The caller does not block waiting for completion either way.
-//
-// Used for fire-and-forget control frames (WINDOW_UPDATE in particular) that
-// callers do not need to acknowledge but where avoiding the writer-goroutine
-// wakeup matters for latency. Under fair-default flow control (65535 B
-// HTTP/2 window) the receiver emits a WINDOW_UPDATE roughly every DATA frame,
-// and the round-trip cost of "enqueue -> wake writer goroutine -> write
-// frame -> futexWake peer" is the dominant stall in the producer's send
-// loop. Writing the WU inline collapses that to "write frame -> futexWake".
-//
-// Returns nil on success (inline or queued); ErrConnClosing if closed.
-func (w *shmFrameWriter) enqueueOrInline(entry frameEntry) error {
-	w.closeMu.RLock()
-	if w.closed.Load() {
-		w.closeMu.RUnlock()
-		return ErrConnClosing
-	}
-	if w.inlineMu.TryLock() {
-		var err error
-		if entry.data != nil {
-			err = writeFrameBuffers(entry.ctx, w.tx, entry.fh, entry.hdr, entry.data)
-		} else {
-			err = writeFrame(entry.ctx, w.tx, entry.fh, entry.payload)
-		}
-		w.inlineMu.Unlock()
-		w.closeMu.RUnlock()
-		return err
-	}
-	w.closeMu.RUnlock()
-	// Writer goroutine is busy; fall back to async enqueue. The caller
-	// does not need synchronous completion, so doneCh stays nil.
-	if !w.trySend(entry) {
-		return ErrConnClosing
-	}
-	return nil
-}
-
 // errFrameWriterFull signals that an enqueue attempted via
 // enqueueOrInlineNonBlocking could not complete because the writer was
 // neither idle nor able to accept an entry on its async channel without
@@ -809,17 +1502,50 @@ func (w *shmFrameWriter) enqueueOrInline(entry frameEntry) error {
 // catch up and a future enqueue attempt will succeed.
 var errFrameWriterFull = errors.New("shm frame writer: channel full, would block")
 
-// enqueueOrInlineNonBlocking is the strictly non-blocking variant of
-// enqueueOrInline. It is the ONLY safe enqueue path for callers that
-// MUST NOT block — most importantly the SHM reader goroutine, which
-// is responsible for committing inbound ring bytes and waking peers.
+// doneChPool reuses buffered-1 error channels across slow-path
+// enqueue calls (enqueueAndWait + enqueueMessageAndWait). The chan
+// itself can't live on the caller's stack (Go channels are heap), so
+// pooling is the only no-alloc option. Steady-state under the
+// N=1000/4 K fair-default bench: ~800 K make(chan error, 1) calls per
+// second eliminated.
 //
-// If the reader were to block on the outbound writer (which is what
-// the blocking trySend in enqueueOrInline can cause), it would create
-// a transport-level deadlock: the outbound ring fills because the
-// peer reader is blocked the same way; the writer can't drain its
-// channel because its ring writes block; the reader can't enqueue
-// the WINDOW_UPDATE that would unblock the peer.
+// Safety: after each sender's recv(<-doneCh), the chan is empty (it
+// was buffered=1 and contained exactly one value the writer sent).
+// We assert empty via a non-blocking recv before returning to the
+// pool to defend against future misuse (e.g., a writer sending twice).
+// The ctx-cancel branch of enqueueMessageAndWait intentionally does
+// NOT return to the pool because the writer may still send into
+// doneCh after the cancel (race window) — a pooled re-use would
+// then leak that late result to a different sender. Heap-allocating
+// on cancel keeps that path safe.
+var doneChPool = sync.Pool{
+	New: func() any { return make(chan error, 1) },
+}
+
+func getDoneCh() chan error {
+	return doneChPool.Get().(chan error)
+}
+
+func putDoneCh(ch chan error) {
+	// Defensive drain — under correct use this is always empty already.
+	select {
+	case <-ch:
+	default:
+	}
+	doneChPool.Put(ch)
+}
+
+// enqueueOrInlineNonBlocking is a strictly non-blocking inline-or-async
+// enqueue. It is the ONLY safe enqueue path for callers that MUST NOT
+// block — most importantly the SHM reader goroutine, which is
+// responsible for committing inbound ring bytes and waking peers.
+//
+// If the reader were to block on the outbound writer (which is what a
+// blocking trySend can cause), it would create a transport-level
+// deadlock: the outbound ring fills because the peer reader is
+// blocked the same way; the writer can't drain its channel because
+// its ring writes block; the reader can't enqueue the WINDOW_UPDATE
+// that would unblock the peer.
 //
 // Behavior:
 //   - inlineMu available → write inline, return nil on success.
@@ -832,9 +1558,8 @@ var errFrameWriterFull = errors.New("shm frame writer: channel full, would block
 //     writer loop drains the restored value on its next tick.
 //
 // Use this from sendWindowUpdate when called via reader callbacks
-// (onDataFrameReceived, onMessageStart). Use the blocking
-// enqueueOrInline only from app goroutines that can tolerate
-// blocking (e.g., sender Write paths).
+// (onDataFrameReceived, onMessageStart). App goroutines on the
+// sender Write path use trySend / enqueueMessageAndWait instead.
 func (w *shmFrameWriter) enqueueOrInlineNonBlocking(entry frameEntry) error {
 	w.closeMu.RLock()
 	if w.closed.Load() {
@@ -842,17 +1567,52 @@ func (w *shmFrameWriter) enqueueOrInlineNonBlocking(entry frameEntry) error {
 		return ErrConnClosing
 	}
 	if w.inlineMu.TryLock() {
-		var err error
+		// Available-precheck: ensure the ring has space for this
+		// frame BEFORE entering writeFrame (which would block in
+		// ReserveWrite). The current callers of this function are
+		// reader-side WU emitters (sendWindowUpdate from both client
+		// and server transports, fired by notifyDataFrameConsumed
+		// during the inbound DATA reservation window). If the outbound
+		// ring is full AND inline TryLock succeeds, writeFrame's
+		// ReserveWrite parks the reader goroutine WHILE the reader is
+		// still holding an uncommitted inbound DATA reservation —
+		// symmetrically the peer's reader can be in the same state
+		// and neither side frees ring space for the other. The
+		// Available-check breaks this deadlock window: when the
+		// outbound is full we bail to the (non-blocking) chan path,
+		// which lets the caller continue + restore credit via
+		// errFrameWriterFull and ping wuRetryWake; the reader then
+		// commits its inbound DATA, peer's writer unblocks, and the
+		// queued WU eventually drains via writeLoop.
+		//
+		// The Available() Load is racy vs concurrent producers, but
+		// (a) the per-WU frame size is small (~13 B) so a false
+		// positive is essentially impossible in practice, and (b) a
+		// false negative just means we take the chan path that one
+		// time — correctness-neutral.
+		var size int
 		if entry.data != nil {
-			err = writeFrameBuffers(entry.ctx, w.tx, entry.fh, entry.hdr, entry.data)
+			size = h2FrameHeaderSize + len(entry.hdr) + entry.data.Len()
 		} else {
-			err = writeFrame(entry.ctx, w.tx, entry.fh, entry.payload)
+			size = h2FrameHeaderSize + len(entry.payload)
 		}
+		if w.tx.Available() >= uint64(size) {
+			var err error
+			if entry.data != nil {
+				err = writeFrameBuffers(entry.ctx, w.tx, entry.fh, entry.hdr, entry.data)
+			} else {
+				err = writeFrame(entry.ctx, w.tx, entry.fh, entry.payload)
+			}
+			w.inlineMu.Unlock()
+			w.closeMu.RUnlock()
+			return err
+		}
+		// Ring lacks space — release inlineMu and fall through to
+		// the non-blocking chan send. Writer goroutine will pick up
+		// the entry when ring space frees.
 		w.inlineMu.Unlock()
-		w.closeMu.RUnlock()
-		return err
 	}
-	// inlineMu busy; try non-blocking channel send.
+	// inlineMu busy or ring full; try non-blocking channel send.
 	select {
 	case w.ch <- entry:
 		w.closeMu.RUnlock()
@@ -922,11 +1682,280 @@ func (w *shmFrameWriter) enqueueAndWait(entry frameEntry) error {
 	w.closeMu.RUnlock()
 
 	// Slow path: writer goroutine is busy, enqueue to channel.
-	entry.doneCh = make(chan error, 1)
+	entry.doneCh = getDoneCh()
 	if !w.trySend(entry) {
+		putDoneCh(entry.doneCh)
 		return ErrConnClosing
 	}
-	return <-entry.doneCh
+	err := <-entry.doneCh
+	putDoneCh(entry.doneCh)
+	return err
+}
+
+// tryInlineWrite attempts to emit the whole message as a single H2
+// DATA frame directly from the sender goroutine, bypassing the
+// channel + writer-goroutine handoff that enqueueMessageAndWait
+// normally takes.
+//
+// Motivation. At low stream concurrency (~10s-100s of streams) the
+// existing channel path's per-message wall time is dominated by
+// goroutine scheduling: sender sends to channel (~100 ns), runtime
+// schedules the writer goroutine (~1 µs), writer processes one
+// entry, futex_wakes the reader (~1 µs syscall), reader scheduler
+// fires (~1 µs). The actual ring memcpy is a small fraction. At
+// high concurrency the existing path amortises beautifully — one
+// writer wake drains many entries, one futex_wake covers many
+// frames — and convincingly beats UDS by 15+% (see
+// grpc-go-shm-beat-uds-roadmap-2026-05-28.md). The hybrid added
+// here keeps the high-concurrency win intact while reclaiming the
+// low-concurrency latency.
+//
+// Return contract. Returns (true, err) once the inline path has
+// taken responsibility for the message — the caller MUST NOT fall
+// back to the channel path even if err is non-nil. Returns
+// (false, nil) for all eligibility bails; the caller continues to
+// the existing channel + writer-goroutine path with no state change.
+//
+// Eligibility checks, ordered cheapest-first so each bail returns
+// fast:
+//
+//  1. payloadLen ∈ (0, shmMaxFrameSize]. Zero-length messages
+//     (client half-close, etc.) go through the channel path's
+//     specialised handler. Oversized messages need the writer
+//     goroutine's chunking + FC-defer machinery.
+//
+//  2. inlineMu.TryLock(). The writer goroutine holds inlineMu for
+//     its entire drain pass. A successful TryLock proves no
+//     writer-goroutine batch is in flight; the inline path will
+//     run alone until it Unlocks.
+//
+//  3. !closed, stream not done, ctx live. Each is checked AFTER
+//     the lock so a concurrent close racing with the TryLock loses
+//     to the close path's lock acquisition.
+//
+//  4. len(w.ch) == 0 AND len(w.deferred) == 0. This is the
+//     batching-preservation gate. Whenever ANY work is queued the
+//     channel path's batched drain is strictly better (one wake
+//     covers many frames). Bailing here means the high-concurrency
+//     workload (N=1000 streams ping-ponging) virtually never
+//     fires the inline path — its batched throughput stays unchanged.
+//
+//  5. stream and conn outbound FC quotas each cover payloadLen.
+//     Insufficient quota means we'd need the writer goroutine's
+//     deferred-retry machinery; bailing back to the channel path
+//     keeps that one canonical path.
+//
+//  6. CAS-deduct both quotas atomically. A CAS race here can only
+//     come from the reader's addSendQuota (incoming WINDOW_UPDATE
+//     applied on conn quota); we bail rather than retry-spin
+//     because the channel path can pick up the larger window cleanly.
+//
+// Concurrency invariant. inlineMu serialises EVERY ring write —
+// both this inline path and the writer goroutine — so at most one
+// goroutine touches the ring at a time. Publish order equals lock
+// acquisition order. There is no reservation list, no CAS-reserve
+// race, no commit-vs-publish split (in contrast to any multi-anchor
+// ZC publish scheme, where concurrent reserve-but-not-yet-published
+// anchors can race the prefix-walk publisher into back-pressure
+// jams). Even when our CAS on connQuota loses to a reader's
+// addSendQuota, the explicit rollback + fall-through to the
+// channel path preserves the lock-acquisition publish order.
+func (w *shmFrameWriter) tryInlineWrite(
+	ctx context.Context,
+	streamPtr *Stream,
+	hdr []byte,
+	data mem.BufferSlice,
+	isLast bool,
+) (handled bool, err error) {
+	// Cheapest gate FIRST: at high stream concurrency (N=1000) the
+	// channel is almost never empty, so this single non-atomic chan
+	// length check bails ~100 % of calls without touching any
+	// expensive field. Reordering matters: prior arrangement
+	// (payloadLen check first) called BufferSlice.Len() — which
+	// iterates segments — before realising we were going to bail.
+	// Linux fair-default bench shows N=1000/4K drops 1-3 % when the
+	// payloadLen path runs first, fully recovered by moving the
+	// channel-length gate to position zero.
+	//
+	// We deliberately do NOT include `len(w.deferredProto)` here:
+	// that map is mutated by the writer goroutine under inlineMu,
+	// and a `len(map)` read off-lock is a data race (go vet -race
+	// flags it; production can panic on concurrent map read/write).
+	// The post-lock check below covers the same ordering invariant
+	// safely. The pre-lock gate stays as a chan-only fast bail.
+	if len(w.ch) > 0 {
+		atomic.AddUint64(&shmInlineWriteBailQueued, 1)
+		return false, nil
+	}
+	payloadLen := len(hdr) + data.Len()
+	if payloadLen == 0 {
+		atomic.AddUint64(&shmInlineWriteBailZeroLen, 1)
+		return false, nil
+	}
+	if payloadLen > shmMaxFrameSize {
+		atomic.AddUint64(&shmInlineWriteBailFrameSize, 1)
+		return false, nil
+	}
+	if !w.inlineMu.TryLock() {
+		atomic.AddUint64(&shmInlineWriteBailLocked, 1)
+		return false, nil
+	}
+
+	// All paths from here must Unlock.
+
+	if w.closed.Load() {
+		w.inlineMu.Unlock()
+		atomic.AddUint64(&shmInlineWriteBailClosed, 1)
+		return false, nil
+	}
+	if streamPtr.getState() == streamDone {
+		w.inlineMu.Unlock()
+		atomic.AddUint64(&shmInlineWriteBailStreamDone, 1)
+		return false, nil
+	}
+	if ctx.Err() != nil {
+		w.inlineMu.Unlock()
+		atomic.AddUint64(&shmInlineWriteBailCtxDone, 1)
+		return false, nil
+	}
+	// Re-check len(w.ch) / deferred / deferredProto under the lock —
+	// between the pre-lock check and TryLock, another goroutine may
+	// have enqueued. Bail preserves the batched-drain invariant AND
+	// the per-stream FIFO invariant (see pre-lock comment for the
+	// deferredProto-overtaking-by-inline ordering bug).
+	if len(w.ch) > 0 || len(w.deferred) > 0 || len(w.deferredProto) > 0 {
+		w.inlineMu.Unlock()
+		atomic.AddUint64(&shmInlineWriteBailQueued, 1)
+		return false, nil
+	}
+	if w.connQuota == nil {
+		// setConnQuotaPtr has not been called yet (transport in the
+		// middle of construction). Fall back to channel path which
+		// also depends on connQuota and will bail more cleanly via
+		// processWholeMessage's misuse check.
+		w.inlineMu.Unlock()
+		atomic.AddUint64(&shmInlineWriteBailQueued, 1)
+		return false, nil
+	}
+	streamQ := streamPtr.sendQuota.Load()
+	if streamQ < int64(payloadLen) {
+		w.inlineMu.Unlock()
+		atomic.AddUint64(&shmInlineWriteBailQuota, 1)
+		return false, nil
+	}
+	connQ := w.connQuota.Load()
+	if connQ < int64(payloadLen) {
+		w.inlineMu.Unlock()
+		atomic.AddUint64(&shmInlineWriteBailQuota, 1)
+		return false, nil
+	}
+	if !streamPtr.sendQuota.CompareAndSwap(streamQ, streamQ-int64(payloadLen)) {
+		w.inlineMu.Unlock()
+		atomic.AddUint64(&shmInlineWriteBailQuota, 1)
+		return false, nil
+	}
+	if !w.connQuota.CompareAndSwap(connQ, connQ-int64(payloadLen)) {
+		streamPtr.sendQuota.Add(int64(payloadLen))
+		shmCASRollback.Add(1)
+		w.inlineMu.Unlock()
+		atomic.AddUint64(&shmInlineWriteBailQuota, 1)
+		return false, nil
+	}
+
+	// All eligibility gates passed. Emit the single H2 DATA frame
+	// carrying the whole MESSAGE. emitH2DataFromCursor handles its
+	// own ring reservation, segment-spanning copy, and reader signal
+	// (no BeginBatch wrapper needed for a single-chunk emit — the
+	// final Commit fires the wake).
+	fh := FrameHeader{StreamID: streamPtr.id, Type: FrameTypeMESSAGE}
+	if isLast {
+		fh.Flags = MessageFlagEndStream
+	} else {
+		fh.Flags = MessageFlagMORE
+	}
+	_, h2f := translateCustomToH2(fh)
+	// PR-B: reuse the Stream's inline-allocated shmDeferred.cur slot
+	// as scratch instead of fresh heap alloc. tryInlineWrite's
+	// post-lock check (`len(w.deferred) > 0` → bail) guarantees no
+	// in-flight whole-msg owns shmDeferred right now, and inlineMu
+	// serialises with the writer-goroutine drain path. After the
+	// emit, we clear cur.data/lpmHdr to drop the BufferSlice ref
+	// (sender's outer scope still holds it for the synchronous
+	// inline path — see enqueueMessageAndWait — so no Free here).
+	cur := &streamPtr.shmDeferred.cur
+	*cur = vecCursor{lpmHdr: hdr, data: data}
+	if committed, emitErr := emitH2DataFromCursor(ctx, w.tx, streamPtr.id, cur, payloadLen, h2f); emitErr != nil {
+		// Partial-commit-aware refund. When shmMaxFrameSize exceeds
+		// h2MaxFramePayload (e.g. shm-tuned mode), emitH2DataFromCursor
+		// may chunk a single whole-message into several H2 DATA frames
+		// and may commit some prefix before failing on a later chunk.
+		// Refund only the uncommitted remainder; refunding the full
+		// payloadLen would inflate conn-level send quota by `committed`
+		// bytes the peer has already received and charged.
+		refund := int64(payloadLen - committed)
+		if refund > 0 {
+			streamPtr.sendQuota.Add(refund)
+			w.connQuota.Add(refund)
+		}
+		// Clear scratch refs so a subsequent SendMsg on this stream
+		// doesn't inherit stale BufferSlice / lpmHdr pinning pooled
+		// buffers in the GC's view.
+		cur.data = nil
+		cur.lpmHdr = nil
+		w.inlineMu.Unlock()
+		// Return handled=true so the caller does NOT fall back to
+		// the channel path (the message has terminally failed).
+		return true, emitErr
+	}
+	if w.piggybackWUFn != nil {
+		w.piggybackWUFn(streamPtr.id)
+	}
+	// Clear scratch refs (success path) — same rationale as above.
+	cur.data = nil
+	cur.lpmHdr = nil
+	// Piggyback amortization (§7.3 / §7.9 of shm-rfc/C-bench-results.md,
+	// v3 design after v1+v2 regressions). The inline writer just paid
+	// the inlineMu acquire cost — while still holding it, opportunistically
+	// drain up to maxInlinePiggyback frames from the existing w.ch
+	// (NO second queue, NO new mutex, NO new wake mechanism). Reuses the
+	// Go runtime's MPSC-tuned chan as the only producer→writer queue, and
+	// the bound (8) keeps the inlineMu hold from blowing up into a
+	// livelock that starves writeLoop's retryDeferred.
+	//
+	// Wake model: my own emit just fired its single reader-wake immediately
+	// (Reserve/Commit above, no batch wrap), so latency for the calling
+	// stream is unaffected. The drained entries are coalesced inside one
+	// BeginBatch/EndBatch scope so they share a single reader-wake at the
+	// end — same wake economics the writer goroutine would have produced.
+	//
+	// Ordering: chan FIFO preserves the same ordering writeLoop sees, so
+	// nothing new at the protocol layer. The connWUCoalescer used by
+	// writeLoop is intentionally NOT used here — at low concurrency the
+	// drained entries are unlikely to be back-to-back conn WUs (those go
+	// through the lockless WU pending path piggybacked onto outbound
+	// DATA, see piggybackWUFn above); coalescing logic is the writer
+	// goroutine's specialty.
+	const maxInlinePiggyback = 8
+	if len(w.ch) > 0 {
+		w.tx.BeginBatch()
+		for i := 0; i < maxInlinePiggyback; i++ {
+			select {
+			case next, ok := <-w.ch:
+				if !ok {
+					i = maxInlinePiggyback // chan closed mid-drain; stop
+					break
+				}
+				w.processEntry(next)
+				atomic.AddUint64(&shmInlinePiggybackDrain, 1)
+			default:
+				i = maxInlinePiggyback // chan empty; stop
+			}
+		}
+		w.tx.EndBatch()
+	}
+	w.inlineMu.Unlock()
+	atomic.AddUint64(&shmInlineWriteFire, 1)
+	return true, nil
 }
 
 // enqueueMessageAndWait submits a whole MESSAGE (header + payload)
@@ -966,8 +1995,23 @@ func (w *shmFrameWriter) enqueueMessageAndWait(ctx context.Context, streamPtr *S
 	if streamPtr == nil {
 		return errStreamDone
 	}
+	// Inline-write fast path: when the writer goroutine is idle and
+	// no other work is queued, emit the message directly from this
+	// goroutine. Bypasses the channel send + writer-goroutine wake
+	// + writer-side futex_wake-to-reader handoffs (~3 µs of
+	// scheduler latency per message). See tryInlineWrite's doc for
+	// the full eligibility set and the GPT-5.5-style adversarial
+	// review.
+	//
+	// data is consumed synchronously inside the inline path; no Ref
+	// bump is required because the caller's existing reference
+	// keeps the BufferSlice alive for the duration of this function.
+	if handled, ierr := w.tryInlineWrite(ctx, streamPtr, hdr, data, isLast); handled {
+		return ierr
+	}
+
 	fh := FrameHeader{StreamID: streamPtr.id, Type: FrameTypeMESSAGE}
-	doneCh := make(chan error, 1)
+	doneCh := getDoneCh()
 	entry := frameEntry{
 		ctx:       ctx,
 		fh:        fh,
@@ -978,7 +2022,23 @@ func (w *shmFrameWriter) enqueueMessageAndWait(ctx context.Context, streamPtr *S
 		streamPtr: streamPtr,
 		isLast:    isLast,
 	}
+	// Bump the BufferSlice refcount BEFORE handing the entry to the
+	// writer. The writer's chunk-emit path (emitH2DataFromCursor via
+	// vecCursor) reads bytes from data after this function may have
+	// already returned via the ctx.Done() select branch below. If the
+	// caller Free()s on Write's early return, the writer would hit a
+	// use-after-free ("Cannot read freed buffer" panic). The extra
+	// Ref keeps the underlying buffer alive until the writer matches
+	// it with a Free() at every exit path (processWholeMessage early
+	// return, advanceDeferred success/streamDone/ctx.Err/emit-err, or
+	// close()-time drain). Buffers backed by mem.DefaultBufferPool are
+	// refcounted so the cost is one atomic add per call.
+	data.Ref()
 	if !w.trySend(entry) {
+		// trySend failed (writer closed before we enqueued); roll back
+		// the Ref so the caller's Free is balanced.
+		data.Free()
+		putDoneCh(doneCh)
 		return ErrConnClosing
 	}
 	// Wait for the writer goroutine to either fully transmit the
@@ -990,8 +2050,20 @@ func (w *shmFrameWriter) enqueueMessageAndWait(ctx context.Context, streamPtr *S
 	// crash, transport close, or call-level cancellation). WL
 	// observes the same ctx via d.ctx and will clean up the
 	// deferred entry on its next retry pass (or close drain).
+	// Writer-side Free of the entry's data Ref happens in every
+	// such cleanup path; this select branch does NOT free.
+	//
+	// Note on the doneCh pool: we ONLY return doneCh to the pool on
+	// the normal completion branch. On ctx.Done() the writer may
+	// still send a late result into doneCh (race: ctx fires AFTER
+	// writer dispatched but BEFORE we read). Returning doneCh to the
+	// pool then risks a second sender reading our late result. The
+	// allocation cost on the ctx.Done() branch is tolerable because
+	// it is the rare cancellation path; the common steady-state
+	// completion path captures the GC win.
 	select {
 	case err := <-doneCh:
+		putDoneCh(doneCh)
 		return err
 	case <-ctx.Done():
 		return ContextErr(ctx.Err())
@@ -1040,6 +2112,39 @@ func (w *shmFrameWriter) close() {
 		default:
 		}
 		delete(w.deferred, sid)
+		// Balance the Ref taken in enqueueMessageAndWait.
+		d.release()
+	}
+	// Drain any ZC proto entries still pending in the deferredProto
+	// map. Senders for these returned success at enqueue time (the
+	// fire-and-forget contract), so there is no doneCh to signal.
+	// The transport's close path (which called us) has already set
+	// t.closed.Load() == true, so any subsequent upper-layer Send /
+	// Recv on the affected streams will surface ErrConnClosing via
+	// the stream state machine. We still need to decrement each
+	// entry's protoInFlight counter so that test-side assertions on
+	// stream resource teardown (counter must reach zero) hold.
+	for sid, queue := range w.deferredProto {
+		for _, entry := range queue {
+			if entry.streamPtr != nil {
+				entry.streamPtr.protoInFlight.Add(-1)
+			}
+		}
+		delete(w.deferredProto, sid)
+	}
+	// Drain any TRAILERS sentinels parked behind DATA that the
+	// transport teardown has just discarded. The writeStatus sender
+	// is blocked on doneCh; signal ErrConnClosing so it surfaces
+	// the right error and the server's response handler / gRPC
+	// infrastructure can complete teardown.
+	for sid, entry := range w.deferredTrailers {
+		if entry.doneCh != nil {
+			select {
+			case entry.doneCh <- ErrConnClosing:
+			default:
+			}
+		}
+		delete(w.deferredTrailers, sid)
 	}
 }
 

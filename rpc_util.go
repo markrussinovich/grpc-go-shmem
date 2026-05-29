@@ -798,11 +798,29 @@ func (p *parser) recvMsg(maxReceiveMessageSize int) (payloadFormat, mem.BufferSl
 // encode serializes msg and returns a buffer containing the message, or an
 // error if it is too large to be transmitted by grpc.  If msg is nil, it
 // generates an empty message.
-func encode(c baseCodec, msg any) (mem.BufferSlice, error) {
+//
+// If pool is non-nil and the codec implements the bufferPoolMarshaler
+// extension, the marshal destination buffer is sourced from pool. This
+// lets the SHM transport supply a tighter per-channel pool that avoids
+// the default tiered pool's per-Get overshoot (4 KiB → 16 KiB jump on
+// a 4 KiB message is the worst case the default pays).
+func encode(c baseCodec, msg any, pool mem.BufferPool) (mem.BufferSlice, error) {
 	if msg == nil { // NOTE: typed nils will not be caught by this check
 		return nil, nil
 	}
-	b, err := c.Marshal(msg)
+	var (
+		b   mem.BufferSlice
+		err error
+	)
+	if pool != nil {
+		if pc, ok := c.(bufferPoolMarshaler); ok {
+			b, err = pc.MarshalWithPool(msg, pool)
+		} else {
+			b, err = c.Marshal(msg)
+		}
+	} else {
+		b, err = c.Marshal(msg)
+	}
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "grpc: error while marshaling: %v", err.Error())
 	}
@@ -811,6 +829,15 @@ func encode(c baseCodec, msg any) (mem.BufferSlice, error) {
 		return nil, status.Errorf(codes.ResourceExhausted, "grpc: message too large (%d bytes)", bufSize)
 	}
 	return b, nil
+}
+
+// bufferPoolMarshaler is an optional extension implemented by codecs
+// that can marshal into a caller-supplied mem.BufferPool. The built-in
+// proto codec (encoding/proto.codecV2) implements this; other codecs
+// (including the V1 bridge) fall back to plain c.Marshal() inside
+// encode(). The fallback is transparent to callers.
+type bufferPoolMarshaler interface {
+	MarshalWithPool(v any, pool mem.BufferPool) (mem.BufferSlice, error)
 }
 
 // compress returns the input bytes compressed by compressor or cp.
@@ -1036,17 +1063,21 @@ func recv(p *parser, c baseCodec, s recvCompressor, dc Decompressor, m any, maxR
 
 	// Zero-copy fast path: if the data is a single contiguous buffer (e.g.,
 	// ring-backed SliceBuffer from SHM transport), the message is a proto,
-	// and the codec is the default proto codec, unmarshal directly from the
-	// buffer without MaterializeToBuffer copy. Custom codecs are not
-	// bypassed — they may have validation or different serialization. We
-	// require an explicit Name() == "proto" match: codecs that do not
-	// implement Name() (an unusual baseCodec) fall through to c.Unmarshal
-	// to preserve their semantics.
+	// and the codec is the built-in gRPC proto codec, unmarshal directly
+	// from the buffer without MaterializeToBuffer copy. Custom codecs are
+	// not bypassed — they may have validation or different serialization.
+	// The two-gate check is:
+	//   1. Name() == "proto" — names the codec class.
+	//   2. Implements bufferPoolMarshaler — identifies the built-in v2
+	//      proto codec (the v1 bridge does not, so v1-codec users named
+	//      "proto" preserve their semantics via c.Unmarshal below).
 	if len(data) == 1 {
 		if pm, ok := m.(protobuf.Message); ok {
 			isProtoCodec := false
 			if nc, ok := c.(interface{ Name() string }); ok && nc.Name() == "proto" {
-				isProtoCodec = true
+				if _, isBuiltin := c.(bufferPoolMarshaler); isBuiltin {
+					isProtoCodec = true
+				}
 			}
 			if isProtoCodec {
 				if err := protobuf.Unmarshal(data[0].ReadOnlyData(), pm); err != nil {
