@@ -41,6 +41,28 @@ func init() {
 type codecV2 struct{}
 
 func (c *codecV2) Marshal(v any) (data mem.BufferSlice, err error) {
+	return c.marshalWithPool(v, mem.DefaultBufferPool())
+}
+
+// MarshalWithPool is an optional extension of the CodecV2 interface that
+// allows the caller to supply the mem.BufferPool used for the marshal
+// destination buffer. Production wiring lives in (rpc_util).encode, which
+// dispatches to this method when the caller (a stream / transport)
+// configures a per-channel BufferPool (e.g. for the shared-memory
+// transport, which provides a tightly sized pool to avoid the default
+// tiered pool's per-Get overshoot).
+//
+// Behaviour is identical to Marshal when pool is nil — the default
+// pool is substituted, preserving backwards-compatible semantics for
+// any caller that has not opted into the pool-injection path.
+func (c *codecV2) MarshalWithPool(v any, pool mem.BufferPool) (data mem.BufferSlice, err error) {
+	if pool == nil {
+		pool = mem.DefaultBufferPool()
+	}
+	return c.marshalWithPool(v, pool)
+}
+
+func (c *codecV2) marshalWithPool(v any, pool mem.BufferPool) (data mem.BufferSlice, err error) {
 	vv := messageV2Of(v)
 	if vv == nil {
 		return nil, fmt.Errorf("proto: failed to marshal, message is %T, want proto.Message", v)
@@ -70,7 +92,6 @@ func (c *codecV2) Marshal(v any) (data mem.BufferSlice, err error) {
 		}
 		data = append(data, mem.SliceBuffer(buf))
 	} else {
-		pool := mem.DefaultBufferPool()
 		buf := pool.Get(size)
 		if _, err := marshalOptions.MarshalAppend((*buf)[:0], vv); err != nil {
 			pool.Put(buf)

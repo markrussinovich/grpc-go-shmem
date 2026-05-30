@@ -51,8 +51,10 @@ func (p *PreparedMsg) Encode(s Stream, msg any) error {
 		return status.Errorf(codes.Internal, "grpc: rpcInfo.preloaderInfo.codec is nil")
 	}
 
-	// prepare the msg
-	data, err := encode(rpcInfo.preloaderInfo.codec, msg)
+	// prepare the msg. PreparedMsg.Encode is a public, codec-only entry
+	// point; it has no channel-scoped pool. Pass nil so encode uses the
+	// codec's default pool (preserves backwards-compatible semantics).
+	data, err := encode(rpcInfo.preloaderInfo.codec, msg, nil)
 	if err != nil {
 		return err
 	}

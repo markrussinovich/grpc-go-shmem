@@ -91,6 +91,37 @@ func startZCProbe(b *testing.B) func() {
 		report("zc-read/op", delta.ZCReadFire)
 		report("copy-read/op", delta.CopyReadFire)
 		report("acc-read/op", delta.AccReadFire)
+		report("zc-anchor-budget/op", delta.ZCAnchorBudgetExceeded)
+		report("zc-fail-wrap/op", delta.ZCFailPSecondNonzero)
+		report("zc-fail-shorthdr/op", delta.ZCFailPFirstShort)
+		report("zc-fail-accinprogress/op", delta.ZCFailAccInProgress)
+		report("zc-fail-lpmmismatch/op", delta.ZCFailLpmMismatch)
+		report("zc-fail-ineligible/op", delta.ZCFailIneligible)
+		report("zc-elig-bp/op", delta.ZCEligBackPressure)
+		report("zc-elig-smallpl/op", delta.ZCEligPayloadSmall)
+		report("zc-elig-smallring/op", delta.ZCEligRingTooSmall)
+		report("zc-elig-notcontig/op", delta.ZCEligNotContig)
+		// Inline-write fast-path counters: emit single-frame whole-
+		// message DATA directly from the sender goroutine, bypassing
+		// the channel + writer-goroutine handoff. Bails dominate at
+		// high concurrency (preserves existing batching win); fires
+		// dominate at low concurrency (closes the goroutine-handoff
+		// latency gap to UDS).
+		report("inline-write-fire/op", delta.InlineWriteFire)
+		report("inline-write-bail-locked/op", delta.InlineWriteBailLocked)
+		report("inline-write-bail-closed/op", delta.InlineWriteBailClosed)
+		report("inline-write-bail-streamdone/op", delta.InlineWriteBailStreamDone)
+		report("inline-write-bail-ctxdone/op", delta.InlineWriteBailCtxDone)
+		report("inline-write-bail-queued/op", delta.InlineWriteBailQueued)
+		report("inline-write-bail-quota/op", delta.InlineWriteBailQuota)
+		report("inline-write-bail-frame/op", delta.InlineWriteBailFrameSize)
+		report("inline-write-bail-zero/op", delta.InlineWriteBailZeroLen)
+		// inline-piggyback-drain/op: frames a tryInlineWrite holder
+		// drained from w.ch (bounded ≤8) before releasing inlineMu.
+		// Amortises writer-goroutine cycles. High at high concurrency
+		// = piggyback working; near-zero at low concurrency = chan
+		// empty (no work to amortise).
+		report("inline-piggyback-drain/op", delta.InlinePiggybackDrain)
 		// Per-data-segment socketpair waker diagnostics (zero on
 		// non-Linux / when the eventfd waker is disabled).
 		report("ds-wake/op", dsDelta.WakeCallsTotal)

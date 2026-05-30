@@ -29,17 +29,16 @@ import (
 const (
 	shmControlSuffix = "_ctl"
 	// controlWireVersion is the version byte emitted at the start of
-	// every control-plane frame. v2 introduces per-connection flow-
-	// control negotiation: CONNECT carries a Flags byte (existing
-	// SINGLE_STREAM bit 0 plus new HTTP2_FC bit 1), and ACCEPT echoes
-	// a Flags byte after the selected-wire byte so the server can
-	// confirm or override the client's mode preference.
+	// every control-plane frame. v2 introduces a Flags byte on CONNECT
+	// (currently carrying SINGLE_STREAM bit 0) and an echoed Flags byte
+	// on ACCEPT after the selected-wire byte so the server can confirm
+	// or override the client's mode preference.
 	//
 	// v1 (legacy) peers without the ACCEPT Flags byte are rejected
 	// at the handshake boundary because the bumped version forces a
 	// matched-version handshake. The grpc-go and grpc-dotnet
 	// implementations are still pre-1.0 so a breaking wire change is
-	// acceptable to land the flow-control negotiation cleanly.
+	// acceptable.
 	controlWireVersion = uint8(2)
 
 	// wireFormatH2 is the on-wire byte for the HTTP/2 data plane.
@@ -48,10 +47,6 @@ const (
 	wireFormatH2 = uint8(1)
 
 	// CONNECT / ACCEPT Flags bits.
-	//
-	// Bit 0 (SINGLE_STREAM) is a CONNECT-only hint that the client
-	// will not open more than one concurrent stream; the server may
-	// optimise scheduling state.
 	//
 	// Bit 0 (SINGLE_STREAM_MODE) opts the connection into the
 	// single-stream fast path on both sides (inline writes, writer-

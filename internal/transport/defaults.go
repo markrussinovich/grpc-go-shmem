@@ -69,10 +69,19 @@ const (
 	// goroutine's recv work is negligible compared to the wakep cost, so
 	// staying on-CPU to drain the ring wins. At larger payloads the
 	// parallel work warrants yielding so other Ps can pick up app
-	// goroutines via work-stealing. 4 KiB is chosen empirically: below
-	// it the N=1000/64B latency improvement dominates; above it the
-	// N=100/64KB throughput would otherwise regress.
-	shmYieldSkipMaxPayload = uint32(4096)
+	// goroutines via work-stealing. 4 KiB body is the design target:
+	// below it the N=1000/64B latency improvement dominates; above it
+	// the N=100/64KB throughput would otherwise regress.
+	//
+	// NOTE: `sz` in the comparison is the H2 DATA payload size and INCLUDES
+	// the 5-byte gRPC LPM (Length-Prefixed Message) header. A nominal
+	// 4 KiB message body therefore arrives as sz=4101 — one byte over a
+	// raw 4096 threshold. The constant is sized to comfortably hold any
+	// 4 KiB body + framing overhead so the design-intent boundary lands
+	// where the comment says. Empirically the next interesting bench
+	// cell up is 64 KiB, so any value in [4101, 65541) is equivalent
+	// for the bench; 8192 is chosen as the clean round number.
+	shmYieldSkipMaxPayload = uint32(8192)
 )
 
 // MaxStreamID is the upper bound for the stream ID before the current

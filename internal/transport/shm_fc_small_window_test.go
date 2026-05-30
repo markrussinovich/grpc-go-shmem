@@ -159,11 +159,8 @@ func TestShmSmallWindowMultiFrameMessage(t *testing.T) {
 	// once both have run we clamp them down here, before the first
 	// write call exercises the flow-control path.
 	const fairWindow = 64 * 1024
-	cliTransport.sendQuotaMu.Lock()
 	cliTransport.connSendQuota.Store(fairWindow)
 	cs.sendQuota.Store(fairWindow)
-	cliTransport.sendQuotaMu.Unlock()
-
 	// 256 KiB payload — 4× the 64 KiB initial window. Forces at least
 	// three WindowUpdate round-trips on the client→server path to fully
 	// drain. Pre-fix this loops on the first iteration forever; the

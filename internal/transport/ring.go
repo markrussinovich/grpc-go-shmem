@@ -148,12 +148,18 @@ type ShmRing struct {
 	// reads header.ReadIdx normally and is correct without knowing
 	// anything about ZC.
 	//
-	// Invariants enforced by callers:
-	//   - At most ONE ZC in flight per ring (gated by IsSpeculativeZCEligible).
+	// Invariants enforced by callers (legacy single-anchor chain path):
+	//   - At most ONE ZC in flight per ring via the zcActive gate
+	//     (IsSpeculativeZCEligible). Multi-frame chains live here.
 	//   - BeginZcReservation/EndZcReservation are paired exactly once per ZC.
 	//   - The reader-side processIncomingData loop is single-threaded;
 	//     ReadCommit.Commit is only called from that thread or from
 	//     EndZcReservation (consumer side).
+	//
+	// The single-frame H2-DATA fast path uses a SEPARATE multi-anchor
+	// lock-free FIFO (see anchorSlots / ring_zc_multi.go) that holds up
+	// to zcAnchorBudgetCount concurrent anchors and is independent of
+	// the zcActive gate above.
 	//
 	// Accessed via atomic.LoadUint32 / atomic.StoreUint32 with explicit
 	// fencing rather than the sync/atomic.Bool wrapper to make the
@@ -176,6 +182,25 @@ type ShmRing struct {
 	// and will copy all remaining chunks. Cleared on the message's
 	// final (!MORE) chunk so the next message starts fresh.
 	chainCopyMode uint32
+
+	// ===== Multi-anchor single-frame ZC FIFO =====
+	//
+	// Lock-free bounded FIFO of in-flight single-frame ZC anchors.
+	// Replaces the at-most-one zcActive gate for the H2 codec ZC fast
+	// path (see ring_zc_multi.go for the protocol). Each slot records
+	// a held byte range [start, end); concurrent receivers can hold
+	// up to zcAnchorBudgetCount anchors simultaneously. head/tail are
+	// atomic.Uint64 monotonic counters; the slot at head%budget is the
+	// next candidate for prefix-walk publish.
+	//
+	// Inline ([256]anchorSlot, 16 KiB) rather than a separate
+	// allocation: keeps the cache layout predictable and avoids the
+	// double indirection on every Begin/Release. Cost is 32 KiB per
+	// connection (TX ring + RX ring) which is acceptable for the ZC
+	// throughput gain at concurrent receive.
+	anchorSlots [zcAnchorBudgetCount]anchorSlot
+	anchorHead  atomic.Uint64 // oldest in-flight anchor sequence
+	anchorTail  atomic.Uint64 // next anchor sequence to claim
 }
 
 // ReadCommit holds the state needed to commit a read operation.
@@ -183,7 +208,19 @@ type ShmRing struct {
 type ReadCommit struct {
 	ring          *ShmRing
 	commitReadIdx uint64
-	maxBytes      int
+	// bodyEndIdx is the monotonic ring offset of the byte just past
+	// the last byte returned by the latest ReadSlices call (i.e.,
+	// pendingReadIdx after the call advanced it). Independent of
+	// sharedReadIdx, which the deferred-ZC path freezes.
+	//
+	// Multi-anchor ZC uses (bodyEndIdx - payloadLen, bodyEndIdx) as
+	// the held byte range for its anchor — sharedReadIdx-based
+	// commitReadIdx is STALE while zcActive=1 and would cause
+	// consecutive anchors to claim overlapping ranges, eventually
+	// driving header.ReadIdx past header.WriteIndex (uint64
+	// underflow in the writer's used-bytes calculation).
+	bodyEndIdx uint64
+	maxBytes   int
 }
 
 // Commit advances the shared read index to free space for the writer.
@@ -268,8 +305,10 @@ func (rc *ReadCommit) Commit(consumed int) {
 // writer's plain `used = writeIdx - readIdx` formula is automatically
 // correct — no shared-memory ZC field, no protocol change.
 //
-// Invariants enforced by callers:
-//   - At most ONE ZC in flight per ring (gated by IsSpeculativeZCEligible).
+// Invariants enforced by callers (legacy single-anchor chain path; the
+// single-frame H2-DATA fast path uses the separate multi-anchor FIFO
+// in ring_zc_multi.go):
+//   - At most ONE ZC in flight per ring via zcActive (IsSpeculativeZCEligible).
 //   - BeginZcReservation/EndZcReservation are paired exactly once per ZC.
 //   - The reader-side processIncomingData loop is single-threaded;
 //     ReadCommit.Commit is only called from that thread or from
@@ -728,19 +767,21 @@ func (r *ShmRing) waitForContig(addr *uint32, val uint32, timeout time.Duration)
 
 // signalData signals that new data is available.
 // On Windows, signals the named event. On Linux, uses futex wake.
+//
+// When the per-data-segment eventfd waker is active on this ring,
+// Segment.finalizeDataSegWaker guarantees the peer is also on the
+// eventfd primitive (asymmetric wake states converge to the futex
+// fallback during handshake; see shm_segment.go). We therefore skip
+// the additional futex_wake on this branch -- it would be pure
+// syscall overhead with no possible peer waiter. Under N=1000
+// concurrent streams this is ~200K skipped syscalls/s.
+//
+// Raw-ring tests that bypass the full handshake path and want to
+// exercise the futex wake primitive must disable the eventfd waker
+// via ConfigureShmEventfdWakerForBench(false).
 func (r *ShmRing) signalData(addr *uint32) {
 	if r.dataSegWaker != nil {
 		r.dataSegWaker.Wake()
-		// Also issue a futex_wake on the same address so peers using a
-		// different wake primitive (raw-ring tests that bypass
-		// RegisterRing; cross-process peers whose SCM_RIGHTS handoff
-		// failed and converged on futex via OpenerWakeReady=false)
-		// still observe the signal. Safe: futex_wake on an address
-		// with no waiters is a cheap kernel hash lookup (~150 ns) --
-		// negligible against the ~100 us per-RPC cost. Use the on-
-		// Linux primitive directly so the Windows events path is not
-		// double-fired.
-		futexWake(addr, 1)
 		return
 	}
 	if r.events != nil {
@@ -752,11 +793,12 @@ func (r *ShmRing) signalData(addr *uint32) {
 
 // signalSpace signals that space is available.
 // On Windows, signals the named event. On Linux, uses futex wake.
+//
+// See signalData for the rationale on skipping futex_wake when the
+// eventfd waker is active.
 func (r *ShmRing) signalSpace(addr *uint32) {
 	if r.dataSegWaker != nil {
 		r.dataSegWaker.Wake()
-		// See signalData for the futex_wake-after-dataSegWaker rationale.
-		futexWake(addr, 1)
 		return
 	}
 	if r.events != nil {
@@ -768,11 +810,12 @@ func (r *ShmRing) signalSpace(addr *uint32) {
 
 // signalContig signals that contiguous space improved.
 // On Windows, signals the named event. On Linux, uses futex wake.
+//
+// See signalData for the rationale on skipping futex_wake when the
+// eventfd waker is active.
 func (r *ShmRing) signalContig(addr *uint32) {
 	if r.dataSegWaker != nil {
 		r.dataSegWaker.Wake()
-		// See signalData for the futex_wake-after-dataSegWaker rationale.
-		futexWake(addr, 1)
 		return
 	}
 	if r.events != nil {
@@ -1529,8 +1572,10 @@ func (r *ShmRing) ReadBlockingContext(ctx context.Context, buf []byte) (int, err
 			if bytesRead > 0 && hdr.SpaceWaiters() > 0 {
 				hdr.IncrementSpaceSequence()
 				newSeq := hdr.SpaceSequence()
-				shmDebugf("READBLOCKING_SPACE_WAKE: freed %d bytes, new spaceSeq=%d, waking waiters",
-					bytesRead, newSeq)
+				if shmDebugEnabled {
+					shmDebugf("READBLOCKING_SPACE_WAKE: freed %d bytes, new spaceSeq=%d, waking waiters",
+						bytesRead, newSeq)
+				}
 				r.signalSpace(&hdr.spaceSeq)
 			}
 
@@ -1545,8 +1590,10 @@ func (r *ShmRing) ReadBlockingContext(ctx context.Context, buf []byte) (int, err
 		// Need to wait for data
 		hdr.IncDataWaiters()
 		dataSeq := hdr.DataSequence()
-		shmDebugf("READBLOCKING_DATA_WAIT: empty ring, dataWaiters=%d, dataSeq=%d, widx=%d, ridx=%d",
-			hdr.DataWaiters(), dataSeq, hdr.WriteIndex(), hdr.ReadIndex())
+		if shmDebugEnabled {
+			shmDebugf("READBLOCKING_DATA_WAIT: empty ring, dataWaiters=%d, dataSeq=%d, widx=%d, ridx=%d",
+				hdr.DataWaiters(), dataSeq, hdr.WriteIndex(), hdr.ReadIndex())
+		}
 
 		// Re-check data availability before sleeping
 		writeIdx = hdr.WriteIndex()
@@ -1665,10 +1712,22 @@ func (wr *WriteReservation) Commit(written int) error {
 		hdr.IncrementDataSequence()
 		newSeq := hdr.DataSequence()
 		waiters := hdr.DataWaiters()
-		shmDebugf("COMMIT_DATA_WAKE: written=%d, newSeq=%d, dataWaiters=%d", written, newSeq, waiters)
+		// Guard the vararg call site: Go evaluates the ...any slice
+		// at the caller BEFORE entering shmDebugf, boxing each
+		// int/uint into interface{} (one 16-byte heap alloc each).
+		// shmDebugf's own early-return only skips the log.Printf,
+		// not the per-call boxing. At N=1000/4 K bench Commit fires
+		// 3.6 M times in 5 s; without this guard the bench profile
+		// attributes 55 MB / 3.6 M obj to this site. Pattern repeated
+		// for every shmDebugf in a hot path below.
+		if shmDebugEnabled {
+			shmDebugf("COMMIT_DATA_WAKE: written=%d, newSeq=%d, dataWaiters=%d", written, newSeq, waiters)
+		}
 		// Only wake if there are waiters - avoids unnecessary syscalls
 		if waiters > 0 {
-			shmDebugf("COMMIT_DATA_WAKE: waking 1 waiter")
+			if shmDebugEnabled {
+				shmDebugf("COMMIT_DATA_WAKE: waking 1 waiter")
+			}
 			wr.ring.signalData(&hdr.dataSeq)
 		}
 	}
@@ -1823,10 +1882,12 @@ func (r *ShmRing) ReserveWrite(ctx context.Context, n int) (WriteReservation, er
 		}
 		atomic.StoreUint32(&r.spaceSpinCutoff, newCutoff)
 
-		if dl, ok := ctx.Deadline(); ok {
-			shmDebugf("ReserveWrite: waiting with timeout=%s", time.Until(dl))
-		} else {
-			shmDebugf("ReserveWrite: waiting WITHOUT timeout")
+		if shmDebugEnabled {
+			if dl, ok := ctx.Deadline(); ok {
+				shmDebugf("ReserveWrite: waiting with timeout=%s", time.Until(dl))
+			} else {
+				shmDebugf("ReserveWrite: waiting WITHOUT timeout")
+			}
 		}
 
 		// Spin failed - fall back to futex, choosing wait type based on fullness
@@ -1862,8 +1923,10 @@ func (r *ShmRing) ReserveWrite(ctx context.Context, n int) (WriteReservation, er
 		if free == 0 {
 			hdr.IncSpaceWaiters()
 			exp := hdr.SpaceSequence()
-			shmDebugf("RESERVE_WRITE_SPACE_WAIT: ring FULL, spaceWaiters=%d, exp=%d, widx=%d, ridx=%d",
-				hdr.SpaceWaiters(), exp, writeIdx, readIdx)
+			if shmDebugEnabled {
+				shmDebugf("RESERVE_WRITE_SPACE_WAIT: ring FULL, spaceWaiters=%d, exp=%d, widx=%d, ridx=%d",
+					hdr.SpaceWaiters(), exp, writeIdx, readIdx)
+			}
 			// Re-check
 			writeIdx = hdr.WriteIndex()
 			readIdx = hdr.ReadIndex()
@@ -1878,9 +1941,13 @@ func (r *ShmRing) ReserveWrite(ctx context.Context, n int) (WriteReservation, er
 					hdr.DecSpaceWaiters()
 					return WriteReservation{}, context.DeadlineExceeded
 				}
-				shmDebugf("FUTEX_ENTER: exp=%d, rem=%v", exp, rem)
+				if shmDebugEnabled {
+					shmDebugf("FUTEX_ENTER: exp=%d, rem=%v", exp, rem)
+				}
 				err = r.waitForSpace(&hdr.spaceSeq, exp, rem)
-				shmDebugf("FUTEX_EXIT: exp=%d, err=%v, newSeq=%d", exp, err, hdr.SpaceSequence())
+				if shmDebugEnabled {
+					shmDebugf("FUTEX_EXIT: exp=%d, err=%v, newSeq=%d", exp, err, hdr.SpaceSequence())
+				}
 			} else {
 				err = r.waitForSpace(&hdr.spaceSeq, exp, 0)
 			}
@@ -2023,10 +2090,12 @@ func (r *ShmRing) ReadSlices(ctx context.Context, n int) (first, second []byte, 
 
 			// Advance pendingReadIdx now - this allows us to read ahead
 			// while the application holds the buffer
-			atomic.StoreUint64(&r.pendingReadIdx, pendingIdx+uint64(n))
+			newPendingIdx := pendingIdx + uint64(n)
+			atomic.StoreUint64(&r.pendingReadIdx, newPendingIdx)
 
 			// Set up pre-allocated commit context (no closure allocation)
 			r.readCommit.commitReadIdx = sharedReadIdx
+			r.readCommit.bodyEndIdx = newPendingIdx
 			r.readCommit.maxBytes = n
 
 			return firstSlice, secondSlice, &r.readCommit, nil
@@ -2085,10 +2154,12 @@ func (r *ShmRing) ReadSlices(ctx context.Context, n int) (first, second []byte, 
 		default:
 		}
 
-		if dl, ok := ctx.Deadline(); ok {
-			shmDebugf("ReadSlices: waiting with timeout=%s", time.Until(dl))
-		} else {
-			shmDebugf("ReadSlices: waiting WITHOUT timeout")
+		if shmDebugEnabled {
+			if dl, ok := ctx.Deadline(); ok {
+				shmDebugf("ReadSlices: waiting with timeout=%s", time.Until(dl))
+			} else {
+				shmDebugf("ReadSlices: waiting WITHOUT timeout")
+			}
 		}
 
 		// Check local closed flag before accessing header
@@ -2141,7 +2212,9 @@ func (r *ShmRing) ReadSlices(ctx context.Context, n int) (first, second []byte, 
 			return nil, nil, nil, io.EOF
 		}
 
-		shmDebugf("[DEBUG] Ring read: no data available, dataSeq=%d, waiting on futex...", dataSeq)
+		if shmDebugEnabled {
+			shmDebugf("[DEBUG] Ring read: no data available, dataSeq=%d, waiting on futex...", dataSeq)
+		}
 
 		// If ctx has a deadline, wait with timeout; otherwise, infinite wait.
 		var err error
@@ -2154,10 +2227,14 @@ func (r *ShmRing) ReadSlices(ctx context.Context, n int) (first, second []byte, 
 				}
 				return nil, nil, nil, context.DeadlineExceeded
 			}
-			shmDebugf("[DEBUG] Ring read: calling waitForData with timeout=%v", rem)
+			if shmDebugEnabled {
+				shmDebugf("[DEBUG] Ring read: calling waitForData with timeout=%v", rem)
+			}
 			err = r.waitForData(&hdr.dataSeq, dataSeq, rem)
 		} else {
-			shmDebugf("[DEBUG] Ring read: calling waitForData (no timeout)")
+			if shmDebugEnabled {
+				shmDebugf("[DEBUG] Ring read: calling waitForData (no timeout)")
+			}
 			err = r.waitForData(&hdr.dataSeq, dataSeq, 0)
 		}
 		// Check if ring is still valid before decrementing - the segment may have
@@ -2165,7 +2242,9 @@ func (r *ShmRing) ReadSlices(ctx context.Context, n int) (first, second []byte, 
 		if atomic.LoadUint32(&r.closed) == 0 {
 			hdr.DecDataWaiters()
 		}
-		shmDebugf("[DEBUG] Ring read: wait returned, err=%v", err)
+		if shmDebugEnabled {
+			shmDebugf("[DEBUG] Ring read: wait returned, err=%v", err)
+		}
 
 		if err != nil {
 			// Translate futex timeout to context timeout; keep going on spurious wake.
