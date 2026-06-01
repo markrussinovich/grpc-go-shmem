@@ -553,7 +553,16 @@ func alignTo64(size uint64) uint64 {
 }
 
 // ValidateSegmentHeader validates a segment header for consistency
-func ValidateSegmentHeader(h *SegmentHeader) error {
+// ValidateSegmentHeader validates a segment header for consistency
+// against an actual mapped backing file/section of length mappedLen.
+// mappedLen MUST be the length of the memory the caller has mapped
+// (typically the size of the backing file/section). The header's
+// self-reported TotalSize and the two ring extents are checked
+// against mappedLen so a peer providing a too-small backing file
+// with a too-large self-claim is rejected at validation time,
+// before any ring-constructor access touches memory beyond the
+// mapping.
+func ValidateSegmentHeader(h *SegmentHeader, mappedLen uint64) error {
 	// Check magic
 	if h.Magic() != [8]byte{'G', 'R', 'P', 'C', 'S', 'H', 'M', 0} {
 		return fmt.Errorf("invalid magic bytes")
@@ -594,6 +603,32 @@ func ValidateSegmentHeader(h *SegmentHeader) error {
 	}
 	if h.RingBOffset() != expectedRingBOff {
 		return fmt.Errorf("ring B offset mismatch: got %d, expected %d", h.RingBOffset(), expectedRingBOff)
+	}
+
+	// Mapped-size enforcement. The previous validator trusted the
+	// header's self-reported TotalSize, leaving an OpenSegment caller
+	// that mapped a too-small backing file vulnerable to a panic
+	// during ring construction when it reached beyond mappedLen.
+	// The trust model is same-UID (mode-0600 segment files, peerUID
+	// SCM_RIGHTS check) so this is a hardening check against
+	// truncated / corrupted local files, not a defence against
+	// untrusted remote peers.
+	if mappedLen > 0 {
+		if h.TotalSize() != mappedLen {
+			return fmt.Errorf("total size %d does not match mapped backing size %d", h.TotalSize(), mappedLen)
+		}
+		// Both ring extents (offset + capacity) must fit inside the
+		// mapped region. Use a uint64 overflow-safe comparison: an
+		// adversarial header could set offset+capacity to wrap, in
+		// which case the addition would produce a small value.
+		ringAEnd := h.RingAOffset() + h.RingACapacity()
+		if ringAEnd < h.RingAOffset() || ringAEnd > mappedLen {
+			return fmt.Errorf("ring A extends past mapped region: offset=%d cap=%d mappedLen=%d", h.RingAOffset(), h.RingACapacity(), mappedLen)
+		}
+		ringBEnd := h.RingBOffset() + h.RingBCapacity()
+		if ringBEnd < h.RingBOffset() || ringBEnd > mappedLen {
+			return fmt.Errorf("ring B extends past mapped region: offset=%d cap=%d mappedLen=%d", h.RingBOffset(), h.RingBCapacity(), mappedLen)
+		}
 	}
 
 	return nil

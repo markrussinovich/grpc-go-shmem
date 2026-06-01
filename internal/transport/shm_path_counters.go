@@ -193,6 +193,77 @@ var (
 	// Counter shape: increments by 1 per drained entry, NOT by 1
 	// per inline-write success.
 	shmInlinePiggybackDrain uint64
+
+	// --- Wake / response-path diagnostics (2026-05-31) ---
+	// These counters trace the unary-response critical path on the
+	// server side. Goal: prove or refute the "3-wake-per-unary"
+	// hypothesis (HEADERS + DATA + TRAILERS each emit an independent
+	// signalData) that motivates the M1 coalesce optimisation.
+
+	// shmSignalDataFire: number of signalData() calls observed at
+	// the ring layer (both directions of every ShmRing). One call
+	// = one ring "DataSeq increment + peer wake" attempt. Note that
+	// when peer is not parked this is still counted (the SetEvent /
+	// futex_wake / eventfd write still runs); only the BeginBatch
+	// suppress path skips it.
+	shmSignalDataFire uint64
+
+	// shmSignalSpaceFire: number of signalSpace() calls observed.
+	// Same semantics as shmSignalDataFire but for the reader-after-
+	// commit-read "hey writer, space freed" wake.
+	shmSignalSpaceFire uint64
+
+	// shmEnqueueWaitInline: enqueueAndWait used its inline fast
+	// path (TryLock succeeded → caller wrote ring directly, no
+	// chan / doneCh / writer-goroutine round-trip). Used for
+	// server HEADERS and other synchronous control frames.
+	shmEnqueueWaitInline uint64
+
+	// shmEnqueueWaitAsync: enqueueAndWait fell back to the chan
+	// path because TryLock(inlineMu) failed (writer goroutine
+	// mid-batch). Caller paid 2 goroutine context switches +
+	// chan-send + doneCh-wait.
+	shmEnqueueWaitAsync uint64
+
+	// shmTrailerAsyncFire: writeStatus enqueued a TRAILERS frame
+	// via trySend (the async chan-sentinel path). This is the
+	// ONLY path TRAILERS take today (preserves DATA-before-TRAILERS
+	// ordering via writer-FIFO + deferredTrailers; experiments
+	// fusing TRAILERS into the writeProto inline batch regressed
+	// throughput by sacrificing producer/consumer parallelism with
+	// the client reader's post-MESSAGE yield gate — see repo memory
+	// grpc-go-shm-m1a-m1b-results-may31.md).
+	shmTrailerAsyncFire uint64
+
+	// shmTrailerCommitParkedReader: legacy TRAILERS Commit observed
+	// DataWaiters() > 0 at signal time, meaning the client reader
+	// had already parked waiting for the trailer and the wake
+	// genuinely fires a kernel syscall (~3-5 us Win EPYC, ~7-10 us
+	// ARM, ~1-2 us Linux eventfd). When low / 0 the reader was
+	// still mid-drain or yielded-then-spinning and the wake is
+	// elided -- no kernel cost. This counter is the platform-
+	// independent way to tell whether a TRAILERS-fusion design
+	// (M1c-class) could ever save real syscall cost on a given
+	// host without relying on noisy throughput numbers.
+	shmTrailerCommitParkedReader uint64
+
+	// shmTrailerDeferredFire: processTrailerEntry parked the
+	// TRAILERS in deferredTrailers because DATA was still in flight
+	// for the same streamID. Indicates the trailer-sentinel
+	// machinery actually engaged. Near-zero in unary ping-pong
+	// (handler returns synchronously) but non-trivial in async
+	// server-streaming workloads.
+	shmTrailerDeferredFire uint64
+
+	// shmM1aBatchFire: ShmServerTransport.writeProto's M1a
+	// wake-coalesce branch entered BeginBatch around HEADERS+DATA
+	// for the first server response message. The unfused fallback
+	// (where emitHeader=false, e.g. subsequent streaming messages,
+	// explicit prior SendHeader, or M1a disabled) does NOT
+	// increment this counter. A regression that disables or breaks
+	// the M1a path would observe this counter stay at zero after
+	// the first server response. Used by TestShmM1aFusesHeaders*.
+	shmM1aBatchFire uint64
 )
 
 // LoadShmPathCounters returns a snapshot of the SHM write/read path
@@ -236,6 +307,36 @@ type ShmPathCounters struct {
 	InlineWriteBailZeroLen       uint64
 
 	InlinePiggybackDrain uint64
+
+	SignalDataFire         uint64
+	SignalSpaceFire        uint64
+	EnqueueWaitInline      uint64
+	EnqueueWaitAsync       uint64
+	TrailerAsyncFire             uint64
+	TrailerCommitParkedReader    uint64
+	TrailerDeferredFire          uint64
+
+	// M1aBatchFire counts ShmServerTransport.writeProto entries
+	// into the HEADERS+DATA wake-coalesce batch (M1a). Zero after
+	// a server response would indicate the M1a path regressed.
+	M1aBatchFire uint64
+
+	// WUFrameEmit counts the total number of WINDOW_UPDATE frames
+	// the SHM transport serialized to the ring (post-coalesce).
+	// Used by bench/zcprobe to attribute per-op signal-data overhead
+	// to flow-control drip.
+	WUFrameEmit uint64
+
+	// ConnWUForce / ConnWUDrip / StreamWUForce / StreamWUDrip
+	// attribute each WUFrameEmit to its originating policy. Drip =
+	// the standalone wuThreshold-crossing path; Force = the
+	// unconditional emit (sendWindowUpdateForce + conn pre-credit).
+	// Sum of all four ≤ WUFrameEmit (the difference is the piggyback
+	// path which currently bypasses emitWindowUpdateFrame).
+	ConnWUForce   uint64
+	ConnWUDrip    uint64
+	StreamWUForce uint64
+	StreamWUDrip  uint64
 }
 
 // LoadShmPathCounters returns a snapshot. Safe to call concurrently
@@ -276,6 +377,23 @@ func LoadShmPathCounters() ShmPathCounters {
 		InlineWriteBailZeroLen:       atomic.LoadUint64(&shmInlineWriteBailZeroLen),
 
 		InlinePiggybackDrain: atomic.LoadUint64(&shmInlinePiggybackDrain),
+
+		SignalDataFire:      atomic.LoadUint64(&shmSignalDataFire),
+		SignalSpaceFire:     atomic.LoadUint64(&shmSignalSpaceFire),
+		EnqueueWaitInline:   atomic.LoadUint64(&shmEnqueueWaitInline),
+		EnqueueWaitAsync:    atomic.LoadUint64(&shmEnqueueWaitAsync),
+		TrailerAsyncFire:          atomic.LoadUint64(&shmTrailerAsyncFire),
+		TrailerCommitParkedReader: atomic.LoadUint64(&shmTrailerCommitParkedReader),
+		TrailerDeferredFire:       atomic.LoadUint64(&shmTrailerDeferredFire),
+
+		M1aBatchFire: atomic.LoadUint64(&shmM1aBatchFire),
+
+		WUFrameEmit: shmWUFrameEmit.Load(),
+
+		ConnWUForce:   shmConnWUForce.Load(),
+		ConnWUDrip:    shmConnWUDrip.Load(),
+		StreamWUForce: shmStreamWUForce.Load(),
+		StreamWUDrip:  shmStreamWUDrip.Load(),
 	}
 }
 
@@ -317,5 +435,22 @@ func (a ShmPathCounters) Sub(before ShmPathCounters) ShmPathCounters {
 		InlineWriteBailZeroLen:       a.InlineWriteBailZeroLen - before.InlineWriteBailZeroLen,
 
 		InlinePiggybackDrain: a.InlinePiggybackDrain - before.InlinePiggybackDrain,
+
+		SignalDataFire:      a.SignalDataFire - before.SignalDataFire,
+		SignalSpaceFire:     a.SignalSpaceFire - before.SignalSpaceFire,
+		EnqueueWaitInline:   a.EnqueueWaitInline - before.EnqueueWaitInline,
+		EnqueueWaitAsync:    a.EnqueueWaitAsync - before.EnqueueWaitAsync,
+		TrailerAsyncFire:          a.TrailerAsyncFire - before.TrailerAsyncFire,
+		TrailerCommitParkedReader: a.TrailerCommitParkedReader - before.TrailerCommitParkedReader,
+		TrailerDeferredFire:       a.TrailerDeferredFire - before.TrailerDeferredFire,
+
+		M1aBatchFire: a.M1aBatchFire - before.M1aBatchFire,
+
+		WUFrameEmit: a.WUFrameEmit - before.WUFrameEmit,
+
+		ConnWUForce:   a.ConnWUForce - before.ConnWUForce,
+		ConnWUDrip:    a.ConnWUDrip - before.ConnWUDrip,
+		StreamWUForce: a.StreamWUForce - before.StreamWUForce,
+		StreamWUDrip:  a.StreamWUDrip - before.StreamWUDrip,
 	}
 }

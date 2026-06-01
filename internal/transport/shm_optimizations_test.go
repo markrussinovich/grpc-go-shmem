@@ -252,6 +252,80 @@ func TestShmWindowUpdateBatching(t *testing.T) {
 	}
 }
 
+// TestShmPiggybackWUThresholdGate exercises the threshold gating in
+// piggybackWUForWriter (both client and server). Below threshold the
+// piggyback must leave pendingConnWU intact (so the standalone
+// sendConnWindowUpdate path remains the sole emission point at
+// the documented batching cadence); at or above threshold the
+// piggyback drains the accumulator.
+//
+// Regression cover: an earlier version of piggybackWUForWriter did an
+// unconditional Swap(0), defeating the wuThreshold gate and emitting
+// one extra WINDOW_UPDATE frame per RT under bidi streaming
+// (measured at +25-30us/op on max profile 1 KiB Windows).
+func TestShmPiggybackWUThresholdGate(t *testing.T) {
+	segName := testSegName("test_wu_piggyback_gate")
+	defer RemoveSegment(segName)
+
+	seg, err := CreateSegment(segName, 128*1024, 128*1024)
+	if err != nil {
+		t.Fatalf("CreateSegment: %v", err)
+	}
+	defer seg.Close()
+	seg.H.SetServerReady(true)
+
+	clientSeg, err := OpenSegment(segName)
+	if err != nil {
+		t.Fatalf("OpenSegment: %v", err)
+	}
+
+	clientAddr := &ShmAddr{Name: segName + "_c"}
+	serverAddr := &ShmAddr{Name: segName + "_s"}
+
+	ct, err := NewShmClientTransport(clientSeg, clientAddr, serverAddr)
+	if err != nil {
+		t.Fatalf("NewShmClientTransport: %v", err)
+	}
+	defer ct.Close(nil)
+
+	thresh := ct.wuThreshold.Load()
+	if thresh == 0 {
+		t.Fatalf("wuThreshold is zero; cannot exercise gate")
+	}
+
+	// Case 1: pending well below threshold. Piggyback must not drain.
+	subThresh := thresh / 4
+	if subThresh == 0 {
+		subThresh = 1
+	}
+	ct.pendingConnWU.Store(subThresh)
+	ct.piggybackWUForWriter(0)
+	if got := ct.pendingConnWU.Load(); got != subThresh {
+		t.Errorf("below-threshold piggyback: pendingConnWU = %d, want %d (must not drain)", got, subThresh)
+	}
+
+	// Case 2: pending at threshold. Piggyback must drain.
+	ct.pendingConnWU.Store(thresh)
+	ct.piggybackWUForWriter(0)
+	if got := ct.pendingConnWU.Load(); got != 0 {
+		t.Errorf("threshold-met piggyback: pendingConnWU = %d, want 0 (must drain)", got)
+	}
+
+	// Case 3: pending above threshold. Piggyback must drain entirely.
+	ct.pendingConnWU.Store(thresh * 2)
+	ct.piggybackWUForWriter(0)
+	if got := ct.pendingConnWU.Load(); got != 0 {
+		t.Errorf("above-threshold piggyback: pendingConnWU = %d, want 0 (must drain)", got)
+	}
+
+	// Case 4: zero pending. Piggyback must remain a no-op.
+	ct.pendingConnWU.Store(0)
+	ct.piggybackWUForWriter(0)
+	if got := ct.pendingConnWU.Load(); got != 0 {
+		t.Errorf("zero-pending piggyback: pendingConnWU = %d, want 0", got)
+	}
+}
+
 func TestShmWindowUpdateStreamCleanup(t *testing.T) {
 	// Verify that per-stream pending WU credit is cleared via the real
 	// closeStream path. Under the WU Lockless Path, per-stream pending
@@ -347,7 +421,10 @@ func TestShmWindowUpdateServerStreamCleanup(t *testing.T) {
 	}
 
 	// handleTrailers should clean up streamA's entry.
-	trailers := encodeTrailers(TrailersV1{Version: 1, GRPCStatusCode: 0, GRPCStatusMsg: "OK"})
+	// PR #10 (Headers Hot Path Cleanup): handleTrailers now takes a
+	// TrailersV1 struct directly; the dispatch site is responsible for
+	// decoding from the wire payload.
+	trailers := TrailersV1{Version: 1, GRPCStatusCode: 0, GRPCStatusMsg: "OK"}
 	st.handleTrailers(streamA, trailers)
 
 	if got := sA.pendingWU.Load(); got != 0 {
@@ -896,13 +973,16 @@ func TestShmBatchDeadlockGuard(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Single stream cache tests
+// Direct-mapped streams table tests (PR #11)
 // ---------------------------------------------------------------------------
 
-func TestShmSingleStreamCache(t *testing.T) {
-	// Verify that cachedStream is set when there's exactly one active stream
-	// and cleared when there are zero or multiple streams.
-	segName := testSegName("test_ssm")
+// TestShmDirectMappedStreamSlots verifies the PR #11 streamSlots
+// direct-mapped table: that creating a stream populates its slot,
+// that closing a stream CAS-clears the slot, and that a collision
+// (two streams whose IDs map to the same slot) is handled correctly
+// via overwrite-and-map-fallback.
+func TestShmDirectMappedStreamSlots(t *testing.T) {
+	segName := testSegName("test_dms")
 	defer RemoveSegment(segName)
 
 	seg, err := CreateSegment(segName, 128*1024, 128*1024)
@@ -923,40 +1003,54 @@ func TestShmSingleStreamCache(t *testing.T) {
 	}
 	defer ct.Close(nil)
 
-	// No streams → cache should be nil.
-	if ct.cachedStream.Load() != nil {
-		t.Error("cachedStream should be nil with no streams")
+	// No streams: every slot must be nil.
+	for i := range ct.streamSlots {
+		if ct.streamSlots[i].Load() != nil {
+			t.Fatalf("slot %d non-nil at startup", i)
+		}
 	}
 
-	// Create first stream → cache should be set.
+	// Create first stream; its slot must contain it.
 	ctx := context.Background()
-	s1, err := ct.NewStream(ctx, &CallHdr{Host: "localhost", Method: "/test/SSM1"}, nil)
+	s1, err := ct.NewStream(ctx, &CallHdr{Host: "localhost", Method: "/test/DMS1"}, nil)
 	if err != nil {
 		t.Fatalf("NewStream 1: %v", err)
 	}
-	if c := ct.cachedStream.Load(); c == nil || c.stream != s1 {
-		t.Error("cachedStream should point to s1 with one stream")
+	idx1 := streamSlotIdx(s1.id)
+	if got := ct.streamSlots[idx1].Load(); got != s1 {
+		t.Errorf("slot[%d] after create: got %p, want %p", idx1, got, s1)
 	}
 
-	// Create second stream → cache should be nil.
-	s2, err := ct.NewStream(ctx, &CallHdr{Host: "localhost", Method: "/test/SSM2"}, nil)
+	// Create second stream; its slot must contain it. With sequential
+	// odd IDs and the >>1 shift, idx1 != idx2.
+	s2, err := ct.NewStream(ctx, &CallHdr{Host: "localhost", Method: "/test/DMS2"}, nil)
 	if err != nil {
 		t.Fatalf("NewStream 2: %v", err)
 	}
-	if ct.cachedStream.Load() != nil {
-		t.Error("cachedStream should be nil with two streams")
+	idx2 := streamSlotIdx(s2.id)
+	if got := ct.streamSlots[idx2].Load(); got != s2 {
+		t.Errorf("slot[%d] after create: got %p, want %p", idx2, got, s2)
+	}
+	if idx1 == idx2 {
+		t.Fatalf("sequential odd IDs %d and %d unexpectedly collided on slot %d", s1.id, s2.id, idx1)
+	}
+	if got := ct.streamSlots[idx1].Load(); got != s1 {
+		t.Errorf("slot[%d] (s1) overwritten by s2 create: got %p", idx1, got)
 	}
 
-	// Close second stream → cache should be set to s1.
+	// Close s2: its slot must CAS-clear back to nil.
 	ct.closeStream(s2, nil, true, 0, nil, nil, false)
-	if c := ct.cachedStream.Load(); c == nil || c.stream != s1 {
-		t.Error("cachedStream should point to s1 after closing s2")
+	if ct.streamSlots[idx2].Load() != nil {
+		t.Errorf("slot[%d] not cleared after closing s2", idx2)
+	}
+	if got := ct.streamSlots[idx1].Load(); got != s1 {
+		t.Errorf("slot[%d] (s1) accidentally cleared by s2 close: got %p", idx1, got)
 	}
 
-	// Close first stream → cache should be nil.
+	// Close s1: its slot must CAS-clear back to nil.
 	ct.closeStream(s1, nil, true, 0, nil, nil, false)
-	if ct.cachedStream.Load() != nil {
-		t.Error("cachedStream should be nil after closing all streams")
+	if ct.streamSlots[idx1].Load() != nil {
+		t.Errorf("slot[%d] not cleared after closing s1", idx1)
 	}
 }
 
@@ -1087,14 +1181,24 @@ func TestShmZeroCopyNonMessageCopies(t *testing.T) {
 	if fh.Type != FrameTypeHEADERS {
 		t.Fatalf("type = %d, want HEADERS", fh.Type)
 	}
-	gotHv, derr := decodeHeaders(buf.ReadOnlyData())
+	// PR #10: HEADERS frames now return a nil mem.Buffer; the decoded
+	// HeadersV1 is stashed on the holder and consumed via
+	// takeOrDecodeHeaders. Pass a nil payload because there is no
+	// wire body to fall back to.
+	var pl []byte
+	if buf != nil {
+		pl = buf.ReadOnlyData()
+	}
+	gotHv, derr := takeOrDecodeHeaders(rx.h2Decoder(), pl)
 	if derr != nil {
 		t.Fatalf("decodeHeaders: %v", derr)
 	}
 	if gotHv.Method != hv.Method || gotHv.Authority != hv.Authority {
 		t.Fatalf("HeadersV1 mismatch: got %+v, want %+v", gotHv, hv)
 	}
-	buf.Free()
+	if buf != nil {
+		buf.Free()
+	}
 }
 
 func TestShmZeroCopyMultiStreamCorrectness(t *testing.T) {

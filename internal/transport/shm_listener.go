@@ -200,8 +200,25 @@ func NewShmListener(addr *ShmAddr, segmentSize, ringASize, ringBSize uint64) (*S
 	ctlSeg.RegisterRing(l.ctlTx)
 
 	// Create events for control rings (Windows). On Linux, these are no-ops.
-	l.ctlRxEvents, _ = CreateRingEvents(ctlEventName, "A")
-	l.ctlTxEvents, _ = CreateRingEvents(ctlEventName, "B")
+	// BUG FIX (GPT-5.5 overnight bug hunt): propagate errors so a
+	// failed Windows event create surfaces as a listener-create
+	// failure instead of a silent cross-process hang at first accept.
+	var evErr error
+	l.ctlRxEvents, evErr = CreateRingEvents(ctlEventName, "A")
+	if evErr != nil {
+		cancel()
+		ctlSeg.Close()
+		return nil, fmt.Errorf("create control ring A events for %q: %w", ctlEventName, evErr)
+	}
+	l.ctlTxEvents, evErr = CreateRingEvents(ctlEventName, "B")
+	if evErr != nil {
+		if l.ctlRxEvents != nil {
+			l.ctlRxEvents.Close()
+		}
+		cancel()
+		ctlSeg.Close()
+		return nil, fmt.Errorf("create control ring B events for %q: %w", ctlEventName, evErr)
+	}
 
 	// Attach events to control rings
 	l.ctlRx.SetEvents(l.ctlRxEvents)
@@ -283,6 +300,10 @@ func (l *ShmListener) Accept() (net.Conn, error) {
 		}
 		connReq, err := decodeConnectRequest(payload)
 		if err != nil {
+			// CONNECT could not be decoded, so no nonce is available to
+			// echo (REJECT carries nonce 0). A matched-v3 dialer will
+			// not correlate it and fails the dial generically; this path
+			// is effectively unreachable between matched-version peers.
 			_ = writeCtlFrame(l.ctx, l.ctlTx, FrameHeader{Type: FrameTypeREJECT}, encodeConnectReject(connectReject{message: err.Error()}))
 			continue
 		}
@@ -297,13 +318,26 @@ func (l *ShmListener) Accept() (net.Conn, error) {
 
 		segment, err := CreateSegment(segmentName, l.ringASize, l.ringBSize)
 		if err != nil {
-			_ = writeCtlFrame(l.ctx, l.ctlTx, FrameHeader{Type: FrameTypeREJECT}, encodeConnectReject(connectReject{message: err.Error()}))
+			_ = writeCtlFrame(l.ctx, l.ctlTx, FrameHeader{Type: FrameTypeREJECT}, encodeConnectReject(connectReject{message: err.Error(), nonce: connReq.nonce}))
 			continue
 		}
 		segment.H.SetMaxStreams(atomic.LoadUint32(&l.maxStreams))
 
 		// Create handshake events for the data segment (Windows).
-		_, _ = CreateHandshakeEvents(segmentName)
+		// On Linux this is a no-op. Propagate failures so a Windows
+		// event create error fails the accept loudly instead of
+		// publishing a half-broken segment that a dialer would block
+		// on indefinitely.
+		if _, hsErr := CreateHandshakeEvents(segmentName); hsErr != nil {
+			segment.Close()
+			_ = RemoveSegment(segmentName)
+			_ = writeCtlFrame(l.ctx, l.ctlTx, FrameHeader{Type: FrameTypeREJECT},
+				encodeConnectReject(connectReject{
+					message: fmt.Sprintf("create handshake events for %q: %v", segmentName, hsErr),
+					nonce:   connReq.nonce,
+				}))
+			continue
+		}
 		segment.SetServerReadyAndSignal(true)
 
 		// Create rings and events BEFORE sending ACCEPT, so events exist
@@ -315,14 +349,32 @@ func (l *ShmListener) Accept() (net.Conn, error) {
 
 		// Create events for this segment. On Linux, these are no-ops.
 		// Must happen before ACCEPT so client's OpenRingEvents finds them.
-		readEvents, _ := CreateRingEvents(segmentName, "A")
-		writeEvents, _ := CreateRingEvents(segmentName, "B")
+		// BUG FIX (GPT-5.5 overnight bug hunt): propagate errors so a
+		// Windows event create failure aborts the accept instead of
+		// silently producing a half-broken connection.
+		readEvents, readErr := CreateRingEvents(segmentName, "A")
+		if readErr != nil {
+			CloseHandshakeEvents(segmentName)
+			segment.Close()
+			_ = RemoveSegment(segmentName)
+			return nil, fmt.Errorf("create data ring A events for %q: %w", segmentName, readErr)
+		}
+		writeEvents, writeErr := CreateRingEvents(segmentName, "B")
+		if writeErr != nil {
+			if readEvents != nil {
+				readEvents.Close()
+			}
+			CloseHandshakeEvents(segmentName)
+			segment.Close()
+			_ = RemoveSegment(segmentName)
+			return nil, fmt.Errorf("create data ring B events for %q: %w", segmentName, writeErr)
+		}
 
 		// Attach events to rings
 		readRing.SetEvents(readEvents)
 		writeRing.SetEvents(writeEvents)
 
-		if err := writeCtlFrame(l.ctx, l.ctlTx, FrameHeader{Type: FrameTypeACCEPT}, encodeConnectResponse(connectResponse{segmentName: segmentName})); err != nil {
+		if err := writeCtlFrame(l.ctx, l.ctlTx, FrameHeader{Type: FrameTypeACCEPT}, encodeConnectResponse(connectResponse{segmentName: segmentName, nonce: connReq.nonce})); err != nil {
 			if readEvents != nil {
 				readEvents.Close()
 			}
@@ -468,9 +520,11 @@ func (l *ShmListener) Close() error {
 			l.ctlSegment.Close()
 			CloseHandshakeEvents(l.baseName + shmControlSuffix)
 			_ = RemoveSegment(l.baseName + shmControlSuffix)
-			// Unlink the cross-process control lock file (Linux) so a
-			// later listener start does not inherit a stale inode.
-			// No-op on Windows where the named mutex is refcounted.
+			// Unlink the cross-process control lock file so a later
+			// listener start does not inherit a stale inode (Linux) or
+			// stale file HANDLE state (Windows). Both platforms use a
+			// sibling `<ctl-segment>.lock` file under the same
+			// LockFileEx / flock advisory scheme.
 			removeControlLock(l.baseName + shmControlSuffix)
 
 			// Release the listener's reference on the control-ring events.

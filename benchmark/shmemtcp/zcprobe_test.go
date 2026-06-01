@@ -122,6 +122,45 @@ func startZCProbe(b *testing.B) func() {
 		// = piggyback working; near-zero at low concurrency = chan
 		// empty (no work to amortise).
 		report("inline-piggyback-drain/op", delta.InlinePiggybackDrain)
+		// Wake / response-path diagnostics (2026-05-31).
+		// signal-data/op = number of ring signalData() calls per
+		// bench iteration (sum of both directions). For a unary
+		// ping-pong the floor is 2 (1 client request + 1 server
+		// response); higher = response side emits multiple
+		// independent wakes (HEADERS, DATA, TRAILERS each fire).
+		report("signal-data/op", delta.SignalDataFire)
+		report("signal-space/op", delta.SignalSpaceFire)
+		// enq-wait-inline = enqueueAndWait took inline fast path
+		// (TryLock succeeded → caller wrote ring directly, no
+		// chan / writer goroutine round-trip). enq-wait-async =
+		// fell back to chan + doneCh.
+		report("enq-wait-inline/op", delta.EnqueueWaitInline)
+		report("enq-wait-async/op", delta.EnqueueWaitAsync)
+		// trailer-async/op = writeStatus enqueued TRAILERS via the
+		// async chan-sentinel path (this is the only path TRAILERS
+		// take today; counter exists to baseline before adding an
+		// optional inline-TRAILERS optimisation).
+		report("trailer-async/op", delta.TrailerAsyncFire)
+		// trailer-commit-parked/op: how often legacy TRAILERS commit
+		// observed a parked client reader (DataWaiters>0) at signal
+		// time -- i.e. the trailer wake genuinely fires a kernel
+		// syscall. A trailer-fusion design (M1c-class) can only save
+		// syscall cost when this is materially > 0.
+		report("trailer-commit-parked/op", delta.TrailerCommitParkedReader)
+		// trailer-deferred/op = processTrailerEntry parked TRAILERS
+		// behind in-flight DATA. Near-zero in unary, may be non-
+		// zero under server-streaming + async sends.
+		report("trailer-deferred/op", delta.TrailerDeferredFire)
+		// wu-frames/op = total WINDOW_UPDATE frames serialized to the
+		// ring (sum of both directions, post-coalesce). For a fair-
+		// window unary ping-pong with single-frame messages this
+		// SHOULD be 0; non-zero indicates flow-control drip overhead
+		// contributing extra signalData wakes per op.
+		report("wu-frames/op", delta.WUFrameEmit)
+		report("wu-conn-force/op", delta.ConnWUForce)
+		report("wu-conn-drip/op", delta.ConnWUDrip)
+		report("wu-stream-force/op", delta.StreamWUForce)
+		report("wu-stream-drip/op", delta.StreamWUDrip)
 		// Per-data-segment socketpair waker diagnostics (zero on
 		// non-Linux / when the eventfd waker is disabled).
 		report("ds-wake/op", dsDelta.WakeCallsTotal)

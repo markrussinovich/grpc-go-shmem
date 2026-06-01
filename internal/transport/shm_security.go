@@ -338,7 +338,10 @@ func (h *ShmSecurityHandshaker) ClientHandshake(ctx context.Context, ring *ShmRi
 		}, nil
 
 	case FrameTypeHandshakeFail:
-		fail, _ := decodeHandshakeFail(payload)
+		fail, ferr := decodeHandshakeFail(payload)
+		if ferr != nil {
+			return nil, fmt.Errorf("decode handshake failure: %w", ferr)
+		}
 		return nil, &HandshakeError{Code: fail.code, Message: string(fail.message)}
 
 	default:
@@ -424,7 +427,10 @@ func (h *ShmSecurityHandshaker) ServerHandshake(ctx context.Context, ring *ShmRi
 		}, nil
 
 	case FrameTypeHandshakeFail:
-		fail, _ := decodeHandshakeFail(payload)
+		fail, ferr := decodeHandshakeFail(payload)
+		if ferr != nil {
+			return nil, fmt.Errorf("decode handshake failure: %w", ferr)
+		}
 		return nil, &HandshakeError{Code: fail.code, Message: string(fail.message)}
 
 	default:

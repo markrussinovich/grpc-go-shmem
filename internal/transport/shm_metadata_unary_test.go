@@ -64,7 +64,7 @@ func TestUnary_MetadataAndStatus(t *testing.T) {
 			t.Errorf("expected HEADERS, got %v", fh.Type)
 			return
 		}
-		hdr, err := decodeHeaders(pl)
+		hdr, err := takeOrDecodeHeaders(srvRx.h2Decoder(), pl)
 		if err != nil {
 			t.Errorf("decode headers: %v", err)
 			return

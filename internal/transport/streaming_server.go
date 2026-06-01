@@ -44,6 +44,9 @@ type ShmStreamingServer struct {
 
 	readerOnce sync.Once
 	readerDone chan struct{}
+	// readerStarted gates the Close()-side wait on readerDone. See
+	// client.go for the full rationale.
+	readerStarted atomic.Bool
 	closed     atomic.Bool
 
 	// Handler for new streams
@@ -65,6 +68,13 @@ type streamingServerStream struct {
 	// Send coordination
 	sendQueue  chan []byte // buffered queue for outgoing messages
 	senderDone chan struct{}
+	// sendMu serializes SendMsg's `case s.sendQueue <- payload:` send
+	// against SendTrailers's `close(s.sendQueue)`. Without it, a
+	// SendMsg that has already passed the `sendDone.Load()` gate and
+	// is mid-select can race with SendTrailers's CAS+close, causing
+	// "send on closed channel" panic. See client mirror in
+	// streaming_client.go for the equivalent guard.
+	sendMu sync.Mutex
 
 	// Lifecycle
 	recvDone   atomic.Bool   // set when client closes send
@@ -118,8 +128,12 @@ func (s *ShmStreamingServer) Close() error {
 	// Close rx ring to unblock reader
 	_ = s.rx.Close()
 
-	// Wait for reader to exit
-	<-s.readerDone
+	// Wait for reader to exit. BUG FIX (GPT-5.5 bug hunt): only wait
+	// if startReader was actually called — otherwise readerDone is
+	// never closed and Close hangs forever.
+	if s.readerStarted.Load() {
+		<-s.readerDone
+	}
 
 	// Close all active streams
 	s.streamsM.Lock()
@@ -134,19 +148,20 @@ func (s *ShmStreamingServer) Close() error {
 // startReader starts the event-driven frame reader
 func (s *ShmStreamingServer) startReader() {
 	s.readerOnce.Do(func() {
+		s.readerStarted.Store(true)
 		go func() {
 			defer close(s.readerDone)
 			ctx := context.Background()
 
-			log.Printf("StreamingServer: reader goroutine starting")
+			shmDebugf("StreamingServer: reader goroutine starting")
 			for !s.closed.Load() {
 				fh, payload, err := readFrame(ctx, s.rx)
 				if err != nil {
 					if errors.Is(err, ErrRingClosed) || errors.Is(err, io.EOF) {
-						log.Printf("StreamingServer: reader exiting due to closed ring")
+						shmDebugf("StreamingServer: reader exiting due to closed ring")
 						return
 					}
-					log.Printf("StreamingServer: reader error: %v", err)
+					shmDebugf("StreamingServer: reader error: %v", err)
 					continue
 				}
 
@@ -155,7 +170,7 @@ func (s *ShmStreamingServer) startReader() {
 				case FrameTypeHEADERS:
 					hdr, err := decodeHeaders(payload)
 					if err != nil {
-						log.Printf("StreamingServer: failed to decode headers: %v", err)
+						shmDebugf("StreamingServer: failed to decode headers: %v", err)
 						continue
 					}
 					s.handleNewStream(fh.StreamID, hdr)
@@ -171,7 +186,7 @@ func (s *ShmStreamingServer) startReader() {
 					_ = writeFrame(ctx, s.tx, FrameHeader{StreamID: fh.StreamID, Type: FrameTypePONG}, payload)
 					s.writeMu.Unlock()
 				default:
-					log.Printf("StreamingServer: unknown frame type %d", fh.Type)
+					shmDebugf("StreamingServer: unknown frame type %d", fh.Type)
 				}
 			}
 		}()
@@ -184,7 +199,7 @@ func (s *ShmStreamingServer) handleNewStream(streamID uint32, hdr HeadersV1) {
 	// Check if stream already exists
 	if _, exists := s.streams[streamID]; exists {
 		s.streamsM.Unlock()
-		log.Printf("StreamingServer: stream %d already exists", streamID)
+		shmDebugf("StreamingServer: stream %d already exists", streamID)
 		return
 	}
 
@@ -255,7 +270,7 @@ func (s *ShmStreamingServer) runStreamSender(stream *streamingServerStream) {
 				Type:     FrameTypeMESSAGE,
 			}
 			if err := s.writeFrameSafe(stream.ctx, fh, wrapped); err != nil {
-				log.Printf("StreamingServer: failed to send message on stream %d: %v", stream.id, err)
+				shmDebugf("StreamingServer: failed to send message on stream %d: %v", stream.id, err)
 				stream.closeWithError(err)
 				return
 			}
@@ -276,14 +291,14 @@ func (s *ShmStreamingServer) dispatchMessage(id uint32, p []byte) {
 	stream := s.streams[id]
 	s.streamsM.Unlock()
 	if stream == nil {
-		log.Printf("StreamingServer: no stream found for id %d", id)
+		shmDebugf("StreamingServer: no stream found for id %d", id)
 		return
 	}
 	// Strip the gRPC LPM 5-byte prefix added by the sender. See the
 	// matching stripLPMHeader in streaming_client.go.
 	body, ok := stripLPMHeader(p)
 	if !ok {
-		log.Printf("StreamingServer: dropping malformed MESSAGE on stream %d (len=%d)", id, len(p))
+		shmDebugf("StreamingServer: dropping malformed MESSAGE on stream %d (len=%d)", id, len(p))
 		return
 	}
 	// Make a copy since the payload buffer may be reused
@@ -343,6 +358,8 @@ func (s *streamingServerStream) SendHeaders(md []KV) error {
 
 // SendMsg sends a message on the stream (non-blocking, queued)
 func (s *streamingServerStream) SendMsg(payload []byte) error {
+	s.sendMu.Lock()
+	defer s.sendMu.Unlock()
 	if s.sendDone.Load() {
 		return errors.New("send already closed")
 	}
@@ -358,11 +375,14 @@ func (s *streamingServerStream) SendMsg(payload []byte) error {
 
 // SendTrailers sends trailers and closes the stream
 func (s *streamingServerStream) SendTrailers(statusCode uint32, statusMsg string, md []KV) error {
+	s.sendMu.Lock()
 	if !s.sendDone.CompareAndSwap(false, true) {
+		s.sendMu.Unlock()
 		return errors.New("send already closed")
 	}
 	// Preserve ordering: ensure all queued messages are flushed before trailers.
 	close(s.sendQueue)
+	s.sendMu.Unlock()
 	<-s.senderDone
 
 	tr := TrailersV1{

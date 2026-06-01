@@ -62,11 +62,10 @@ Both read from `tmp/fair_results/A_fair_default*.txt` and
 | `BENCH_DIRTY_DEFAULT_POOL=1` | Swaps grpc-go's process-wide default buffer pool to a dirty (no-memclr-on-Get) variant. **Cross-transport** (affects SHM + UDS + TCP). Off by default in the canonical numbers. |
 | `SHM_BENCH_CPU=1` | Include `%cpu` and `cpu-ns/op` columns in bench output (Linux only, ResourceUsage). |
 
-Note: the v3.4 baseline (no-WINDOW_UPDATE flow control + per-data-segment eventfd waker)
-is now the default behaviour of the SHM transport. There are no env vars to enable them;
-tests/benchmarks that want to compare against the futex / HTTP/2-WU paths can call
-`transport.ConfigureShmNoWindowUpdate(false)` and / or
-`transport.ConfigureShmEventfdWakerForBench(false)` before running.
+Note: the per-data-segment eventfd waker is the default behaviour of the SHM
+transport on Linux. Tests/benchmarks that want to compare against the futex
+wait path can call `transport.ConfigureShmEventfdWakerForBench(false)` before
+running.
 
 ## Output layout reference
 

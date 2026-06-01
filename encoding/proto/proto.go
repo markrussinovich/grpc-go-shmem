@@ -40,6 +40,31 @@ func init() {
 // gRPC.
 type codecV2 struct{}
 
+// IsBuiltin reports whether c is the gRPC built-in proto codec
+// registered by this package. Used by transport fast paths (e.g. the
+// shared-memory transport's WriteProto bypass) that need an
+// unspoofable identity check to safely skip the user-supplied codec
+// and call protobuf marshal/unmarshal directly.
+//
+// Why an exported identity function rather than a capability
+// interface like bufferPoolMarshaler: capability-based detection can
+// be silently satisfied by a third-party codec that registers under
+// the name "proto" and happens to implement the same capability,
+// which would cause the SHM bypass path to marshal via the built-in
+// protobuf library instead of the user's codec — silent wire-format
+// divergence. IsBuiltin is a pointer-identity test against the
+// concrete *codecV2 registered by this package and cannot be spoofed.
+//
+// Accepts any (rather than encoding.CodecV2) so callers can pass
+// their internal baseCodec/CodecV1Bridge interface values without an
+// up-cast; non-codec values cleanly return false.
+//
+// Returns false for nil receivers.
+func IsBuiltin(c any) bool {
+	_, ok := c.(*codecV2)
+	return ok
+}
+
 func (c *codecV2) Marshal(v any) (data mem.BufferSlice, err error) {
 	return c.marshalWithPool(v, mem.DefaultBufferPool())
 }

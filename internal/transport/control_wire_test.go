@@ -33,10 +33,11 @@ func TestConnectRequest_RoundTrip(t *testing.T) {
 		ringA:            1 << 20,
 		ringB:            2 << 20,
 		singleStreamMode: true,
+		nonce:            0xDEADBEEFCAFEF00D,
 	}
 	enc := encodeConnectRequest(in)
-	if len(enc) != 20 {
-		t.Fatalf("encoded length: got %d want 20", len(enc))
+	if len(enc) != 28 {
+		t.Fatalf("encoded length: got %d want 28", len(enc))
 	}
 	out, err := decodeConnectRequest(enc)
 	if err != nil {
@@ -117,7 +118,7 @@ func TestConnectRequest_RejectsUnknownVersion(t *testing.T) {
 
 // TestConnectResponse_RoundTrip exercises the happy path.
 func TestConnectResponse_RoundTrip(t *testing.T) {
-	in := connectResponse{segmentName: "shm-foo-bar-baz"}
+	in := connectResponse{segmentName: "shm-foo-bar-baz", nonce: 0x0123456789ABCDEF}
 	enc := encodeConnectResponse(in)
 	out, err := decodeConnectResponse(enc)
 	if err != nil {
@@ -166,7 +167,7 @@ func TestConnectResponse_RejectsNonH2Selection(t *testing.T) {
 
 // TestConnectReject_RoundTrip exercises REJECT happy path.
 func TestConnectReject_RoundTrip(t *testing.T) {
-	in := connectReject{message: "no streams available"}
+	in := connectReject{message: "no streams available", nonce: 0xFEEDFACEFEEDFACE}
 	enc := encodeConnectReject(in)
 	out, err := decodeConnectReject(enc)
 	if err != nil {
@@ -175,4 +176,88 @@ func TestConnectReject_RoundTrip(t *testing.T) {
 	if out != in {
 		t.Fatalf("round-trip mismatch: got %+v want %+v", out, in)
 	}
+}
+
+
+// TestConnectResponse_RejectsEmptyName verifies a zero-length name
+// field is rejected. Previously a malformed peer sending nameLen=0
+// could slip through and cause a less-helpful "OpenSegment empty
+// name" error downstream.
+func TestConnectResponse_RejectsEmptyName(t *testing.T) {
+// version + nameLen=0 + selected + flags + nonce
+b := make([]byte, 1+4+0+1+1+8)
+b[0] = controlWireVersion
+binary.LittleEndian.PutUint32(b[1:5], 0)
+b[5] = wireFormatH2
+b[6] = 0
+_, err := decodeConnectResponse(b)
+if err == nil {
+t.Fatal("expected error for empty name length, got nil")
+}
+}
+
+// TestConnectResponse_RejectsOversizeName verifies that a nameLen
+// claim above maxSegmentNameLen is rejected early, before we copy
+// peer-controlled bytes into a Go string.
+func TestConnectResponse_RejectsOversizeName(t *testing.T) {
+tooLong := maxSegmentNameLen + 1
+b := make([]byte, 1+4+tooLong+1+1+8)
+b[0] = controlWireVersion
+binary.LittleEndian.PutUint32(b[1:5], uint32(tooLong))
+for i := 0; i < tooLong; i++ {
+b[5+i] = 'a'
+}
+b[5+tooLong] = wireFormatH2
+b[5+tooLong+1] = 0
+_, err := decodeConnectResponse(b)
+if err == nil {
+t.Fatal("expected error for oversize name length, got nil")
+}
+if !strings.Contains(err.Error(), "exceeds max") {
+t.Fatalf("error message should mention max length; got %q", err.Error())
+}
+}
+
+// TestConnectResponse_RejectsTrailingJunk verifies that bytes past
+// the mandatory nonce are rejected. A malformed peer cannot smuggle
+// extra payload through.
+func TestConnectResponse_RejectsTrailingJunk(t *testing.T) {
+name := "ok_seg"
+b := make([]byte, 1+4+len(name)+1+1+8+3) // 3 extra trailing bytes
+b[0] = controlWireVersion
+binary.LittleEndian.PutUint32(b[1:5], uint32(len(name)))
+copy(b[5:5+len(name)], name)
+b[5+len(name)] = wireFormatH2
+b[5+len(name)+1] = 0
+_, err := decodeConnectResponse(b)
+if err == nil {
+t.Fatal("expected error for trailing bytes after nonce, got nil")
+}
+if !strings.Contains(err.Error(), "trailing") {
+t.Fatalf("error message should mention trailing bytes; got %q", err.Error())
+}
+}
+
+// TestConnectResponse_RejectsInvalidNameGrammar verifies the peer-
+// supplied name is run through validateSegmentName before being
+// trusted as a segment identifier. Names with invalid characters or
+// the reserved ".lock"/".fds.sock" suffixes are rejected.
+func TestConnectResponse_RejectsInvalidNameGrammar(t *testing.T) {
+for _, name := range []string{
+"bad/slash",
+"bad name with space",
+"reserved.lock",
+"reserved.fds.sock",
+} {
+b := make([]byte, 1+4+len(name)+1+1+8)
+b[0] = controlWireVersion
+binary.LittleEndian.PutUint32(b[1:5], uint32(len(name)))
+copy(b[5:5+len(name)], name)
+b[5+len(name)] = wireFormatH2
+b[5+len(name)+1] = 0
+_, err := decodeConnectResponse(b)
+if err == nil {
+t.Errorf("expected error for invalid name %q, got nil", name)
+}
+}
 }

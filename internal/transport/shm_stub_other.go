@@ -67,6 +67,21 @@ type Segment struct{}
 // handshaker type so portable DialOptions declarations compile.
 type ShmSecurityHandshaker struct{}
 
+// vecCursor is a placeholder for the linux/windows vecCursor type
+// (defined in h2_codec.go). It exists on non-supported platforms only
+// so that the embedding deferredMessage stub below compiles. No code
+// on this platform constructs or reads it.
+type vecCursor struct{}
+
+// deferredMessage is a placeholder for the linux/windows deferredMessage
+// type (defined in shm_frame_writer.go). It exists on non-supported
+// platforms only because Stream.shmDeferred (transport.go) embeds it
+// by value to avoid per-stream heap allocation on the SHM hot path.
+// No code on this platform constructs or reads it.
+type deferredMessage struct {
+	_ vecCursor
+}
+
 // DialOptions contains options for dialing a shared memory connection.
 // On unsupported platforms it is only a configuration placeholder used
 // by the experimental/shm public API.

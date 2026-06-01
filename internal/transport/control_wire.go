@@ -21,6 +21,7 @@
 package transport
 
 import (
+	"crypto/rand"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -29,17 +30,24 @@ import (
 const (
 	shmControlSuffix = "_ctl"
 	// controlWireVersion is the version byte emitted at the start of
-	// every control-plane frame. v2 introduces a Flags byte on CONNECT
-	// (currently carrying SINGLE_STREAM bit 0) and an echoed Flags byte
-	// on ACCEPT after the selected-wire byte so the server can confirm
-	// or override the client's mode preference.
+	// every control-plane frame. While the gRFC and both reference
+	// implementations remain pre-release, the wire layout is allowed to
+	// evolve freely and this byte is held at 1: mismatched-version
+	// peers are hard-rejected at the handshake boundary, which is the
+	// only behaviour we need during development. Version bumps are
+	// reserved for post-release wire-format evolution.
 	//
-	// v1 (legacy) peers without the ACCEPT Flags byte are rejected
-	// at the handshake boundary because the bumped version forces a
-	// matched-version handshake. The grpc-go and grpc-dotnet
-	// implementations are still pre-1.0 so a breaking wire change is
-	// acceptable.
-	controlWireVersion = uint8(2)
+	// Current v1 layout (subject to change before the gRFC is ratified):
+	//   - CONNECT carries a Flags byte and an 8-byte per-request
+	//     correlation nonce.
+	//   - ACCEPT carries a reserved Flags byte and echoes the nonce.
+	//   - REJECT echoes the nonce (or zero when CONNECT could not be
+	//     decoded).
+	// The nonce closes the CONNECT/ACCEPT misbinding race in which a
+	// stale response left on the shared Ring B by a previously
+	// timed-out dialer could otherwise be mis-consumed by the next
+	// dialer (binding it with the wrong peer's singleStreamMode flag).
+	controlWireVersion = uint8(1)
 
 	// wireFormatH2 is the on-wire byte for the HTTP/2 data plane.
 	// Matches grpc-dotnet-shm's ControlWire.ProtocolWireHttp2. The
@@ -68,24 +76,47 @@ type connectRequest struct {
 	ringA            uint64
 	ringB            uint64
 	singleStreamMode bool
+	nonce            uint64
 }
 
 type connectResponse struct {
 	segmentName string
+	nonce       uint64
 }
 
 type connectReject struct {
 	message string
+	nonce   uint64
+}
+
+// newConnectNonce returns a 64-bit random value used to correlate a
+// CONNECT with its ACCEPT/REJECT. crypto/rand is used (not math/rand)
+// so the nonce is unpredictable, closing any future "guess the nonce"
+// vector even though the current threat model only needs uniqueness.
+//
+// crypto/rand.Read is documented as never failing on supported
+// platforms, but the runtime contract is best-effort and an unexpected
+// kernel-entropy failure is preferable surfaced as a dial-time error
+// than silently producing zero entropy (which would defeat stale-
+// response correlation under bug-replay conditions). Callers fail the
+// dial on error.
+func newConnectNonce() (uint64, error) {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return 0, fmt.Errorf("shm: crypto/rand.Read failed generating connect nonce: %w", err)
+	}
+	return binary.LittleEndian.Uint64(b[:]), nil
 }
 
 func encodeConnectRequest(req connectRequest) []byte {
-	// 20 bytes total:
+	// 28 bytes total:
 	//   version(1) + ringA(8) + ringB(8) + flags(1)
-	//   + wireFormatCount(1) + wireFormat(1)
+	//   + wireFormatCount(1) + wireFormat(1) + nonce(8)
 	//
-	// The trailing 2 bytes (count=1, format=H2) are mandatory on the
-	// wire; the .NET peer rejects connections that omit them.
-	b := make([]byte, 1+8+8+1+1+1)
+	// The wire-format bytes (count=1, format=H2) are mandatory; the
+	// trailing 8-byte nonce correlates the server's ACCEPT/REJECT
+	// back to this exact CONNECT.
+	b := make([]byte, 1+8+8+1+1+1+8)
 	b[0] = controlWireVersion
 	binary.LittleEndian.PutUint64(b[1:9], req.ringA)
 	binary.LittleEndian.PutUint64(b[9:17], req.ringB)
@@ -96,6 +127,7 @@ func encodeConnectRequest(req connectRequest) []byte {
 	b[17] = flags
 	b[18] = 1            // wireFormatCount
 	b[19] = wireFormatH2 // only H2 is advertised
+	binary.LittleEndian.PutUint64(b[20:28], req.nonce)
 	return b
 }
 
@@ -147,24 +179,31 @@ func decodeConnectRequest(b []byte) (connectRequest, error) {
 		return connectRequest{}, errors.New(
 			"connect request does not advertise HTTP/2; legacy Custom16-only peers are not supported")
 	}
+
+	// Nonce: mandatory 8 bytes after the wire-format advertisement.
+	nonceOff := 19 + count
+	if len(b) < nonceOff+8 {
+		return connectRequest{}, errors.New("connect request missing correlation nonce")
+	}
+	req.nonce = binary.LittleEndian.Uint64(b[nonceOff : nonceOff+8])
 	return req, nil
 }
 
 func encodeConnectResponse(resp connectResponse) []byte {
 	name := []byte(resp.segmentName)
-	// version(1) + nameLen(4) + name(N) + selectedWire(1)=H2 + flags(1).
+	// version(1) + nameLen(4) + name(N) + selectedWire(1)=H2
+	//   + flags(1) + nonce(8).
 	//
-	// The selected-wire byte and Flags byte are both mandatory in v2
-	// of the control wire format. Flags is currently always zero; bit 1
-	// was reserved earlier for the HTTP/2 flow-control mode flag, which
-	// has been removed (HTTP/2-compatible flow control is the only
-	// profile and is unconditional).
-	b := make([]byte, 1+4+len(name)+1+1)
+	// Flags is reserved (always zero). The trailing 8-byte nonce
+	// echoes the CONNECT nonce so the dialer can confirm this ACCEPT
+	// answers its own in-flight request.
+	b := make([]byte, 1+4+len(name)+1+1+8)
 	b[0] = controlWireVersion
 	binary.LittleEndian.PutUint32(b[1:5], uint32(len(name)))
 	copy(b[5:5+len(name)], name)
 	b[5+len(name)] = wireFormatH2
 	b[5+len(name)+1] = 0 // reserved flags byte
+	binary.LittleEndian.PutUint64(b[5+len(name)+2:5+len(name)+10], resp.nonce)
 	return b
 }
 
@@ -176,7 +215,23 @@ func decodeConnectResponse(b []byte) (connectResponse, error) {
 		return connectResponse{}, fmt.Errorf("unsupported connect response version %d (this peer speaks v%d)", b[0], controlWireVersion)
 	}
 	nameLen := int(binary.LittleEndian.Uint32(b[1:5]))
-	if nameLen < 0 || len(b[5:]) < nameLen {
+	if nameLen <= 0 {
+		// Empty segment name is meaningless on the wire — the dialer
+		// has no segment to open. Reject explicitly so a buggy /
+		// malicious peer cannot trip a generic "OpenSegment empty
+		// name" error path later. Also rejects nameLen<0 which
+		// uint32 conversion to int would normally hide as a huge
+		// positive value (but len(b[5:]) >= nameLen would still
+		// catch oversize).
+		return connectResponse{}, errors.New("connect response name length must be > 0")
+	}
+	if nameLen > maxSegmentNameLen {
+		// Defence-in-depth: the segment-name grammar caps at
+		// maxSegmentNameLen. Reject early so we do not allocate a
+		// >200 B string from peer-controlled input.
+		return connectResponse{}, fmt.Errorf("connect response name length %d exceeds max %d", nameLen, maxSegmentNameLen)
+	}
+	if len(b[5:]) < nameLen {
 		return connectResponse{}, errors.New("connect response name missing")
 	}
 	// Selected-wire byte is mandatory; legacy responses without it
@@ -191,27 +246,50 @@ func decodeConnectResponse(b []byte) (connectResponse, error) {
 			"connect response selects wire format 0x%02x, expected HTTP/2 (0x%02x)",
 			selected, wireFormatH2)
 	}
-	// Flags byte is mandatory in v2.
+	// Flags byte is mandatory.
 	if len(b) <= 5+nameLen+1 {
 		return connectResponse{}, errors.New(
-			"connect response missing flags byte; v2 servers MUST include the reserved flags byte")
+			"connect response missing flags byte; server MUST include the reserved flags byte")
 	}
-	// Flags bit 1 was the HTTP/2 flow-control mode flag in earlier drafts;
-	// it is now reserved and ignored.
+	// Nonce: mandatory 8 bytes after the flags byte.
+	nonceOff := 5 + nameLen + 2
+	if len(b) < nonceOff+8 {
+		return connectResponse{}, errors.New("connect response missing correlation nonce")
+	}
+	// Exact-length check: anything after the nonce is unexpected
+	// trailing junk. Reject so a malformed peer cannot smuggle
+	// payload past the strict-length contract.
+	if len(b) != nonceOff+8 {
+		return connectResponse{}, fmt.Errorf("connect response has %d trailing byte(s) after nonce", len(b)-(nonceOff+8))
+	}
+	// Validate the segment name against the on-wire grammar BEFORE
+	// returning it. The dialer trusts the result directly as input
+	// to OpenSegment / per-data-segment FD-pass socket name
+	// derivation, so an invalid name would surface as a less-helpful
+	// error from those lower-level paths and (worst case) admit
+	// reserved suffixes such as ".lock" / ".fds.sock" that the
+	// transport reserves for its own siblings.
+	segName := string(b[5 : 5+nameLen])
+	if err := validateSegmentName(segName); err != nil {
+		return connectResponse{}, fmt.Errorf("connect response: %w", err)
+	}
 	return connectResponse{
-		segmentName: string(b[5 : 5+nameLen]),
+		segmentName: segName,
+		nonce:       binary.LittleEndian.Uint64(b[nonceOff : nonceOff+8]),
 	}, nil
 }
 
 func encodeConnectReject(r connectReject) []byte {
 	msg := []byte(r.message)
-	// version(1) + msgLen(4) + msg. No wire-format byte on REJECT —
-	// the handshake never reached the negotiation step, and .NET does
-	// not emit one either.
-	b := make([]byte, 1+4+len(msg))
+	// version(1) + msgLen(4) + msg(N) + nonce(8). The trailing nonce
+	// echoes the CONNECT nonce so the dialer can correlate the REJECT
+	// to its own request. When the server could not decode the CONNECT
+	// (and thus has no nonce) it echoes zero.
+	b := make([]byte, 1+4+len(msg)+8)
 	b[0] = controlWireVersion
 	binary.LittleEndian.PutUint32(b[1:5], uint32(len(msg)))
-	copy(b[5:], msg)
+	copy(b[5:5+len(msg)], msg)
+	binary.LittleEndian.PutUint64(b[5+len(msg):5+len(msg)+8], r.nonce)
 	return b
 }
 
@@ -226,5 +304,36 @@ func decodeConnectReject(b []byte) (connectReject, error) {
 	if msgLen < 0 || len(b[5:]) < msgLen {
 		return connectReject{}, errors.New("connect reject message missing")
 	}
-	return connectReject{message: string(b[5 : 5+msgLen])}, nil
+	nonceOff := 5 + msgLen
+	if len(b) < nonceOff+8 {
+		return connectReject{}, errors.New("connect reject missing correlation nonce")
+	}
+	return connectReject{
+		message: string(b[5 : 5+msgLen]),
+		nonce:   binary.LittleEndian.Uint64(b[nonceOff : nonceOff+8]),
+	}, nil
+}
+
+// peekResponseNonce extracts the echoed CONNECT nonce from an ACCEPT or
+// REJECT payload for correlation. The bool is false when the frame type
+// carries no nonce or fails to decode; the dialer then stops looping
+// and lets its response switch surface the appropriate error rather
+// than spinning on an undecodable frame.
+func peekResponseNonce(ft FrameType, payload []byte) (uint64, bool) {
+	switch ft {
+	case FrameTypeACCEPT:
+		resp, err := decodeConnectResponse(payload)
+		if err != nil {
+			return 0, false
+		}
+		return resp.nonce, true
+	case FrameTypeREJECT:
+		r, err := decodeConnectReject(payload)
+		if err != nil {
+			return 0, false
+		}
+		return r.nonce, true
+	default:
+		return 0, false
+	}
 }

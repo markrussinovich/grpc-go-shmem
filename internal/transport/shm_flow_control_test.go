@@ -1122,12 +1122,18 @@ func TestInFlow_MaybeAdjustAdditive_PipelinedLargeLPMs(t *testing.T) {
 		}
 	})
 
-	// Fix: confirm maybeAdjustAdditive admits both LPMs correctly.
-	t.Run("maybeAdjustAdditive_accumulates_and_admits", func(t *testing.T) {
+	// Fix: confirm maybeAdjustAdditive admits LPM 1 (initial admission)
+	// AND correctly REFUSES LPM 2 when the app has not drained (force
+	// sender backpressure, the H2-correct behaviour). This replaces the
+	// pre-fix "accumulates_and_admits" semantic which allowed unbounded
+	// delta growth and produced the demo-agent-reported FC-VIOLATION
+	// stream cancel under client-streaming with response_size=0.
+	t.Run("maybeAdjustAdditive_admits_first_LPM_then_backpressures", func(t *testing.T) {
 		var f inFlow
 		f.limit = limit
 
-		// LPM 1: additive pre-credit.
+		// LPM 1: additive pre-credit. Should grant enough to admit
+		// the LPM (~lpmSize - limit additional bytes on top of limit).
 		w1 := f.maybeAdjustAdditive(lpmSize)
 		if w1 == 0 {
 			t.Fatalf("expected pre-credit for LPM 1, got 0")
@@ -1138,28 +1144,33 @@ func TestInFlow_MaybeAdjustAdditive_PipelinedLargeLPMs(t *testing.T) {
 		}
 		// Slow reader: no onRead.
 
-		// LPM 2: additive pre-credit, on top of LPM 1's outstanding delta.
+		// LPM 2 (slow reader, pendingData = lpmSize from LPM 1):
+		// MUST refuse pre-credit so the sender backpressures. The
+		// receiver's buffer cap is `n + limit` = ~lpmSize + 64K; with
+		// pendingData already = lpmSize, admitting another lpmSize
+		// would push total to 2*lpmSize, well past the cap.
 		w2 := f.maybeAdjustAdditive(lpmSize)
-		if w2 == 0 {
-			t.Fatalf("expected additive pre-credit for LPM 2, got 0 (delta=%d, pendingData=%d)",
-				f.delta, f.pendingData)
-		}
-		// DATA for LPM 2 arrives. Must NOT reject.
-		if err := f.onData(lpmSize); err != nil {
-			t.Fatalf("LPM 2 onData rejected after additive pre-credit: %v (limit=%d, delta=%d, pendingData=%d)",
-				err, f.limit, f.delta, f.pendingData)
+		if w2 != 0 {
+			t.Errorf("BACKPRESSURE BUG: expected LPM 2 pre-credit = 0 (sender should backpressure when app is not draining), got %d. Pre-fix this granted unbounded delta growth, eventually tripping FC-VIOLATION at maxWindowSize cap.", w2)
 		}
 
-		// Now app drains both messages: onRead must repay the full
-		// outstanding delta debt before crediting WU.
+		// Now app drains LPM 1.
 		_ = f.onRead(lpmSize)
-		_ = f.onRead(lpmSize)
-		// After both reads, delta and pendingData should be 0 (or near 0).
-		if f.pendingData != 0 {
-			t.Errorf("after draining: pendingData=%d, want 0", f.pendingData)
+
+		// LPM 2 retry: now that pendingData is drained, pre-credit
+		// should succeed (sender can proceed).
+		w2 = f.maybeAdjustAdditive(lpmSize)
+		if w2 == 0 {
+			t.Fatalf("expected LPM 2 pre-credit after app drain, got 0 (delta=%d, pendingData=%d)",
+				f.delta, f.pendingData)
 		}
-		if f.delta != 0 {
-			t.Errorf("after draining: delta=%d, want 0", f.delta)
+		if err := f.onData(lpmSize); err != nil {
+			t.Fatalf("LPM 2 onData rejected after drain + pre-credit: %v (limit=%d, delta=%d, pendingData=%d)",
+				err, f.limit, f.delta, f.pendingData)
+		}
+		_ = f.onRead(lpmSize)
+		if f.pendingData != 0 {
+			t.Errorf("after draining both: pendingData=%d, want 0", f.pendingData)
 		}
 	})
 

@@ -836,6 +836,12 @@ func encode(c baseCodec, msg any, pool mem.BufferPool) (mem.BufferSlice, error) 
 // proto codec (encoding/proto.codecV2) implements this; other codecs
 // (including the V1 bridge) fall back to plain c.Marshal() inside
 // encode(). The fallback is transparent to callers.
+//
+// NOTE: this interface is a CAPABILITY check only — it MUST NOT be used
+// to identify the built-in proto codec. A third-party codec that
+// happens to implement MarshalWithPool would otherwise be silently
+// matched by SHM's WriteProto bypass path, causing wire-format
+// divergence. Use encoding/proto.IsBuiltin for identity checks.
 type bufferPoolMarshaler interface {
 	MarshalWithPool(v any, pool mem.BufferPool) (mem.BufferSlice, error)
 }
@@ -1068,14 +1074,16 @@ func recv(p *parser, c baseCodec, s recvCompressor, dc Decompressor, m any, maxR
 	// not bypassed — they may have validation or different serialization.
 	// The two-gate check is:
 	//   1. Name() == "proto" — names the codec class.
-	//   2. Implements bufferPoolMarshaler — identifies the built-in v2
-	//      proto codec (the v1 bridge does not, so v1-codec users named
-	//      "proto" preserve their semantics via c.Unmarshal below).
+	//   2. Implements builtinProtoCodec — unspoofable identity
+	//      marker for the built-in v2 proto codec; the SHM transport
+	//      ZC read path calls protobuf.Unmarshal directly so any
+	//      custom codec with different semantics must not silently
+	//      take this path. See rpc_util.go builtinProtoCodec.
 	if len(data) == 1 {
 		if pm, ok := m.(protobuf.Message); ok {
 			isProtoCodec := false
 			if nc, ok := c.(interface{ Name() string }); ok && nc.Name() == "proto" {
-				if _, isBuiltin := c.(bufferPoolMarshaler); isBuiltin {
+				if proto.IsBuiltin(c) {
 					isProtoCodec = true
 				}
 			}

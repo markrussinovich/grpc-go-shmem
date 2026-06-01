@@ -148,8 +148,21 @@ func DialShm(ctx context.Context, addr string, opts *DialOptions) (ClientTranspo
 	ctlSeg.RegisterRing(ctlRx)
 
 	// Create events for control rings (Windows). On Linux, these are no-ops.
-	ctlTxEvents, _ := OpenRingEvents(ctlName, "A")
-	ctlRxEvents, _ := OpenRingEvents(ctlName, "B")
+	// BUG FIX (GPT-5.5 overnight bug hunt): propagate Windows event
+	// open failures instead of silently dropping them; otherwise a
+	// failed open turns into a cross-process hang on the very first
+	// control-frame exchange.
+	ctlTxEvents, ctlTxErr := OpenRingEvents(ctlName, "A")
+	if ctlTxErr != nil {
+		return nil, fmt.Errorf("open control ring A events for %q: %w", ctlName, ctlTxErr)
+	}
+	ctlRxEvents, ctlRxErr := OpenRingEvents(ctlName, "B")
+	if ctlRxErr != nil {
+		if ctlTxEvents != nil {
+			ctlTxEvents.Close()
+		}
+		return nil, fmt.Errorf("open control ring B events for %q: %w", ctlName, ctlRxErr)
+	}
 	defer func() {
 		if ctlTxEvents != nil {
 			ctlTxEvents.Close()
@@ -207,8 +220,13 @@ func DialShm(ctx context.Context, addr string, opts *DialOptions) (ClientTranspo
 		releaseCtlLock()
 	}()
 
+	myNonce, err := newConnectNonce()
+	if err != nil {
+		return nil, NewShmErrorWithCause(ShmErrConnectionRefused, "generate connect nonce", err)
+	}
 	if err := writeCtlFrame(ctx, ctlTx, FrameHeader{Type: FrameTypeCONNECT}, encodeConnectRequest(connectRequest{
 		singleStreamMode: opts.SingleStreamMode,
+		nonce:            myNonce,
 	})); err != nil {
 		return nil, NewShmErrorWithCause(ShmErrConnectionRefused, "send connect request", err)
 	}
@@ -218,22 +236,54 @@ func DialShm(ctx context.Context, addr string, opts *DialOptions) (ClientTranspo
 	// readCtlFrame's two-phase header+payload commit would leave Ring B
 	// mid-frame and corrupt the next dialer's read. The outer
 	// DialShm ConnectTimeout (and any caller-supplied deadline)
-	// still bounds the wait via deadline propagation. Residual risk:
-	// a deadline firing between the header commit and payload read
-	// could still leave bytes pending; the deferred drain attempts a
-	// best-effort cleanup. A wire-level request nonce would close
-	// the remaining window; tracked as a gRFC follow-up.
+	// still bounds the wait via deadline propagation.
+	//
+	// The remaining "stale response" window — a deadline firing between
+	// a prior dialer's lock release and its response landing on Ring B
+	// — is now closed by the v3 per-request nonce: each ACCEPT/REJECT
+	// echoes the CONNECT nonce and we skip any response that does not
+	// match myNonce (see the bounded read loop below).
 	readCtx := context.Background()
 	if d, ok := ctx.Deadline(); ok {
 		var cancel context.CancelFunc
 		readCtx, cancel = context.WithDeadline(context.Background(), d)
 		defer cancel()
 	}
-	respFH, respPayload, err := readCtlFrame(readCtx, ctlRx)
-	if err != nil {
-		// Deferred drain + release handles the abandoned-response
-		// recovery; just surface the read error.
-		return nil, NewShmErrorWithCause(ShmErrConnectionRefused, "read connect response", err)
+	// Read the response, skipping any stale ACCEPT/REJECT left on the
+	// shared Ring B by a previous dialer that timed out and released
+	// the control lock before its response arrived. Each such frame is
+	// fully consumed by readCtlFrame, so a non-matching nonce just means
+	// "read the next one". Bound the retries so a ring full of stale or
+	// adversarial responses fails the dial instead of looping forever.
+	const maxStaleResponses = 3
+	var respFH FrameHeader
+	var respPayload []byte
+	matched := false
+	for attempt := 0; attempt < maxStaleResponses; attempt++ {
+		respFH, respPayload, err = readCtlFrame(readCtx, ctlRx)
+		if err != nil {
+			// Deferred drain + release handles the abandoned-response
+			// recovery; just surface the read error.
+			return nil, NewShmErrorWithCause(ShmErrConnectionRefused, "read connect response", err)
+		}
+		respNonce, ok := peekResponseNonce(respFH.Type, respPayload)
+		if !ok {
+			// Not a correlatable frame type, or the ACCEPT/REJECT
+			// payload would not decode. Either way it is not the
+			// response to our CONNECT; skip and retry so a stray
+			// or malformed frame on the shared Ring B does not
+			// poison the dial with a wrong-class error.
+			continue
+		}
+		if respNonce != myNonce {
+			continue // stale response for another dialer; consumed, retry
+		}
+		matched = true
+		break
+	}
+	if !matched {
+		return nil, NewShmError(ShmErrConnectionRefused,
+			"no matching connect response after draining stale responses on control ring")
 	}
 	// Mark sentConnect=false BEFORE the explicit release so any
 	// panic in the release path itself does not trigger a stale
@@ -259,9 +309,15 @@ func DialShm(ctx context.Context, addr string, opts *DialOptions) (ClientTranspo
 		// which decrements the refcount via CloseHandshakeEvents.
 		// On any failure path before that hand-off the segHandshakeOwned
 		// flag triggers a local CloseHandshakeEvents so we never leak
-		// the dialer-side ref. No-op on Linux.
-		_, hsErr := OpenHandshakeEvents(segName)
-		segHandshakeOwned := hsErr == nil
+		// the dialer-side ref. No-op on Linux. On Windows a failure
+		// here must fail the dial: WaitForServer / SetClientReadyAndSignal
+		// rely on the named event and would otherwise hang.
+		if _, hsErr := OpenHandshakeEvents(segName); hsErr != nil {
+			segment.Close()
+			return nil, NewShmErrorWithCause(ShmErrConnectionRefused,
+				fmt.Sprintf("open handshake events for %q", segName), hsErr)
+		}
+		segHandshakeOwned := true
 		defer func() {
 			if segHandshakeOwned {
 				CloseHandshakeEvents(segName)
@@ -307,8 +363,24 @@ func DialShm(ctx context.Context, addr string, opts *DialOptions) (ClientTranspo
 			// references whether the handshake succeeds or fails.
 			// Otherwise every secured Windows dial leaks one handle
 			// per direction.
-			txEvents, _ := OpenRingEvents(segName, "A")
-			rxEvents, _ := OpenRingEvents(segName, "B")
+			//
+			// BUG FIX (GPT-5.5 overnight bug hunt): propagate Windows
+			// event open failures instead of silently dropping them;
+			// a failed open + handshake attempt would otherwise sit
+			// in a cross-process wait forever.
+			txEvents, txErr := OpenRingEvents(segName, "A")
+			if txErr != nil {
+				segment.Close()
+				return nil, NewShmErrorWithCause(ShmErrUnknown, "open handshake ring A events", txErr)
+			}
+			rxEvents, rxErr := OpenRingEvents(segName, "B")
+			if rxErr != nil {
+				if txEvents != nil {
+					txEvents.Close()
+				}
+				segment.Close()
+				return nil, NewShmErrorWithCause(ShmErrUnknown, "open handshake ring B events", rxErr)
+			}
 			txRing.SetEvents(txEvents)
 			rxRing.SetEvents(rxEvents)
 

@@ -54,12 +54,28 @@ const (
 	CtlMDKey = "shm-ctl"
 )
 
+// DialOptions contains transport-level dial options. On unsupported
+// platforms it is a placeholder configuration type used by the
+// experimental/shm public API. See shm.go for the full doc.
+//
+// Notice: This API is EXPERIMENTAL and may be changed or removed in
+// a later release.
+type DialOptions = transport.DialOptions
+
+// DefaultDialOptions returns portable defaults for unsupported platforms.
+//
+// Notice: This API is EXPERIMENTAL and may be changed or removed in
+// a later release.
+func DefaultDialOptions() *DialOptions {
+	return transport.DefaultDialOptions()
+}
+
 // Config contains configuration options for the shared-memory transport.
 //
 // Notice: This API is EXPERIMENTAL and may be changed or removed in a
 // later release.
 type Config struct {
-	DialOptions         *transport.DialOptions
+	DialOptions         *DialOptions
 	FallbackEnabled     bool
 	TCPFallbackAddr     string
 	AllowMixedTransport bool
@@ -72,7 +88,7 @@ type Config struct {
 // later release.
 func DefaultConfig() *Config {
 	return &Config{
-		DialOptions:         transport.DefaultDialOptions(),
+		DialOptions:         DefaultDialOptions(),
 		FallbackEnabled:     true,
 		AllowMixedTransport: true,
 	}
@@ -93,7 +109,7 @@ func WithTransport() grpc.DialOption {
 //
 // Notice: This API is EXPERIMENTAL and may be changed or removed in a
 // later release.
-func WithTransportAndOptions(opts *transport.DialOptions) grpc.DialOption {
+func WithTransportAndOptions(opts *DialOptions) grpc.DialOption {
 	cfg := DefaultConfig()
 	if opts != nil {
 		cfg.DialOptions = opts

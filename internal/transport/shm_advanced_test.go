@@ -94,7 +94,7 @@ func TestShmPingPongSizes(t *testing.T) {
 					t.Errorf("expected HEADERS, got %v", fh.Type)
 					return
 				}
-				if _, err := decodeHeaders(pl); err != nil {
+				if _, err := takeOrDecodeHeaders(srvRx.h2Decoder(), pl); err != nil {
 					t.Errorf("decode headers: %v", err)
 					return
 				}
@@ -215,7 +215,7 @@ func TestShmConcurrentStreams(t *testing.T) {
 				t.Errorf("server expected HEADERS, got %v", fh.Type)
 				return
 			}
-			if _, err := decodeHeaders(pl); err != nil {
+			if _, err := takeOrDecodeHeaders(srvRx.h2Decoder(), pl); err != nil {
 				t.Errorf("decode headers: %v", err)
 				return
 			}
