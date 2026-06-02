@@ -33,6 +33,7 @@ import (
 	"google.golang.org/grpc/balancer"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/encoding"
+	protoenc "google.golang.org/grpc/encoding/proto"
 	"google.golang.org/grpc/internal"
 	"google.golang.org/grpc/internal/balancerload"
 	"google.golang.org/grpc/internal/binarylog"
@@ -992,23 +993,20 @@ func (cs *clientStream) SendMsg(m any) (err error) {
 	if canZC {
 		// Two gates:
 		//   1. Name() == "proto" — names the codec class.
-		//   2. Implements bufferPoolMarshaler — identifies the built-
-		//      in gRPC proto codec (which is the only codec for which
-		//      the SHM transport's WriteProto path is wire-compatible,
-		//      because that path calls protobuf marshal directly,
-		//      bypassing cs.codec entirely). A user-registered
-		//      "proto"-named v1 codec is rejected here because the
-		//      codecV1Bridge does NOT implement bufferPoolMarshaler;
-		//      the standard sendMsg path preserves that codec's
-		//      marshal semantics. A user-registered v2 codec named
-		//      "proto" that DOES implement bufferPoolMarshaler is
-		//      opting into the SHM-direct-marshal contract and is
-		//      their responsibility.
+		//   2. Implements builtinProtoCodec — unspoofable identity
+		//      marker for the built-in gRPC proto codec (which is the
+		//      only codec for which the SHM transport's WriteProto path
+		//      is wire-compatible, because that path calls protobuf
+		//      marshal directly, bypassing cs.codec entirely). A user-
+		//      registered "proto"-named v1 codec is rejected here
+		//      because the codecV1Bridge does NOT implement the marker;
+		//      the standard sendMsg path preserves that codec's marshal
+		//      semantics. A user-registered v2 codec named "proto" that
+		//      does NOT implement the marker also falls through.
 		nc, ok := cs.codec.(interface{ Name() string })
 		canZC = ok && nc.Name() == "proto"
 		if canZC {
-			_, isBuiltin := cs.codec.(bufferPoolMarshaler)
-			canZC = isBuiltin
+			canZC = protoenc.IsBuiltin(cs.codec)
 		}
 	}
 	if canZC {
@@ -2043,16 +2041,15 @@ func (ss *serverStream) SendMsg(m any) (err error) {
 	// No retry concerns on the server side.
 	if ss.compressorV0 == nil && ss.compressorV1 == nil {
 		// Two-gate codec check (see client SendMsg above for rationale):
-		// Name()=="proto" plus implements bufferPoolMarshaler identifies
+		// Name()=="proto" plus implements builtinProtoCodec identifies
 		// the built-in v2 proto codec. The v1 codec bridge does not
-		// implement bufferPoolMarshaler, so a custom v1 codec named
-		// "proto" falls through to the standard send path and keeps its
-		// own marshal semantics.
+		// implement the marker, so a custom v1 codec named "proto"
+		// falls through to the standard send path and keeps its own
+		// marshal semantics.
 		nc, hasName := ss.codec.(interface{ Name() string })
 		isProtoCodec := hasName && nc.Name() == "proto"
 		if isProtoCodec {
-			_, isBuiltin := ss.codec.(bufferPoolMarshaler)
-			isProtoCodec = isBuiltin
+			isProtoCodec = protoenc.IsBuiltin(ss.codec)
 		}
 		if isProtoCodec {
 			if pm, ok := m.(proto.Message); ok {

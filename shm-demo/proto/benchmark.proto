@@ -1,0 +1,59 @@
+// Copyright 2026 gRPC SHM Demo authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// benchmark.proto defines the gRPC service used by the SHM demo. It mirrors
+// the BenchmarkService shape used by both grpc-go-shmem and grpc-dotnet-shm
+// benchmarks so the demo workload matches a real engineering benchmark:
+//   - UnaryCall: request/response echo of a configured size.
+//   - StreamingCall: bidirectional streaming ping-pong of configured size.
+//
+// The same generated service is served identically over TCP, UDS, and SHM;
+// only the listener (server) and channel/dial options (client) differ.
+
+syntax = "proto3";
+
+package shmdemo;
+
+option go_package = "shmdemo/proto/shmdemobench";
+option csharp_namespace = "ShmDemo.Bench";
+
+// BenchmarkService is a minimal echo service for transport benchmarking.
+service BenchmarkService {
+  // UnaryCall sends a request and receives a response of the configured size.
+  rpc UnaryCall(SimpleRequest) returns (SimpleResponse);
+
+  // StreamingCall is a bidirectional stream used for single-stream ping-pong
+  // (latency) and one-way blast (throughput) measurements.
+  rpc StreamingCall(stream SimpleRequest) returns (stream SimpleResponse);
+}
+
+// Payload carries the raw message bytes.
+message Payload {
+  bytes body = 1;
+}
+
+// SimpleRequest is a benchmark request.
+message SimpleRequest {
+  // Desired size in bytes of the response payload.
+  int32 response_size = 1;
+
+  // Request payload.
+  Payload payload = 2;
+}
+
+// SimpleResponse is a benchmark response.
+message SimpleResponse {
+  // Response payload.
+  Payload payload = 1;
+}

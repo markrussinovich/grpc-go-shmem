@@ -17,9 +17,10 @@
 // Package transport contains gRPC-Go's transport plumbing, including the
 // experimental shared-memory transport (SHM). This file documents the SHM
 // transport at the level of architecture, on-wire layout, lifecycle, and
-// runtime tunables. The user-facing entry points (NewShmListener,
-// WithShmTransport, ShmDiscovery*) live in the top-level
-// google.golang.org/grpc package and are marked Experimental.
+// runtime tunables. The user-facing entry points (shm.NewListener,
+// shm.WithTransport, shm.IsShmEnabled) live in the
+// google.golang.org/grpc/experimental/shm package and are marked
+// Experimental.
 //
 // # Goal
 //
@@ -99,13 +100,14 @@
 //
 // # Connection lifecycle
 //
-//  1. Listen. NewShmListener creates a control segment (a small
+//  1. Listen. shm.NewListener creates a control segment (a small
 //     SegmentMagic-tagged region) at a caller-supplied path. The server
 //     starts accepting via Accept.
-//  2. Dial. The client calls DialShm with the same segment name. It
-//     opens and validates the control segment, then exchanges a small
-//     CONNECT frame to learn the dynamic name of a private data segment
-//     the server allocates per-connection.
+//  2. Dial. The client calls grpc.NewClient with shm.WithTransport and
+//     the same segment name. It opens and validates the control
+//     segment, then exchanges a small CONNECT frame to learn the
+//     dynamic name of a private data segment the server allocates
+//     per-connection.
 //  3. Handshake. The client opens the data segment, mmaps it, and the
 //     SHM security handshaker (shm_security.go) exchanges identity
 //     tokens over the data rings, producing a ShmAuthInfo carried up

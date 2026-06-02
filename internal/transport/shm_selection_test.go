@@ -66,7 +66,7 @@ func TestSelection_ChoosesSHM_and_ExecutesUnary(t *testing.T) {
 			t.Errorf("expected HEADERS")
 			return
 		}
-		if _, err := decodeHeaders(pl); err != nil {
+		if _, err := takeOrDecodeHeaders(srvRx.h2Decoder(), pl); err != nil {
 			t.Errorf("decode headers: %v", err)
 			return
 		}

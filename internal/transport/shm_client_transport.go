@@ -45,12 +45,9 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-// clientStreamCache holds a cached stream pointer and its ID for lock-free
-// lookup in the frame dispatch hot path. Loaded/stored atomically.
-type clientStreamCache struct {
-	stream   *ClientStream
-	streamID uint32
-}
+// PR #11 (Direct-Mapped Streams Table) removed the single-entry MRU
+// `clientStreamCache` / `cachedStream` field. Stream resolution now
+// goes through a fixed-size direct-mapped table; see shm_stream_table.go.
 
 // ShmClientTransport implements the gRPC ClientTransport interface
 // for shared memory communication.
@@ -86,16 +83,19 @@ type ShmClientTransport struct {
 	streams  map[uint32]*ClientStream
 	streamID uint32 // next stream ID to assign
 
-	// cachedStream caches the only active stream for single-stream connections,
-	// allowing frame dispatch to skip the map lookup + RLock.
+	// streamSlots is a direct-mapped table (PR #11) that resolves a
+	// stream ID to its *ClientStream without taking t.mu.RLock in
+	// the per-frame dispatch hot path. Slot index is streamSlotIdx
+	// (= (streamID>>1) & (shmStreamSlotCount-1)); see
+	// shm_stream_table.go for the design contract.
 	//
-	// Loaded atomically without t.mu in the frame dispatch hot path.
-	// Stored atomically under t.mu when the stream set changes.
-	cachedStream atomic.Pointer[clientStreamCache]
+	// Replaces the pre-PR-#11 single-entry MRU `cachedStream` field,
+	// which only worked for the 1-stream-at-a-time case.
+	streamSlots [shmStreamSlotCount]atomic.Pointer[ClientStream]
 
 	// singleStreamMode is negotiated via the CONNECT frame. When true,
 	// the client requested single-stream optimizations and the transport
-	// uses inline writes via inlineMu.TryLock and cachedStream fast path.
+	// uses inline writes via inlineMu.TryLock and direct-mapped slots.
 	singleStreamMode bool
 
 	// Flow control (outbound send windows)
@@ -119,7 +119,6 @@ type ShmClientTransport struct {
 	// chunked whole-message path) now also services ZC proto entries
 	// via shmFrameWriter.deferredProto.
 	connSendQuota atomic.Int64
-	streamInFlow          map[uint32]*inFlow
 	connInFlow            trInFlow
 	maxConcurrentStreams  uint32
 	streamQuota           int64
@@ -174,6 +173,31 @@ type ShmClientTransport struct {
 	// outbound send quota.
 	pendingConnWU atomic.Uint32
 
+	// pendingConnWUForceCredit is the liveness backstop flag for the
+	// drainPendingWUForWriter conn-level threshold gate. When
+	// sendConnWindowUpdate(_, force=true) emits a sub-threshold
+	// conn-WU and the emission hits errFrameWriterFull, the restore
+	// path Adds the value back to pendingConnWU AND sets this flag
+	// to 1. drainPendingWUForWriter Swap(0)s this flag at the start
+	// of every drain cycle; if it was 1 OR pendingConnWU has
+	// crossed wuThreshold, it emits unconditionally. Otherwise it
+	// skips, deferring the (sub-threshold) drip remainder until the
+	// next standalone sendConnWindowUpdate (threshold-cross) or
+	// piggybackWUForWriter (outbound DATA chunk) emit.
+	//
+	// Why a flag instead of a separate accumulator: only the
+	// emit-restore path needs the bypass; ordinary drip accumulation
+	// can sit below the threshold without harm. A single atomic bit
+	// preserves liveness for the restored force-credit corner case
+	// without complicating the producer-side fast paths.
+	//
+	// Clear-before-Swap-pending ordering avoids ABA: drainer
+	// Swap(0)s this flag FIRST, then Swap(0)s pendingConnWU. A
+	// concurrent producer that races to Set(1) after our drain
+	// Swap'd 0 wins ownership of its credit: the next drain (or
+	// piggyback) finds flag=1 and emits the residual value.
+	pendingConnWUForceCredit atomic.Uint32
+
 	// wuDirty is the per-stream restore-WU dirty list, used by
 	// drainPendingWUForWriter to skip the legacy O(N=streams) walk.
 	// Two-slot ping-pong design (Opus 4.8 review):
@@ -213,9 +237,30 @@ type ShmClientTransport struct {
 	readerWG sync.WaitGroup
 
 	// Keepalive
-	lastRead         int64 // Unix nanos; updated atomically on each received frame
-	kp               keepalive.ClientParameters
-	keepaliveEnabled bool
+	// lastReadTick is incremented atomically on every received frame
+	// (including PONG) so the keepalive goroutine can detect activity
+	// by comparing the counter to its previous snapshot. Replacing the
+	// previous nanosecond-timestamp approach saves a per-frame
+	// time.Now() syscall + atomic.StoreInt64; the only loss is the
+	// sub-tick-interval precision optimization (next kpTimer reset is
+	// just kp.Time after the check, vs kp.Time after the actual
+	// last activity). At default kp.Time = infinity on the client
+	// (keepalive goroutine not even started), and 2h on the server,
+	// the loss is negligible.
+	//
+	// Increment is gated on keepaliveEnabled in the dispatch loop;
+	// when keepalive is OFF (the default), even this cheap atomic.Add
+	// is skipped — the consumer goroutine doesn't exist.
+	lastReadTick atomic.Uint64
+	kp           keepalive.ClientParameters
+	// keepaliveEnabled is set by ConfigureKeepalive (called from the
+	// dialer AFTER NewShmClientTransport has already spawned
+	// processIncomingData). The dispatch loop checks it on every
+	// frame to decide whether to record lastRead. Plain bool would be
+	// a data race on the writer-vs-reader access; atomic.Bool makes
+	// the load free (a single MOV instruction on amd64) compared to
+	// the per-frame time.Now() + atomic.StoreInt64 it gates.
+	keepaliveEnabled atomic.Bool
 	keepaliveDone    chan struct{} // closed when keepalive goroutine exits
 	// kpDormancyCond signals the keepalive goroutine to exit dormant state.
 	// Guarded by mu.
@@ -427,7 +472,12 @@ func (t *ShmClientTransport) sendConnWindowUpdate(delta uint32, force bool) {
 		// emit a frame carrying our delta (plus theirs). No work to do.
 		return
 	}
-	t.emitWindowUpdateFrame(0, v, nil)
+	if force {
+		shmConnWUForce.Add(1)
+	} else {
+		shmConnWUDrip.Add(1)
+	}
+	t.emitWindowUpdateFrame(0, v, nil, force)
 }
 
 // sendStreamWindowUpdate is the lockless emission path for stream-
@@ -462,7 +512,12 @@ func (t *ShmClientTransport) sendStreamWindowUpdate(s *ClientStream, delta uint3
 		// Raced close after our Swap. Credit is now ours; drop it.
 		return
 	}
-	t.emitWindowUpdateFrame(s.id, v, s)
+	if force {
+		shmStreamWUForce.Add(1)
+	} else {
+		shmStreamWUDrip.Add(1)
+	}
+	t.emitWindowUpdateFrame(s.id, v, s, false)
 }
 
 // emitWindowUpdateFrame writes a single WINDOW_UPDATE frame via the
@@ -478,7 +533,8 @@ func (t *ShmClientTransport) sendStreamWindowUpdate(s *ClientStream, delta uint3
 // signal, or (b) dropped because the stream closed. Therefore no
 // WINDOW_UPDATE credit can stall indefinitely on the SHM transport
 // once a value crosses Swap.
-func (t *ShmClientTransport) emitWindowUpdateFrame(streamID uint32, v uint32, s *ClientStream) {
+func (t *ShmClientTransport) emitWindowUpdateFrame(streamID uint32, v uint32, s *ClientStream, connForce bool) {
+	shmWUFrameEmit.Add(1)
 	buf := make([]byte, 4)
 	// RFC 7540 §6.9.1: WINDOW_UPDATE Window Size Increment is a 31-bit
 	// big-endian unsigned integer. Match the spec so the codec's
@@ -499,11 +555,19 @@ func (t *ShmClientTransport) emitWindowUpdateFrame(streamID uint32, v uint32, s 
 		// pending atomics on its next wake.
 		if streamID == 0 {
 			t.pendingConnWU.Add(v)
-			// Conn-level: no dirty flag. drainPendingWUForWriter
-			// always Swaps pendingConnWU unconditionally — one
-			// atomic on every drain is cheaper than maintaining
-			// a CAS-gated dirty bit. Saves the bit + a producer-
-			// side atomic + an ordering surface.
+			if connForce {
+				// Force restore: arm the liveness backstop so the
+				// drainPendingWUForWriter threshold gate cannot strand
+				// a sub-threshold force credit. See pendingConnWUForceCredit
+				// field doc for the clear-before-Swap-pending ordering.
+				t.pendingConnWUForceCredit.Store(1)
+			}
+			// Conn-level: no per-producer dirty flag. drainPendingWUForWriter
+			// gates the conn-level drain on (force-credit OR pending >=
+			// wuThreshold) so the ordinary drip remainder can sit below
+			// the threshold without firing an extra wake on every
+			// wuRetryWake cycle (see pendingConnWUForceCredit for the
+			// liveness backstop covering the sub-threshold force case).
 		} else if s != nil && s.getState() != streamDone {
 			s.pendingWU.Add(v)
 			// Per-stream dirty enqueue: CAS-dedup ensures at most
@@ -578,11 +642,27 @@ func (t *ShmClientTransport) drainPendingWUForWriter() {
 	if t.closed.Load() {
 		return
 	}
-	// CONN-LEVEL: unconditional Swap (no dirty gate).
-	if v := t.pendingConnWU.Swap(0); v > 0 {
-		binary.BigEndian.PutUint32(t.wuBuf[:], v)
-		_ = writeFrame(context.Background(), t.frameWriter.tx,
-			FrameHeader{Type: FrameTypeWindowUpdate, StreamID: 0}, t.wuBuf[:])
+	// CONN-LEVEL: threshold-gated, with a force-credit liveness
+	// backstop. The clear-before-Swap-pending ordering (Swap the
+	// flag FIRST, then check threshold/Swap pending) ensures that
+	// any producer racing to Set(1) after our flag Swap retains
+	// ownership of its credit: the next drain (or piggyback) will
+	// see flag=1 and emit. Without this gate the drain would emit
+	// a tiny WU frame on every wuRetryWake cycle (one per inbound
+	// peer WU = one per RT for small payloads), wasting a
+	// signalData wake per op and ~5-15µs of cross-process latency
+	// at 1K/4K fair-default.
+	forceFlag := t.pendingConnWUForceCredit.Swap(0)
+	thresh := t.wuThreshold.Load()
+	if thresh == 0 {
+		thresh = 1 // never elide entirely; preserve liveness
+	}
+	if forceFlag != 0 || uint32(t.pendingConnWU.Load()) >= thresh {
+		if v := t.pendingConnWU.Swap(0); v > 0 {
+			binary.BigEndian.PutUint32(t.wuBuf[:], v)
+			_ = writeFrame(context.Background(), t.frameWriter.tx,
+				FrameHeader{Type: FrameTypeWindowUpdate, StreamID: 0}, t.wuBuf[:])
+		}
 	}
 	// PER-STREAM: ping-pong rotate under brief lock.
 	t.wuDirtyMu.Lock()
@@ -628,9 +708,14 @@ func (t *ShmClientTransport) drainPendingWUForWriter() {
 // via frameWriter.setPiggybackWUFn. Called by the writer goroutine
 // (advanceDeferred / processWholeMessage; fire-and-forget control
 // frames via processEntry) UNDER inlineMu, just before the function
-// unlocks. Drains the connection-level pending WU accumulator AND
-// the just-written stream's pendingWU into additional ring writes
-// that share the same SPSC writer position.
+// unlocks. Opportunistically drains the connection-level pending WU
+// accumulator AND the just-written stream's pendingWU into additional
+// ring writes that share the same SPSC writer position — but ONLY
+// when the accumulator has reached wuThreshold, mirroring the
+// standalone sendConnWindowUpdate / sendStreamWindowUpdate batching
+// gate. Sub-threshold credit is intentionally left for the next
+// standalone emission or wuRetryWake retry-drain so the piggyback
+// does not defeat WU batching.
 //
 // LOCK ORDERING (must hold): this callback runs WITH inlineMu held
 // and acquires t.mu.RLock via lookupStream's slow path (on stream-
@@ -662,12 +747,34 @@ func (t *ShmClientTransport) piggybackWUForWriter(streamID uint32) {
 	if t.closed.Load() {
 		return
 	}
-	// Conn-level WU: always check, regardless of streamID.
-	if v := t.pendingConnWU.Swap(0); v > 0 {
-		buf := make([]byte, 4)
-		binary.BigEndian.PutUint32(buf, v)
-		_ = writeFrame(context.Background(), t.frameWriter.tx,
-			FrameHeader{Type: FrameTypeWindowUpdate, StreamID: 0}, buf)
+	// Conn-level WU: only piggyback when pending credit reaches the
+	// batching threshold. An unconditional Swap(0) would defeat the
+	// wuThreshold batching gate (window/4: ~16 KiB under fair, ~8 MiB
+	// under shm-tuned). Under bidi streaming the receiver accumulates
+	// ~payload bytes of pendingConnWU per DATA frame, so unconditional
+	// piggyback emits one extra WINDOW_UPDATE frame per RT (≈2 extra
+	// syscalls/RT — measured at +25–30 µs/op on max profile 1 KiB
+	// Windows, 87→62 µs in-proc / 104→72 µs xproc). The standalone
+	// sendConnWindowUpdate path still fires at threshold, so flow
+	// credit is not delayed beyond the normal threshold cadence; the
+	// sub-threshold remainder is intentionally deferred to the next
+	// standalone emission or wuRetryWake retry-drain.
+	thresh := t.wuThreshold.Load()
+	if thresh == 0 {
+		thresh = 1 // never elide entirely; preserve liveness
+	}
+	if uint32(t.pendingConnWU.Load()) >= thresh {
+		if v := t.pendingConnWU.Swap(0); v > 0 {
+			// Reuse the per-transport wuBuf scratch. Safe: this fn runs
+			// under the writer's inlineMu so the buffer is single-
+			// goroutine; writeFrame copies the payload into the ring
+			// synchronously so the buffer can be re-used on the very
+			// next line for the stream-level WU below. Mirrors the
+			// existing drainPendingWUForWriter usage (~L589).
+			binary.BigEndian.PutUint32(t.wuBuf[:], v)
+			_ = writeFrame(context.Background(), t.frameWriter.tx,
+				FrameHeader{Type: FrameTypeWindowUpdate, StreamID: 0}, t.wuBuf[:])
+		}
 	}
 	// Stream-level WU: only meaningful for streamID != 0 and a still-
 	// active stream. The piggyback callback is only fired for
@@ -680,11 +787,20 @@ func (t *ShmClientTransport) piggybackWUForWriter(streamID uint32) {
 	if s == nil || s.getState() == streamDone {
 		return
 	}
-	if v := s.pendingWU.Swap(0); v > 0 {
-		buf := make([]byte, 4)
-		binary.BigEndian.PutUint32(buf, v)
-		_ = writeFrame(context.Background(), t.frameWriter.tx,
-			FrameHeader{Type: FrameTypeWindowUpdate, StreamID: streamID}, buf)
+	if uint32(s.pendingWU.Load()) >= thresh {
+		if v := s.pendingWU.Swap(0); v > 0 {
+			// Re-check streamDone after the Swap: a concurrent close
+			// between getState() and Swap could leave a stream WU
+			// targeted at a defunct stream. RFC 7540 §6.9.1 permits
+			// the peer to ignore late WU on a closed stream, so this
+			// is benign — but matches sendStreamWindowUpdate's pattern.
+			if s.getState() == streamDone {
+				return
+			}
+			binary.BigEndian.PutUint32(t.wuBuf[:], v)
+			_ = writeFrame(context.Background(), t.frameWriter.tx,
+				FrameHeader{Type: FrameTypeWindowUpdate, StreamID: streamID}, t.wuBuf[:])
+		}
 	}
 }
 
@@ -713,11 +829,20 @@ func (t *ShmClientTransport) updateFlowControl(n uint32) {
 }
 
 // sendBDPPing sends a BDP estimation ping to the server.
+//
+// UNREACHABLE in production today. BDP estimator is permanently
+// disabled on the SHM path (NewShmClientTransport sets t.bdpEst = nil
+// — SHM has no bandwidth-delay product to discover, see commit
+// 79b5b9732). Callers go through `t.bdpEst.add(...)` which short-
+// circuits on nil. If a future edit re-wires any caller of
+// sendBDPPing without also restoring t.bdpEst, the `t.bdpEst.timesnap()`
+// below will nil-panic — keep it that way deliberately so the broken
+// wiring fails loud and fast.
 func (t *ShmClientTransport) sendBDPPing() {
 	if t.closed.Load() {
 		return
 	}
-	t.bdpEst.timesnap()
+	t.bdpEst.timesnap() // intentional tripwire: see doc comment.
 	_ = t.frameWriter.enqueue(frameEntry{
 		ctx:     context.Background(),
 		fh:      FrameHeader{Type: FrameTypePING, Flags: PingFlagBDP},
@@ -750,8 +875,21 @@ func NewShmClientTransport(segment *Segment, localAddr, remoteAddr net.Addr) (*S
 
 	// Open events for cross-mapping synchronization (Windows).
 	// Client opens events created by the server. On Linux, these are no-ops.
-	writeEvents, _ := OpenRingEvents(segmentName, "A")
-	readEvents, _ := OpenRingEvents(segmentName, "B")
+	// BUG FIX (GPT-5.5 overnight bug hunt): previously errors were
+	// silently dropped; on Windows that turned a failed event open
+	// into a cross-process hang (nil events -> in-process
+	// WaitOnAddress fallback that does not cross processes).
+	writeEvents, werr := OpenRingEvents(segmentName, "A")
+	if werr != nil {
+		return nil, fmt.Errorf("open ring A events for %q: %w", segmentName, werr)
+	}
+	readEvents, rerr := OpenRingEvents(segmentName, "B")
+	if rerr != nil {
+		if writeEvents != nil {
+			writeEvents.Close()
+		}
+		return nil, fmt.Errorf("open ring B events for %q: %w", segmentName, rerr)
+	}
 
 	// Attach events to rings
 	clientToServer.SetEvents(writeEvents)
@@ -777,7 +915,6 @@ func NewShmClientTransport(segment *Segment, localAddr, remoteAddr net.Addr) (*S
 		cancel:         cancel,
 		streams:        make(map[uint32]*ClientStream),
 
-		streamInFlow: make(map[uint32]*inFlow),
 		errCh:           make(chan struct{}),
 		goAwayCh:        make(chan struct{}),
 		streamsQuotaAvailable: make(chan struct{}, 1),
@@ -845,7 +982,18 @@ func NewShmClientTransport(segment *Segment, localAddr, remoteAddr net.Addr) (*S
 	// deadlock this avoids. Atomic so lockless WU emission can read it
 	// without taking sendQuotaMu.
 	t.wuThreshold.Store(computeWUThreshold(t.initialWindowSize))
-	t.bdpEst = newShmBDPEstimator(uint32(shmInitialWindowSize), t.updateFlowControl)
+	// BDP estimator intentionally NOT initialized for SHM. The BDP
+	// estimator's purpose is to discover the bandwidth-delay product
+	// for a TCP path with unknown bandwidth and non-trivial RTT, then
+	// grow the receive window to keep the pipe full. SHM is a local
+	// memcpy: BDP is effectively infinite, RTT is sub-microsecond, and
+	// the receive window is already chosen to amortise per-frame
+	// overhead (32 MiB default). Running BDP estimation here costs a
+	// periodic PING+ACK round-trip plus a lock-contended updateFlowControl
+	// pass on every BDP recalculation, and was measured as a noticeable
+	// fixed-cost overhead on 1 KiB Unary RPCs (ARM/x64 alike). The
+	// nil bdpEst short-circuits at every call site that reads it.
+	t.bdpEst = nil
 
 	max := segment.H.MaxStreams()
 	if max == 0 {
@@ -884,7 +1032,7 @@ func (t *ShmClientTransport) ConfigureKeepalive(kp keepalive.ClientParameters) {
 	}
 	t.kp = kp
 	if kp.Time != infinity {
-		t.keepaliveEnabled = true
+		t.keepaliveEnabled.Store(true)
 		go t.keepalive()
 	}
 }
@@ -969,8 +1117,20 @@ func (t *ShmClientTransport) processIncomingData(ctx context.Context) {
 			shmDebugf("[DEBUG] ShmClientTransport.processIncomingData: received frame type=%d, streamID=%d, length=%d", fh.Type, fh.StreamID, fh.Length)
 		}
 
-		// Update last read timestamp for keepalive tracking.
-		atomic.StoreInt64(&t.lastRead, time.Now().UnixNano())
+		// Update last read tick for keepalive tracking.
+		// Only the keepalive goroutine reads t.lastReadTick, and keepalive
+		// is OFF by default (kp.Time = infinity per defaults.go).
+		// When keepalive is OFF the counter is never consumed, so
+		// skipping the atomic.Add here is pure dead-work removal.
+		// Mirrors stock http2_client.go which also gates lastRead
+		// tracking on keepaliveEnabled. The atomic.Bool field defends
+		// against the dialer setting keepaliveEnabled concurrently with
+		// this reader goroutine (ConfigureKeepalive is called AFTER
+		// NewShmClientTransport spawns the reader; plain-bool access
+		// would race).
+		if t.keepaliveEnabled.Load() {
+			t.lastReadTick.Add(1)
+		}
 
 		payloadTransferred := false
 		release := func() {
@@ -1026,17 +1186,53 @@ func (t *ShmClientTransport) processIncomingData(ctx context.Context) {
 			continue
 		}
 
-		// Dispatch frame to appropriate stream.
-		// Fast path: if we have a cached single stream, skip map lookup + RLock.
+		// Dispatch frame to appropriate stream via the direct-mapped
+		// table (PR #11). On slot miss fall back to the streams map
+		// under RLock and republish under the same RLock to avoid the
+		// stale-publish race (see lookupStream's docstring).
 		var stream *ClientStream
-		if c := t.cachedStream.Load(); c != nil && c.streamID == fh.StreamID {
-			stream = c.stream
+		if s := t.streamSlots[streamSlotIdx(fh.StreamID)].Load(); s != nil &&
+			s.id == fh.StreamID && s.getState() != streamDone {
+			stream = s
 		} else {
 			t.mu.RLock()
-			var ok bool
-			stream, ok = t.streams[fh.StreamID]
+			s, ok := t.streams[fh.StreamID]
+			if ok && s.getState() != streamDone {
+				// Republish into the slot. Closing path serialises
+				// via t.mu.Lock for delete, so the entry we just
+				// observed cannot disappear while we hold RLock.
+				// The streamDone recheck closes the window in which
+				// closeStream has already transitioned state to
+				// streamDone but has not yet reached t.mu.Lock to
+				// delete: without the recheck we would resurrect a
+				// dead-state stream into the slot AND return it for
+				// dispatch.
+				t.streamSlots[streamSlotIdx(fh.StreamID)].Store(s)
+				stream = s
+			} else {
+				ok = false
+			}
 			t.mu.RUnlock()
 			if !ok {
+				// PR #10 (Headers Hot Path Cleanup): orphan-stream frame
+				// (a locally-cancelled stream whose server HEADERS or
+				// TRAILERS are still in flight). The codec may have
+				// stashed a HeadersV1 / TrailersV1 struct on the holder
+				// for this frame; the documented contract is "consumer
+				// MUST take before the next read". Clear the slots
+				// defensively so a future refactor that adds another
+				// dispatch branch doesn't surface a stale prior-frame
+				// struct, and so the byte slices inside the struct are
+				// not pinned past their use.
+				h := t.serverToClient.h2Decoder()
+				if h.decodedHeaderSet {
+					h.decodedHeader = HeadersV1{}
+					h.decodedHeaderSet = false
+				}
+				if h.decodedTrailerSet {
+					h.decodedTrailer = TrailersV1{}
+					h.decodedTrailerSet = false
+				}
 				release()
 				continue
 			}
@@ -1046,7 +1242,11 @@ func (t *ShmClientTransport) processIncomingData(ctx context.Context) {
 		switch fh.Type {
 		case FrameTypeHEADERS:
 			// Server sent headers (response headers)
-			h, err := decodeHeaders(payload)
+			// PR #10 (Headers Hot Path Cleanup): takeOrDecodeHeaders picks
+			// up the HeadersV1 struct that the codec stashed on the holder,
+			// skipping the encodeHeaders → decodeHeaders round-trip that
+			// pre-PR-#10 ran per HEADERS frame.
+			h, err := takeOrDecodeHeaders(t.serverToClient.h2Decoder(), payload)
 			if err != nil {
 				release()
 				stream.write(recvMsg{err: err})
@@ -1054,13 +1254,22 @@ func (t *ShmClientTransport) processIncomingData(ctx context.Context) {
 			}
 
 			// Populate the received header metadata.
-			md := make(metadata.MD)
-			for _, kv := range h.Metadata {
-				vals := make([]string, 0, len(kv.Values))
-				for _, v := range kv.Values {
-					vals = append(vals, string(v))
+			// PR #10 (C2): skip metadata.MD construction when no metadata
+			// is present (common case). Pre-PR-#10 a fresh map + per-KV
+			// slice were allocated per HEADERS frame regardless.
+			var md metadata.MD
+			if len(h.Metadata) > 0 {
+				md = make(metadata.MD, len(h.Metadata))
+				for _, kv := range h.Metadata {
+					// Pre-size with len() + indexed assignment: skip
+					// the append-growth bookkeeping. Same strings,
+					// same order.
+					vals := make([]string, len(kv.Values))
+					for i, v := range kv.Values {
+						vals[i] = string(v)
+					}
+					md[kv.Key] = vals
 				}
-				md[kv.Key] = vals
 			}
 			if v := md.Get("grpc-encoding"); len(v) > 0 {
 				stream.recvCompress = v[0]
@@ -1190,17 +1399,26 @@ func (t *ShmClientTransport) processIncomingData(ctx context.Context) {
 
 		case FrameTypeTRAILERS:
 			// Server sent trailers (end of stream)
-			tr, err := decodeTrailers(payload)
+			// PR #10: see HEADERS branch above.
+			tr, err := takeOrDecodeTrailers(t.serverToClient.h2Decoder(), payload)
 			if err != nil {
 				release()
 				t.closeStream(stream, err, false, 0, nil, nil, false)
 			} else {
-				// Convert metadata from protocol format to map
-				trailerMap := make(map[string][]string)
-				for _, kv := range tr.Metadata {
-					trailerMap[kv.Key] = make([]string, len(kv.Values))
-					for i, v := range kv.Values {
-						trailerMap[kv.Key][i] = string(v)
+				// Convert metadata from protocol format to map.
+				// Mirror of PR #10 (C2): skip allocation when there are
+				// no trailer metadata entries (the common case for
+				// stock gRPC unary RPCs). closeStream accepts nil for
+				// the mdata arg.
+				var trailerMap map[string][]string
+				if len(tr.Metadata) > 0 {
+					trailerMap = make(map[string][]string, len(tr.Metadata))
+					for _, kv := range tr.Metadata {
+						vals := make([]string, len(kv.Values))
+						for i, v := range kv.Values {
+							vals[i] = string(v)
+						}
+						trailerMap[kv.Key] = vals
 					}
 				}
 
@@ -1277,6 +1495,20 @@ func (t *ShmClientTransport) Close(err error) {
 				_ = t.serverToClient.Close()
 			}
 		}
+		// BUG FIX (Opus 4.8 overnight review): Wake any writer goroutine
+		// that may be parked in ReserveWrite -> waitForSpace -> eventfd
+		// WaitForChange BEFORE calling frameWriter.close() (which does
+		// wg.Wait()). Under the Linux eventfd waker, ring.Close()'s
+		// signalSpace wakes only the PEER's eventfd, not the local
+		// writer's, so a writer parked at Close-time would otherwise
+		// hang the wg.Wait() forever. Closing the local eventfd here
+		// makes WaitForChange return ErrRingClosed and the writer can
+		// exit cleanly. The waker's sync.Once makes a second
+		// UnblockSameSideParkers() call later (before readerWG.Wait)
+		// idempotent. No-op on per-address-eventfd/futex paths.
+		if t.segment != nil {
+			t.segment.UnblockSameSideParkers()
+		}
 		t.frameWriter.close()
 
 		// Wake up the keepalive goroutine if it's dormant, so it can exit.
@@ -1287,7 +1519,7 @@ func (t *ShmClientTransport) Close(err error) {
 		t.mu.Unlock()
 
 		// Wait for keepalive goroutine to exit.
-		if t.keepaliveEnabled && t.keepaliveDone != nil {
+		if t.keepaliveEnabled.Load() && t.keepaliveDone != nil {
 			<-t.keepaliveDone
 		}
 
@@ -1510,12 +1742,10 @@ func (t *ShmClientTransport) NewStream(ctx context.Context, callHdr *CallHdr, ha
 
 		// Register the stream
 		t.streams[streamID] = s
-		// Update single-stream cache.
-		if len(t.streams) == 1 {
-			t.cachedStream.Store(&clientStreamCache{stream: s, streamID: streamID})
-		} else {
-			t.cachedStream.Store(nil)
-		}
+		// PR #11: publish into direct-mapped slot. Collision policy
+		// is overwrite — the displaced occupant stays fully correct
+		// via the map fallback path in lookupStream.
+		t.streamSlots[streamSlotIdx(streamID)].Store(s)
 		streamWindow := int64(t.initialWindowSize)
 		if t.initialStreamWindow > 0 {
 			streamWindow = t.initialStreamWindow
@@ -1536,7 +1766,6 @@ func (t *ShmClientTransport) NewStream(ctx context.Context, callHdr *CallHdr, ha
 		// map. The Stream zero-value starts at 0, so we Store the
 		// initial window here.
 		s.sendQuota.Store(streamWindow)
-		t.streamInFlow[streamID] = &s.fc
 		if t.streamQuota > 0 && t.waitingStreams > 0 {
 			select {
 			case t.streamsQuotaAvailable <- struct{}{}:
@@ -1561,31 +1790,45 @@ func (t *ShmClientTransport) NewStream(ctx context.Context, callHdr *CallHdr, ha
 			deadlineUnixNano = uint64(unixNano)
 		}
 	}
-	var kvs []KV
-	hasKey := func(key string) bool {
-		for _, kv := range kvs {
-			if kv.Key == key {
-				return true
-			}
-		}
-		return false
-	}
+	// Pre-size kvs to len(md)+3 to cover up to three appended gRPC
+	// fields (content-type, grpc-encoding, grpc-accept-encoding).
+	// Track presence via 3 typed bools while copying outgoing
+	// metadata so the later "add if missing" checks don't need a
+	// hasKey closure (escape-prone and O(n) per check).
+	var (
+		kvs                []KV
+		hasContentType    bool
+		hasGrpcEncoding   bool
+		hasAcceptEncoding bool
+	)
 	if md, ok := metadata.FromOutgoingContext(ctx); ok {
+		kvs = make([]KV, 0, len(md)+3)
 		for k, vals := range md {
-			byteVals := make([][]byte, 0, len(vals))
-			for _, v := range vals {
-				byteVals = append(byteVals, []byte(v))
+			// Pre-size byteVals: skip append-growth bookkeeping.
+			byteVals := make([][]byte, len(vals))
+			for i, v := range vals {
+				byteVals[i] = []byte(v)
+			}
+			switch k {
+			case "content-type":
+				hasContentType = true
+			case "grpc-encoding":
+				hasGrpcEncoding = true
+			case "grpc-accept-encoding":
+				hasAcceptEncoding = true
 			}
 			kvs = append(kvs, KV{Key: k, Values: byteVals})
 		}
+	} else {
+		kvs = make([]KV, 0, 3)
 	}
 	// Add gRPC-required/expected metadata fields if not already present.
-	if !hasKey("content-type") {
+	if !hasContentType {
 		kvs = append(kvs, KV{Key: "content-type", Values: [][]byte{[]byte(grpcutil.ContentType(callHdr.ContentSubtype))}})
 	}
 	registeredCompressors := grpcutil.RegisteredCompressors()
 	if callHdr.SendCompress != "" {
-		if !hasKey("grpc-encoding") {
+		if !hasGrpcEncoding {
 			kvs = append(kvs, KV{Key: "grpc-encoding", Values: [][]byte{[]byte(callHdr.SendCompress)}})
 		}
 		if !grpcutil.IsCompressorNameRegistered(callHdr.SendCompress) {
@@ -1595,7 +1838,7 @@ func (t *ShmClientTransport) NewStream(ctx context.Context, callHdr *CallHdr, ha
 			registeredCompressors += callHdr.SendCompress
 		}
 	}
-	if registeredCompressors != "" && !hasKey("grpc-accept-encoding") {
+	if registeredCompressors != "" && !hasAcceptEncoding {
 		kvs = append(kvs, KV{Key: "grpc-accept-encoding", Values: [][]byte{[]byte(registeredCompressors)}})
 	}
 	hdr := HeadersV1{
@@ -1621,6 +1864,10 @@ func (t *ShmClientTransport) NewStream(ctx context.Context, callHdr *CallHdr, ha
 	}); err != nil {
 		t.mu.Lock()
 		delete(t.streams, streamID)
+		// PR #11: clear the direct-mapped slot for the rolled-back
+		// stream so a later stream with a colliding slot index can
+		// claim it cleanly (and so this dead pointer is not pinned).
+		t.clearStreamSlot(s)
 		t.streamQuota++
 		if t.streamQuota > 0 && t.waitingStreams > 0 {
 			select {
@@ -1728,18 +1975,49 @@ func (t *ShmClientTransport) updateWindow(s *ClientStream, n uint32) {
 	}
 }
 
-// lookupStream resolves a stream id to its ClientStream. Uses the
-// cachedStream MRU fast path for single-stream connections (the
-// common case for unary RPC ping-pong); falls back to the streams
-// map under RLock otherwise. Returns nil for unknown ids.
+// lookupStream resolves a stream id to its ClientStream via the
+// direct-mapped table (PR #11). On slot miss it falls back to the
+// streams map under RLock and republishes into the slot WHILE STILL
+// HOLDING THE RLOCK (avoids a stale-publish race: post-unlock
+// publishing could race with a close that already cleared the slot,
+// resurrecting a dead pointer with no future close to clean it).
+// Returns nil for unknown ids and for streams that have already
+// transitioned to streamDone.
 func (t *ShmClientTransport) lookupStream(streamID uint32) *ClientStream {
-	if c := t.cachedStream.Load(); c != nil && c.streamID == streamID {
-		return c.stream
+	if s := t.streamSlots[streamSlotIdx(streamID)].Load(); s != nil &&
+		s.id == streamID && s.getState() != streamDone {
+		return s
 	}
 	t.mu.RLock()
 	s := t.streams[streamID]
+	if s != nil && s.getState() != streamDone {
+		// Republish while still under RLock: a close path needs
+		// t.mu.Lock to remove the entry, so it cannot run between
+		// our snapshot and Store. The streamDone recheck (mirrors
+		// the server side) closes the window in which closeStream
+		// has already transitioned state to streamDone but has not
+		// yet reached t.mu.Lock to delete: without the recheck we
+		// would resurrect a dead-state stream into the slot AND
+		// return it for frame dispatch (caller then mutates flow
+		// control state on an already-closed stream).
+		t.streamSlots[streamSlotIdx(streamID)].Store(s)
+	} else {
+		s = nil
+	}
 	t.mu.RUnlock()
 	return s
+}
+
+// clearStreamSlot atomically clears the direct-mapped slot for the
+// given stream IFF the slot still points to it. Required because a
+// later stream with a colliding slot index may have already
+// overwritten this slot via Store; we must not wipe the newer
+// occupant.
+func (t *ShmClientTransport) clearStreamSlot(s *ClientStream) {
+	slot := &t.streamSlots[streamSlotIdx(s.id)]
+	if slot.Load() == s {
+		slot.CompareAndSwap(s, nil)
+	}
 }
 
 // onMessageStart is invoked by the h2 codec the moment it parses a
@@ -1904,15 +2182,10 @@ func (t *ShmClientTransport) closeStream(s *ClientStream, err error, rst bool, _
 	var shouldClose bool
 	t.mu.Lock()
 	delete(t.streams, s.id)
-	// Update single-stream cache.
-	if len(t.streams) == 1 {
-		for id, cs := range t.streams {
-			t.cachedStream.Store(&clientStreamCache{stream: cs, streamID: id})
-			break
-		}
-	} else {
-		t.cachedStream.Store(nil)
-	}
+	// PR #11: CAS-clear the direct-mapped slot — only clear if it
+	// still points to this stream (a later stream may have won the
+	// slot via overwrite policy and must not be wiped).
+	t.clearStreamSlot(s)
 	// Per-stream send quota lives on the Stream itself
 	// (s.sendQuota atomic.Int64); no map deletion needed. The
 	// detached Stream remains GC-rooted only via the in-flight
@@ -1929,7 +2202,6 @@ func (t *ShmClientTransport) closeStream(s *ClientStream, err error, rst bool, _
 	case t.frameWriter.wuRetryWake <- struct{}{}:
 	default:
 	}
-	delete(t.streamInFlow, s.id)
 	t.streamQuota++
 	if t.streamQuota > 0 && t.waitingStreams > 0 {
 		select {
@@ -2034,6 +2306,14 @@ func (t *ShmClientTransport) writeProto(s *ClientStream, msg any, opts *WriteOpt
 		return false, nil
 	}
 
+	// Resolve "is this the last message?" exactly once. Treat a nil
+	// opts the same as opts.Last=false (i.e. MORE on the wire AND
+	// no local state transition). Pre-fix the wire/local split was
+	// inconsistent: nil opts emitted END_STREAM on the wire but kept
+	// local state in streamActive, so a follow-up send would race
+	// with the peer's half-close handling.
+	isLast := opts != nil && opts.Last
+
 	// Set frame flags based on the caller's "last message" signal:
 	//
 	//   - MessageFlagMORE: signals "more frames follow on this stream".
@@ -2045,10 +2325,10 @@ func (t *ShmClientTransport) writeProto(s *ClientStream, msg any, opts *WriteOpt
 	//     server-side H2 reader translates END_STREAM back to MORE=0
 	//     so the same handleMessage MORE=0 EOF logic fires.
 	var frameFlags uint8
-	if opts != nil && !opts.Last {
-		frameFlags = MessageFlagMORE
-	} else {
+	if isLast {
 		frameFlags = MessageFlagEndStream
+	} else {
+		frameFlags = MessageFlagMORE
 	}
 	fh := FrameHeader{
 		Type:     FrameTypeMESSAGE,
@@ -2117,7 +2397,7 @@ func (t *ShmClientTransport) writeProto(s *ClientStream, msg any, opts *WriteOpt
 					return true, err
 				}
 				// ZC succeeded — transition stream state if last.
-				if opts != nil && opts.Last {
+				if isLast {
 					if !s.compareAndSwapState(streamActive, streamWriteDone) {
 						// Race: stream was closed concurrently.
 						// Data is already on the ring which is
@@ -2148,7 +2428,7 @@ func (t *ShmClientTransport) writeProto(s *ClientStream, msg any, opts *WriteOpt
 	// upper-layer observes the semantic "I'm done sending" at the
 	// instant writeProto returns. The H2 END_STREAM bit on the
 	// emitted frame is already encoded in fh.Flags.
-	if opts != nil && opts.Last {
+	if isLast {
 		if !s.compareAndSwapState(streamActive, streamWriteDone) {
 			return true, errStreamDone
 		}
@@ -2158,7 +2438,26 @@ func (t *ShmClientTransport) writeProto(s *ClientStream, msg any, opts *WriteOpt
 	// count and also routes through async, preserving FIFO. The
 	// writer decrements after the entry is fully resolved.
 	s.protoInFlight.Add(1)
-	if err := t.frameWriter.enqueueProtoAsync(s.ctx, &s.Stream, fh, pm, pSize); err != nil {
+	// Eagerly marshal on the SendMsg caller's goroutine. This closes
+	// a data race that the previous protoMsg-deferred path was
+	// exposed to: gRPC's SendMsg contract lets callers mutate the
+	// proto.Message as soon as the call returns, but the deferred
+	// path stored the live pointer in the writer queue and only
+	// marshalled it later on the writer goroutine — racing the
+	// caller's mutation against the wire serialisation.
+	//
+	// Marshal cost paid on the SendMsg goroutine instead of the
+	// writer goroutine: acceptable because async fallback is the
+	// cold path (TryLock fail OR CAS fail). The inline fast path,
+	// which is hit at steady-state low contention, still marshals
+	// directly into the ring under inlineMu (zero-copy).
+	protoBytes := make([]byte, 0, pSize)
+	protoBytes, err := protoMarshalAppend(protoBytes, pm)
+	if err != nil {
+		s.protoInFlight.Add(-1)
+		return true, err
+	}
+	if err := t.frameWriter.enqueueProtoBytesAsync(s.ctx, &s.Stream, fh, protoBytes); err != nil {
 		s.protoInFlight.Add(-1)
 		return true, err
 	}
@@ -2247,21 +2546,28 @@ func (t *ShmClientTransport) keepalive() {
 	// Amount of time remaining before which we should receive an ACK for the
 	// last sent ping.
 	timeoutLeft := time.Duration(0)
-	// Records the last value of t.lastRead before we go block on the timer.
-	prevNano := time.Now().UnixNano()
+	// Records the last value of t.lastReadTick before we go block on
+	// the timer.
+	prevTick := t.lastReadTick.Load()
 	timer := time.NewTimer(t.kp.Time)
 	defer timer.Stop()
 
 	for {
 		select {
 		case <-timer.C:
-			lastRead := atomic.LoadInt64(&t.lastRead)
-			if lastRead > prevNano {
+			curTick := t.lastReadTick.Load()
+			if curTick != prevTick {
 				// There has been read activity since the last time we were here.
 				outstandingPing = false
-				// Next timer should fire at kp.Time seconds from lastRead time.
-				timer.Reset(time.Duration(lastRead) + t.kp.Time - time.Duration(time.Now().UnixNano()))
-				prevNano = lastRead
+				// Reset to kp.Time from now. The old code reset to
+				// "kp.Time after the exact last activity" using a
+				// nanosecond timestamp; the tick-counter approach
+				// loses that sub-interval precision but at default
+				// client kp.Time = infinity (this goroutine wouldn't
+				// even run) and any reasonable configured kp.Time the
+				// extra check is at worst one tick-interval late.
+				timer.Reset(t.kp.Time)
+				prevTick = curTick
 				continue
 			}
 			if outstandingPing && timeoutLeft <= 0 {

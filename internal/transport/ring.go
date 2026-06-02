@@ -780,6 +780,7 @@ func (r *ShmRing) waitForContig(addr *uint32, val uint32, timeout time.Duration)
 // exercise the futex wake primitive must disable the eventfd waker
 // via ConfigureShmEventfdWakerForBench(false).
 func (r *ShmRing) signalData(addr *uint32) {
+	atomic.AddUint64(&shmSignalDataFire, 1)
 	if r.dataSegWaker != nil {
 		r.dataSegWaker.Wake()
 		return
@@ -797,6 +798,7 @@ func (r *ShmRing) signalData(addr *uint32) {
 // See signalData for the rationale on skipping futex_wake when the
 // eventfd waker is active.
 func (r *ShmRing) signalSpace(addr *uint32) {
+	atomic.AddUint64(&shmSignalSpaceFire, 1)
 	if r.dataSegWaker != nil {
 		r.dataSegWaker.Wake()
 		return
@@ -2011,6 +2013,17 @@ func (r *ShmRing) ReserveWrite(ctx context.Context, n int) (WriteReservation, er
 func (r *ShmRing) ReadSlices(ctx context.Context, n int) (first, second []byte, commit *ReadCommit, err error) {
 	if n <= 0 {
 		return nil, nil, nil, errors.New("read size must be positive")
+	}
+	// BUG FIX (Opus 4.8 overnight bug hunt round 2): mirror the
+	// ReserveWrite oversize check. Without it, a hostile or buggy
+	// peer that advertises an H2 frame Length > ring capacity makes
+	// this loop wait forever for `availableBefore >= n` bytes that
+	// the ring physically cannot hold — a DoS/permanent reader stall
+	// on user-configured small rings (RingASize/RingBSize down to
+	// MinRingCapacity = 4 KiB). h2MaxFramePayload caps Length at
+	// 16 MiB which exceeds the 4 KiB floor by ~4000x.
+	if uint64(n) > r.capacity {
+		return nil, nil, nil, fmt.Errorf("shm ring read size %d exceeds ring capacity %d", n, r.capacity)
 	}
 
 	// Check local closed flag first - this is safe even if memory is unmapped.

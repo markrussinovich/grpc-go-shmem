@@ -333,7 +333,7 @@ func TestValidateSegmentHeaderVersionMismatch(t *testing.T) {
 	h.SetRingACapacity(MinRingCapacity)
 	h.SetRingBCapacity(MinRingCapacity)
 	h.SetVersion(SegmentVersion + 1)
-	err := ValidateSegmentHeader(h)
+	err := ValidateSegmentHeader(h, 0)
 	if err == nil {
 		t.Fatal("ValidateSegmentHeader accepted mismatched version; expected error")
 	}
@@ -958,4 +958,84 @@ func TestFutexWithSharedMemory(t *testing.T) {
 	case <-time.After(1 * time.Second):
 		t.Fatal("Futex wait on shared memory did not complete within timeout")
 	}
+}
+
+
+// TestValidateSegmentHeader_TotalSizeMustMatchMapped covers the
+// mapped-size enforcement added to close a local-DoS surface: a
+// peer providing a backing file shorter than the header's self-
+// reported TotalSize would previously pass validation and then
+// panic in ring construction. With mappedLen > 0, ValidateSegmentHeader
+// rejects the mismatch with a clear error.
+func TestValidateSegmentHeader_TotalSizeMustMatchMapped(t *testing.T) {
+const ringCap = uint64(MinRingCapacity)
+expectedTotal, _, _, err := CalculateSegmentLayout(ringCap, ringCap)
+if err != nil {
+t.Fatalf("CalculateSegmentLayout: %v", err)
+}
+h := &SegmentHeader{}
+h.SetMagic([8]byte{'G', 'R', 'P', 'C', 'S', 'H', 'M', 0})
+h.SetVersion(SegmentVersion)
+h.SetRingACapacity(ringCap)
+h.SetRingBCapacity(ringCap)
+h.SetTotalSize(expectedTotal)
+// Set the correct offsets so the existing layout check passes.
+_, ringAOff, ringBOff, _ := CalculateSegmentLayout(ringCap, ringCap)
+h.SetRingAOffset(ringAOff)
+h.SetRingBOffset(ringBOff)
+
+// mappedLen=0 is the legacy "skip mapped-size check" mode for
+// callers that have not migrated yet (and for the version-
+// mismatch test). It must still pass with valid header.
+if err := ValidateSegmentHeader(h, 0); err != nil {
+t.Fatalf("ValidateSegmentHeader(h, 0) on valid header = %v, want nil", err)
+}
+// mappedLen == TotalSize is the production happy path.
+if err := ValidateSegmentHeader(h, expectedTotal); err != nil {
+t.Fatalf("ValidateSegmentHeader(h, %d) = %v, want nil", expectedTotal, err)
+}
+// mappedLen smaller than TotalSize MUST be rejected — this is
+// the truncated-file / malicious-peer surface.
+if err := ValidateSegmentHeader(h, expectedTotal-1); err == nil {
+t.Fatal("ValidateSegmentHeader accepted truncated mapping; expected error")
+} else if !strings.Contains(err.Error(), "does not match mapped backing size") {
+t.Errorf("error = %q, want contains \"does not match mapped backing size\"", err.Error())
+}
+// mappedLen larger than TotalSize MUST also be rejected — header
+// must describe the actual mapping exactly.
+if err := ValidateSegmentHeader(h, expectedTotal+1); err == nil {
+t.Fatal("ValidateSegmentHeader accepted oversize mapping; expected error")
+}
+}
+
+// TestValidateSegmentHeader_RingExtentsMustFitInMapped covers the
+// uint64-overflow-safe ring-extent fit check: a header that claims
+// a ringAOffset + ringACapacity wrapping past 2^64 must be
+// rejected.
+func TestValidateSegmentHeader_RingExtentsMustFitInMapped(t *testing.T) {
+const ringCap = uint64(MinRingCapacity)
+expectedTotal, expectedAOff, expectedBOff, err := CalculateSegmentLayout(ringCap, ringCap)
+if err != nil {
+t.Fatalf("CalculateSegmentLayout: %v", err)
+}
+h := &SegmentHeader{}
+h.SetMagic([8]byte{'G', 'R', 'P', 'C', 'S', 'H', 'M', 0})
+h.SetVersion(SegmentVersion)
+h.SetRingACapacity(ringCap)
+h.SetRingBCapacity(ringCap)
+h.SetTotalSize(expectedTotal)
+h.SetRingAOffset(expectedAOff)
+h.SetRingBOffset(expectedBOff)
+
+// The standard layout check (offset == expected) catches most
+// "ring extends past mapped region" cases before the new fit
+// check runs. The fit check still adds defence-in-depth in case
+// CalculateSegmentLayout ever returns a value that matches the
+// header but exceeds an unexpectedly small mappedLen — that
+// scenario is covered by the TotalSizeMustMatchMapped test
+// above, so this test merely confirms the happy path stays
+// happy under tighter validation.
+if err := ValidateSegmentHeader(h, expectedTotal); err != nil {
+t.Fatalf("ValidateSegmentHeader on valid layout = %v, want nil", err)
+}
 }

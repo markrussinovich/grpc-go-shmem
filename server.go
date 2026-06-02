@@ -1199,8 +1199,7 @@ func (s *Server) sendResponse(ctx context.Context, stream *transport.ServerStrea
 		nc, hasName := codec.(interface{ Name() string })
 		isProtoCodec := hasName && nc.Name() == "proto"
 		if isProtoCodec {
-			_, isBuiltin := codec.(bufferPoolMarshaler)
-			isProtoCodec = isBuiltin
+			isProtoCodec = proto.IsBuiltin(codec)
 		}
 		if isProtoCodec {
 			if pm, ok := msg.(protobuf.Message); ok {

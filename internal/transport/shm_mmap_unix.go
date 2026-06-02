@@ -195,7 +195,7 @@ func OpenSegment(name string) (*Segment, error) {
 	hdr := &hdrView{basePtr: unsafe.Pointer(&mem[0])}
 
 	// Validate the header
-	if err := ValidateSegmentHeader((*SegmentHeader)(hdr.basePtr)); err != nil {
+	if err := ValidateSegmentHeader((*SegmentHeader)(hdr.basePtr), uint64(size)); err != nil {
 		munmapImpl(mem)
 		file.Close()
 		return nil, fmt.Errorf("invalid segment header: %w", err)

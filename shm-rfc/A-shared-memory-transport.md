@@ -273,11 +273,19 @@ from multiple client processes, the SPSC assumption does not hold on this
 ring. Implementations MUST serialize writes to Ring A using an OS-level
 mutual exclusion primitive tied to the control segment name:
 
-- **Linux / POSIX**: advisory lock (`flock`) on the control segment's
-  backing file.
-- **Windows**: a named mutex whose name is the control segment name with
-  a `.lock` suffix (e.g. if the control segment is `grpc_ctl`, the mutex
-  is `grpc_ctl.lock`).
+- **Linux / POSIX**: advisory lock (`flock`) on a sibling lock file
+  named `<control-segment>.lock` (e.g. if the control segment is
+  `grpc_ctl`, the lock file is `grpc_ctl.lock` in the same directory).
+- **Windows**: a byte-range lock (`LockFileEx` with `LOCKFILE_EXCLUSIVE_LOCK`)
+  on the same sibling `<control-segment>.lock` file.
+
+The sibling-file scheme is used uniformly because Windows named-mutex
+ownership is bound to the acquiring thread, which is incompatible with
+Go's goroutine migration across OS threads: a Go runtime that re-schedules
+the acquiring goroutine onto a different thread between `Acquire` and
+`Release` would leave the mutex held forever. `LockFileEx` ownership is
+tied to the file HANDLE, which crosses thread boundaries cleanly and
+is automatically released on process exit by the kernel.
 
 The client acquires the lock before writing CONNECT and releases it after
 reading ACCEPT or REJECT. While the lock is held, the holding client is
@@ -325,19 +333,23 @@ oversized `Length`, the receiver:
 
 ### Control Frame Payloads
 
-#### CONNECT Payload (variable, minimum 20 bytes)
+#### CONNECT Payload (variable, minimum 28 bytes)
 
 ```
 Version(1B) | RingACapacity(8B LE) | RingBCapacity(8B LE) | Flags(1B)
-            | WireFormatCount(1B) | WireFormats(count B)
+            | WireFormatCount(1B) | WireFormats(count B) | Nonce(8B LE)
 ```
 
-- Version: control-frame encoding version (current = 2). This is
+- Version: control-frame encoding version (current = 1). This is
   independent of the segment header Version field, which describes the
-  segment binary layout. v2 introduces the Flags byte on CONNECT and
-  a reserved Flags byte on ACCEPT (see ACCEPT Payload). v1 peers that
-  omit these bytes MUST be rejected at the handshake boundary; the
-  protocol is pre-1.0 and does not preserve v1 wire compatibility.
+  segment binary layout. Until this gRFC and the reference
+  implementations reach a stable release, the wire layout is allowed
+  to evolve freely under the single version byte 1: mismatched-version
+  peers MUST be hard-rejected at the handshake boundary, and the
+  protocol makes no compatibility guarantees across pre-release
+  revisions. The version byte will only be incremented after release,
+  when wire-format evolution requires preserving compatibility with
+  older peers.
 - RingACapacity / RingBCapacity: client's preferred ring sizes in bytes.
   A value of 0 means "use the server's default." The server is free to
   choose smaller capacities.
@@ -380,11 +392,21 @@ Version(1B) | RingACapacity(8B LE) | RingBCapacity(8B LE) | Flags(1B)
   trailing bytes) MUST be treated as protocol-incompatible and rejected
   at the handshake boundary.
 
-#### ACCEPT Payload (variable, minimum 7 bytes)
+- Nonce: a 64-bit value that the client MUST generate from a
+  cryptographically secure random source (e.g., `crypto/rand` /
+  `RandomNumberGenerator.Fill`). The server MUST echo this value
+  unchanged in the ACCEPT or REJECT that answers this CONNECT.
+  Clients use the echoed nonce to correlate the response with their
+  in-flight CONNECT (see [Stale Response Correlation
+  ](#stale-response-correlation)). Using a CSPRNG, rather than a
+  monotonic counter, makes the value unpredictable to other local
+  processes that might observe the shared control segment.
+
+#### ACCEPT Payload (variable, minimum 15 bytes)
 
 ```
 Version(1B) | NameLen(4B LE) | DataSegmentName(var, UTF-8)
-            | SelectedWire(1B) | Flags(1B)
+            | SelectedWire(1B) | Flags(1B) | Nonce(8B LE)
 ```
 
 Contains the name of the data segment the server has allocated and the
@@ -397,18 +419,30 @@ client's CONNECT advertisement. MUST be 0x01 (HTTP/2). Clients MUST
 treat any other value as a connection failure and continue on the
 bootstrap channel.
 
-`Flags` is a v2 reserved byte. Senders MUST set it to 0; receivers
+`Flags` is a reserved byte. Senders MUST set it to 0; receivers
 MUST accept any value for forward compatibility but MUST NOT
 interpret bits without a normative definition in a later revision
 of this gRFC.
 
-#### REJECT Payload (variable)
+`Nonce` MUST be the exact 64-bit value the client supplied in the
+corresponding CONNECT, copied without modification. The client uses
+this field to confirm that the ACCEPT answers its own in-flight
+request and not a request from a previously timed-out dialer that
+share the same control segment.
+
+#### REJECT Payload (variable, minimum 13 bytes)
 
 ```
-Version(1B) | MsgLen(4B LE) | ErrorMessage(var, UTF-8)
+Version(1B) | MsgLen(4B LE) | ErrorMessage(var, UTF-8) | Nonce(8B LE)
 ```
 
 The connection attempt has failed; ErrorMessage is diagnostic text.
+`Nonce` MUST be the value the client supplied in the corresponding
+CONNECT. When the server could not decode the CONNECT (and therefore
+cannot recover a nonce to echo), it MUST set Nonce to 0; a matched-
+version client correlating responses by nonce will then surface a
+generic correlation failure rather than the server's diagnostic
+message, but this path is unreachable between matched-version peers.
 
 The Version field in CONNECT, ACCEPT, and REJECT identifies the control-
 frame encoding version. A receiver that does not recognize the Version
@@ -421,19 +455,52 @@ HTTP/2.
 Receivers MUST validate every control-frame payload before acting on
 it:
 
-- CONNECT: payload length ≥ 20 (`Version(1) + RingACapacity(8) +
-  RingBCapacity(8) + Flags(1) + WireFormatCount(1) + WireFormats(≥1)`),
-  `WireFormatCount ≥ 1`, the WireFormats list fits within the remaining
-  `Length`, and the advertised list contains code 0x01 (HTTP/2).
-- ACCEPT: `NameLen > 0`, `NameLen + 7 == Length` (Version + NameLen +
-  Name + SelectedWire + Flags), `DataSegmentName` is valid UTF-8, and
-  `SelectedWire` is one of the codes the client advertised in CONNECT.
-- REJECT: `MsgLen + 5 == Length` and `ErrorMessage` is valid UTF-8.
+- CONNECT: payload length ≥ 28 (`Version(1) + RingACapacity(8) +
+  RingBCapacity(8) + Flags(1) + WireFormatCount(1) + WireFormats(≥1) +
+  Nonce(8)`), `WireFormatCount ≥ 1`, the WireFormats list fits within
+  the remaining `Length` with 8 bytes left for the trailing Nonce, and
+  the advertised list contains code 0x01 (HTTP/2).
+- ACCEPT: `NameLen > 0`, `NameLen + 15 == Length` (Version + NameLen +
+  Name + SelectedWire + Flags + Nonce), `DataSegmentName` is valid
+  UTF-8, and `SelectedWire` is one of the codes the client advertised
+  in CONNECT.
+- REJECT: `MsgLen + 13 == Length` (Version + MsgLen + Message + Nonce)
+  and `ErrorMessage` is valid UTF-8.
 
 A payload that fails any check MUST be treated as a connection
 failure: the receiver of a malformed CONNECT responds with REJECT and
 drops the offending client; the receiver of a malformed ACCEPT or
 REJECT closes the SHM attempt and continues on the bootstrap channel.
+
+#### Stale Response Correlation
+
+Ring B is a single-consumer ring but its consumer rotates among
+dialers as each acquires and releases the control-segment write lock
+(see [Control Segment](#control-segment)). A dialer whose CONNECT
+deadline fires after the lock is released, but before the matching
+ACCEPT/REJECT arrives on Ring B, can leave a stale response in the
+ring. The next dialer to acquire the lock would otherwise read that
+stale response, bind to the wrong data segment, and silently inherit
+the previous dialer's CONNECT flags (notably `SINGLE_STREAM`).
+
+To close this race, every CONNECT carries a per-request 64-bit Nonce
+and every ACCEPT/REJECT echoes the originating CONNECT's Nonce in its
+trailing Nonce field. After writing CONNECT, a dialer MUST:
+
+1. Read frames from Ring B one at a time.
+2. For each ACCEPT or REJECT, compare the trailing Nonce against the
+   value the dialer placed in its own CONNECT.
+3. If the Nonce differs, the frame is a stale response intended for a
+   previously timed-out dialer. The frame MUST be fully consumed and
+   the dialer MUST proceed to the next frame.
+4. If the Nonce matches, the dialer processes the frame normally.
+
+Dialers MUST bound the number of consecutive stale frames they will
+skip (a small fixed limit, e.g., 3, is sufficient) so that a Ring B
+filled with stale or adversarial responses fails the dial rather than
+spinning indefinitely. After exhausting the bound without finding a
+matching response, the dialer MUST fail the connection attempt and
+continue on the bootstrap channel.
 
 ### Establishment Sequence
 
@@ -443,11 +510,15 @@ REJECT closes the SHM attempt and continues on the bootstrap channel.
 2. Client opens the control segment. It MUST wait until `ServerReady == 1`
    and then perform full segment-header validation (see
    [Segment Header](#segment-header-128-bytes)).
-3. Client acquires the control-segment write lock and sends CONNECT on
-   Ring A.
-4. Server reads CONNECT, allocates a data segment, and responds with ACCEPT
-   (or REJECT) on Ring B.
-5. Client reads the response and releases the write lock.
+3. Client acquires the control-segment write lock, generates a random
+   64-bit Nonce, and sends CONNECT (carrying that Nonce) on Ring A.
+4. Server reads CONNECT, allocates a data segment, and responds with
+   ACCEPT (or REJECT) on Ring B; the response echoes the CONNECT's
+   Nonce in its trailing Nonce field.
+5. Client reads responses from Ring B and skips any whose Nonce does
+   not match the value it placed in its own CONNECT (see [Stale
+   Response Correlation](#stale-response-correlation)). Once it finds
+   the matching response, the client releases the write lock.
 6. Client maps the data segment and sets `ClientReady = 1` in the **data**
    segment header.
 7. HTTP/2 frames begin flowing on Ring A and Ring B of the data segment,
@@ -492,9 +563,9 @@ and is not subject to these rules.
 HTTP/2 frame parsing on this transport is byte-stream oriented and
 identical to HTTP/2 over any other transport. A frame's 9-byte header and
 its payload MAY be produced and consumed across multiple ring write or
-read operations. Receivers MUST process frame bytes incrementally;
-senders MAY advance `WriteIdx` mid-frame so that the receiver can begin
-draining payload while the rest is still being written.
+read operations. Receivers MUST process frame bytes incrementally; senders
+MAY advance `WriteIdx` at any granularity (per-frame, mid-frame, or
+batched across multiple frames).
 
 Ring capacity is therefore independent of `MAX_FRAME_SIZE`. A ring
 smaller than the peer's advertised `MAX_FRAME_SIZE` is well-formed; a

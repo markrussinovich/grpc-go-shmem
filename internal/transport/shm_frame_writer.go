@@ -59,6 +59,13 @@ type shmFrameWriter struct {
 	ch     chan frameEntry // data + control frames from app goroutines
 	wg     sync.WaitGroup
 	closed atomic.Bool
+	// wuScratch is a 4-byte writer-owned buffer used by
+	// connWUCoalescer.flush() to render the BE-uint32 WU increment
+	// without a per-flush make([]byte,4). Safe because writeLoop is
+	// single-goroutine and writeFrame copies the payload into the
+	// ring synchronously (so the scratch is fully consumed before any
+	// subsequent flush can reuse it).
+	wuScratch [4]byte
 	// closeMu synchronizes channel close with concurrent senders.
 	// Senders hold RLock; close() holds Lock.
 	closeMu sync.RWMutex
@@ -107,12 +114,13 @@ type shmFrameWriter struct {
 	// for writing under the existing inlineMu invariant.
 	drainPendingWUFn func()
 
-	// piggybackWUFn, if non-nil, is invoked by the writer goroutine
-	// after each DATA chunk emit (advanceDeferred / processWholeMessage;
-	// control frames via processEntry) WHILE STILL HOLDING inlineMu,
-	// just before the function returns and releases the lock. The
-	// callback receives the streamID of the just-emitted DATA chunk
-	// and is expected to drain the transport's connection-level WU
+	// piggybackWUFn, if non-nil, is invoked WHILE inlineMu is held
+	// by the caller (either the writer goroutine in advanceDeferred /
+	// processWholeMessage / control frames via processEntry, OR by a
+	// request goroutine running the inline ZC fast path — e.g.
+	// tryInlineWrite, server-side M1a writeProto). The callback
+	// receives the streamID of the just-emitted DATA frame/chunk and
+	// is expected to drain the transport's connection-level WU
 	// accumulator AND that stream's pending WU into additional ring
 	// writes that ride out in the same SPSC writer position.
 	//
@@ -138,7 +146,12 @@ type shmFrameWriter struct {
 	//
 	// Implementations on ShmClientTransport and ShmServerTransport
 	// look up the *Stream by streamID, check streamDone state, and
-	// Swap+writeFrame for any non-zero pending WU. Set in the owning
+	// emit additional WU frames ONLY when the accumulated pending
+	// credit has reached the transport's wuThreshold (the same gate
+	// the standalone sendConnWindowUpdate / sendStreamWindowUpdate
+	// paths apply). Sub-threshold credit is intentionally left for
+	// the next standalone emission or wuRetryWake retry-drain, so the
+	// piggyback does not defeat WU batching. Set in the owning
 	// transport's constructor before the writer goroutine begins
 	// servicing real traffic.
 	piggybackWUFn func(streamID uint32)
@@ -284,21 +297,29 @@ type frameEntry struct {
 
 	// ZC marshal in writeLoop.
 	//
-	// When `protoMsg != nil`, this entry carries an UNMARSHALLED
-	// proto.Message that writeLoop should marshal DIRECTLY into a
-	// ring reservation (via writeProtoToRingH2Blocking), bypassing
-	// the upper-layer codec.Marshal allocation. Used as the queued
-	// fallback when (*ShmClientTransport|ShmServerTransport).writeProto's
-	// inlineMu.TryLock fails — even bailed senders still get ZC
-	// marshal via the writer goroutine instead of the
-	// tightBufferPool + chunked-write-vec copy path.
+	// `protoBytes` carries a PRE-MARSHALLED gRPC body (the
+	// `protobuf.Marshal(msg)` output, without the 5-byte LPM length
+	// prefix and without the H2 frame header). The writer copies
+	// these bytes directly into a ring reservation via
+	// writeProtoBytesToRingH2Blocking, prepending the H2 frame
+	// header and 5-byte LPM length. This is the SAFE async fallback
+	// path used by (*ShmClientTransport|ShmServerTransport).writeProto
+	// when the inline TryLock fails: the caller marshals on its own
+	// goroutine BEFORE returning to gRPC core, so a SendMsg caller
+	// is free to mutate the user-visible proto.Message immediately
+	// after writeProto returns — matching stock gRPC's semantics.
 	//
-	// Caller MUST pre-validate single-frame size bounds AND must
-	// have already acquired send quota for (5 + protoSize) bytes
-	// before pushing — writeLoop cannot soft-reject these from its
-	// drain context. fh.Flags carries MessageFlagEndStream / MORE.
-	protoMsg  proto.Message
-	protoSize int
+	// `protoMsg` is the legacy unmarshalled-message variant kept
+	// for compatibility with any caller that opts out of eager
+	// marshal. WriteProto callers always populate protoBytes; the
+	// processProtoEntry / retryDeferredProto paths prefer protoBytes
+	// when both are non-nil.
+	//
+	// Caller MUST pre-validate single-frame size bounds. fh.Flags
+	// carries MessageFlagEndStream / MORE.
+	protoBytes []byte
+	protoMsg   proto.Message
+	protoSize  int
 }
 
 const (
@@ -641,8 +662,12 @@ func (c *connWUCoalescer) flush() {
 	if !c.hasAny {
 		return
 	}
-	buf := make([]byte, 4)
-	binary.BigEndian.PutUint32(buf, uint32(c.pending))
+	// Reuse the writer's wuScratch. Safe: connWUCoalescer is owned by
+	// writeLoop (single-goroutine); processEntry -> writeFrameH2
+	// reserves+copies the payload into the ring synchronously before
+	// returning, so any subsequent flush in the same drain can reuse
+	// the same 4 bytes. Removes 1 alloc per coalesced WU flush.
+	binary.BigEndian.PutUint32(c.w.wuScratch[:], uint32(c.pending))
 	ctx := c.ctx
 	if ctx == nil {
 		ctx = context.Background()
@@ -650,7 +675,7 @@ func (c *connWUCoalescer) flush() {
 	c.w.processEntry(frameEntry{
 		ctx:     ctx,
 		fh:      FrameHeader{Type: FrameTypeWindowUpdate, StreamID: 0},
-		payload: buf,
+		payload: c.w.wuScratch[:],
 	})
 	shmConnWUCoalesced.Add(1)
 	c.pending = 0
@@ -673,12 +698,14 @@ func (w *shmFrameWriter) processEntry(entry frameEntry) {
 		w.processWholeMessage(entry)
 		return
 	}
-	// ZC marshal entries: marshal the proto.Message DIRECTLY into a
-	// ring reservation here (under inlineMu), bypassing the upper-
-	// layer codec.Marshal + tightBufferPool allocation that the
-	// sender would otherwise pay. See enqueueProtoAndWait for the
-	// caller-side contract.
-	if entry.protoMsg != nil {
+	// ZC marshal entries: write a proto body directly into a ring
+	// reservation here (under inlineMu), bypassing the upper-layer
+	// codec.Marshal + tightBufferPool allocation that the sender
+	// would otherwise pay. protoBytes is the safe, eagerly-marshalled
+	// async fallback; protoMsg is the legacy deferred-marshal path
+	// retained for any caller that opts out of eager marshal. See
+	// enqueueProtoBytesAsync for the caller-side contract.
+	if entry.protoBytes != nil || entry.protoMsg != nil {
 		w.processProtoEntry(entry)
 		return
 	}
@@ -822,8 +849,20 @@ func (w *shmFrameWriter) processProtoEntry(entry frameEntry) {
 		w.deferredProto[sid] = []frameEntry{entry}
 		return
 	}
-	err := writeProtoToRingH2Blocking(entry.ctx, w.tx, sid,
-		entry.protoMsg, entry.protoSize, entry.fh.Flags)
+	// Prefer the bytes path when the SendMsg caller pre-marshalled
+	// (the standard fire-and-forget WriteProto fallback does this so
+	// the caller is free to mutate the proto.Message after writeProto
+	// returns — closes a data race on the user-visible message). The
+	// legacy msg path is retained for any caller that opts out of
+	// eager marshal.
+	var err error
+	if entry.protoBytes != nil {
+		err = writeProtoBytesToRingH2Blocking(entry.ctx, w.tx, sid,
+			entry.protoBytes, entry.fh.Flags)
+	} else {
+		err = writeProtoToRingH2Blocking(entry.ctx, w.tx, sid,
+			entry.protoMsg, entry.protoSize, entry.fh.Flags)
+	}
 	if err != nil {
 		// Refund the quota we just reserved — these bytes did not
 		// land on the wire. ReserveWrite returns BEFORE Commit on
@@ -877,10 +916,12 @@ func (w *shmFrameWriter) processTrailerEntry(entry frameEntry) {
 	}
 	// FIFO with same-stream DATA: if DATA is queued, defer.
 	if _, ok := w.deferred[sid]; ok {
+		atomic.AddUint64(&shmTrailerDeferredFire, 1)
 		w.deferredTrailers[sid] = entry
 		return
 	}
 	if len(w.deferredProto[sid]) > 0 {
+		atomic.AddUint64(&shmTrailerDeferredFire, 1)
 		w.deferredTrailers[sid] = entry
 		return
 	}
@@ -894,6 +935,17 @@ func (w *shmFrameWriter) processTrailerEntry(entry frameEntry) {
 // sender's doneCh. Caller MUST have already verified no DATA is
 // pending for this stream.
 func (w *shmFrameWriter) emitTrailerEntry(entry frameEntry) {
+	// Snapshot DataWaiters right before publishing TRAILERS. A
+	// non-zero observation means the client reader is currently
+	// parked AND the upcoming Commit will fire a real signalData
+	// syscall (~3-5us Win EPYC, ~7-10us ARM, ~1-2us Linux eventfd).
+	// A zero observation means the wake will be elided -- reader is
+	// still mid-drain or yielded-then-spinning. Used by
+	// `trailer-commit-parked/op` diag to tell platforms apart
+	// without relying on noisy throughput numbers.
+	if w.tx != nil && w.tx.header().DataWaiters() > 0 {
+		atomic.AddUint64(&shmTrailerCommitParkedReader, 1)
+	}
 	err := writeFrame(entry.ctx, w.tx, entry.fh, entry.payload)
 	if entry.streamPtr != nil {
 		// Swap state inside the writer at TRAILERS-emit time so
@@ -1032,8 +1084,11 @@ func (w *shmFrameWriter) discardDeferredTrailer(sid uint32, s *Stream) {
 	}
 }
 
-// enqueueProtoAsync pushes a ZC marshal request onto the writer
-// channel fire-and-forget. The sender does NOT block on completion.
+// enqueueProtoBytesAsync pushes a PRE-MARSHALLED proto body onto the
+// writer channel fire-and-forget. The sender does NOT block on
+// completion. The writer goroutine takes ownership of the bytes
+// until the entry is fully drained (success or stream/transport
+// close).
 //
 // Used by (*ShmClientTransport|ShmServerTransport).writeProto when
 // either the inline TryLock fails OR the inline lock-free CAS for
@@ -1045,12 +1100,35 @@ func (w *shmFrameWriter) discardDeferredTrailer(sid uint32, s *Stream) {
 // message path, eliminating the parallel slow-path machinery that
 // previously parked ~10% of senders at fair-default 1000/4K.
 //
+// The eager-marshal contract (caller marshals before pushing the
+// entry, rather than queueing the live proto.Message for the
+// writer to marshal later) closes a data race against gRPC's
+// SendMsg semantics: a SendMsg caller is allowed to mutate the
+// message immediately after the call returns, and the prior
+// deferred-marshal path stored the live pointer in the writer
+// queue, racing the caller's mutation against the wire
+// serialisation. The trade-off is that the SendMsg caller pays
+// the marshal cost instead of the writer goroutine; that's
+// acceptable because async fallback is the cold path (TryLock
+// fail OR CAS fail). The inline fast path, which is hit at
+// steady-state low contention, still marshals directly into the
+// ring under inlineMu (zero-copy).
+//
 // Pre-conditions (caller MUST satisfy):
-//   - Single-frame size bounds pre-validated.
-//   - opts.Last → stream state already CAS'd to streamWriteDone
-//     (semantic transition happens-before the upper-layer return).
-//   - NO send-quota pre-reserved. The writer's processProtoEntry
-//     does the CAS reservation under its own context.
+//   - protoBytes is the exact output of protobuf.Marshal(msg) for
+//     the message the caller wants on the wire — the writer will NOT
+//     re-marshal. len(protoBytes) is the gRPC LPM length the
+//     receiver's flow-control accounting expects.
+//   - Single-frame size bounds pre-validated; the caller is
+//     responsible for falling back to the chunked whole-message
+//     path for oversize messages.
+//   - opts.Last → stream state already CAS'd to streamWriteDone.
+//   - NO send-quota pre-reserved (writer's processProtoEntry does
+//     the CAS reservation under its own ownership).
+//
+// On success the protoBytes slice is owned by the writer until the
+// entry is fully drained; the caller MUST NOT mutate or pool-
+// release it. On ErrConnClosing the caller owns the slice again.
 //
 // Errors: returns ErrConnClosing if the chan is full or the writer
 // is closed. The frameWriterQueueSize=2048 buffer makes "full"
@@ -1060,13 +1138,13 @@ func (w *shmFrameWriter) discardDeferredTrailer(sid uint32, s *Stream) {
 // guaranteed to be processed (or silently dropped on stream/
 // transport close, both of which the upper layer observes via the
 // stream state machine).
-func (w *shmFrameWriter) enqueueProtoAsync(ctx context.Context, streamPtr *Stream, fh FrameHeader, msg proto.Message, pSize int) error {
+func (w *shmFrameWriter) enqueueProtoBytesAsync(ctx context.Context, streamPtr *Stream, fh FrameHeader, protoBytes []byte) error {
 	entry := frameEntry{
-		ctx:       ctx,
-		fh:        fh,
-		streamPtr: streamPtr,
-		protoMsg:  msg,
-		protoSize: pSize,
+		ctx:        ctx,
+		fh:         fh,
+		streamPtr:  streamPtr,
+		protoBytes: protoBytes,
+		protoSize:  len(protoBytes),
 	}
 	if !w.trySend(entry) {
 		return ErrConnClosing
@@ -1428,8 +1506,17 @@ func (w *shmFrameWriter) retryDeferredProto(sid uint32, queue []frameEntry) {
 			// revisit on the next wuRetryWake.
 			break
 		}
-		err := writeProtoToRingH2Blocking(entry.ctx, w.tx, sid,
-			entry.protoMsg, entry.protoSize, entry.fh.Flags)
+		// Prefer the bytes path when the entry was pre-marshalled
+		// (the standard async fallback path). See processProtoEntry
+		// for the full rationale.
+		var err error
+		if entry.protoBytes != nil {
+			err = writeProtoBytesToRingH2Blocking(entry.ctx, w.tx, sid,
+				entry.protoBytes, entry.fh.Flags)
+		} else {
+			err = writeProtoToRingH2Blocking(entry.ctx, w.tx, sid,
+				entry.protoMsg, entry.protoSize, entry.fh.Flags)
+		}
 		if err != nil {
 			// Refund and tear down; subsequent senders see
 			// ErrConnClosing via t.closed.Load(). Break out: a
@@ -1486,11 +1573,12 @@ func (w *shmFrameWriter) retryDeferredProto(sid uint32, queue []frameEntry) {
 // Returns false if the writer has been closed.
 func (w *shmFrameWriter) trySend(entry frameEntry) bool {
 	w.closeMu.RLock()
-	defer w.closeMu.RUnlock()
 	if w.closed.Load() {
+		w.closeMu.RUnlock()
 		return false
 	}
 	w.ch <- entry
+	w.closeMu.RUnlock()
 	return true
 }
 
@@ -1628,14 +1716,16 @@ func (w *shmFrameWriter) enqueueOrInlineNonBlocking(entry frameEntry) error {
 // deadlock if the channel is full (writer goroutine stuck on ring write).
 func (w *shmFrameWriter) tryEnqueueNonBlocking(entry frameEntry) bool {
 	w.closeMu.RLock()
-	defer w.closeMu.RUnlock()
 	if w.closed.Load() {
+		w.closeMu.RUnlock()
 		return false
 	}
 	select {
 	case w.ch <- entry:
+		w.closeMu.RUnlock()
 		return true
 	default:
+		w.closeMu.RUnlock()
 		return false
 	}
 }
@@ -1643,9 +1733,9 @@ func (w *shmFrameWriter) tryEnqueueNonBlocking(entry frameEntry) bool {
 // enqueue submits a frame for asynchronous writing. Returns ErrConnClosing
 // if the writer has been closed or is racing with close.
 func (w *shmFrameWriter) enqueue(entry frameEntry) error {
-	if w.closed.Load() {
-		return ErrConnClosing
-	}
+	// trySend re-checks `w.closed` under closeMu.RLock (the authoritative
+	// close-race gate). Skipping the duplicate fast-path load here is
+	// equivalent and avoids one atomic load per enqueue.
 	if !w.trySend(entry) {
 		return ErrConnClosing
 	}
@@ -1669,6 +1759,7 @@ func (w *shmFrameWriter) enqueueAndWait(entry frameEntry) error {
 		return ErrConnClosing
 	}
 	if w.inlineMu.TryLock() {
+		atomic.AddUint64(&shmEnqueueWaitInline, 1)
 		var err error
 		if entry.data != nil {
 			err = writeFrameBuffers(entry.ctx, w.tx, entry.fh, entry.hdr, entry.data)
@@ -1682,6 +1773,7 @@ func (w *shmFrameWriter) enqueueAndWait(entry frameEntry) error {
 	w.closeMu.RUnlock()
 
 	// Slow path: writer goroutine is busy, enqueue to channel.
+	atomic.AddUint64(&shmEnqueueWaitAsync, 1)
 	entry.doneCh = getDoneCh()
 	if !w.trySend(entry) {
 		putDoneCh(entry.doneCh)

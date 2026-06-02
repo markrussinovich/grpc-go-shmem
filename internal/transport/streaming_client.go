@@ -47,6 +47,9 @@ type ShmStreamingClient struct {
 
 	readerOnce sync.Once
 	readerDone chan struct{}
+	// readerStarted gates the Close()-side wait on readerDone. See
+	// client.go for the full rationale.
+	readerStarted atomic.Bool
 	closed     atomic.Bool
 }
 
@@ -69,6 +72,14 @@ type StreamingClientStream struct {
 	// Send coordination
 	sendQueue  chan []byte // buffered queue for outgoing messages
 	senderDone chan struct{}
+	// sendMu serializes SendMsg's `case s.sendQueue <- payload:` send
+	// against CloseSend's `close(s.sendQueue)`. Without it, a SendMsg
+	// that has already passed the `sendDone.Load()` gate and is mid-
+	// select can race with CloseSend's CAS+close, causing
+	// "send on closed channel" panic. The mutex is held only across
+	// the small select / CAS+close critical sections; the blocking
+	// `<-senderDone` in CloseSend runs after release.
+	sendMu sync.Mutex
 
 	// Lifecycle
 	recvDone atomic.Bool // set when TRAILERS received
@@ -112,8 +123,12 @@ func (c *ShmStreamingClient) Close() error {
 	// Close rx ring to unblock reader
 	_ = c.rx.Close()
 
-	// Wait for reader to exit
-	<-c.readerDone
+	// Wait for reader to exit. BUG FIX (GPT-5.5 bug hunt): only wait
+	// if startReader was actually called — otherwise readerDone is
+	// never closed and Close hangs forever.
+	if c.readerStarted.Load() {
+		<-c.readerDone
+	}
 
 	// Close all active streams
 	c.streamsM.Lock()
@@ -128,19 +143,20 @@ func (c *ShmStreamingClient) Close() error {
 // startReader starts the event-driven frame reader
 func (c *ShmStreamingClient) startReader() {
 	c.readerOnce.Do(func() {
+		c.readerStarted.Store(true)
 		go func() {
 			defer close(c.readerDone)
 			ctx := context.Background()
 
-			log.Printf("StreamingClient: reader goroutine starting")
+			shmDebugf("StreamingClient: reader goroutine starting")
 			for !c.closed.Load() {
 				fh, payload, err := readFrame(ctx, c.rx)
 				if err != nil {
 					if errors.Is(err, ErrRingClosed) || errors.Is(err, io.EOF) {
-						log.Printf("StreamingClient: reader exiting due to closed ring")
+						shmDebugf("StreamingClient: reader exiting due to closed ring")
 						return
 					}
-					log.Printf("StreamingClient: reader error: %v", err)
+					shmDebugf("StreamingClient: reader error: %v", err)
 					continue
 				}
 
@@ -160,12 +176,12 @@ func (c *ShmStreamingClient) startReader() {
 					_ = writeFrame(ctx, c.tx, FrameHeader{StreamID: fh.StreamID, Type: FrameTypePONG}, payload)
 					c.writeMu.Unlock()
 				case FrameTypeGOAWAY:
-					log.Printf("StreamingClient: received GOAWAY")
+					shmDebugf("StreamingClient: received GOAWAY")
 					// TODO: handle graceful shutdown
 				case FrameTypeCANCEL:
 					c.dispatchCancel(fh.StreamID)
 				default:
-					log.Printf("StreamingClient: unknown frame type %d", fh.Type)
+					shmDebugf("StreamingClient: unknown frame type %d", fh.Type)
 				}
 			}
 		}()
@@ -265,7 +281,7 @@ func (c *ShmStreamingClient) runStreamSender(s *StreamingClientStream) {
 				Type:     FrameTypeMESSAGE,
 			}
 			if err := c.writeFrameSafe(s.ctx, fh, wrapped); err != nil {
-				log.Printf("StreamingClient: failed to send message on stream %d: %v", s.id, err)
+				shmDebugf("StreamingClient: failed to send message on stream %d: %v", s.id, err)
 				s.closeWithError(err)
 				return
 			}
@@ -313,7 +329,7 @@ func (c *ShmStreamingClient) dispatchMessage(id uint32, p []byte) {
 	// present here). If the frame is malformed (too short) drop it.
 	body, ok := stripLPMHeader(p)
 	if !ok {
-		log.Printf("StreamingClient: dropping malformed MESSAGE on stream %d (len=%d)", id, len(p))
+		shmDebugf("StreamingClient: dropping malformed MESSAGE on stream %d (len=%d)", id, len(p))
 		return
 	}
 	// Make a copy since the payload buffer may be reused
@@ -366,6 +382,8 @@ func (c *ShmStreamingClient) dispatchCancel(id uint32) {
 
 // SendMsg sends a message on the stream (non-blocking, queued).
 func (s *StreamingClientStream) SendMsg(payload []byte) error {
+	s.sendMu.Lock()
+	defer s.sendMu.Unlock()
 	if s.sendDone.Load() {
 		return errors.New("send already closed")
 	}
@@ -381,14 +399,18 @@ func (s *StreamingClientStream) SendMsg(payload []byte) error {
 
 // CloseSend signals that no more messages will be sent.
 func (s *StreamingClientStream) CloseSend() error {
+	s.sendMu.Lock()
 	if !s.sendDone.CompareAndSwap(false, true) {
+		s.sendMu.Unlock()
 		return errors.New("send already closed")
 	}
 	if s.client == nil {
+		s.sendMu.Unlock()
 		return errors.New("client is nil")
 	}
 	// Preserve ordering: ensure all queued messages are sent before half-closing.
 	close(s.sendQueue)
+	s.sendMu.Unlock()
 	<-s.senderDone
 	fh := FrameHeader{StreamID: s.id, Type: FrameTypeHALFCLOSE}
 	return s.client.writeFrameSafe(s.ctx, fh, nil)

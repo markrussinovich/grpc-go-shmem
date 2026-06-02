@@ -533,7 +533,7 @@ func TestShmInvalidHeaderField(t *testing.T) {
 			return
 		}
 		if fh.Type == FrameTypeTRAILERS {
-			tr, err := decodeTrailers(payload)
+			tr, err := takeOrDecodeTrailers(clientRx.h2Decoder(), payload)
 			if err == nil && tr.GRPCStatusCode != uint32(codes.OK) {
 				t.Logf("Server correctly rejected with status: %v", codes.Code(tr.GRPCStatusCode))
 			}

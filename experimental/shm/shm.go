@@ -43,6 +43,27 @@ import (
 
 var logger = grpclog.Component("shm")
 
+// DialOptions contains transport-level dial options (segment size,
+// ring sizes, keepalive, security handshaker, etc.).
+//
+// This type is an alias for the internal transport.DialOptions so the
+// public API surface does not name an internal/ package directly.
+// The underlying struct layout is shared with the internal type, so
+// existing field access (Opts.SegmentSize = ...) continues to work.
+//
+// Notice: This API is EXPERIMENTAL and may be changed or removed in
+// a later release. Concrete fields may move into a smaller, public-
+// API-stable struct in a future revision.
+type DialOptions = transport.DialOptions
+
+// DefaultDialOptions returns sensible defaults for dialing.
+//
+// Notice: This API is EXPERIMENTAL and may be changed or removed in
+// a later release.
+func DefaultDialOptions() *DialOptions {
+	return transport.DefaultDialOptions()
+}
+
 // Config contains configuration options for the shared-memory transport.
 //
 // Notice: This API is EXPERIMENTAL and may be changed or removed in a
@@ -50,7 +71,7 @@ var logger = grpclog.Component("shm")
 type Config struct {
 	// DialOptions contains shm-specific dial options (segment size, ring
 	// sizes, etc.).
-	DialOptions *transport.DialOptions
+	DialOptions *DialOptions
 
 	// FallbackEnabled allows falling back to TCP if shm connection fails.
 	// Default is true.
@@ -80,7 +101,7 @@ type Config struct {
 // later release.
 func DefaultConfig() *Config {
 	return &Config{
-		DialOptions:         transport.DefaultDialOptions(),
+		DialOptions:         DefaultDialOptions(),
 		FallbackEnabled:     true,
 		AllowMixedTransport: true,
 	}
@@ -113,7 +134,7 @@ func WithTransport() grpc.DialOption {
 //
 // Notice: This API is EXPERIMENTAL and may be changed or removed in a
 // later release.
-func WithTransportAndOptions(opts *transport.DialOptions) grpc.DialOption {
+func WithTransportAndOptions(opts *DialOptions) grpc.DialOption {
 	cfg := DefaultConfig()
 	if opts != nil {
 		cfg.DialOptions = opts
@@ -132,7 +153,7 @@ func WithTransportConfig(cfg *Config) grpc.DialOption {
 		cfg = DefaultConfig()
 	}
 	if cfg.DialOptions == nil {
-		cfg.DialOptions = transport.DefaultDialOptions()
+		cfg.DialOptions = DefaultDialOptions()
 	}
 	cfg.DialOptions.SingleStreamMode = cfg.SingleStreamMode
 

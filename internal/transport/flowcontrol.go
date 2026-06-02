@@ -117,13 +117,15 @@ func (f *trInFlow) newLimit(n uint32) uint32 {
 // effectiveWindowSize counter.
 func (f *trInFlow) onData(n uint32) uint32 {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.unacked += n
 	if f.unacked < f.limit/4 {
 		f.updateEffectiveWindowSizeLocked()
+		f.mu.Unlock()
 		return 0
 	}
-	return f.resetLocked()
+	r := f.resetLocked()
+	f.mu.Unlock()
+	return r
 }
 
 // reset returns the current unacked bytes and zeroes the counter.
@@ -258,18 +260,50 @@ func (f *inFlow) maybeAdjust(n uint32) uint32 {
 // balanced.
 //
 // Returns the additional credit (bytes) to emit as a stream-level
-// WINDOW_UPDATE, or 0 if existing capacity already admits the LPM.
+// WINDOW_UPDATE, or 0 if existing capacity already admits the LPM
+// OR backpressure should fire (receiver already buffering too much
+// pending data — sender MUST wait for the app to drain).
+//
+// Backpressure cap: we will not pre-credit beyond what would leave
+// the total receiver-buffered bytes (pendingData + pendingUpdate +
+// this LPM's `n`) exceeding `n + limit` — that is, "1 LPM in
+// flight + 1 stream-window's worth of slack". When an app stops
+// draining, pendingData accumulates; once it reaches the cap, this
+// function returns 0, no WU is emitted, the sender's send-quota is
+// not replenished, and Write parks correctly (HTTP/2-correct
+// backpressure semantics).
+//
+// Without this cap, a slow-reading app on an unbounded-Send client
+// would let delta grow to ~2 GiB (maxWindowSize) before saturation;
+// at saturation onData's `pendingData + n > limit + delta` check
+// trips and the server cancels the stream with
+// "received N-bytes data exceeding the limit M bytes" — exactly
+// the bug demo agents have observed under client-streaming with
+// `response_size=0` and `payload >= window`.
 func (f *inFlow) maybeAdjustAdditive(n uint32) uint32 {
 	if n > uint32(math.MaxInt32) {
 		n = uint32(math.MaxInt32)
 	}
 	f.mu.Lock()
-	defer f.mu.Unlock()
+	// Backpressure gate: refuse pre-credit if total outstanding
+	// receiver-buffered bytes (pendingData + pendingUpdate) already
+	// exceeds f.limit. The +n on both sides of an earlier formulation
+	// cancelled algebraically; the cap is just "buffered <= limit", i.e.
+	// "1 window's worth of slack can sit ahead of consumption before a
+	// pending LPM is refused". Matches HTTP/2's "1 message in transit,
+	// 1 ready to read" depth model — the new LPM (n bytes) can be
+	// admitted only when the buffer has not yet absorbed a full window
+	// of unread bytes.
+	if int64(f.pendingData)+int64(f.pendingUpdate) > int64(f.limit) {
+		f.mu.Unlock()
+		return 0
+	}
 	// avail is the remaining receive capacity within current
 	// enforcement bounds: limit + delta - (pendingData + pendingUpdate).
 	avail := int64(f.limit) + int64(f.delta) - int64(f.pendingData) - int64(f.pendingUpdate)
 	need := int64(n) - avail
 	if need <= 0 {
+		f.mu.Unlock()
 		return 0
 	}
 	// Cap so f.limit + f.delta does not exceed HTTP/2 31-bit window.
@@ -278,23 +312,26 @@ func (f *inFlow) maybeAdjustAdditive(n uint32) uint32 {
 		need = headroom
 	}
 	if need <= 0 {
+		f.mu.Unlock()
 		return 0
 	}
 	f.delta += uint32(need)
+	f.mu.Unlock()
 	return uint32(need)
 }
 
 // onData is invoked when some data frame is received. It updates pendingData.
 func (f *inFlow) onData(n uint32) error {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 
 	f.pendingData += n
 	if f.pendingData+f.pendingUpdate > f.limit+f.delta {
 		limit := f.limit
 		rcvd := f.pendingData + f.pendingUpdate
+		f.mu.Unlock()
 		return fmt.Errorf("received %d-bytes data exceeding the limit %d bytes", rcvd, limit)
 	}
+	f.mu.Unlock()
 	return nil
 }
 
@@ -302,9 +339,9 @@ func (f *inFlow) onData(n uint32) error {
 // to be sent to the peer.
 func (f *inFlow) onRead(n uint32) uint32 {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 
 	if f.pendingData == 0 {
+		f.mu.Unlock()
 		return 0
 	}
 	f.pendingData -= n
@@ -319,7 +356,9 @@ func (f *inFlow) onRead(n uint32) uint32 {
 	if f.pendingUpdate >= f.limit/4 {
 		wu := f.pendingUpdate
 		f.pendingUpdate = 0
+		f.mu.Unlock()
 		return wu
 	}
+	f.mu.Unlock()
 	return 0
 }
