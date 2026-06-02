@@ -1,0 +1,53 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <ManagePackageVersionsCentrally>false</ManagePackageVersionsCentrally>
+    <SignAssembly>false</SignAssembly>
+    <AssemblyName>ShmDemo.Engine</AssemblyName>
+    <RootNamespace>ShmDemo.Engine</RootNamespace>
+    <NoWarn>CA1416;CA1822;CA2007;CA2016</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Protobuf Include="Proto\benchmark.proto" GrpcServices="Both" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Google.Protobuf" Version="3.31.1" />
+    <PackageReference Include="Grpc.AspNetCore" Version="2.70.0" />
+    <PackageReference Include="Grpc.Tools" Version="2.70.0" PrivateAssets="All" />
+  </ItemGroup>
+
+  <!-- Reference the local shared-memory transport library (the same
+       grpc-dotnet-shm fork the .NET SHM benchmarks use). That fork is a
+       SEPARATE repository, so its location is a parameter:
+
+         GrpcDotnetShmDir  - path to the grpc-dotnet-shm checkout.
+
+       It defaults to a sibling checkout next to this grpc-go-shmem repo
+       (../../../../grpc-dotnet-shm), which is the layout the build script
+       sets up. Override it for a custom location:
+
+         dotnet publish ... -p:GrpcDotnetShmDir=D:\path\to\grpc-dotnet-shm
+
+       The Go demo never needs this; only the optional .NET engine does. -->
+  <PropertyGroup>
+    <GrpcDotnetShmDir Condition="'$(GrpcDotnetShmDir)' == ''">$(MSBuildThisFileDirectory)..\..\..\..\grpc-dotnet-shm</GrpcDotnetShmDir>
+    <_GrpcNetShmProj>$(GrpcDotnetShmDir)\src\Grpc.Net.SharedMemory\Grpc.Net.SharedMemory.csproj</_GrpcNetShmProj>
+  </PropertyGroup>
+
+  <Target Name="CheckGrpcDotnetShm" BeforeTargets="ResolveProjectReferences">
+    <Error Condition="!Exists('$(_GrpcNetShmProj)')"
+           Text="grpc-dotnet-shm not found at '$(GrpcDotnetShmDir)'. Clone it next to grpc-go-shmem, or pass -p:GrpcDotnetShmDir=&lt;path&gt;. See shm-demo/README.md." />
+  </Target>
+
+  <ItemGroup>
+    <ProjectReference Include="$(_GrpcNetShmProj)">
+      <SetTargetFramework>TargetFramework=net10.0</SetTargetFramework>
+    </ProjectReference>
+  </ItemGroup>
+</Project>

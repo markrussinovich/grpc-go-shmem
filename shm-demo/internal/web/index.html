@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>gRPC Transport Showdown</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div class="app">
+    <header class="hero">
+      <h1>gRPC Transport Showdown</h1>
+      <p class="subtitle">Same code. One option changes. <span class="accent">TCP → UDS → Shared Memory.</span></p>
+    </header>
+
+    <section class="controls">
+      <div class="seg" id="langToggle" role="tablist" aria-label="Language">
+        <button class="seg-btn active" data-lang="go">Go</button>
+        <button class="seg-btn" data-lang="dotnet">.NET</button>
+      </div>
+
+      <label class="field">
+        <span>Payload</span>
+        <select id="payload">
+          <option value="1024">1 KB</option>
+          <option value="4096" selected>4 KB</option>
+          <option value="65536">64 KB</option>
+          <option value="262144">256 KB</option>
+          <option value="1048576">1 MB</option>
+          <option value="4194304">4 MB</option>
+          <option value="16777216">16 MB</option>
+          <option value="67108864">64 MB</option>
+          <option value="268435456">256 MB</option>
+        </select>
+      </label>
+
+      <label class="field">
+        <span>Profile</span>
+        <select id="profile">
+          <option value="max" selected>Highest performance</option>
+          <option value="fair">Fair (H2 defaults)</option>
+        </select>
+      </label>
+
+      <button id="runBtn" class="btn primary">Run benchmark</button>
+      <button id="resetBtn" class="btn ghost">Reset</button>
+
+      <div class="status" id="status">Ready.</div>
+    </section>
+
+    <section class="notes">
+      <div class="note">
+        <span class="note-tag">Ring buffer</span>
+        <p>
+          SHM uses a <strong>64 MiB</strong> ring per direction. Large payloads
+          (e.g. 256 MB) stream through it in frames — a message never has to fit
+          all at once.
+        </p>
+      </div>
+    </section>
+
+    <section class="charts">
+      <div class="card" data-metric="latency">
+        <div class="card-head">
+          <h2>Latency <span class="tag">P50</span></h2>
+          <span class="hint">round-trip · lower is better</span>
+        </div>
+        <div class="bars" id="bars-latency"></div>
+      </div>
+
+      <div class="card" data-metric="throughput">
+        <div class="card-head">
+          <h2>Throughput</h2>
+          <span class="hint">single stream · higher is better</span>
+        </div>
+        <div class="bars" id="bars-throughput"></div>
+      </div>
+
+      <div class="card" data-metric="cpu">
+        <div class="card-head">
+          <h2>CPU cost</h2>
+          <span class="hint">CPU-s / 1M msgs · lower is better</span>
+        </div>
+        <div class="bars" id="bars-cpu"></div>
+      </div>
+    </section>
+
+    <section class="codepanel">
+      <h2>The only thing that changes</h2>
+      <pre id="codeBlock"></pre>
+    </section>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
