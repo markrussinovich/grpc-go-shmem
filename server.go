@@ -53,6 +53,7 @@ import (
 	"google.golang.org/grpc/stats"
 	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/tap"
+	transportserver "google.golang.org/grpc/transport/server"
 	protobuf "google.golang.org/protobuf/proto"
 )
 
@@ -1029,6 +1030,22 @@ func (s *Server) newHTTP2Transport(c net.Conn) transport.ServerTransport {
 		BufferPool:            s.opts.bufferPool,
 		StaticWindowSize:      s.opts.staticWindowSize,
 	}
+	// Pluggable transport selection (L37-style, server side): if the accepted
+	// connection names a registered transport type, build it via the exported
+	// registry, symmetric to client-side selection by resolver.Address.TransportType.
+	if tn, ok := c.(interface{ TransportType() string }); ok {
+		if b := transportserver.Get(tn.TransportType()); b != nil {
+			st, err := b.Build(c, transportserver.BuildOptions{Config: config})
+			if err != nil {
+				s.mu.Lock()
+				s.errorf("pluggable transport Build(%q) failed: %v", c.RemoteAddr(), err)
+				s.mu.Unlock()
+				c.Close()
+				return nil
+			}
+			return st
+		}
+	}
 	st, err := transport.NewServerTransport(c, config)
 	if err != nil {
 		s.mu.Lock()
@@ -1068,7 +1085,7 @@ func (s *Server) serveStreams(ctx context.Context, st transport.ServerTransport,
 	}()
 
 	streamQuota := newHandlerQuota(s.opts.maxConcurrentStreams)
-	st.HandleStreams(ctx, func(stream *transport.ServerStream) {
+	st.HandleStreams(ctx, func(stream transport.ServerStreamIface) {
 		s.handlersWG.Add(1)
 		streamQuota.acquire()
 		f := func() {
@@ -1184,7 +1201,7 @@ func (s *Server) incrCallsFailed() {
 	s.channelz.ServerMetrics.CallsFailed.Add(1)
 }
 
-func (s *Server) sendResponse(ctx context.Context, stream *transport.ServerStream, msg any, cp Compressor, opts *transport.WriteOptions, comp encoding.Compressor) error {
+func (s *Server) sendResponse(ctx context.Context, stream transport.ServerStreamIface, msg any, cp Compressor, opts *transport.WriteOptions, comp encoding.Compressor) error {
 	// Zero-copy fast path: when no compression is configured, the codec is
 	// the built-in gRPC proto codec, and the message is a proto.Message
 	// (not an adapted v1 message), serialize directly into the ring buffer.
@@ -1208,7 +1225,7 @@ func (s *Server) sendResponse(ctx context.Context, stream *transport.ServerStrea
 				if pSize > s.opts.maxSendMessageSize {
 					return status.Errorf(codes.ResourceExhausted, "grpc: trying to send message larger than max (%d vs. %d)", pSize, s.opts.maxSendMessageSize)
 				}
-				if handled, err := stream.WriteProto(msg, opts); handled {
+				if handled, err := tryServerWriteProto(stream, msg, opts); handled {
 					if err != nil {
 						return err
 					}
@@ -1292,7 +1309,7 @@ func getChainUnaryHandler(interceptors []UnaryServerInterceptor, curr int, info 
 	}
 }
 
-func (s *Server) processUnaryRPC(ctx context.Context, stream *transport.ServerStream, info *serviceInfo, md *MethodDesc, trInfo *traceInfo) (err error) {
+func (s *Server) processUnaryRPC(ctx context.Context, stream transport.ServerStreamIface, info *serviceInfo, md *MethodDesc, trInfo *traceInfo) (err error) {
 	sh := s.statsHandler
 	if sh != nil || trInfo != nil || channelz.IsOn() {
 		if channelz.IsOn() {
@@ -1622,7 +1639,7 @@ func getChainStreamHandler(interceptors []StreamServerInterceptor, curr int, inf
 	}
 }
 
-func (s *Server) processStreamingRPC(ctx context.Context, stream *transport.ServerStream, info *serviceInfo, sd *StreamDesc, trInfo *traceInfo) (err error) {
+func (s *Server) processStreamingRPC(ctx context.Context, stream transport.ServerStreamIface, info *serviceInfo, sd *StreamDesc, trInfo *traceInfo) (err error) {
 	if channelz.IsOn() {
 		s.incrCallsStarted()
 	}
@@ -1814,7 +1831,7 @@ func (s *Server) processStreamingRPC(ctx context.Context, stream *transport.Serv
 	return ss.s.WriteStatus(statusOK)
 }
 
-func (s *Server) handleMalformedMethodName(stream *transport.ServerStream, ti *traceInfo) {
+func (s *Server) handleMalformedMethodName(stream transport.ServerStreamIface, ti *traceInfo) {
 	if ti != nil {
 		ti.tr.LazyLog(&fmtStringer{"Malformed method name %q", []any{stream.Method()}}, true)
 		ti.tr.SetError()
@@ -1832,7 +1849,7 @@ func (s *Server) handleMalformedMethodName(stream *transport.ServerStream, ti *t
 	}
 }
 
-func (s *Server) handleStream(t transport.ServerTransport, stream *transport.ServerStream) {
+func (s *Server) handleStream(t transport.ServerTransport, stream transport.ServerStreamIface) {
 	ctx := stream.Context()
 	ctx = contextWithServer(ctx, s)
 	var ti *traceInfo
@@ -2158,6 +2175,16 @@ func SendHeader(ctx context.Context, md metadata.MD) error {
 	return nil
 }
 
+// compressorCapableStream is the minimal stream surface the server-side
+// compressor helpers (SetSendCompressor / ClientSupportedCompressors) need from
+// the stream stored in the handler context. Asserting this narrow interface
+// (rather than the concrete *transport.ServerStream) lets the helpers work for
+// both the built-in transports and a pluggable transport's wrapped stream.
+type compressorCapableStream interface {
+	ClientAdvertisedCompressors() []string
+	SetSendCompress(string) error
+}
+
 // SetSendCompressor sets a compressor for outbound messages from the server.
 // It must not be called after any event that causes headers to be sent
 // (see ServerStream.SetHeader for the complete list). Provided compressor is
@@ -2182,7 +2209,7 @@ func SendHeader(ctx context.Context, md metadata.MD) error {
 // Notice: This function is EXPERIMENTAL and may be changed or removed in a
 // later release.
 func SetSendCompressor(ctx context.Context, name string) error {
-	stream, ok := ServerTransportStreamFromContext(ctx).(*transport.ServerStream)
+	stream, ok := ServerTransportStreamFromContext(ctx).(compressorCapableStream)
 	if !ok || stream == nil {
 		return fmt.Errorf("failed to fetch the stream from the given context")
 	}
@@ -2204,7 +2231,7 @@ func SetSendCompressor(ctx context.Context, name string) error {
 // Notice: This function is EXPERIMENTAL and may be changed or removed in a
 // later release.
 func ClientSupportedCompressors(ctx context.Context) ([]string, error) {
-	stream, ok := ServerTransportStreamFromContext(ctx).(*transport.ServerStream)
+	stream, ok := ServerTransportStreamFromContext(ctx).(compressorCapableStream)
 	if !ok || stream == nil {
 		return nil, fmt.Errorf("failed to fetch the stream from the given context %v", ctx)
 	}

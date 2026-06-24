@@ -297,7 +297,8 @@ func TestH2ServerTransport_HeadersEndStream_HandlerSeesEOF(t *testing.T) {
 	}
 	resCh := make(chan readResult, 1)
 
-	go st.HandleStreams(ctx, func(s *ServerStream) {
+	go st.HandleStreams(ctx, func(si ServerStreamIface) {
+		s := si.(*ServerStream)
 		// Single Read should return io.EOF immediately because
 		// HEADERS+END_STREAM signals "no request payload, half-close
 		// now". A pre-fix transport blocks here until ctx expires.

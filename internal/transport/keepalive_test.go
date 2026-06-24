@@ -68,7 +68,8 @@ func (s) TestMaxConnectionIdle(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	defer cancel()
-	stream, err := client.NewStream(ctx, &CallHdr{}, nil)
+	streamI, err := client.NewStream(ctx, &CallHdr{}, nil)
+	stream, _ := streamI.(*ClientStream)
 	if err != nil {
 		t.Fatalf("client.NewStream() failed: %v", err)
 	}
@@ -747,7 +748,8 @@ func (s) TestTCPUserTimeout(t *testing.T) {
 
 		ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 		defer cancel()
-		stream, err := client.NewStream(ctx, &CallHdr{}, nil)
+		streamI, err := client.NewStream(ctx, &CallHdr{}, nil)
+		stream, _ := streamI.(*ClientStream)
 		if err != nil {
 			t.Fatalf("client.NewStream() failed: %v", err)
 		}
@@ -814,7 +816,8 @@ func makeTLSCreds(t *testing.T, certPath, keyPath, rootsPath string) credentials
 func checkForHealthyStream(client *http2Client) error {
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	defer cancel()
-	stream, err := client.NewStream(ctx, &CallHdr{}, nil)
+	streamI, err := client.NewStream(ctx, &CallHdr{}, nil)
+	stream, _ := streamI.(*ClientStream)
 	if err != nil {
 		return err
 	}

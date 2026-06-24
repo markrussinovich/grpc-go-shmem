@@ -1412,7 +1412,7 @@ func (t *ShmClientTransport) GracefulClose() {
 }
 
 // NewStream creates a Stream for an RPC.
-func (t *ShmClientTransport) NewStream(ctx context.Context, callHdr *CallHdr, handler stats.Handler) (*ClientStream, error) {
+func (t *ShmClientTransport) NewStream(ctx context.Context, callHdr *CallHdr, handler stats.Handler) (ClientStreamIface, error) {
 	if t.closed.Load() || t.draining.Load() {
 		return nil, &NewStreamError{Err: ErrConnClosing, AllowTransparentRetry: true}
 	}

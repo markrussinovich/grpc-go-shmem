@@ -83,7 +83,7 @@ type ShmServerTransport struct {
 
 	// Stream management
 	streams    map[uint32]*ServerStream
-	handleFunc func(*ServerStream)
+	handleFunc func(ServerStreamIface)
 	maxStreams uint32
 
 	// cachedStream caches the only active stream pointer for single-stream
@@ -643,7 +643,7 @@ func NewShmServerTransport(segment *Segment, localAddr, remoteAddr net.Addr) (*S
 
 // HandleStreams receives incoming streams using the given handler.
 // This is typically run in a separate goroutine.
-func (t *ShmServerTransport) HandleStreams(ctx context.Context, handle func(*ServerStream)) {
+func (t *ShmServerTransport) HandleStreams(ctx context.Context, handle func(ServerStreamIface)) {
 	t.mu.Lock()
 	if t.closed.Load() {
 		t.mu.Unlock()

@@ -526,7 +526,8 @@ func TestShmContextCanceledOnClose(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	started := make(chan struct{}, 1)
-	go serverTransport.HandleStreams(ctx, func(s *ServerStream) {
+	go serverTransport.HandleStreams(ctx, func(si ServerStreamIface) {
+		s := si.(*ServerStream)
 		started <- struct{}{}
 		<-s.Context().Done()
 		ctxCanceled.Store(true)
@@ -544,10 +545,11 @@ func TestShmContextCanceledOnClose(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewStream failed: %v", err)
 	}
+	csC := cs.(*ClientStream)
 
 	// Send initial data
 	hdr := make([]byte, 5)
-	if err := clientTransport.write(cs, hdr, mem.BufferSlice{}, &WriteOptions{}); err != nil {
+	if err := clientTransport.write(csC, hdr, mem.BufferSlice{}, &WriteOptions{}); err != nil {
 		t.Fatalf("write error: %v", err)
 	}
 
@@ -602,7 +604,8 @@ func TestShmGracefulClose(t *testing.T) {
 
 	// Start server stream handler: echo one message, then wait for client
 	// half-close and send OK trailers.
-	go serverTransport.HandleStreams(testCtx, func(s *ServerStream) {
+	go serverTransport.HandleStreams(testCtx, func(si ServerStreamIface) {
+		s := si.(*ServerStream)
 		// Signal that the server handler is running.
 		select {
 		case serverStarted <- struct{}{}:
@@ -645,6 +648,7 @@ func TestShmGracefulClose(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewStream(_, _) = _, %v, want _, <nil>", err)
 	}
+	csC := cs.(*ClientStream)
 
 	// Confirm basic stream functionality.
 	msg := make([]byte, 1024)
@@ -663,12 +667,12 @@ func TestShmGracefulClose(t *testing.T) {
 		t.Fatal("timeout waiting for server handler to start")
 	}
 
-	if _, err := cs.readTo(incomingHeader); err != nil {
+	if _, err := csC.readTo(incomingHeader); err != nil {
 		t.Fatalf("Error while reading: %v", err)
 	}
 	sz := binary.BigEndian.Uint32(incomingHeader[1:])
 	recvMsg := make([]byte, int(sz))
-	if _, err := cs.readTo(recvMsg); err != nil {
+	if _, err := csC.readTo(recvMsg); err != nil {
 		t.Fatalf("Error while reading: %v", err)
 	}
 
@@ -692,7 +696,7 @@ func TestShmGracefulClose(t *testing.T) {
 
 	// Confirm existing stream can still complete.
 	cs.Write(nil, nil, &WriteOptions{Last: true})
-	if _, err := cs.readTo(incomingHeader); err != io.EOF {
+	if _, err := csC.readTo(incomingHeader); err != io.EOF {
 		t.Fatalf("Client expected EOF from the server. Got: %v", err)
 	}
 
@@ -738,7 +742,8 @@ func TestShmMaxStreams(t *testing.T) {
 	allowFinishFirst := make(chan struct{})
 	firstStarted := make(chan struct{})
 	var streamCount atomic.Uint32
-	go serverTransport.HandleStreams(testCtx, func(s *ServerStream) {
+	go serverTransport.HandleStreams(testCtx, func(si ServerStreamIface) {
+		s := si.(*ServerStream)
 		idx := streamCount.Add(1)
 		if idx == 1 {
 			close(firstStarted)
@@ -833,7 +838,8 @@ func TestShmServerHandlesClientGoAwayDraining(t *testing.T) {
 	defer testCancel()
 
 	// Start server stream handler: respond OK immediately.
-	go serverTransport.HandleStreams(testCtx, func(s *ServerStream) {
+	go serverTransport.HandleStreams(testCtx, func(si ServerStreamIface) {
+		s := si.(*ServerStream)
 		_ = serverTransport.writeHeader(s, metadata.MD{"content-type": []string{"application/grpc"}})
 		_ = serverTransport.writeStatus(s, status.New(codes.OK, ""))
 	})

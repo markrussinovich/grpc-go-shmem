@@ -421,7 +421,7 @@ func NewServerTransport(conn net.Conn, config *ServerConfig) (_ ServerTransport,
 
 // operateHeaders takes action on the decoded headers. Returns an error if fatal
 // error encountered and transport needs to close, otherwise returns nil.
-func (t *http2Server) operateHeaders(ctx context.Context, frame *http2.MetaHeadersFrame, handle func(*ServerStream)) error {
+func (t *http2Server) operateHeaders(ctx context.Context, frame *http2.MetaHeadersFrame, handle func(ServerStreamIface)) error {
 	// Acquire max stream ID lock for entire duration
 	t.maxStreamMu.Lock()
 	defer t.maxStreamMu.Unlock()
@@ -683,7 +683,7 @@ func (t *http2Server) operateHeaders(ctx context.Context, frame *http2.MetaHeade
 // HandleStreams receives incoming streams using the given handler. This is
 // typically run in a separate goroutine.
 // traceCtx attaches trace to ctx and returns the new context.
-func (t *http2Server) HandleStreams(ctx context.Context, handle func(*ServerStream)) {
+func (t *http2Server) HandleStreams(ctx context.Context, handle func(ServerStreamIface)) {
 	defer func() {
 		close(t.readerDone)
 		<-t.loopyWriterDone

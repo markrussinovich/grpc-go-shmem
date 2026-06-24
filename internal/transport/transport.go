@@ -794,7 +794,7 @@ type ClientTransport interface {
 	GracefulClose()
 
 	// NewStream creates a Stream for an RPC.
-	NewStream(ctx context.Context, callHdr *CallHdr, handler stats.Handler) (*ClientStream, error)
+	NewStream(ctx context.Context, callHdr *CallHdr, handler stats.Handler) (ClientStreamIface, error)
 
 	// Error returns a channel that is closed when some I/O error
 	// happens. Typically the caller should have a goroutine to monitor
@@ -824,7 +824,7 @@ type ClientTransport interface {
 // Write methods for a given Stream will be called serially.
 type ServerTransport interface {
 	// HandleStreams receives incoming streams using the given handler.
-	HandleStreams(context.Context, func(*ServerStream))
+	HandleStreams(context.Context, func(ServerStreamIface))
 
 	// Close tears down the transport. Once it is called, the transport
 	// should not be accessed any more. All the pending streams and their
