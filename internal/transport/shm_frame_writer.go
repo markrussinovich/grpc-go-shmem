@@ -29,7 +29,6 @@ import (
 	"sync/atomic"
 
 	"google.golang.org/grpc/mem"
-	"google.golang.org/protobuf/proto"
 )
 
 // shmFrameWriter provides a dedicated writer goroutine with an MPSC queue for
@@ -206,6 +205,17 @@ type shmFrameWriter struct {
 	// writeStatus contract). map zero-value is acceptable; lazy-
 	// allocated in newShmFrameWriter.
 	deferredTrailers map[uint32]frameEntry
+
+	// pendingEndStream holds a parked zero-length client half-close
+	// (END_STREAM, from CloseSend) that arrived while the stream still
+	// had DATA queued (a deferred whole-message in w.deferred or async
+	// proto entries in w.deferredProto). flushPendingEndStream emits it
+	// at the DATA-drain terminal once BOTH DATA queues for the stream
+	// are empty, so the peer never sees the half-close before the
+	// preceding DATA (gRPC per-stream message order). Sentinel pattern
+	// mirrors deferredTrailers; at most one per stream (gRPC's one-Last-
+	// per-stream contract). Lazy-allocated in newShmFrameWriter.
+	pendingEndStream map[uint32]frameEntry
 }
 
 // deferredMessage holds the partial state of a whole-message entry
@@ -282,23 +292,27 @@ type frameEntry struct {
 	streamPtr *Stream
 	isLast    bool
 
-	// ZC marshal in writeLoop.
+	// Async writeProto fallback: PRE-MARSHALLED proto body.
 	//
-	// When `protoMsg != nil`, this entry carries an UNMARSHALLED
-	// proto.Message that writeLoop should marshal DIRECTLY into a
-	// ring reservation (via writeProtoToRingH2Blocking), bypassing
-	// the upper-layer codec.Marshal allocation. Used as the queued
-	// fallback when (*ShmClientTransport|ShmServerTransport).writeProto's
-	// inlineMu.TryLock fails — even bailed senders still get ZC
-	// marshal via the writer goroutine instead of the
-	// tightBufferPool + chunked-write-vec copy path.
+	// When `protoBytes != nil`, this entry carries the already-
+	// serialized gRPC LPM proto body. The sender (ShmClient/
+	// ServerTransport.writeProto) marshals the proto.Message into a
+	// pooled buffer on its OWN SendMsg goroutine — so the live message
+	// is never retained across SendMsg, which would race an application
+	// that legally reuses the message per the grpc-go SendMsg contract
+	// — and the writer copies these bytes into a ring reservation via
+	// writeProtoBytesToRingH2Blocking. The buffer is owned by the writer
+	// once enqueued and returned to asyncProtoBufPool via
+	// putAsyncProtoBuf on every terminal path (written / errored /
+	// dropped). Used as the queued fallback when writeProto's
+	// inlineMu.TryLock fails, the quota CAS fails, or the stream already
+	// has async entries in flight.
 	//
-	// Caller MUST pre-validate single-frame size bounds AND must
-	// have already acquired send quota for (5 + protoSize) bytes
-	// before pushing — writeLoop cannot soft-reject these from its
-	// drain context. fh.Flags carries MessageFlagEndStream / MORE.
-	protoMsg  proto.Message
-	protoSize int
+	// Caller MUST pre-validate single-frame size bounds. protoSize
+	// equals len(protoBytes) (kept explicit for the 5 + protoSize quota
+	// calc). fh.Flags carries MessageFlagEndStream / MORE.
+	protoBytes []byte
+	protoSize  int
 }
 
 const (
@@ -327,6 +341,7 @@ func newShmFrameWriter(tx *ShmRing) *shmFrameWriter {
 		deferred:         make(map[uint32]*deferredMessage),
 		deferredProto:    make(map[uint32][]frameEntry),
 		deferredTrailers: make(map[uint32]frameEntry),
+		pendingEndStream: make(map[uint32]frameEntry),
 	}
 	w.wg.Add(1)
 	go w.writeLoop()
@@ -678,7 +693,7 @@ func (w *shmFrameWriter) processEntry(entry frameEntry) {
 	// layer codec.Marshal + tightBufferPool allocation that the
 	// sender would otherwise pay. See enqueueProtoAndWait for the
 	// caller-side contract.
-	if entry.protoMsg != nil {
+	if entry.protoBytes != nil {
 		w.processProtoEntry(entry)
 		return
 	}
@@ -753,6 +768,7 @@ func (w *shmFrameWriter) processProtoEntry(entry frameEntry) {
 		// transport.Close-time test assertions hold; on close all
 		// streams go to streamDone anyway, so the counter value
 		// becomes irrelevant.
+		putAsyncProtoBuf(entry.protoBytes)
 		if entry.streamPtr != nil {
 			entry.streamPtr.protoInFlight.Add(-1)
 		}
@@ -768,6 +784,7 @@ func (w *shmFrameWriter) processProtoEntry(entry frameEntry) {
 		// drain its in-flight counter so the upper layer's
 		// resource-teardown invariants hold even on this
 		// construction-order misuse path.
+		putAsyncProtoBuf(entry.protoBytes)
 		if s != nil {
 			s.protoInFlight.Add(-1)
 		}
@@ -776,12 +793,14 @@ func (w *shmFrameWriter) processProtoEntry(entry frameEntry) {
 		}
 		return
 	}
-	if s.getState() == streamDone {
+	if s.getState() == streamDone || s.shmDataDropped.Load() {
+		putAsyncProtoBuf(entry.protoBytes)
 		s.protoInFlight.Add(-1)
 		// Stream gone; discard any TRAILERS sentinel parked for it
 		// (NOT flush — emitting OK-status after dropping DATA
 		// would put the peer in a cardinality-violation state).
 		// writeStatus sender will surface errStreamDone.
+		w.discardPendingEndStream(entry.fh.StreamID)
 		w.discardDeferredTrailer(entry.fh.StreamID, s)
 		return
 	}
@@ -791,10 +810,12 @@ func (w *shmFrameWriter) processProtoEntry(entry frameEntry) {
 	// (ReserveWrite usually returns ctx err and the error path
 	// classifies it as benign, but it still burns writer cycles).
 	if entry.ctx.Err() != nil {
+		putAsyncProtoBuf(entry.protoBytes)
 		s.protoInFlight.Add(-1)
 		// DATA dropped on ctx cancel — discard parked TRAILERS
 		// rather than flush (same cardinality argument as
 		// streamDone branch above).
+		w.discardPendingEndStream(entry.fh.StreamID)
 		w.discardDeferredTrailer(entry.fh.StreamID, s)
 		return
 	}
@@ -822,8 +843,9 @@ func (w *shmFrameWriter) processProtoEntry(entry frameEntry) {
 		w.deferredProto[sid] = []frameEntry{entry}
 		return
 	}
-	err := writeProtoToRingH2Blocking(entry.ctx, w.tx, sid,
-		entry.protoMsg, entry.protoSize, entry.fh.Flags)
+	err := writeProtoBytesToRingH2Blocking(entry.ctx, w.tx, sid,
+		entry.protoBytes, entry.fh.Flags)
+	putAsyncProtoBuf(entry.protoBytes)
 	if err != nil {
 		// Refund the quota we just reserved — these bytes did not
 		// land on the wire. ReserveWrite returns BEFORE Commit on
@@ -840,8 +862,10 @@ func (w *shmFrameWriter) processProtoEntry(entry frameEntry) {
 	// success → emit parked TRAILERS; failure → discard (peer would
 	// see TRAILERS without the missing DATA, cardinality violation).
 	if err != nil {
+		w.discardPendingEndStream(sid)
 		w.discardDeferredTrailer(sid, s)
 	} else {
+		w.flushPendingEndStream(sid)
 		w.flushDeferredTrailer(sid)
 	}
 }
@@ -867,9 +891,11 @@ func (w *shmFrameWriter) processProtoEntry(entry frameEntry) {
 // / w.deferredTrailers are race-free.
 func (w *shmFrameWriter) processTrailerEntry(entry frameEntry) {
 	sid := entry.fh.StreamID
-	if entry.streamPtr != nil && entry.streamPtr.getState() == streamDone {
-		// Stream forcibly closed before we got here; don't emit
-		// TRAILERS to a peer that already saw RST.
+	if entry.streamPtr != nil && (entry.streamPtr.getState() == streamDone || entry.streamPtr.shmDataDropped.Load()) {
+		// Stream forcibly closed (streamDone) or a DATA entry was
+		// already dropped (shmDataDropped) before we got here; don't
+		// emit OK TRAILERS — the peer already saw RST or is missing
+		// DATA (cardinality violation).
 		if entry.doneCh != nil {
 			entry.doneCh <- errStreamDone
 		}
@@ -943,17 +969,16 @@ func (w *shmFrameWriter) flushDeferredTrailer(sid uint32) {
 		return
 	}
 	delete(w.deferredTrailers, sid)
-	// streamDone gate: if a prior DATA-drop terminal already
-	// tombstoned this stream (via discardDeferredTrailer's
-	// unconditional CAS), do NOT emit OK trailers — that drop
-	// means the peer is missing at least one DATA frame, and
-	// emitting OK trailers here would produce the cardinality
-	// violation the trailer-sentinel design exists to prevent.
-	// This branch is reached only in the rare sibling-pending
-	// interleave: one DATA queue dropped (tombstoned) while the
-	// other queue's drain eventually succeeded and called flush.
-	// In the common case the stream is still streamActive here.
-	if entry.streamPtr != nil && entry.streamPtr.getState() == streamDone {
+	// Drop-tombstone gate: if a prior DATA-drop terminal already
+	// tombstoned this stream (via discardDeferredTrailer setting
+	// shmDataDropped), do NOT emit OK trailers — that drop means the
+	// peer is missing at least one DATA frame, and emitting OK trailers
+	// here would produce the cardinality violation the trailer-sentinel
+	// design exists to prevent. This branch is reached only in the rare
+	// sibling-pending interleave: one DATA queue dropped (tombstoned)
+	// while the other queue's drain eventually succeeded and called
+	// flush. (streamDone is also checked in case a real closer raced.)
+	if entry.streamPtr != nil && (entry.streamPtr.getState() == streamDone || entry.streamPtr.shmDataDropped.Load()) {
 		if entry.doneCh != nil {
 			entry.doneCh <- errStreamDone
 		}
@@ -1009,11 +1034,14 @@ func (w *shmFrameWriter) flushDeferredTrailer(sid uint32) {
 // Runs under writeLoop's inlineMu (see flushDeferredTrailer comment).
 func (w *shmFrameWriter) discardDeferredTrailer(sid uint32, s *Stream) {
 	if s != nil {
-		// Tombstone the stream FIRST so a late-arriving trailer
+		// Tombstone the stream FIRST (via the dedicated shmDataDropped
+		// flag, NOT the streamDone state) so a late-arriving trailer
 		// (writeStatus called AFTER us) is rejected by
-		// processTrailerEntry's streamDone check rather than
-		// emitted on the wire.
-		s.compareAndSwapState(streamActive, streamDone)
+		// processTrailerEntry's drop check, while leaving the streamDone
+		// state reserved for closeStream. Setting streamDone here would
+		// impersonate a closer and deadlock a later closeStream on
+		// <-s.done (nothing else closes a ClientStream's done channel).
+		s.shmDataDropped.Store(true)
 		s.pendingWU.Store(0)
 	}
 	entry, ok := w.deferredTrailers[sid]
@@ -1030,6 +1058,79 @@ func (w *shmFrameWriter) discardDeferredTrailer(sid uint32, s *Stream) {
 	if entry.doneCh != nil {
 		entry.doneCh <- errStreamDone
 	}
+}
+
+// flushPendingEndStream emits a parked zero-length END_STREAM (client
+// half-close, from CloseSend) for stream sid once ALL earlier DATA for
+// that stream has drained. Co-located with flushDeferredTrailer at every
+// successful DATA-drain terminal. No-op when no END_STREAM is parked or
+// when DATA is still queued for the stream. Runs under writeLoop's
+// inlineMu.
+func (w *shmFrameWriter) flushPendingEndStream(sid uint32) {
+	entry, ok := w.pendingEndStream[sid]
+	if !ok {
+		return
+	}
+	// Still ordered behind pending DATA — a later DATA-drain terminal
+	// fires this helper again once both queues are empty.
+	if _, hasWhole := w.deferred[sid]; hasWhole {
+		return
+	}
+	if len(w.deferredProto[sid]) > 0 {
+		return
+	}
+	delete(w.pendingEndStream, sid)
+	// Drop rather than emit if the stream was closed/tombstoned or the
+	// CloseSend ctx was cancelled while the END_STREAM was parked.
+	if s := entry.streamPtr; (s != nil && (s.getState() == streamDone || s.shmDataDropped.Load())) || entry.ctx.Err() != nil {
+		if entry.doneCh != nil {
+			entry.doneCh <- errStreamDone
+		}
+		entry.data.Free()
+		return
+	}
+	w.emitEmptyEndStream(entry)
+}
+
+// discardPendingEndStream drops a parked zero-length END_STREAM WITHOUT
+// emitting it (the DATA it was ordered behind was dropped). Wakes the
+// blocked CloseSend caller with errStreamDone. Co-located with
+// discardDeferredTrailer at every DATA-drop terminal. No-op when none is
+// parked. Runs under writeLoop's inlineMu.
+func (w *shmFrameWriter) discardPendingEndStream(sid uint32) {
+	entry, ok := w.pendingEndStream[sid]
+	if !ok {
+		return
+	}
+	delete(w.pendingEndStream, sid)
+	if entry.doneCh != nil {
+		entry.doneCh <- errStreamDone
+	}
+	entry.data.Free()
+}
+
+// emitEmptyEndStream writes the single zero-length H2 DATA frame that
+// carries a client half-close (END_STREAM when isLast, else MORE),
+// wakes the blocked CloseSend caller, and releases the retained data
+// reference. Shared by the immediate (no pending DATA) path in
+// processWholeMessage and the deferred flushPendingEndStream path.
+func (w *shmFrameWriter) emitEmptyEndStream(entry frameEntry) {
+	fh := entry.fh
+	if entry.isLast {
+		fh.Flags = MessageFlagEndStream
+	} else {
+		fh.Flags = MessageFlagMORE
+	}
+	_, h2f := translateCustomToH2(fh)
+	err := writeH2Single(entry.ctx, w.tx, H2FrameDATA, h2f, fh.StreamID, nil)
+	if err == nil && w.piggybackWUFn != nil {
+		w.piggybackWUFn(fh.StreamID)
+	}
+	if entry.doneCh != nil {
+		entry.doneCh <- err
+	}
+	// Balance the Ref taken in enqueueMessageAndWait.
+	entry.data.Free()
 }
 
 // enqueueProtoAsync pushes a ZC marshal request onto the writer
@@ -1060,13 +1161,13 @@ func (w *shmFrameWriter) discardDeferredTrailer(sid uint32, s *Stream) {
 // guaranteed to be processed (or silently dropped on stream/
 // transport close, both of which the upper layer observes via the
 // stream state machine).
-func (w *shmFrameWriter) enqueueProtoAsync(ctx context.Context, streamPtr *Stream, fh FrameHeader, msg proto.Message, pSize int) error {
+func (w *shmFrameWriter) enqueueProtoAsync(ctx context.Context, streamPtr *Stream, fh FrameHeader, protoBytes []byte, pSize int) error {
 	entry := frameEntry{
-		ctx:       ctx,
-		fh:        fh,
-		streamPtr: streamPtr,
-		protoMsg:  msg,
-		protoSize: pSize,
+		ctx:        ctx,
+		fh:         fh,
+		streamPtr:  streamPtr,
+		protoBytes: protoBytes,
+		protoSize:  pSize,
 	}
 	if !w.trySend(entry) {
 		return ErrConnClosing
@@ -1107,20 +1208,44 @@ func (w *shmFrameWriter) processWholeMessage(entry frameEntry) {
 		// (cs.Write(nil, nil, {Last:true})). No flow-control bytes to
 		// reserve; emit a single H2 DATA frame with empty payload
 		// carrying END_STREAM (when isLast) or MORE.
-		fh := entry.fh
-		if entry.isLast {
-			fh.Flags = MessageFlagEndStream
-		} else {
-			fh.Flags = MessageFlagMORE
+		//
+		// Honour the writer tombstone / stream close: if this stream's
+		// DATA was already dropped (shmDataDropped) or the stream is
+		// closed (streamDone), do NOT emit — signal errStreamDone to the
+		// blocked CloseSend caller. Per-stream FIFO ordering (the
+		// END_STREAM must not overtake still-deferred DATA on the same
+		// stream) is enforced immediately below via the pendingEndStream
+		// sentinel.
+		if entry.streamPtr.getState() == streamDone || entry.streamPtr.shmDataDropped.Load() {
+			entry.doneCh <- errStreamDone
+			// Balance the Ref taken in enqueueMessageAndWait.
+			entry.data.Free()
+			return
 		}
-		_, h2f := translateCustomToH2(fh)
-		err := writeH2Single(entry.ctx, w.tx, H2FrameDATA, h2f, fh.StreamID, nil)
-		if err == nil && w.piggybackWUFn != nil {
-			w.piggybackWUFn(fh.StreamID)
+		// Per-stream FIFO: if this stream still has DATA queued — a
+		// chunked whole-message in w.deferred[sid] or async proto
+		// entries in w.deferredProto[sid] — the END_STREAM MUST wait
+		// behind them; emitting it now would let the peer see the
+		// half-close BEFORE the DATA (gRPC per-stream message-order
+		// violation). Park it in the pendingEndStream sentinel; a
+		// later DATA-drain terminal fires flushPendingEndStream once
+		// both queues are empty.
+		sid := entry.fh.StreamID
+		if _, dup := w.pendingEndStream[sid]; dup {
+			// Duplicate CloseSend (unreachable given gRPC's one-Last-
+			// per-stream contract); reject rather than overwrite (that
+			// would leak the prior data reference).
+			entry.doneCh <- errStreamDone
+			entry.data.Free()
+			return
 		}
-		entry.doneCh <- err
-		// Balance the Ref taken in enqueueMessageAndWait.
-		entry.data.Free()
+		_, hasWhole := w.deferred[sid]
+		if hasWhole || len(w.deferredProto[sid]) > 0 {
+			w.pendingEndStream[sid] = entry
+			return
+		}
+		// No pending DATA — emit immediately.
+		w.emitEmptyEndStream(entry)
 		return
 	}
 	// PR-B: reuse Stream's inline-allocated deferred slot instead of
@@ -1181,7 +1306,7 @@ func (w *shmFrameWriter) advanceDeferred(streamID uint32, d *deferredMessage) {
 		// remove the entry — emitting more DATA for a locally-closed
 		// stream is a wire-protocol violation against any peer that
 		// has already seen the RST/CANCEL the close path enqueued.
-		if d.streamPtr.getState() == streamDone {
+		if d.streamPtr.getState() == streamDone || d.streamPtr.shmDataDropped.Load() {
 			select {
 			case d.doneCh <- errStreamDone:
 			default:
@@ -1193,6 +1318,7 @@ func (w *shmFrameWriter) advanceDeferred(streamID uint32, d *deferredMessage) {
 			// sentinel is parked behind it, discard rather than
 			// emit. Emitting OK-status TRAILERS after dropping DATA
 			// would put the peer in a cardinality-violation state.
+			w.discardPendingEndStream(streamID)
 			w.discardDeferredTrailer(streamID, d.streamPtr)
 			return
 		}
@@ -1213,6 +1339,7 @@ func (w *shmFrameWriter) advanceDeferred(streamID uint32, d *deferredMessage) {
 			// DATA dropped on ctx cancellation — discard the
 			// parked TRAILERS sentinel rather than emit (see
 			// streamDone branch above for rationale).
+			w.discardPendingEndStream(streamID)
 			w.discardDeferredTrailer(streamID, d.streamPtr)
 			return
 		}
@@ -1296,6 +1423,7 @@ func (w *shmFrameWriter) advanceDeferred(streamID uint32, d *deferredMessage) {
 			// partial LPM on the wire already. Discard the parked
 			// TRAILERS sentinel; emitting OK-status now would
 			// compound the protocol violation.
+			w.discardPendingEndStream(streamID)
 			w.discardDeferredTrailer(streamID, d.streamPtr)
 			return
 		}
@@ -1309,8 +1437,9 @@ func (w *shmFrameWriter) advanceDeferred(streamID uint32, d *deferredMessage) {
 	delete(w.deferred, streamID)
 	// Balance the Ref taken in enqueueMessageAndWait.
 	d.release()
-	// DATA successfully on the ring — fire any parked TRAILERS
-	// sentinel for this stream.
+	// DATA successfully on the ring — fire any parked END_STREAM
+	// (CloseSend half-close) and TRAILERS sentinel for this stream.
+	w.flushPendingEndStream(streamID)
 	w.flushDeferredTrailer(streamID)
 }
 
@@ -1394,11 +1523,12 @@ func (w *shmFrameWriter) retryDeferredProto(sid uint32, queue []frameEntry) {
 		// Stream-local close → drop remaining entries silently;
 		// upper layer sees errStreamDone via stream state machine
 		// the next time it touches the stream.
-		if s == nil || s.getState() == streamDone {
+		if s == nil || s.getState() == streamDone || s.shmDataDropped.Load() {
 			// Decrement protoInFlight for every drained entry —
 			// the count must drain to zero so the stream's resource
 			// teardown can complete without a leaked debit.
 			for j := emitted; j < len(queue); j++ {
+				putAsyncProtoBuf(queue[j].protoBytes)
 				if queue[j].streamPtr != nil {
 					queue[j].streamPtr.protoInFlight.Add(-1)
 					if dropStream == nil {
@@ -1414,6 +1544,7 @@ func (w *shmFrameWriter) retryDeferredProto(sid uint32, queue []frameEntry) {
 			// Context cancellation: same as stream close — drop and
 			// move to the next head. Upper layer's deadline already
 			// fired and surfaced via ctx.Err() on the recv side.
+			putAsyncProtoBuf(entry.protoBytes)
 			s.protoInFlight.Add(-1)
 			emitted++
 			dropped = true
@@ -1428,8 +1559,9 @@ func (w *shmFrameWriter) retryDeferredProto(sid uint32, queue []frameEntry) {
 			// revisit on the next wuRetryWake.
 			break
 		}
-		err := writeProtoToRingH2Blocking(entry.ctx, w.tx, sid,
-			entry.protoMsg, entry.protoSize, entry.fh.Flags)
+		err := writeProtoBytesToRingH2Blocking(entry.ctx, w.tx, sid,
+			entry.protoBytes, entry.fh.Flags)
+		putAsyncProtoBuf(entry.protoBytes)
 		if err != nil {
 			// Refund and tear down; subsequent senders see
 			// ErrConnClosing via t.closed.Load(). Break out: a
@@ -1466,8 +1598,10 @@ func (w *shmFrameWriter) retryDeferredProto(sid uint32, queue []frameEntry) {
 		// to the writeStatus sender and skips the wire write. Only
 		// the all-success path flushes (emits) the trailer.
 		if dropped {
+			w.discardPendingEndStream(sid)
 			w.discardDeferredTrailer(sid, dropStream)
 		} else {
+			w.flushPendingEndStream(sid)
 			w.flushDeferredTrailer(sid)
 		}
 		return
@@ -1808,7 +1942,7 @@ func (w *shmFrameWriter) tryInlineWrite(
 		atomic.AddUint64(&shmInlineWriteBailClosed, 1)
 		return false, nil
 	}
-	if streamPtr.getState() == streamDone {
+	if streamPtr.getState() == streamDone || streamPtr.shmDataDropped.Load() {
 		w.inlineMu.Unlock()
 		atomic.AddUint64(&shmInlineWriteBailStreamDone, 1)
 		return false, nil
@@ -2126,6 +2260,7 @@ func (w *shmFrameWriter) close() {
 	// stream resource teardown (counter must reach zero) hold.
 	for sid, queue := range w.deferredProto {
 		for _, entry := range queue {
+			putAsyncProtoBuf(entry.protoBytes)
 			if entry.streamPtr != nil {
 				entry.streamPtr.protoInFlight.Add(-1)
 			}
@@ -2145,6 +2280,19 @@ func (w *shmFrameWriter) close() {
 			}
 		}
 		delete(w.deferredTrailers, sid)
+	}
+	// Drain any parked zero-length END_STREAM (CloseSend half-close)
+	// sentinels: wake the blocked CloseSend caller and release the
+	// retained data reference.
+	for sid, entry := range w.pendingEndStream {
+		if entry.doneCh != nil {
+			select {
+			case entry.doneCh <- ErrConnClosing:
+			default:
+			}
+		}
+		entry.data.Free()
+		delete(w.pendingEndStream, sid)
 	}
 }
 

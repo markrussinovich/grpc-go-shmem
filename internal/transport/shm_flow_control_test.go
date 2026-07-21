@@ -75,13 +75,15 @@ func TestShmFlowControlBlocksUntilWindowUpdate(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	defer cancel()
 
-	go srvTransport.HandleStreams(testCtx, func(s *ServerStream) {
+	go srvTransport.HandleStreams(testCtx, func(si ServerStreamIface) {
+		s := si.(*ServerStream)
 		// Read whatever the client sends to consume the window on the receive side.
 		_, _ = s.Read(5)
 		_ = s.WriteStatus(status.New(codes.OK, ""))
 	})
 
-	cs, err := cliTransport.NewStream(ctx, &CallHdr{Method: "/test/FlowControl"}, nil)
+	csI, err := cliTransport.NewStream(ctx, &CallHdr{Method: "/test/FlowControl"}, nil)
+	cs, _ := csI.(*ClientStream)
 	if err != nil {
 		t.Fatalf("NewStream: %v", err)
 	}
@@ -158,7 +160,8 @@ func TestShmFlowControlMultiStreamAccountCheck(t *testing.T) {
 	const msgSize = 1024
 
 	// Server echo handler
-	go srvTransport.HandleStreams(testCtx, func(s *ServerStream) {
+	go srvTransport.HandleStreams(testCtx, func(si ServerStreamIface) {
+		s := si.(*ServerStream)
 		data, err := s.Read(msgSize * 2)
 		if err != nil {
 			// Ignore read errors - stream might be closed
@@ -173,7 +176,8 @@ func TestShmFlowControlMultiStreamAccountCheck(t *testing.T) {
 	// Create multiple streams
 	streams := make([]*ClientStream, numStreams)
 	for i := 0; i < numStreams; i++ {
-		s, err := cliTransport.NewStream(testCtx, &CallHdr{Method: fmt.Sprintf("/test/Stream%d", i)}, nil)
+		sI, err := cliTransport.NewStream(testCtx, &CallHdr{Method: fmt.Sprintf("/test/Stream%d", i)}, nil)
+		s, _ := sI.(*ClientStream)
 		if err != nil {
 			t.Fatalf("NewStream %d: %v", i, err)
 		}
@@ -270,7 +274,7 @@ func TestShmFlowControl_SlowConsumer_SenderBlocks(t *testing.T) {
 	// the "slow consumer" scenario; the absence of Recv must propagate
 	// back-pressure to the sender via the missing WINDOW_UPDATE.
 	handlerEntered := make(chan struct{}, 1)
-	go srvTransport.HandleStreams(testCtx, func(s *ServerStream) {
+	go srvTransport.HandleStreams(testCtx, func(s ServerStreamIface) {
 		select {
 		case handlerEntered <- struct{}{}:
 		default:
@@ -280,7 +284,8 @@ func TestShmFlowControl_SlowConsumer_SenderBlocks(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	cs, err := cliTransport.NewStream(ctx, &CallHdr{Method: "/test/SlowConsumer"}, nil)
+	csI, err := cliTransport.NewStream(ctx, &CallHdr{Method: "/test/SlowConsumer"}, nil)
+	cs, _ := csI.(*ClientStream)
 	if err != nil {
 		t.Fatalf("NewStream: %v", err)
 	}
@@ -383,7 +388,8 @@ func TestShmFlowControl_SlowConsumer_UnblocksOnAppRead(t *testing.T) {
 	// Server handler: read on demand from a channel-driven trigger.
 	startReading := make(chan struct{})
 	readerDone := make(chan struct{})
-	go srvTransport.HandleStreams(testCtx, func(s *ServerStream) {
+	go srvTransport.HandleStreams(testCtx, func(si ServerStreamIface) {
+		s := si.(*ServerStream)
 		<-startReading
 		// Drain all received messages.
 		for {
@@ -396,7 +402,8 @@ func TestShmFlowControl_SlowConsumer_UnblocksOnAppRead(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	cs, err := cliTransport.NewStream(ctx, &CallHdr{Method: "/test/SlowUnblock"}, nil)
+	csI, err := cliTransport.NewStream(ctx, &CallHdr{Method: "/test/SlowUnblock"}, nil)
+	cs, _ := csI.(*ClientStream)
 	if err != nil {
 		t.Fatalf("NewStream: %v", err)
 	}
@@ -482,7 +489,8 @@ func TestShmFlowControl_MemoryBoundedByWindow(t *testing.T) {
 
 	const numStreams = 10
 	streamRefs := make(chan *ServerStream, numStreams)
-	go srvTransport.HandleStreams(testCtx, func(s *ServerStream) {
+	go srvTransport.HandleStreams(testCtx, func(si ServerStreamIface) {
+		s := si.(*ServerStream)
 		streamRefs <- s
 		<-testCtx.Done() // park; never read
 	})
@@ -491,7 +499,8 @@ func TestShmFlowControl_MemoryBoundedByWindow(t *testing.T) {
 	defer cancel()
 	clientStreams := make([]*ClientStream, numStreams)
 	for i := 0; i < numStreams; i++ {
-		cs, err := cliTransport.NewStream(ctx, &CallHdr{Method: fmt.Sprintf("/test/Bound/%d", i)}, nil)
+		csI, err := cliTransport.NewStream(ctx, &CallHdr{Method: fmt.Sprintf("/test/Bound/%d", i)}, nil)
+		cs, _ := csI.(*ClientStream)
 		if err != nil {
 			t.Fatalf("NewStream %d: %v", i, err)
 		}
@@ -662,8 +671,9 @@ func TestShmFlowControl_RealOptionPath_NoDeadlock(t *testing.T) {
 	// from opts.InitialWindowSize), not maxWindowSize.
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	go srv.HandleStreams(ctx, func(s *ServerStream) { <-ctx.Done() })
-	cs, err := cli.NewStream(ctx, &CallHdr{Method: "/test/UnitAssert"}, nil)
+	go srv.HandleStreams(ctx, func(s ServerStreamIface) { <-ctx.Done() })
+	csI, err := cli.NewStream(ctx, &CallHdr{Method: "/test/UnitAssert"}, nil)
+	cs, _ := csI.(*ClientStream)
 	if err != nil {
 		t.Fatalf("NewStream: %v", err)
 	}
@@ -701,8 +711,9 @@ func TestShmFlowControl_RealOptionPath_NoDeadlock(t *testing.T) {
 	}
 	defer cli2.Close(nil)
 
-	go srv2.HandleStreams(ctx, func(s *ServerStream) { <-ctx.Done() })
-	cs2, err := cli2.NewStream(ctx, &CallHdr{Method: "/test/UnitAssert2"}, nil)
+	go srv2.HandleStreams(ctx, func(s ServerStreamIface) { <-ctx.Done() })
+	cs2I, err := cli2.NewStream(ctx, &CallHdr{Method: "/test/UnitAssert2"}, nil)
+	cs2, _ := cs2I.(*ClientStream)
 	if err != nil {
 		t.Fatalf("NewStream 2: %v", err)
 	}
@@ -852,14 +863,15 @@ func TestShmFlowControl_StreamCloseUnblocksDeferredWrite(t *testing.T) {
 	defer cliTransport.Close(nil)
 
 	// Park the server handler so it doesn't drain the receive ring.
-	go srvTransport.HandleStreams(testCtx, func(s *ServerStream) {
+	go srvTransport.HandleStreams(testCtx, func(s ServerStreamIface) {
 		<-testCtx.Done()
 	})
 
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	defer cancel()
 
-	cs, err := cliTransport.NewStream(ctx, &CallHdr{Method: "/test/DeferredStreamClose"}, nil)
+	csI, err := cliTransport.NewStream(ctx, &CallHdr{Method: "/test/DeferredStreamClose"}, nil)
+	cs, _ := csI.(*ClientStream)
 	if err != nil {
 		t.Fatalf("NewStream: %v", err)
 	}
@@ -927,14 +939,15 @@ func TestShmFlowControl_CtxCancelUnblocksDeferredWrite(t *testing.T) {
 	cliTransport, _ := NewShmClientTransport(clientSeg, testAddr{"shm", "client"}, testAddr{"shm", "server"})
 	defer cliTransport.Close(nil)
 
-	go srvTransport.HandleStreams(testCtx, func(s *ServerStream) {
+	go srvTransport.HandleStreams(testCtx, func(s ServerStreamIface) {
 		<-testCtx.Done()
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	cs, err := cliTransport.NewStream(ctx, &CallHdr{Method: "/test/DeferredCtxCancel"}, nil)
+	csI, err := cliTransport.NewStream(ctx, &CallHdr{Method: "/test/DeferredCtxCancel"}, nil)
+	cs, _ := csI.(*ClientStream)
 	if err != nil {
 		t.Fatalf("NewStream: %v", err)
 	}
@@ -964,6 +977,218 @@ func TestShmFlowControl_CtxCancelUnblocksDeferredWrite(t *testing.T) {
 		t.Logf("write returned with %v after ctx cancel", err)
 	case <-time.After(2 * time.Second):
 		t.Fatal("sender did not return within 2s after ctx cancel — deferred entry not cleaned")
+	}
+}
+
+// TestShmFlowControl_DeferredDataBeforeCloseSend verifies the per-stream
+// FIFO fix for the whole-message deferral path: a zero-length client
+// half-close (CloseSend → empty END_STREAM) that arrives while an earlier
+// DATA message is still parked in the writer's `deferred` (whole-message)
+// map MUST NOT overtake that DATA on the wire. It has to park in the
+// pendingEndStream sentinel and only fire after the DATA drains, so the
+// peer never observes END_STREAM before the preceding DATA (a gRPC
+// per-stream message-order violation). The sibling `deferredProto` branch
+// of the same guard is covered by
+// TestShmFlowControl_DeferredProtoBeforeCloseSend.
+func TestShmFlowControl_DeferredDataBeforeCloseSend(t *testing.T) {
+	testCtx, testCancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer testCancel()
+
+	segName := fmt.Sprintf("test-endstream-fifo-%d", time.Now().UnixNano())
+	defer RemoveSegment(segName)
+
+	serverSeg, err := CreateSegment(segName, 65536, 65536)
+	if err != nil {
+		t.Fatalf("create segment: %v", err)
+	}
+	serverSeg.H.SetServerReady(true)
+	defer serverSeg.Close()
+
+	clientSeg, err := OpenSegment(segName)
+	if err != nil {
+		t.Fatalf("open segment: %v", err)
+	}
+	clientSeg.H.SetClientReady(true)
+	defer clientSeg.Close()
+
+	srvTransport, err := NewShmServerTransport(serverSeg, testAddr{"shm", "server"}, testAddr{"shm", "client"})
+	if err != nil {
+		t.Fatalf("server transport: %v", err)
+	}
+	defer srvTransport.Close(nil)
+
+	cliTransport, err := NewShmClientTransport(clientSeg, testAddr{"shm", "client"}, testAddr{"shm", "server"})
+	if err != nil {
+		t.Fatalf("client transport: %v", err)
+	}
+	defer cliTransport.Close(nil)
+
+	// Park the server handler so it never drains the receive ring.
+	go srvTransport.HandleStreams(testCtx, func(s ServerStreamIface) {
+		<-testCtx.Done()
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer cancel()
+
+	csI, err := cliTransport.NewStream(ctx, &CallHdr{Method: "/test/EndStreamFIFO"}, nil)
+	if err != nil {
+		t.Fatalf("NewStream: %v", err)
+	}
+	cs := csI.(*ClientStream)
+	sid := cs.id
+
+	// Drive both quotas to zero so the first (non-last) whole-MESSAGE
+	// DATA write lands in the writer's deferred map instead of the ring.
+	cliTransport.connSendQuota.Store(0)
+	cs.sendQuota.Store(0)
+
+	body := make([]byte, 1024)
+	hdr := []byte{0, 0, 0, 0x04, 0x00} // 5-byte LPM header for a 1024-byte body
+
+	dataErr := make(chan error, 1)
+	go func() {
+		dataErr <- cs.Write(hdr, mem.BufferSlice{mem.Copy(body, mem.DefaultBufferPool())}, &WriteOptions{Last: false})
+	}()
+
+	// Let the DATA entry install into frameWriter.deferred[sid].
+	time.Sleep(50 * time.Millisecond)
+
+	// Now issue the empty END_STREAM (CloseSend). It must NOT emit
+	// immediately — the DATA above is still deferred.
+	endErr := make(chan error, 1)
+	go func() {
+		endErr <- cs.Write(nil, mem.BufferSlice{}, &WriteOptions{Last: true})
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+
+	// Assert the sentinel state: END_STREAM parked, DATA still deferred,
+	// and neither sender has returned.
+	fw := cliTransport.frameWriter
+	fw.inlineMu.Lock()
+	_, pending := fw.pendingEndStream[sid]
+	_, dataDeferred := fw.deferred[sid]
+	fw.inlineMu.Unlock()
+	if !pending {
+		t.Fatalf("expected zero-length END_STREAM to be parked in pendingEndStream[%d] while DATA is deferred", sid)
+	}
+	if !dataDeferred {
+		t.Fatalf("expected DATA to still be deferred in deferred[%d]", sid)
+	}
+	select {
+	case err := <-dataErr:
+		t.Fatalf("DATA write returned early (%v) — it should stay parked until quota is restored", err)
+	case err := <-endErr:
+		t.Fatalf("END_STREAM write returned early (%v) — it must wait behind the deferred DATA", err)
+	default:
+	}
+
+	// Restore quota and wake the writer. advanceDeferred drains the DATA
+	// first, then flushPendingEndStream emits the parked END_STREAM.
+	cs.sendQuota.Store(1 << 20)
+	cliTransport.connSendQuota.Store(1 << 20)
+	select {
+	case cliTransport.frameWriter.wuRetryWake <- struct{}{}:
+	default:
+	}
+
+	for i := 0; i < 2; i++ {
+		select {
+		case err := <-dataErr:
+			if err != nil {
+				t.Errorf("DATA write returned error after quota restore: %v", err)
+			}
+		case err := <-endErr:
+			if err != nil {
+				t.Errorf("END_STREAM write returned error after quota restore: %v", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("write did not complete within 2s after quota restore — deferred/pending entry leaked")
+		}
+	}
+
+	// Both queues must be drained.
+	fw.inlineMu.Lock()
+	_, stillPending := fw.pendingEndStream[sid]
+	_, stillDeferred := fw.deferred[sid]
+	fw.inlineMu.Unlock()
+	if stillPending {
+		t.Errorf("pendingEndStream[%d] not cleared after flush", sid)
+	}
+	if stillDeferred {
+		t.Errorf("deferred[%d] not cleared after drain", sid)
+	}
+}
+
+// TestShmFlowControl_DeferredProtoBeforeCloseSend covers the sibling
+// branch of the pendingEndStream FIFO guard: a zero-length END_STREAM
+// parked while the stream still has async proto DATA queued in
+// w.deferredProto[sid]. flushPendingEndStream must keep it parked until
+// the proto queue drains, then emit exactly once. White-box: the proto
+// sibling is injected directly (mirrors the async-trailer sibling tests)
+// to keep the ordering deterministic without driving the full async
+// WriteProto path.
+func TestShmFlowControl_DeferredProtoBeforeCloseSend(t *testing.T) {
+	name := fmt.Sprintf("test-endstream-proto-fifo-%d", time.Now().UnixNano())
+	defer RemoveSegment(name)
+	seg, err := CreateSegment(name, 65536, 65536)
+	if err != nil {
+		t.Fatalf("CreateSegment: %v", err)
+	}
+	defer seg.Close()
+
+	tx := NewShmRingFromSegment(seg.A, seg.Mem)
+	w := newShmFrameWriter(tx)
+	defer w.close()
+
+	const sid = uint32(7)
+	s := &Stream{}
+	doneCh := make(chan error, 1)
+	entry := frameEntry{
+		ctx:       context.Background(),
+		fh:        FrameHeader{StreamID: sid, Type: FrameTypeMESSAGE},
+		doneCh:    doneCh,
+		streamPtr: s,
+		isLast:    true,
+		data:      mem.BufferSlice{},
+	}
+
+	// Park the END_STREAM behind a still-pending async proto sibling.
+	w.inlineMu.Lock()
+	w.deferredProto[sid] = []frameEntry{{}}
+	w.pendingEndStream[sid] = entry
+	w.flushPendingEndStream(sid) // must be a no-op: proto sibling pending
+	_, stillParked := w.pendingEndStream[sid]
+	w.inlineMu.Unlock()
+
+	if !stillParked {
+		t.Fatal("END_STREAM emitted despite pending deferredProto sibling")
+	}
+	select {
+	case got := <-doneCh:
+		t.Fatalf("doneCh signalled prematurely with %v (proto sibling still pending)", got)
+	case <-time.After(50 * time.Millisecond):
+		// expected: still parked, CloseSend sender still blocked
+	}
+
+	// Drain the proto sibling, then flush: END_STREAM must now emit once.
+	w.inlineMu.Lock()
+	delete(w.deferredProto, sid)
+	w.flushPendingEndStream(sid)
+	_, stillParked2 := w.pendingEndStream[sid]
+	w.inlineMu.Unlock()
+
+	if stillParked2 {
+		t.Fatal("END_STREAM still parked after proto sibling drained")
+	}
+	select {
+	case got := <-doneCh:
+		if got != nil {
+			t.Fatalf("emitEmptyEndStream returned error: %v", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("END_STREAM not emitted after proto sibling drained")
 	}
 }
 
@@ -1001,7 +1226,8 @@ func TestShmFlowControl_ConcurrentWholeMessageWrites(t *testing.T) {
 	defer cliTransport.Close(nil)
 
 	// Server drains everything quickly so windows keep refilling.
-	go srvTransport.HandleStreams(testCtx, func(s *ServerStream) {
+	go srvTransport.HandleStreams(testCtx, func(si ServerStreamIface) {
+		s := si.(*ServerStream)
 		buf := make([]byte, 8192)
 		for {
 			if _, err := s.Read(len(buf)); err != nil {
@@ -1027,7 +1253,8 @@ func TestShmFlowControl_ConcurrentWholeMessageWrites(t *testing.T) {
 
 	streams := make([]*ClientStream, numStreams)
 	for i := 0; i < numStreams; i++ {
-		cs, err := cliTransport.NewStream(ctx, &CallHdr{Method: fmt.Sprintf("/test/CAS/%d", i)}, nil)
+		csI, err := cliTransport.NewStream(ctx, &CallHdr{Method: fmt.Sprintf("/test/CAS/%d", i)}, nil)
+		cs, _ := csI.(*ClientStream)
 		if err != nil {
 			t.Fatalf("NewStream %d: %v", i, err)
 		}
@@ -1089,7 +1316,7 @@ func TestShmFlowControl_ConcurrentWholeMessageWrites(t *testing.T) {
 // additive path accepts both.
 func TestInFlow_MaybeAdjustAdditive_PipelinedLargeLPMs(t *testing.T) {
 	const (
-		limit   uint32 = 65535      // 64 KiB-ish stream window
+		limit   uint32 = 65535       // 64 KiB-ish stream window
 		lpmSize uint32 = 1024 * 1024 // 1 MiB LPM
 	)
 
@@ -1238,7 +1465,7 @@ func TestShmFrameWriter_EnqueueMessageAndWait_CtxCancelRace(t *testing.T) {
 	cliTransport, _ := NewShmClientTransport(clientSeg, testAddr{"shm", "client"}, testAddr{"shm", "server"})
 	defer cliTransport.Close(nil)
 
-	go srvTransport.HandleStreams(testCtx, func(s *ServerStream) {
+	go srvTransport.HandleStreams(testCtx, func(s ServerStreamIface) {
 		// Drain inbound but never reply — keeps streams open so
 		// sender's ctx cancellation is the only exit path.
 		<-testCtx.Done()
@@ -1261,7 +1488,8 @@ func TestShmFrameWriter_EnqueueMessageAndWait_CtxCancelRace(t *testing.T) {
 			for i := 0; i < iterations; i++ {
 				ctx, cancel := context.WithTimeout(context.Background(), time.Duration(50+i%100)*time.Microsecond)
 
-				cs, err := cliTransport.NewStream(ctx, &CallHdr{Method: "/test/CtxCancelRace"}, nil)
+				csI, err := cliTransport.NewStream(ctx, &CallHdr{Method: "/test/CtxCancelRace"}, nil)
+				cs, _ := csI.(*ClientStream)
 				if err != nil {
 					cancel()
 					continue
@@ -1302,9 +1530,9 @@ func TestShmFrameWriter_EnqueueMessageAndWait_CtxCancelRace(t *testing.T) {
 //     successful vs failed reservations.
 //  4. After a fixed duration, stop all goroutines. Verify:
 //     - shmCASRollback counter incremented at least once (proves
-//       the rollback path was exercised).
+//     the rollback path was exercised).
 //     - Quota invariant: streamQ.Load() == initialStream -
-//       sum(successful reservations) + reverts. Conn similarly.
+//     sum(successful reservations) + reverts. Conn similarly.
 //
 // Without the rollback Add(grant), stream quota would drift down
 // every time conn-CAS lost, eventually starving the reserver.
@@ -1406,5 +1634,3 @@ func TestTryReserveSendQuota_CASRollbackUnderContention(t *testing.T) {
 	t.Logf("rollbacks observed: %d (attempts=%d, successes=%d)",
 		delta, totalAttempt, totalSuccess)
 }
-
-

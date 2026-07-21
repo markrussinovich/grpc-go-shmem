@@ -638,7 +638,7 @@ type csAttempt struct {
 	ctx             context.Context
 	cs              *clientStream
 	transport       transport.ClientTransport
-	transportStream *transport.ClientStream
+	transportStream transport.ClientStreamIface
 	parser          parser
 	pickResult      balancer.PickResult
 
@@ -1047,7 +1047,7 @@ func (cs *clientStream) SendMsg(m any) (err error) {
 			fastAttempt := cs.attempt
 			cs.mu.Unlock()
 			if isCommitted && fastAttempt != nil && fastAttempt.trInfo == nil && len(cs.binlogs) == 0 {
-				if handled, werr := fastAttempt.transportStream.WriteProto(m, opts); handled {
+				if handled, werr := tryClientWriteProto(fastAttempt.transportStream, m, opts); handled {
 					if werr != nil {
 						if !cs.desc.ClientStreams {
 							return nil
@@ -1104,7 +1104,7 @@ func (cs *clientStream) SendMsg(m any) (err error) {
 					}
 					a.mu.Unlock()
 				}
-				if handled, err := a.transportStream.WriteProto(m, opts); handled {
+				if handled, err := tryClientWriteProto(a.transportStream, m, opts); handled {
 					if err != nil {
 						if !cs.desc.ClientStreams {
 							return nil
@@ -1685,7 +1685,7 @@ func newNonRetryClientStream(ctx context.Context, desc *StreamDesc, method strin
 }
 
 type addrConnStream struct {
-	transportStream  *transport.ClientStream
+	transportStream  transport.ClientStreamIface
 	ac               *addrConn
 	callHdr          *transport.CallHdr
 	cancel           context.CancelFunc
@@ -1928,7 +1928,7 @@ type ServerStream interface {
 // serverStream implements a server side Stream.
 type serverStream struct {
 	ctx   context.Context
-	s     *transport.ServerStream
+	s     transport.ServerStreamIface
 	p     parser
 	codec baseCodec
 	desc  *StreamDesc
@@ -2060,7 +2060,7 @@ func (ss *serverStream) SendMsg(m any) (err error) {
 				if pSize > ss.maxSendMessageSize {
 					return status.Errorf(codes.ResourceExhausted, "trying to send message larger than max (%d vs. %d)", pSize, ss.maxSendMessageSize)
 				}
-				if handled, err := ss.s.WriteProto(m, &transport.WriteOptions{Last: false}); handled {
+				if handled, err := tryServerWriteProto(ss.s, m, &transport.WriteOptions{Last: false}); handled {
 					if err != nil {
 						return toRPCErr(err)
 					}

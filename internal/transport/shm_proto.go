@@ -22,6 +22,7 @@ package transport
 
 import (
 	"context"
+	"fmt"
 
 	"google.golang.org/protobuf/proto"
 )
@@ -37,6 +38,28 @@ func protoSize(msg proto.Message) int {
 // protoMarshalAppend serializes msg and appends the result to dst.
 func protoMarshalAppend(dst []byte, msg proto.Message) ([]byte, error) {
 	return proto.MarshalOptions{UseCachedSize: true}.MarshalAppend(dst, msg)
+}
+
+// marshalProtoForAsync marshals pm into a pooled buffer for the async
+// writeProto fallback and verifies the encoded length matches the
+// pre-computed pSize. It is called on the sender's SendMsg goroutine so
+// the live proto.Message is fully serialized BEFORE writeProto returns;
+// the writer goroutine then copies the returned owned bytes into the
+// ring (see writeProtoBytesToRingH2Blocking). On success the caller owns
+// the buffer and MUST release it via putAsyncProtoBuf on every terminal
+// path; on error the buffer is already released.
+func marshalProtoForAsync(pm proto.Message, pSize int) ([]byte, error) {
+	buf := getAsyncProtoBuf(pSize)
+	out, err := protoMarshalAppend(buf[:0], pm)
+	if err != nil {
+		putAsyncProtoBuf(buf)
+		return nil, err
+	}
+	if len(out) != pSize {
+		putAsyncProtoBuf(out)
+		return nil, fmt.Errorf("shm writeProto: marshal size mismatch: %d vs %d", pSize, len(out))
+	}
+	return out, nil
 }
 
 // writeProtoToRing serializes a proto.Message directly into the ring buffer

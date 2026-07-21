@@ -51,6 +51,7 @@ import (
 	"google.golang.org/grpc/serviceconfig"
 	"google.golang.org/grpc/stats"
 	"google.golang.org/grpc/status"
+	transportclient "google.golang.org/grpc/transport/client"
 
 	_ "google.golang.org/grpc/balancer/roundrobin"           // To register roundrobin.
 	_ "google.golang.org/grpc/internal/resolver/passthrough" // To register passthrough resolver.
@@ -1529,7 +1530,16 @@ func (ac *addrConn) createTransport(ctx context.Context, addr resolver.Address, 
 	var newTr transport.ClientTransport
 	var err error
 
-	if transport.IsShmEnabled(addr) {
+	// Pluggable transport selection (L37-style): if the resolved address names a
+	// registered transport type, build it via the registry; otherwise fall back
+	// to attribute-based shm selection / default HTTP/2.
+	var pluggable transportclient.Builder
+	if addr.TransportType != "" {
+		pluggable = transportclient.Get(addr.TransportType)
+	}
+	if pluggable != nil {
+		newTr, err = pluggable.Build(connectCtx, ac.cc.ctx, addr, transportclient.BuildOptions{ConnectOptions: copts, OnClose: onClose})
+	} else if transport.IsShmEnabled(addr) {
 		// Try shm transport first
 		newTr, err = transport.NewShmClient(connectCtx, ac.cc.ctx, addr, copts, onClose)
 		if err != nil {

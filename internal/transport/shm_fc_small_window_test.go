@@ -131,7 +131,8 @@ func TestShmSmallWindowMultiFrameMessage(t *testing.T) {
 	// incrementally (this is the path through s.fc.onRead → WindowUpdate
 	// that, in the buggy implementation, never gets exercised because
 	// handleMessage is never called).
-	go srvTransport.HandleStreams(testCtx, func(s *ServerStream) {
+	go srvTransport.HandleStreams(testCtx, func(si ServerStreamIface) {
+		s := si.(*ServerStream)
 		const chunk = 4096
 		for {
 			_, err := s.Read(chunk)
@@ -144,7 +145,8 @@ func TestShmSmallWindowMultiFrameMessage(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
-	cs, err := cliTransport.NewStream(ctx, &CallHdr{Method: "/test/SmallWindow"}, nil)
+	csI, err := cliTransport.NewStream(ctx, &CallHdr{Method: "/test/SmallWindow"}, nil)
+	cs, _ := csI.(*ClientStream)
 	if err != nil {
 		t.Fatalf("NewStream: %v", err)
 	}

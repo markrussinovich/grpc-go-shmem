@@ -55,9 +55,12 @@ import (
 	"google.golang.org/grpc/experimental/shm"
 	imem "google.golang.org/grpc/internal/mem"
 	"google.golang.org/grpc/internal/transport"
-	"google.golang.org/grpc/mem"
 	testgrpc "google.golang.org/grpc/interop/grpc_testing"
 	testpb "google.golang.org/grpc/interop/grpc_testing"
+	"google.golang.org/grpc/mem"
+	pluginshm "google.golang.org/grpc/plugin/shm"
+	"google.golang.org/grpc/resolver"
+	"google.golang.org/grpc/resolver/manual"
 )
 
 const (
@@ -354,7 +357,6 @@ func loadBenchProfile() benchProfile {
 	return p
 }
 
-
 func (p benchProfile) dialOpts(transport string) []grpc.DialOption {
 	apply := true
 	if transport == "shm" && !p.applyToShm {
@@ -489,6 +491,90 @@ func newShmEnv(b *testing.B) *grpcBenchEnv {
 			// Restore SHM flow-control defaults so subsequent bench
 			// envs in the same `go test` invocation don't inherit
 			// this profile's overrides. No-op if we didn't override.
+			transport.ResetShmFlowControlForBench,
+			transport.ResetShmSpinIterationsForBench,
+		},
+	}
+}
+
+// newShmPluginEnv is newShmEnv's twin, but the SHM transport is selected through
+// the EXPORTED pluggable registry (resolver.Address.TransportType == "shm" plus
+// the tagged listener) and driven through the byte-only stream adapter, rather
+// than the experimental shm.WithTransport() dialer. The adapter hides WriteProto,
+// so this arm runs WITHOUT INLINE_TX: it is the Position-A plugin arm of the
+// three-arm benchmark (vs. monolithic+INLINE and monolithic+GRPC_SHM_STD_FLOW).
+func newShmPluginEnv(b *testing.B) *grpcBenchEnv {
+	profile := loadBenchProfile()
+	logBenchEnvOnce(b)
+	if profile.applyToShm && profile.initialWindowSize > 0 {
+		transport.ConfigureShmFlowControlForBench(int(profile.initialWindowSize))
+	}
+	if profile.applyToShm && profile.maxFrameSize > 0 {
+		transport.ConfigureShmMaxFrameSizeForBench(profile.maxFrameSize)
+	}
+	if v := os.Getenv("SHM_MAX_FRAME_SIZE"); v != "" {
+		n, perr := strconv.Atoi(v)
+		if perr != nil || n <= 0 {
+			b.Fatalf("SHM_MAX_FRAME_SIZE=%q invalid: %v", v, perr)
+		}
+		transport.ConfigureShmMaxFrameSizeForBench(n)
+	}
+	if v := os.Getenv("SHM_SPIN_ITERS"); v != "" {
+		n, perr := strconv.Atoi(v)
+		if perr != nil || n < 0 {
+			b.Fatalf("SHM_SPIN_ITERS=%q invalid: %v", v, perr)
+		}
+		transport.ConfigureShmSpinIterations(n)
+	}
+	name := fmt.Sprintf("bench_grpc_shmplugin_%d", time.Now().UnixNano())
+	lis, err := pluginshm.NewListenerWithSizes(name, uint64(benchSeg), uint64(benchRing), uint64(benchRing))
+	if err != nil {
+		b.Fatalf("plugin NewListenerWithSizes: %v", err)
+	}
+
+	srvOpts := []grpc.ServerOption{
+		grpc.MaxRecvMsgSize(benchMaxMsg),
+		grpc.MaxSendMsgSize(benchMaxMsg),
+		experimental.BufferPool(experimental.TightBufferPool()),
+	}
+	srvOpts = append(srvOpts, profile.serverOpts("shm")...)
+	stop := benchmark.StartServer(benchmark.ServerInfo{Type: "protobuf", Listener: lis}, srvOpts...)
+
+	// The plugin path selects the transport by resolver.Address.TransportType,
+	// so a manual resolver tags the address with "shm". No shm.WithTransport().
+	r := manual.NewBuilderWithScheme("shmplugin")
+	r.InitialState(resolver.State{
+		Addresses: []resolver.Address{{Addr: name, TransportType: pluginshm.Name}},
+	})
+
+	dialOpts := []grpc.DialOption{
+		grpc.WithResolvers(r),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithDefaultCallOptions(
+			grpc.MaxCallRecvMsgSize(benchMaxMsg),
+			grpc.MaxCallSendMsgSize(benchMaxMsg),
+		),
+		experimental.WithBufferPool(experimental.TightBufferPool()),
+	}
+	dialOpts = append(dialOpts, profile.dialOpts("shm")...)
+	conn, err := grpc.NewClient("shmplugin:///"+name, dialOpts...)
+	if err != nil {
+		stop()
+		lis.Close()
+		transport.RemoveSegment(name)
+		b.Fatalf("NewClient: %v", err)
+	}
+
+	client := testgrpc.NewBenchmarkServiceClient(conn)
+	warmUpGRPC(b, client)
+
+	return &grpcBenchEnv{
+		stopSrv: stop,
+		conn:    conn,
+		client:  client,
+		cleanups: []func(){
+			func() { lis.Close() },
+			func() { transport.RemoveSegment(name) },
 			transport.ResetShmFlowControlForBench,
 			transport.ResetShmSpinIterationsForBench,
 		},
@@ -749,7 +835,38 @@ func BenchmarkGRPCShmUnary(b *testing.B) {
 }
 
 // =============================================================================
-// TCP Transport — Full gRPC Stack
+// SHM Plugin (Position A) — Full gRPC Stack
+// =============================================================================
+
+// BenchmarkGRPCShmPluginStream is the Position-A plugin arm: streaming ping-pong
+// over SHM selected through the exported pluggable registry and driven through
+// the byte-only adapter (no INLINE_TX). Compare against BenchmarkGRPCShmStream
+// (monolithic, INLINE on) and the same with GRPC_SHM_STD_FLOW=1 (INLINE off).
+func BenchmarkGRPCShmPluginStream(b *testing.B) {
+	env := newShmPluginEnv(b)
+	defer env.close()
+	for _, p := range benchPayloadSizes {
+		p := p
+		b.Run(fmt.Sprintf("size=%s", p.label), func(b *testing.B) {
+			benchStream(b, env.client, p.bytes)
+		})
+	}
+}
+
+// BenchmarkGRPCShmPluginUnary is the unary Position-A plugin arm.
+func BenchmarkGRPCShmPluginUnary(b *testing.B) {
+	env := newShmPluginEnv(b)
+	defer env.close()
+	for _, p := range benchPayloadSizes {
+		p := p
+		b.Run(fmt.Sprintf("size=%s", p.label), func(b *testing.B) {
+			benchUnary(b, env.client, p.bytes)
+		})
+	}
+}
+
+// =============================================================================
+// TCP Transport (continued)
 // =============================================================================
 
 // BenchmarkGRPCTCPStream measures streaming ping-pong through the full gRPC

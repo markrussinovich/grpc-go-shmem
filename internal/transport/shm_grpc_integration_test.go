@@ -70,7 +70,8 @@ func TestClientTransport_NewStream_Integration(t *testing.T) {
 		Method: "/test.Service/TestMethod",
 	}
 
-	stream, err := clientTransport.NewStream(ctx, callHdr, nil)
+	streamI, err := clientTransport.NewStream(ctx, callHdr, nil)
+	stream, _ := streamI.(*ClientStream)
 	if err != nil {
 		t.Fatalf("NewStream failed: %v", err)
 	}
@@ -146,7 +147,8 @@ func TestServerTransport_HandleStreams_Placeholder(t *testing.T) {
 	defer cancel()
 
 	streamReceived := false
-	handler := func(s *ServerStream) {
+	handler := func(si ServerStreamIface) {
+		s := si.(*ServerStream)
 		t.Logf("Handler called with stream ID: %d", s.id)
 		streamReceived = true
 	}
@@ -206,7 +208,8 @@ func TestFullRPC_Integration(t *testing.T) {
 	t.Log("Both transports created")
 
 	// Start server handler (HandleStreams starts the server reader)
-	go serverTransport.HandleStreams(ctx, func(s *ServerStream) {
+	go serverTransport.HandleStreams(ctx, func(si ServerStreamIface) {
+		s := si.(*ServerStream)
 		t.Logf("Server: Received stream %d, method: %s", s.id, s.method)
 
 		// Send response headers
@@ -250,7 +253,8 @@ func TestFullRPC_Integration(t *testing.T) {
 		Method: "/test.Service/TestMethod",
 	}
 
-	stream, err := clientTransport.NewStream(ctx, callHdr, nil)
+	streamI, err := clientTransport.NewStream(ctx, callHdr, nil)
+	stream, _ := streamI.(*ClientStream)
 	if err != nil {
 		t.Fatalf("Client: NewStream failed: %v", err)
 	}
@@ -337,7 +341,8 @@ func TestShmDeadlinePropagation(t *testing.T) {
 	serverCtx, serverCancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	defer serverCancel()
 
-	go serverTransport.HandleStreams(serverCtx, func(s *ServerStream) {
+	go serverTransport.HandleStreams(serverCtx, func(si ServerStreamIface) {
+		s := si.(*ServerStream)
 		d, ok := s.Context().Deadline()
 		<-s.Context().Done()
 		gotCh <- deadlineResult{ok: ok, unixNano: d.UnixNano(), ctxErr: s.Context().Err()}
@@ -419,7 +424,8 @@ func TestShmMetadataPropagation(t *testing.T) {
 	serverCtx, serverCancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	defer serverCancel()
 
-	go serverTransport.HandleStreams(serverCtx, func(s *ServerStream) {
+	go serverTransport.HandleStreams(serverCtx, func(si ServerStreamIface) {
+		s := si.(*ServerStream)
 		defer close(serverDone)
 		inMD, _ := metadata.FromIncomingContext(s.Context())
 		if got := inMD.Get("x-test"); len(got) != 1 || got[0] != "abc" {
@@ -440,7 +446,8 @@ func TestShmMetadataPropagation(t *testing.T) {
 	defer cancel()
 	ctx = metadata.NewOutgoingContext(ctx, metadata.Pairs("x-test", "abc"))
 
-	stream, err := clientTransport.NewStream(ctx, &CallHdr{Host: "testhost", Method: "/test.Service/Metadata"}, nil)
+	streamI, err := clientTransport.NewStream(ctx, &CallHdr{Host: "testhost", Method: "/test.Service/Metadata"}, nil)
+	stream, _ := streamI.(*ClientStream)
 	if err != nil {
 		t.Fatalf("Client: NewStream failed: %v", err)
 	}
@@ -506,7 +513,8 @@ func TestShmContentTypeAndEncodingNegotiation(t *testing.T) {
 	serverCtx, serverCancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	defer serverCancel()
 
-	go serverTransport.HandleStreams(serverCtx, func(s *ServerStream) {
+	go serverTransport.HandleStreams(serverCtx, func(si ServerStreamIface) {
+		s := si.(*ServerStream)
 		defer close(serverDone)
 		if got := s.ContentSubtype(); got != "proto" {
 			t.Errorf("Server ContentSubtype=%q, want %q", got, "proto")
@@ -529,7 +537,8 @@ func TestShmContentTypeAndEncodingNegotiation(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	stream, err := clientTransport.NewStream(ctx, &CallHdr{Host: "testhost", Method: "/test.Service/Negotiation", ContentSubtype: "proto", SendCompress: "gzip"}, nil)
+	streamI, err := clientTransport.NewStream(ctx, &CallHdr{Host: "testhost", Method: "/test.Service/Negotiation", ContentSubtype: "proto", SendCompress: "gzip"}, nil)
+	stream, _ := streamI.(*ClientStream)
 	if err != nil {
 		t.Fatalf("Client: NewStream failed: %v", err)
 	}
@@ -592,7 +601,8 @@ func TestShmServerDrain(t *testing.T) {
 	serverCtx, serverCancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	defer serverCancel()
 
-	go serverTransport.HandleStreams(serverCtx, func(s *ServerStream) {
+	go serverTransport.HandleStreams(serverCtx, func(si ServerStreamIface) {
+		s := si.(*ServerStream)
 		serverSaw <- s
 		<-allowReply
 
@@ -606,7 +616,8 @@ func TestShmServerDrain(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	stream, err := clientTransport.NewStream(ctx, &CallHdr{Host: "testhost", Method: "/test.Service/Drain"}, nil)
+	streamI, err := clientTransport.NewStream(ctx, &CallHdr{Host: "testhost", Method: "/test.Service/Drain"}, nil)
+	stream, _ := streamI.(*ClientStream)
 	if err != nil {
 		t.Fatalf("Client: NewStream failed: %v", err)
 	}
@@ -689,7 +700,8 @@ func TestShmTrailerMetadataPropagation(t *testing.T) {
 	serverCtx, serverCancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	defer serverCancel()
 
-	go serverTransport.HandleStreams(serverCtx, func(s *ServerStream) {
+	go serverTransport.HandleStreams(serverCtx, func(si ServerStreamIface) {
+		s := si.(*ServerStream)
 		defer close(serverDone)
 		serverSaw <- struct{}{}
 		if err := s.SetTrailer(metadata.Pairs("x-trailer", "tv")); err != nil {
@@ -702,7 +714,8 @@ func TestShmTrailerMetadataPropagation(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	stream, err := clientTransport.NewStream(ctx, &CallHdr{Host: "testhost", Method: "/test.Service/Trailer"}, nil)
+	streamI, err := clientTransport.NewStream(ctx, &CallHdr{Host: "testhost", Method: "/test.Service/Trailer"}, nil)
+	stream, _ := streamI.(*ClientStream)
 	if err != nil {
 		t.Fatalf("Client: NewStream failed: %v", err)
 	}
@@ -768,7 +781,8 @@ func TestShmServerCloseTerminatesActiveStreams(t *testing.T) {
 	serverCtx, serverCancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	defer serverCancel()
 
-	go serverTransport.HandleStreams(serverCtx, func(s *ServerStream) {
+	go serverTransport.HandleStreams(serverCtx, func(si ServerStreamIface) {
+		s := si.(*ServerStream)
 		close(started)
 		_, err := s.Read(1)
 		readErrCh <- err

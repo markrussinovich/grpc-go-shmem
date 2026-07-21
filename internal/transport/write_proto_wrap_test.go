@@ -21,6 +21,7 @@
 package transport
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"fmt"
@@ -30,6 +31,33 @@ import (
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 )
+
+// TestWriteTwoSegAcrossSpans verifies the ring-wrap split-copy used by
+// writeProtoBytesToRingH2Blocking: writing two logical segments (the
+// 14-byte preamble `a` and the payload `b`) into the concatenation
+// first++second must reproduce a++b for EVERY boundary position —
+// including len(first) < len(a), == len(a), and > len(a).
+func TestWriteTwoSegAcrossSpans(t *testing.T) {
+	aa := make([]byte, h2FrameHeaderSize+5) // 14-byte preamble
+	for i := range aa {
+		aa[i] = byte('A' + i)
+	}
+	bb := make([]byte, 40)
+	for i := range bb {
+		bb[i] = byte(i)
+	}
+	want := append(append([]byte{}, aa...), bb...)
+	total := len(want)
+	for firstLen := 0; firstLen <= total; firstLen++ {
+		first := make([]byte, firstLen)
+		second := make([]byte, total-firstLen)
+		writeTwoSegAcrossSpans(first, second, aa, bb)
+		got := append(append([]byte{}, first...), second...)
+		if !bytes.Equal(got, want) {
+			t.Fatalf("firstLen=%d: split-copy mismatch\n got=%v\nwant=%v", firstLen, got, want)
+		}
+	}
+}
 
 // TestWriteProtoToRingH2_Wrap reproduces the wire-format corruption
 // observed on the Linux bench after enabling ZC marshal in writeLoop

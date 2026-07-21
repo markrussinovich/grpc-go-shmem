@@ -148,10 +148,11 @@ func TestShmClientWithMisbehavedServer(t *testing.T) {
 		defer cancel()
 
 		// Client creates a stream
-		stream, err := clientTransport.NewStream(ctx, &CallHdr{
+		streamI, err := clientTransport.NewStream(ctx, &CallHdr{
 			Host:   "localhost",
 			Method: "/test/Misbehaved",
 		}, nil)
+		stream, _ := streamI.(*ClientStream)
 		if err != nil {
 			t.Fatalf("NewStream failed: %v", err)
 		}
@@ -288,7 +289,8 @@ func TestShmServerWithMisbehavedClient(t *testing.T) {
 
 		// Start server handler
 		streamReceived := make(chan *ServerStream, 1)
-		go serverTransport.HandleStreams(ctx, func(s *ServerStream) {
+		go serverTransport.HandleStreams(ctx, func(si ServerStreamIface) {
+			s := si.(*ServerStream)
 			select {
 			case streamReceived <- s:
 			default:
@@ -370,7 +372,7 @@ func TestShmServerWithMisbehavedClient(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
 
-		go serverTransport.HandleStreams(ctx, func(_ *ServerStream) {
+		go serverTransport.HandleStreams(ctx, func(_ ServerStreamIface) {
 			// Don't expect any streams
 		})
 
@@ -406,7 +408,8 @@ func TestShmStreamIDExhaustion(t *testing.T) {
 	defer cancel()
 
 	// Start server handler
-	go st.HandleStreams(ctx, func(s *ServerStream) {
+	go st.HandleStreams(ctx, func(si ServerStreamIface) {
+		s := si.(*ServerStream)
 		// Simple echo: send HEADERS + TRAILERS OK
 		st.writeHeader(s, nil)
 		st.writeStatus(s, status.New(codes.OK, ""))
@@ -424,7 +427,8 @@ func TestShmStreamIDExhaustion(t *testing.T) {
 	}
 
 	// First stream should succeed (ID = MaxStreamID - 2)
-	s1, err := ct.NewStream(ctx, callHdr, nil)
+	s1I, err := ct.NewStream(ctx, callHdr, nil)
+	s1, _ := s1I.(*ClientStream)
 	if err != nil {
 		t.Fatalf("ct.NewStream() = %v", err)
 	}
@@ -440,7 +444,8 @@ func TestShmStreamIDExhaustion(t *testing.T) {
 
 	// Second stream should succeed (ID = MaxStreamID) and trigger draining
 	// because next ID would be MaxStreamID + 2 > MaxStreamID
-	s2, err := ct.NewStream(ctx, callHdr, nil)
+	s2I, err := ct.NewStream(ctx, callHdr, nil)
+	s2, _ := s2I.(*ClientStream)
 	if err != nil {
 		t.Fatalf("ct.NewStream() = %v", err)
 	}
@@ -495,7 +500,8 @@ func TestShmInvalidHeaderField(t *testing.T) {
 
 	// Start server
 	streamCh := make(chan *ServerStream, 1)
-	go serverTransport.HandleStreams(ctx, func(s *ServerStream) {
+	go serverTransport.HandleStreams(ctx, func(si ServerStreamIface) {
+		s := si.(*ServerStream)
 		select {
 		case streamCh <- s:
 		default:
@@ -557,7 +563,8 @@ func TestShmEncodingRequiredStatus(t *testing.T) {
 	specialStatus := status.New(codes.Internal, "\n\t\r special chars: ä½ å¥½")
 
 	// Start server that returns the special status
-	go st.HandleStreams(ctx, func(s *ServerStream) {
+	go st.HandleStreams(ctx, func(si ServerStreamIface) {
+		s := si.(*ServerStream)
 		// Read the request (read header first then message)
 		data, err := s.Read(1024)
 		if data != nil {
@@ -625,7 +632,8 @@ func TestShmClientConnDecoupledFromApplicationRead(t *testing.T) {
 	var serverStreams sync.Map
 
 	// Start server that sends data on each stream
-	go st.HandleStreams(ctx, func(s *ServerStream) {
+	go st.HandleStreams(ctx, func(si ServerStreamIface) {
+		s := si.(*ServerStream)
 		serverStreams.Store(s.id, s)
 
 		// Send response headers
@@ -647,7 +655,8 @@ func TestShmClientConnDecoupledFromApplicationRead(t *testing.T) {
 	})
 
 	// Create first stream
-	stream1, err := ct.NewStream(ctx, &CallHdr{Method: "/test/Stream1"}, nil)
+	stream1I, err := ct.NewStream(ctx, &CallHdr{Method: "/test/Stream1"}, nil)
+	stream1, _ := stream1I.(*ClientStream)
 	if err != nil {
 		t.Fatalf("Failed to create stream 1: %v", err)
 	}
@@ -660,7 +669,8 @@ func TestShmClientConnDecoupledFromApplicationRead(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 
 	// Create second stream WITHOUT reading from first
-	stream2, err := ct.NewStream(ctx, &CallHdr{Method: "/test/Stream2"}, nil)
+	stream2I, err := ct.NewStream(ctx, &CallHdr{Method: "/test/Stream2"}, nil)
+	stream2, _ := stream2I.(*ClientStream)
 	if err != nil {
 		t.Fatalf("Failed to create stream 2 (connection should not be blocked): %v", err)
 	}
@@ -708,7 +718,8 @@ func TestShmServerConnDecoupledFromApplicationRead(t *testing.T) {
 	streamDataReceived := make(chan uint32, 2)
 
 	// Server handler that processes streams independently
-	go st.HandleStreams(ctx, func(s *ServerStream) {
+	go st.HandleStreams(ctx, func(si ServerStreamIface) {
+		s := si.(*ServerStream)
 		// Signal that we received a stream
 		streamDataReceived <- s.id
 
@@ -728,7 +739,8 @@ func TestShmServerConnDecoupledFromApplicationRead(t *testing.T) {
 	})
 
 	// Create and send on first stream
-	stream1, err := ct.NewStream(ctx, &CallHdr{Method: "/test/Stream1"}, nil)
+	stream1I, err := ct.NewStream(ctx, &CallHdr{Method: "/test/Stream1"}, nil)
+	stream1, _ := stream1I.(*ClientStream)
 	if err != nil {
 		t.Fatalf("Failed to create stream 1: %v", err)
 	}
@@ -748,7 +760,8 @@ func TestShmServerConnDecoupledFromApplicationRead(t *testing.T) {
 	}
 
 	// Create and send on second stream
-	stream2, err := ct.NewStream(ctx, &CallHdr{Method: "/test/Stream2"}, nil)
+	stream2I, err := ct.NewStream(ctx, &CallHdr{Method: "/test/Stream2"}, nil)
+	stream2, _ := stream2I.(*ClientStream)
 	if err != nil {
 		t.Fatalf("Failed to create stream 2: %v", err)
 	}
@@ -781,7 +794,8 @@ func TestShmGoAwayDrainingCompletesGracefully(t *testing.T) {
 	streamCompleted := make(chan struct{})
 
 	// Server handler that takes a while to complete
-	go st.HandleStreams(ctx, func(s *ServerStream) {
+	go st.HandleStreams(ctx, func(si ServerStreamIface) {
+		s := si.(*ServerStream)
 		// Simulate work
 		time.Sleep(200 * time.Millisecond)
 
@@ -793,7 +807,8 @@ func TestShmGoAwayDrainingCompletesGracefully(t *testing.T) {
 	})
 
 	// Create a stream
-	stream, err := ct.NewStream(ctx, &CallHdr{Method: "/test/GracefulClose"}, nil)
+	streamI, err := ct.NewStream(ctx, &CallHdr{Method: "/test/GracefulClose"}, nil)
+	stream, _ := streamI.(*ClientStream)
 	if err != nil {
 		t.Fatalf("Failed to create stream: %v", err)
 	}
@@ -935,7 +950,8 @@ func TestShmClientMix(t *testing.T) {
 	serverDone := make(chan struct{})
 	go func() {
 		defer close(serverDone)
-		st.HandleStreams(serverCtx, func(s *ServerStream) {
+		st.HandleStreams(serverCtx, func(si ServerStreamIface) {
+			s := si.(*ServerStream)
 			// Read incoming message (use a reasonable default size)
 			msg, err := s.Read(1024)
 			if err != nil && err != io.EOF {
@@ -992,10 +1008,11 @@ func performOneShmRPC(ct *ShmClientTransport) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	s, err := ct.NewStream(ctx, &CallHdr{
+	sI, err := ct.NewStream(ctx, &CallHdr{
 		Host:   "localhost",
 		Method: "/test/Small",
 	}, nil)
+	s, _ := sI.(*ClientStream)
 	if err != nil {
 		return
 	}
@@ -1039,7 +1056,8 @@ func TestShmLargeMessageWithDelayRead(t *testing.T) {
 	defer serverCancel()
 	go func() {
 		defer close(serverDone)
-		st.HandleStreams(serverCtx, func(s *ServerStream) {
+		st.HandleStreams(serverCtx, func(si ServerStreamIface) {
+			s := si.(*ServerStream)
 			close(serverReady)
 
 			// Wait before reading to cause client to block on flow control
@@ -1077,7 +1095,8 @@ func TestShmLargeMessageWithDelayRead(t *testing.T) {
 	defer cancel()
 
 	// Create stream
-	s, err := ct.NewStream(ctx, &CallHdr{Host: "localhost", Method: "/test/Large"}, nil)
+	sI, err := ct.NewStream(ctx, &CallHdr{Host: "localhost", Method: "/test/Large"}, nil)
+	s, _ := sI.(*ClientStream)
 	if err != nil {
 		t.Fatalf("NewStream: %v", err)
 	}
@@ -1150,7 +1169,7 @@ func TestShmLargeMessageSuspension(t *testing.T) {
 	serverDone := make(chan struct{})
 	go func() {
 		defer close(serverDone)
-		st.HandleStreams(serverCtx, func(_ *ServerStream) {
+		st.HandleStreams(serverCtx, func(_ ServerStreamIface) {
 			// Do nothing - let client timeout
 			time.Sleep(5 * time.Second)
 		})
@@ -1160,7 +1179,8 @@ func TestShmLargeMessageSuspension(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
 
-	s, err := ct.NewStream(ctx, &CallHdr{Host: "localhost", Method: "/test/Large"}, nil)
+	sI, err := ct.NewStream(ctx, &CallHdr{Host: "localhost", Method: "/test/Large"}, nil)
+	s, _ := sI.(*ClientStream)
 	if err != nil {
 		t.Fatalf("NewStream: %v", err)
 	}
@@ -1217,7 +1237,8 @@ func TestShmReadGivesSameError(t *testing.T) {
 	// Server that returns an error status
 	go func() {
 		defer close(serverDone)
-		st.HandleStreams(serverCtx, func(s *ServerStream) {
+		st.HandleStreams(serverCtx, func(si ServerStreamIface) {
+			s := si.(*ServerStream)
 			// Send error status
 			_ = s.WriteStatus(status.New(codes.Internal, "test error"))
 		})
@@ -1226,7 +1247,8 @@ func TestShmReadGivesSameError(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	s, err := ct.NewStream(ctx, &CallHdr{Host: "localhost", Method: "/test/Error"}, nil)
+	sI, err := ct.NewStream(ctx, &CallHdr{Host: "localhost", Method: "/test/Error"}, nil)
+	s, _ := sI.(*ClientStream)
 	if err != nil {
 		t.Fatalf("NewStream: %v", err)
 	}
@@ -1291,7 +1313,8 @@ func TestShmWriteHeaderConnectionError(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 
 	// Try to create a new stream - should fail or succeed initially
-	s, err := ct.NewStream(ctx, &CallHdr{Host: "localhost", Method: "/test/Write"}, nil)
+	sI, err := ct.NewStream(ctx, &CallHdr{Host: "localhost", Method: "/test/Write"}, nil)
+	s, _ := sI.(*ClientStream)
 	if err != nil {
 		// Expected - transport might be closed already
 		t.Logf("NewStream returned expected error: %v", err)

@@ -395,17 +395,18 @@ func (s *server) start(t *testing.T, port int, serverConfig *ServerConfig, ht hT
 		switch ht {
 		case notifyCall:
 			go func() {
-				transport.HandleStreams(ctx, h.handleStreamAndNotify)
+				transport.HandleStreams(ctx, func(si ServerStreamIface) { h.handleStreamAndNotify(si.(*ServerStream)) })
 				wg.Done()
 			}()
 		case suspended:
 			go func() {
-				transport.HandleStreams(ctx, func(*ServerStream) {})
+				transport.HandleStreams(ctx, func(ServerStreamIface) {})
 				wg.Done()
 			}()
 		case misbehaved:
 			go func() {
-				transport.HandleStreams(ctx, func(s *ServerStream) {
+				transport.HandleStreams(ctx, func(si ServerStreamIface) {
+					s := si.(*ServerStream)
 					wg.Add(1)
 					go func() {
 						h.handleStreamMisbehave(t, s)
@@ -416,7 +417,8 @@ func (s *server) start(t *testing.T, port int, serverConfig *ServerConfig, ht hT
 			}()
 		case encodingRequiredStatus:
 			go func() {
-				transport.HandleStreams(ctx, func(s *ServerStream) {
+				transport.HandleStreams(ctx, func(si ServerStreamIface) {
+					s := si.(*ServerStream)
 					wg.Add(1)
 					go func() {
 						h.handleStreamEncodingRequiredStatus(s)
@@ -427,7 +429,8 @@ func (s *server) start(t *testing.T, port int, serverConfig *ServerConfig, ht hT
 			}()
 		case invalidHeaderField:
 			go func() {
-				transport.HandleStreams(ctx, func(s *ServerStream) {
+				transport.HandleStreams(ctx, func(si ServerStreamIface) {
+					s := si.(*ServerStream)
 					wg.Add(1)
 					go func() {
 						h.handleStreamInvalidHeaderField(s)
@@ -443,7 +446,8 @@ func (s *server) start(t *testing.T, port int, serverConfig *ServerConfig, ht hT
 			close(s.ready)
 			s.mu.Unlock()
 			go func() {
-				transport.HandleStreams(ctx, func(s *ServerStream) {
+				transport.HandleStreams(ctx, func(si ServerStreamIface) {
+					s := si.(*ServerStream)
 					wg.Add(1)
 					go func() {
 						h.handleStreamDelayRead(t, s)
@@ -454,7 +458,8 @@ func (s *server) start(t *testing.T, port int, serverConfig *ServerConfig, ht hT
 			}()
 		case pingpong:
 			go func() {
-				transport.HandleStreams(ctx, func(s *ServerStream) {
+				transport.HandleStreams(ctx, func(si ServerStreamIface) {
+					s := si.(*ServerStream)
 					wg.Add(1)
 					go func() {
 						h.handleStreamPingPong(t, s)
@@ -465,7 +470,8 @@ func (s *server) start(t *testing.T, port int, serverConfig *ServerConfig, ht hT
 			}()
 		default:
 			go func() {
-				transport.HandleStreams(ctx, func(s *ServerStream) {
+				transport.HandleStreams(ctx, func(si ServerStreamIface) {
+					s := si.(*ServerStream)
 					wg.Add(1)
 					go func() {
 						h.handleStream(t, s)
@@ -630,7 +636,8 @@ func (s) TestInflightStreamClosing(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	defer cancel()
-	stream, err := client.NewStream(ctx, &CallHdr{}, nil)
+	streamI, err := client.NewStream(ctx, &CallHdr{}, nil)
+	stream, _ := streamI.(*ClientStream)
 	if err != nil {
 		t.Fatalf("Client failed to create RPC request: %v", err)
 	}
@@ -678,7 +685,8 @@ func (s) TestClientTransportDrainsAfterStreamIDExhausted(t *testing.T) {
 	ctx, ctxCancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	defer ctxCancel()
 
-	s, err := ct.NewStream(ctx, callHdr, nil)
+	sI, err := ct.NewStream(ctx, callHdr, nil)
+	s, _ := sI.(*ClientStream)
 	if err != nil {
 		t.Fatalf("ct.NewStream() = %v", err)
 	}
@@ -691,7 +699,8 @@ func (s) TestClientTransportDrainsAfterStreamIDExhausted(t *testing.T) {
 	}
 
 	// The expected stream ID here is 3 since stream IDs are incremented by 2.
-	s, err = ct.NewStream(ctx, callHdr, nil)
+	sI, err = ct.NewStream(ctx, callHdr, nil)
+	s, _ = sI.(*ClientStream)
 	if err != nil {
 		t.Fatalf("ct.NewStream() = %v", err)
 	}
@@ -714,14 +723,16 @@ func (s) TestClientSendAndReceive(t *testing.T) {
 	}
 	ctx, ctxCancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	defer ctxCancel()
-	s1, err1 := ct.NewStream(ctx, callHdr, nil)
+	s1I, err1 := ct.NewStream(ctx, callHdr, nil)
+	s1, _ := s1I.(*ClientStream)
 	if err1 != nil {
 		t.Fatalf("failed to open stream: %v", err1)
 	}
 	if s1.id != 1 {
 		t.Fatalf("wrong stream id: %d", s1.id)
 	}
-	s2, err2 := ct.NewStream(ctx, callHdr, nil)
+	s2I, err2 := ct.NewStream(ctx, callHdr, nil)
+	s2, _ := s2I.(*ClientStream)
 	if err2 != nil {
 		t.Fatalf("failed to open stream: %v", err2)
 	}
@@ -761,7 +772,8 @@ func performOneRPC(ct ClientTransport) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	defer cancel()
-	s, err := ct.NewStream(ctx, callHdr, nil)
+	sI, err := ct.NewStream(ctx, callHdr, nil)
+	s, _ := sI.(*ClientStream)
 	if err != nil {
 		return
 	}
@@ -807,7 +819,8 @@ func (s) TestLargeMessage(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			s, err := ct.NewStream(ctx, callHdr, nil)
+			sI, err := ct.NewStream(ctx, callHdr, nil)
+			s, _ := sI.(*ClientStream)
 			if err != nil {
 				t.Errorf("%v.NewStream(_, _) = _, %v, want _, <nil>", ct, err)
 			}
@@ -855,7 +868,8 @@ func (s) TestLargeMessageWithDelayRead(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
 	defer cancel()
-	s, err := ct.NewStream(ctx, callHdr, nil)
+	sI, err := ct.NewStream(ctx, callHdr, nil)
+	s, _ := sI.(*ClientStream)
 	if err != nil {
 		t.Fatalf("%v.NewStream(_, _) = _, %v, want _, <nil>", ct, err)
 		return
@@ -954,7 +968,8 @@ func (s) TestGracefulClose(t *testing.T) {
 
 	// Create a stream that will exist for this whole test and confirm basic
 	// functionality.
-	s, err := ct.NewStream(ctx, &CallHdr{}, nil)
+	sI, err := ct.NewStream(ctx, &CallHdr{}, nil)
+	s, _ := sI.(*ClientStream)
 	if err != nil {
 		t.Fatalf("NewStream(_, _) = _, %v, want _, <nil>", err)
 	}
@@ -1014,7 +1029,8 @@ func (s) TestLargeMessageSuspension(t *testing.T) {
 	// Set a long enough timeout for writing a large message out.
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	s, err := ct.NewStream(ctx, callHdr, nil)
+	sI, err := ct.NewStream(ctx, callHdr, nil)
+	s, _ := sI.(*ClientStream)
 	if err != nil {
 		t.Fatalf("failed to open stream: %v", err)
 	}
@@ -1054,7 +1070,8 @@ func (s) TestMaxStreams(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	defer cancel()
-	s, err := ct.NewStream(ctx, callHdr, nil)
+	sI, err := ct.NewStream(ctx, callHdr, nil)
+	s, _ := sI.(*ClientStream)
 	if err != nil {
 		t.Fatalf("Failed to open stream: %v", err)
 	}
@@ -1076,7 +1093,7 @@ func (s) TestMaxStreams(t *testing.T) {
 		// context which is canceled at the end of the test.
 		defer cancel()
 		if str, err := ct.NewStream(ctx, callHdr, nil); err == nil {
-			slist = append(slist, str)
+			slist = append(slist, str.(*ClientStream))
 			continue
 		} else if err.Error() != expectedErr.Error() {
 			t.Fatalf("ct.NewStream(_,_) = _, %v, want _, %v", err, expectedErr)
@@ -1141,7 +1158,8 @@ func (s) TestServerContextCanceledOnClosedConnection(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	defer cancel()
-	s, err := ct.NewStream(ctx, callHdr, nil)
+	sI, err := ct.NewStream(ctx, callHdr, nil)
+	s, _ := sI.(*ClientStream)
 	if err != nil {
 		t.Fatalf("Failed to open stream: %v", err)
 	}
@@ -1211,7 +1229,8 @@ func (s) TestClientConnDecoupledFromApplicationRead(t *testing.T) {
 	server.mu.Unlock()
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	defer cancel()
-	cstream1, err := client.NewStream(ctx, &CallHdr{}, nil)
+	cstream1I, err := client.NewStream(ctx, &CallHdr{}, nil)
+	cstream1, _ := cstream1I.(*ClientStream)
 	if err != nil {
 		t.Fatalf("Client failed to create first stream. Err: %v", err)
 	}
@@ -1238,7 +1257,8 @@ func (s) TestClientConnDecoupledFromApplicationRead(t *testing.T) {
 	server.h.notify = notifyChan
 	server.mu.Unlock()
 	// Create another stream on client.
-	cstream2, err := client.NewStream(ctx, &CallHdr{}, nil)
+	cstream2I, err := client.NewStream(ctx, &CallHdr{}, nil)
+	cstream2, _ := cstream2I.(*ClientStream)
 	if err != nil {
 		t.Fatalf("Client failed to create second stream. Err: %v", err)
 	}
@@ -1300,7 +1320,8 @@ func (s) TestServerConnDecoupledFromApplicationRead(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	defer cancel()
 	server.mu.Unlock()
-	cstream1, err := client.NewStream(ctx, &CallHdr{}, nil)
+	cstream1I, err := client.NewStream(ctx, &CallHdr{}, nil)
+	cstream1, _ := cstream1I.(*ClientStream)
 	if err != nil {
 		t.Fatalf("Failed to create 1st stream. Err: %v", err)
 	}
@@ -1309,7 +1330,8 @@ func (s) TestServerConnDecoupledFromApplicationRead(t *testing.T) {
 		t.Fatalf("Client failed to write data. Err: %v", err)
 	}
 	// Client should be able to create another stream and send data on it.
-	cstream2, err := client.NewStream(ctx, &CallHdr{}, nil)
+	cstream2I, err := client.NewStream(ctx, &CallHdr{}, nil)
+	cstream2, _ := cstream2I.(*ClientStream)
 	if err != nil {
 		t.Fatalf("Failed to create 2nd stream. Err: %v", err)
 	}
@@ -1587,7 +1609,8 @@ func (s) TestClientWithMisbehavedServer(t *testing.T) {
 	}
 	defer ct.Close(fmt.Errorf("closed manually by test"))
 
-	str, err := ct.NewStream(connectCtx, &CallHdr{}, nil)
+	strI, err := ct.NewStream(connectCtx, &CallHdr{}, nil)
+	str, _ := strI.(*ClientStream)
 	if err != nil {
 		t.Fatalf("Error while creating stream: %v", err)
 	}
@@ -1617,7 +1640,8 @@ func (s) TestEncodingRequiredStatus(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	defer cancel()
-	s, err := ct.NewStream(ctx, callHdr, nil)
+	sI, err := ct.NewStream(ctx, callHdr, nil)
+	s, _ := sI.(*ClientStream)
 	if err != nil {
 		return
 	}
@@ -1647,7 +1671,8 @@ func (s) TestInvalidHeaderField(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	defer cancel()
-	s, err := ct.NewStream(ctx, callHdr, nil)
+	sI, err := ct.NewStream(ctx, callHdr, nil)
+	s, _ := sI.(*ClientStream)
 	if err != nil {
 		return
 	}
@@ -1667,7 +1692,8 @@ func (s) TestHeaderChanClosedAfterReceivingAnInvalidHeader(t *testing.T) {
 	defer ct.Close(fmt.Errorf("closed manually by test"))
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	defer cancel()
-	s, err := ct.NewStream(ctx, &CallHdr{Host: "localhost", Method: "foo"}, nil)
+	sI, err := ct.NewStream(ctx, &CallHdr{Host: "localhost", Method: "foo"}, nil)
+	s, _ := sI.(*ClientStream)
 	if err != nil {
 		t.Fatalf("failed to create the stream")
 	}
@@ -1797,10 +1823,12 @@ func testFlowControlAccountCheck(t *testing.T, msgSize int, wc windowSizeConfig)
 	clientStreams := make([]*ClientStream, numStreams)
 	for i := 0; i < numStreams; i++ {
 		var err error
-		clientStreams[i], err = client.NewStream(ctx, &CallHdr{}, nil)
+		var csI ClientStreamIface
+		csI, err = client.NewStream(ctx, &CallHdr{}, nil)
 		if err != nil {
 			t.Fatalf("Failed to create stream. Err: %v", err)
 		}
+		clientStreams[i] = csI.(*ClientStream)
 	}
 	var wg sync.WaitGroup
 	// For each stream send pingpong messages to the server.
@@ -2348,7 +2376,8 @@ func (s) TestWriteHeaderConnectionError(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	defer cancel()
-	cstream, err := client.NewStream(ctx, &CallHdr{}, nil)
+	cstreamI, err := client.NewStream(ctx, &CallHdr{}, nil)
+	cstream, _ := cstreamI.(*ClientStream)
 	if err != nil {
 		t.Fatalf("Client failed to create first stream. Err: %v", err)
 	}
@@ -2412,7 +2441,8 @@ func runPingPongTest(t *testing.T, msgSize int) {
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	defer cancel()
-	stream, err := client.NewStream(ctx, &CallHdr{}, nil)
+	streamI, err := client.NewStream(ctx, &CallHdr{}, nil)
+	stream, _ := streamI.(*ClientStream)
 	if err != nil {
 		t.Fatalf("Failed to create stream. Err: %v", err)
 	}
@@ -3558,7 +3588,8 @@ func setupRSTStreamOnEOSTest(ctx context.Context, t *testing.T, sendServerFrames
 	t.Cleanup(func() { ct.Close(errors.New("test cleanup: forcing close")) })
 
 	// Create a stream.
-	stream, err := ct.NewStream(ctx, &CallHdr{}, nil)
+	streamI, err := ct.NewStream(ctx, &CallHdr{}, nil)
+	stream, _ := streamI.(*ClientStream)
 	if err != nil {
 		t.Fatalf("NewStream failed: %v", err)
 	}
@@ -3853,7 +3884,8 @@ func (s) TestDeleteStreamMetricsIncrementedOnlyOnce(t *testing.T) {
 				t.Fatal("Server transport not found")
 			}
 
-			clientStream, err := client.NewStream(ctx, &CallHdr{}, nil)
+			clientStreamI, err := client.NewStream(ctx, &CallHdr{}, nil)
+			clientStream, _ := clientStreamI.(*ClientStream)
 			if err != nil {
 				t.Fatalf("Failed to create stream: %v", err)
 			}
