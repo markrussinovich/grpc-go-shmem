@@ -35,15 +35,16 @@ import (
 // bytes (Write); the receive path hands ring/buffer-backed bytes upward
 // (ReadMessageHeader + Read returning a ref-counted mem.BufferSlice, which is
 // how read-side zero-copy survives a clean transport boundary). It deliberately
-// does NOT expose a message-typed fast path such as WriteProto(msg any):
-// marshalling an application message is a codec responsibility (user-pluggable
-// in every gRPC language) and is not portable across C++/Java/Python/Go, so
-// "marshal directly into the transport buffer" (INLINE_TX) stays a first-party,
-// monolithic-only optimization rather than part of the pluggable contract. Core
-// still uses that optimization opportunistically via an optional capability
-// assertion (see writeProtoCapable in the grpc package) when the concrete stream
-// offers it; a plugin that implements only this interface simply does not, and
-// falls back to Write.
+// does NOT include a message-typed fast path such as WriteProto(msg any) in the
+// MANDATORY method set: the required send path is byte-based. Marshalling an
+// application message directly into transport memory (INLINE_TX) is instead an
+// OPTIONAL capability that a stream MAY additionally implement; core detects it
+// by assertion (see writeProtoCapable in the grpc package, exported as
+// ProtoWriteStream in transport/client and transport/server) and transparently
+// falls back to Write when it is absent or declines. Keeping it optional rather
+// than mandatory preserves portability — a plugin whose stack has no compatible
+// serialization destination simply omits it — while a plugin over a capable
+// engine (e.g. the SHM bridge) forwards it to recover marshal-into-ring.
 type ClientStreamIface interface {
 	// Write writes the pre-framed hdr and data bytes to the output stream.
 	Write(hdr []byte, data mem.BufferSlice, opts *WriteOptions) error
@@ -75,9 +76,10 @@ type ClientStreamIface interface {
 // transport stream. It is the in-tree backing type for the exported pluggable
 // interface (google.golang.org/grpc/transport/server.ServerStream).
 //
-// Like ClientStreamIface it is byte-based and excludes WriteProto for the same
-// portability reasons; the send-side zero-copy a plugin retains is the single
-// contiguous Write into transport memory, not marshal-into-buffer.
+// Like ClientStreamIface it keeps WriteProto out of the MANDATORY method set for
+// the same portability reasons; it remains available as the optional
+// ProtoWriteStream capability that a capable plugin MAY forward (see the
+// ClientStreamIface note above).
 type ServerStreamIface interface {
 	// Read / ReadMessageHeader form the parser contract.
 	ReadMessageHeader(header []byte) error
@@ -107,9 +109,10 @@ type ServerStreamIface interface {
 // Compile-time checks: the concrete in-tree streams satisfy the byte-based
 // interfaces. They additionally implement the optional WriteProto (INLINE_TX)
 // fast path, which is deliberately NOT part of the byte interfaces above: core
-// detects it by assertion (see writeProtoCapable in the grpc package), so the
-// first-party monolithic transport keeps INLINE_TX while a byte-only plugin does
-// not.
+// detects it by assertion (see writeProtoCapable in the grpc package). Both the
+// first-party monolithic transport and a plugin that forwards the optional
+// ProtoWriteStream capability (e.g. the SHM bridge) keep INLINE_TX; a plugin
+// whose stream implements only the mandatory byte interface falls back to Write.
 var (
 	_ ClientStreamIface = (*ClientStream)(nil)
 	_ ServerStreamIface = (*ServerStream)(nil)

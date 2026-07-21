@@ -26,13 +26,17 @@
 //
 // # Implementation status: a thin bridge over the existing engine
 //
-// The types in this package — the bridge* transports and streams — are a
-// deliberately THIN bridge layer. They implement the exported byte-based plugin
-// contract, but they do NOT reimplement SHM: they delegate every operation to the
-// full, already-developed in-tree SHM engine in internal/transport. The only
-// thing the bridge adds is contract conformance — it presents ONLY the byte
-// interface and drops the engine stream's WriteProto (INLINE_TX) fast path — so
-// the plugin strictly obeys the cross-language plugin constraint.
+// The types in this package — the bridge* transports — are a deliberately THIN
+// bridge layer. They implement the exported byte-based plugin contract, but they
+// do NOT reimplement SHM: they delegate every operation to the full,
+// already-developed in-tree SHM engine in internal/transport. The bridge returns
+// the engine's streams DIRECTLY: those streams already implement the mandatory
+// byte interface AND the OPTIONAL INLINE_TX capability (WriteProto, see
+// transport/client.ProtoWriteStream), so the plugin marshals protobuf directly
+// into the SHM ring exactly as the first-party monolithic transport does. Core
+// detects WriteProto by assertion and, for any transport whose stream lacks it,
+// transparently uses the byte Write path — which is what keeps the contract
+// portable. No per-stream wrapper is used, so there is no per-RPC wrapping cost.
 //
 // This is intentional for the POC: it shows a working, contract-conformant plugin
 // today, on top of the full engine, without rewriting the ~40k-line engine. The
@@ -61,12 +65,12 @@ func init() {
 type clientBuilder struct{}
 
 // Build dials an SHM client transport using the full in-tree engine
-// (transport.NewShmClient), then wraps it in the thin bridge below. The bridge is
-// the plugin's whole implementation: it adds no transport logic, it only enforces
-// the byte-only plugin contract by hiding the engine stream's WriteProto
-// (INLINE_TX) fast path, so the plugin uses the portable Write path. Decoupling
-// the engine out of internal/ into a standalone implementation owned by this
-// package is the planned next phase (see the package doc).
+// (transport.NewShmClient), then wraps it in the thin bridge below. The bridge
+// adds no transport logic: it forwards the transport lifecycle and returns the
+// engine's streams directly, which already implement the exported contract (the
+// byte interface + the optional WriteProto/INLINE_TX capability). Decoupling the
+// engine out of internal/ into a standalone implementation owned by this package
+// is the planned next phase (see the package doc).
 func (clientBuilder) Build(connectCtx, ctx context.Context, addr resolver.Address, opts transportclient.BuildOptions) (transport.ClientTransport, error) {
 	inner, err := transport.NewShmClient(connectCtx, ctx, addr, opts.ConnectOptions, opts.OnClose)
 	if err != nil {
@@ -77,8 +81,8 @@ func (clientBuilder) Build(connectCtx, ctx context.Context, addr resolver.Addres
 
 // bridgeClientTransport is the thin bridge from the exported byte-based plugin
 // contract to the full in-tree SHM client transport. Every method forwards to the
-// engine; NewStream additionally wraps the returned stream to drop the
-// non-portable WriteProto fast path.
+// engine; NewStream returns the engine stream directly (it already implements the
+// exported contract, including the optional WriteProto capability).
 type bridgeClientTransport struct {
 	inner transport.ClientTransport
 }
@@ -86,11 +90,14 @@ type bridgeClientTransport struct {
 var _ transport.ClientTransport = (*bridgeClientTransport)(nil)
 
 func (p *bridgeClientTransport) NewStream(ctx context.Context, callHdr *transport.CallHdr, handler stats.Handler) (transport.ClientStreamIface, error) {
-	s, err := p.inner.NewStream(ctx, callHdr, handler)
-	if err != nil {
-		return nil, err
-	}
-	return bridgeClientStream{s}, nil
+	// Return the engine stream directly. It already implements the full
+	// exported contract — the mandatory byte interface AND the optional
+	// WriteProto (INLINE_TX) capability (transportclient.ProtoWriteStream) —
+	// so no per-stream wrapper is needed. Core detects WriteProto by
+	// assertion and uses marshal-into-ring exactly like the monolithic
+	// transport. Avoiding the wrapper also removes a per-RPC allocation
+	// (measurable on unary; amortised on streaming).
+	return p.inner.NewStream(ctx, callHdr, handler)
 }
 
 func (p *bridgeClientTransport) Close(err error)         { p.inner.Close(err) }
@@ -101,11 +108,3 @@ func (p *bridgeClientTransport) GetGoAwayReason() (transport.GoAwayReason, strin
 	return p.inner.GetGoAwayReason()
 }
 func (p *bridgeClientTransport) Peer() *peer.Peer { return p.inner.Peer() }
-
-// bridgeClientStream embeds only the byte-based stream interface. Because that
-// interface does not declare WriteProto, this wrapper type does not expose it
-// either, so core's optional INLINE_TX capability assertion fails and the
-// standard Write path is used.
-type bridgeClientStream struct {
-	transport.ClientStreamIface
-}

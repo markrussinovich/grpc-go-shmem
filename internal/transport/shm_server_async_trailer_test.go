@@ -112,8 +112,11 @@ func TestShmAsyncTrailerDiscardOnDropTerminal(t *testing.T) {
 		t.Fatal("doneCh did not receive within 2s (writeStatus would hang)")
 	}
 
-	if got := s.getState(); got != streamDone {
-		t.Fatalf("stream state: got %v, want streamDone", got)
+	if !s.shmDataDropped.Load() {
+		t.Fatalf("stream not tombstoned: shmDataDropped=false, want true")
+	}
+	if got := s.getState(); got == streamDone {
+		t.Fatalf("stream state: got streamDone, want non-streamDone (writer tombstone must NOT set streamDone — that deadlocks closeStream)")
 	}
 
 	produceAfter := tx.header().WriteIndex()
@@ -241,14 +244,19 @@ func TestShmAsyncTrailerDiscardRespectsSibling(t *testing.T) {
 		// expected: still parked
 	}
 
-	// Stream MUST be tombstoned even though the trailer stayed
-	// parked — this is the TOCTOU close: if the sibling's drain
-	// eventually succeeds and calls flushDeferredTrailer, that
-	// flush MUST see streamDone and refuse to emit OK trailers
-	// (the current call's DATA was dropped → peer cardinality
-	// violation if OK trailers were emitted later).
-	if got := s.getState(); got != streamDone {
-		t.Fatalf("stream state: got %v, want streamDone (TOCTOU tombstone)", got)
+	// Stream MUST be tombstoned (shmDataDropped) even though the
+	// trailer stayed parked — this is the TOCTOU close: if the
+	// sibling's drain eventually succeeds and calls
+	// flushDeferredTrailer, that flush MUST see shmDataDropped and
+	// refuse to emit OK trailers (the current call's DATA was dropped
+	// → peer cardinality violation if OK trailers were emitted later).
+	// The tombstone MUST NOT be the streamDone state, which is
+	// reserved for closeStream.
+	if !s.shmDataDropped.Load() {
+		t.Fatalf("stream not tombstoned: shmDataDropped=false, want true (TOCTOU tombstone)")
+	}
+	if got := s.getState(); got == streamDone {
+		t.Fatalf("stream state: got streamDone, want non-streamDone (tombstone must not set streamDone)")
 	}
 }
 
@@ -256,9 +264,10 @@ func TestShmAsyncTrailerDiscardRespectsSibling(t *testing.T) {
 // close: when async DATA drops BEFORE writeStatus has enqueued the
 // TRAILER, a later writeStatus call MUST NOT emit OK trailers on
 // the wire (peer cardinality violation). The fix relies on
-// discardDeferredTrailer tombstoning the stream to streamDone
-// unconditionally, so a subsequent processTrailerEntry call sees
-// streamDone and signals errStreamDone instead of emitting.
+// discardDeferredTrailer tombstoning the stream via the sticky
+// shmDataDropped flag unconditionally, so a subsequent
+// processTrailerEntry call sees the tombstone and signals
+// errStreamDone instead of emitting.
 //
 // This exercises the race the original trailer-sentinel design
 // didn't cover: the trailer-sentinel only protects against
@@ -288,10 +297,14 @@ func TestShmAsyncTrailerTOCTOUDropBeforeStatus(t *testing.T) {
 	w.discardDeferredTrailer(5, s)
 	w.inlineMu.Unlock()
 
-	// Stream must be tombstoned — the late writeStatus arriving
-	// after us must be rejected by processTrailerEntry.
-	if got := s.getState(); got != streamDone {
-		t.Fatalf("stream state: got %v, want streamDone after drop-before-status", got)
+	// Stream must be tombstoned (shmDataDropped) — the late
+	// writeStatus arriving after us must be rejected by
+	// processTrailerEntry.
+	if !s.shmDataDropped.Load() {
+		t.Fatalf("stream not tombstoned: shmDataDropped=false, want true after drop-before-status")
+	}
+	if got := s.getState(); got == streamDone {
+		t.Fatalf("stream state: got streamDone, want non-streamDone (tombstone must not set streamDone)")
 	}
 
 	// Now simulate writeStatus arriving LATE: processTrailerEntry

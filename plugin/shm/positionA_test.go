@@ -22,42 +22,38 @@ import (
 	"testing"
 
 	"google.golang.org/grpc/internal/transport"
+	transportclient "google.golang.org/grpc/transport/client"
+	transportserver "google.golang.org/grpc/transport/server"
 )
 
-// writeProtoFastPath mirrors the optional, non-portable INLINE_TX capability
-// that grpc-go core detects by assertion. The first-party concrete streams
-// implement it; a byte-only plugin stream must not.
+// writeProtoFastPath mirrors the optional INLINE_TX capability that grpc-go core
+// detects by assertion (marshal a protobuf message directly into transport
+// memory). The plugin returns the engine's concrete streams DIRECTLY (no
+// per-stream wrapper), so those streams must implement the capability for core
+// to use marshal-into-ring.
 type writeProtoFastPath interface {
 	WriteProto(msg any, opts *transport.WriteOptions) (bool, error)
 }
 
-// TestPluginStreamsDoNotExposeWriteProto proves Position A structurally: the
-// streams the plugin hands to grpc-go core present ONLY the byte-based
-// interface, so core's optional INLINE_TX (marshal-into-ring) capability
-// assertion fails and the portable Write path is used. INLINE_TX therefore
-// remains a first-party-monolithic-only optimization that the plugin does not
-// (and cannot, over the exported contract) use.
-func TestPluginStreamsDoNotExposeWriteProto(t *testing.T) {
-	var cs transport.ClientStreamIface = bridgeClientStream{}
-	if _, ok := cs.(writeProtoFastPath); ok {
-		t.Fatal("bridgeClientStream must NOT expose WriteProto: INLINE_TX is a first-party-only optimization, not part of the byte-based pluggable contract")
-	}
-
-	var ss transport.ServerStreamIface = bridgeServerStream{}
-	if _, ok := ss.(writeProtoFastPath); ok {
-		t.Fatal("bridgeServerStream must NOT expose WriteProto: INLINE_TX is a first-party-only optimization, not part of the byte-based pluggable contract")
-	}
-}
-
-// TestConcreteStreamsDoExposeWriteProto is the companion: the in-tree concrete
-// streams DO implement the optional fast path, which is exactly why the
-// monolithic (non-plugin) path keeps INLINE_TX. This pins the asymmetry the
-// benchmark measures.
-func TestConcreteStreamsDoExposeWriteProto(t *testing.T) {
+// TestEngineStreamsExposeOptionalWriteProto proves the streams the plugin hands
+// to grpc-go core — the in-tree concrete engine streams, returned directly by
+// the bridge transport WITHOUT a per-stream wrapper — implement the optional
+// INLINE_TX capability, both as the core-internal shape (writeProtoFastPath) and
+// as the exported transportclient/transportserver.ProtoWriteStream contract. So
+// core's assertion succeeds and the plugin uses marshal-into-ring exactly like
+// the monolithic transport. The real end-to-end path is exercised by
+// TestRegistryPath* in registry_e2e_test.go.
+func TestEngineStreamsExposeOptionalWriteProto(t *testing.T) {
 	if _, ok := any((*transport.ClientStream)(nil)).(writeProtoFastPath); !ok {
-		t.Fatal("expected concrete *transport.ClientStream to implement the WriteProto fast path")
+		t.Fatal("*transport.ClientStream must implement the WriteProto fast path")
+	}
+	if _, ok := any((*transport.ClientStream)(nil)).(transportclient.ProtoWriteStream); !ok {
+		t.Fatal("*transport.ClientStream must implement the exported transportclient.ProtoWriteStream capability")
 	}
 	if _, ok := any((*transport.ServerStream)(nil)).(writeProtoFastPath); !ok {
-		t.Fatal("expected concrete *transport.ServerStream to implement the WriteProto fast path")
+		t.Fatal("*transport.ServerStream must implement the WriteProto fast path")
+	}
+	if _, ok := any((*transport.ServerStream)(nil)).(transportserver.ProtoWriteStream); !ok {
+		t.Fatal("*transport.ServerStream must implement the exported transportserver.ProtoWriteStream capability")
 	}
 }

@@ -980,6 +980,218 @@ func TestShmFlowControl_CtxCancelUnblocksDeferredWrite(t *testing.T) {
 	}
 }
 
+// TestShmFlowControl_DeferredDataBeforeCloseSend verifies the per-stream
+// FIFO fix for the whole-message deferral path: a zero-length client
+// half-close (CloseSend → empty END_STREAM) that arrives while an earlier
+// DATA message is still parked in the writer's `deferred` (whole-message)
+// map MUST NOT overtake that DATA on the wire. It has to park in the
+// pendingEndStream sentinel and only fire after the DATA drains, so the
+// peer never observes END_STREAM before the preceding DATA (a gRPC
+// per-stream message-order violation). The sibling `deferredProto` branch
+// of the same guard is covered by
+// TestShmFlowControl_DeferredProtoBeforeCloseSend.
+func TestShmFlowControl_DeferredDataBeforeCloseSend(t *testing.T) {
+	testCtx, testCancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer testCancel()
+
+	segName := fmt.Sprintf("test-endstream-fifo-%d", time.Now().UnixNano())
+	defer RemoveSegment(segName)
+
+	serverSeg, err := CreateSegment(segName, 65536, 65536)
+	if err != nil {
+		t.Fatalf("create segment: %v", err)
+	}
+	serverSeg.H.SetServerReady(true)
+	defer serverSeg.Close()
+
+	clientSeg, err := OpenSegment(segName)
+	if err != nil {
+		t.Fatalf("open segment: %v", err)
+	}
+	clientSeg.H.SetClientReady(true)
+	defer clientSeg.Close()
+
+	srvTransport, err := NewShmServerTransport(serverSeg, testAddr{"shm", "server"}, testAddr{"shm", "client"})
+	if err != nil {
+		t.Fatalf("server transport: %v", err)
+	}
+	defer srvTransport.Close(nil)
+
+	cliTransport, err := NewShmClientTransport(clientSeg, testAddr{"shm", "client"}, testAddr{"shm", "server"})
+	if err != nil {
+		t.Fatalf("client transport: %v", err)
+	}
+	defer cliTransport.Close(nil)
+
+	// Park the server handler so it never drains the receive ring.
+	go srvTransport.HandleStreams(testCtx, func(s ServerStreamIface) {
+		<-testCtx.Done()
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer cancel()
+
+	csI, err := cliTransport.NewStream(ctx, &CallHdr{Method: "/test/EndStreamFIFO"}, nil)
+	if err != nil {
+		t.Fatalf("NewStream: %v", err)
+	}
+	cs := csI.(*ClientStream)
+	sid := cs.id
+
+	// Drive both quotas to zero so the first (non-last) whole-MESSAGE
+	// DATA write lands in the writer's deferred map instead of the ring.
+	cliTransport.connSendQuota.Store(0)
+	cs.sendQuota.Store(0)
+
+	body := make([]byte, 1024)
+	hdr := []byte{0, 0, 0, 0x04, 0x00} // 5-byte LPM header for a 1024-byte body
+
+	dataErr := make(chan error, 1)
+	go func() {
+		dataErr <- cs.Write(hdr, mem.BufferSlice{mem.Copy(body, mem.DefaultBufferPool())}, &WriteOptions{Last: false})
+	}()
+
+	// Let the DATA entry install into frameWriter.deferred[sid].
+	time.Sleep(50 * time.Millisecond)
+
+	// Now issue the empty END_STREAM (CloseSend). It must NOT emit
+	// immediately — the DATA above is still deferred.
+	endErr := make(chan error, 1)
+	go func() {
+		endErr <- cs.Write(nil, mem.BufferSlice{}, &WriteOptions{Last: true})
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+
+	// Assert the sentinel state: END_STREAM parked, DATA still deferred,
+	// and neither sender has returned.
+	fw := cliTransport.frameWriter
+	fw.inlineMu.Lock()
+	_, pending := fw.pendingEndStream[sid]
+	_, dataDeferred := fw.deferred[sid]
+	fw.inlineMu.Unlock()
+	if !pending {
+		t.Fatalf("expected zero-length END_STREAM to be parked in pendingEndStream[%d] while DATA is deferred", sid)
+	}
+	if !dataDeferred {
+		t.Fatalf("expected DATA to still be deferred in deferred[%d]", sid)
+	}
+	select {
+	case err := <-dataErr:
+		t.Fatalf("DATA write returned early (%v) — it should stay parked until quota is restored", err)
+	case err := <-endErr:
+		t.Fatalf("END_STREAM write returned early (%v) — it must wait behind the deferred DATA", err)
+	default:
+	}
+
+	// Restore quota and wake the writer. advanceDeferred drains the DATA
+	// first, then flushPendingEndStream emits the parked END_STREAM.
+	cs.sendQuota.Store(1 << 20)
+	cliTransport.connSendQuota.Store(1 << 20)
+	select {
+	case cliTransport.frameWriter.wuRetryWake <- struct{}{}:
+	default:
+	}
+
+	for i := 0; i < 2; i++ {
+		select {
+		case err := <-dataErr:
+			if err != nil {
+				t.Errorf("DATA write returned error after quota restore: %v", err)
+			}
+		case err := <-endErr:
+			if err != nil {
+				t.Errorf("END_STREAM write returned error after quota restore: %v", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("write did not complete within 2s after quota restore — deferred/pending entry leaked")
+		}
+	}
+
+	// Both queues must be drained.
+	fw.inlineMu.Lock()
+	_, stillPending := fw.pendingEndStream[sid]
+	_, stillDeferred := fw.deferred[sid]
+	fw.inlineMu.Unlock()
+	if stillPending {
+		t.Errorf("pendingEndStream[%d] not cleared after flush", sid)
+	}
+	if stillDeferred {
+		t.Errorf("deferred[%d] not cleared after drain", sid)
+	}
+}
+
+// TestShmFlowControl_DeferredProtoBeforeCloseSend covers the sibling
+// branch of the pendingEndStream FIFO guard: a zero-length END_STREAM
+// parked while the stream still has async proto DATA queued in
+// w.deferredProto[sid]. flushPendingEndStream must keep it parked until
+// the proto queue drains, then emit exactly once. White-box: the proto
+// sibling is injected directly (mirrors the async-trailer sibling tests)
+// to keep the ordering deterministic without driving the full async
+// WriteProto path.
+func TestShmFlowControl_DeferredProtoBeforeCloseSend(t *testing.T) {
+	name := fmt.Sprintf("test-endstream-proto-fifo-%d", time.Now().UnixNano())
+	defer RemoveSegment(name)
+	seg, err := CreateSegment(name, 65536, 65536)
+	if err != nil {
+		t.Fatalf("CreateSegment: %v", err)
+	}
+	defer seg.Close()
+
+	tx := NewShmRingFromSegment(seg.A, seg.Mem)
+	w := newShmFrameWriter(tx)
+	defer w.close()
+
+	const sid = uint32(7)
+	s := &Stream{}
+	doneCh := make(chan error, 1)
+	entry := frameEntry{
+		ctx:       context.Background(),
+		fh:        FrameHeader{StreamID: sid, Type: FrameTypeMESSAGE},
+		doneCh:    doneCh,
+		streamPtr: s,
+		isLast:    true,
+		data:      mem.BufferSlice{},
+	}
+
+	// Park the END_STREAM behind a still-pending async proto sibling.
+	w.inlineMu.Lock()
+	w.deferredProto[sid] = []frameEntry{{}}
+	w.pendingEndStream[sid] = entry
+	w.flushPendingEndStream(sid) // must be a no-op: proto sibling pending
+	_, stillParked := w.pendingEndStream[sid]
+	w.inlineMu.Unlock()
+
+	if !stillParked {
+		t.Fatal("END_STREAM emitted despite pending deferredProto sibling")
+	}
+	select {
+	case got := <-doneCh:
+		t.Fatalf("doneCh signalled prematurely with %v (proto sibling still pending)", got)
+	case <-time.After(50 * time.Millisecond):
+		// expected: still parked, CloseSend sender still blocked
+	}
+
+	// Drain the proto sibling, then flush: END_STREAM must now emit once.
+	w.inlineMu.Lock()
+	delete(w.deferredProto, sid)
+	w.flushPendingEndStream(sid)
+	_, stillParked2 := w.pendingEndStream[sid]
+	w.inlineMu.Unlock()
+
+	if stillParked2 {
+		t.Fatal("END_STREAM still parked after proto sibling drained")
+	}
+	select {
+	case got := <-doneCh:
+		if got != nil {
+			t.Fatalf("emitEmptyEndStream returned error: %v", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("END_STREAM not emitted after proto sibling drained")
+	}
+}
+
 // TestShmFlowControl_ConcurrentWholeMessageWrites stress-tests the
 // concurrent whole-message dispatch path. Spawns many streams each
 // firing multiple sequential writes; default windows so no entry

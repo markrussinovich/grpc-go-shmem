@@ -26,9 +26,10 @@ import "google.golang.org/grpc/internal/transport"
 // (transport.ClientStreamIface / ServerStreamIface), because "marshal an
 // application message" is a codec responsibility that is not portable across
 // gRPC languages. Core therefore detects it by assertion and uses it only when
-// the concrete transport stream offers it: the first-party monolithic transport
-// keeps INLINE_TX, while a byte-only plugin stream does not implement WriteProto
-// and transparently falls back to the standard Write path.
+// the transport stream offers it: both the first-party monolithic transport and
+// a plugin that forwards the optional ProtoWriteStream capability (e.g. the SHM
+// plugin bridge) keep INLINE_TX, while a stream that implements only the
+// mandatory byte interface transparently falls back to the standard Write path.
 
 // writeProtoCapable is the optional INLINE_TX capability. The client and server
 // concrete streams share the identical signature, so one interface covers both.

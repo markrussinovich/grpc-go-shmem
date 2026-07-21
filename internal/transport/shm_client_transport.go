@@ -2144,12 +2144,24 @@ func (t *ShmClientTransport) writeProto(s *ClientStream, msg any, opts *WriteOpt
 	// sendQuotaMu. The writer's processProtoEntry handles ordering
 	// vs already-deferred entries via deferredProto[sid] append.
 	//
+	// Marshal the proto into an owned pooled buffer on THIS (SendMsg)
+	// goroutine, so the writer copies bytes into the ring rather than
+	// reading the live message asynchronously — which would race an
+	// application that reuses the message after SendMsg returns (see the
+	// grpc-go SendMsg contract). The uncontended inline fast path above
+	// is unchanged; only this contended fallback pays the marshal-buffer
+	// + copy.
+	protoBytes, merr := marshalProtoForAsync(pm, pSize)
+	if merr != nil {
+		return true, merr
+	}
 	// opts.Last state transition happens BEFORE enqueue so the
 	// upper-layer observes the semantic "I'm done sending" at the
 	// instant writeProto returns. The H2 END_STREAM bit on the
 	// emitted frame is already encoded in fh.Flags.
 	if opts != nil && opts.Last {
 		if !s.compareAndSwapState(streamActive, streamWriteDone) {
+			putAsyncProtoBuf(protoBytes)
 			return true, errStreamDone
 		}
 	}
@@ -2158,8 +2170,9 @@ func (t *ShmClientTransport) writeProto(s *ClientStream, msg any, opts *WriteOpt
 	// count and also routes through async, preserving FIFO. The
 	// writer decrements after the entry is fully resolved.
 	s.protoInFlight.Add(1)
-	if err := t.frameWriter.enqueueProtoAsync(s.ctx, &s.Stream, fh, pm, pSize); err != nil {
+	if err := t.frameWriter.enqueueProtoAsync(s.ctx, &s.Stream, fh, protoBytes, pSize); err != nil {
 		s.protoInFlight.Add(-1)
+		putAsyncProtoBuf(protoBytes)
 		return true, err
 	}
 	return true, nil

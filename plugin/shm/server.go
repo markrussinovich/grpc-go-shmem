@@ -34,8 +34,10 @@ func init() {
 type serverBuilder struct{}
 
 // Build wraps the full in-tree SHM server transport (transport.NewServerTransport)
-// in the thin bridge below, so each stream handed to grpc.Server is byte-only
-// (no WriteProto), symmetric to the client side.
+// in the thin bridge below. Each stream handed to grpc.Server is the engine's
+// stream directly, which already implements the exported contract (the byte
+// interface + the optional WriteProto/INLINE_TX capability), symmetric to the
+// client side.
 func (serverBuilder) Build(conn net.Conn, opts transportserver.BuildOptions) (transport.ServerTransport, error) {
 	inner, err := transport.NewServerTransport(conn, opts.Config)
 	if err != nil {
@@ -45,8 +47,10 @@ func (serverBuilder) Build(conn net.Conn, opts transportserver.BuildOptions) (tr
 }
 
 // bridgeServerTransport is the thin bridge from the exported byte-based plugin
-// contract to the full in-tree SHM server transport. HandleStreams wraps each
-// accepted stream so the grpc.Server handler sees only the byte interface.
+// contract to the full in-tree SHM server transport. HandleStreams passes each
+// accepted engine stream directly to the grpc.Server handler (the engine stream
+// already implements the exported contract, including the optional WriteProto
+// capability).
 type bridgeServerTransport struct {
 	inner transport.ServerTransport
 }
@@ -54,20 +58,12 @@ type bridgeServerTransport struct {
 var _ transport.ServerTransport = (*bridgeServerTransport)(nil)
 
 func (p *bridgeServerTransport) HandleStreams(ctx context.Context, handle func(transport.ServerStreamIface)) {
-	p.inner.HandleStreams(ctx, func(s transport.ServerStreamIface) {
-		handle(bridgeServerStream{s})
-	})
+	p.inner.HandleStreams(ctx, handle)
 }
 
 func (p *bridgeServerTransport) Close(err error)        { p.inner.Close(err) }
 func (p *bridgeServerTransport) Peer() *peer.Peer       { return p.inner.Peer() }
 func (p *bridgeServerTransport) Drain(debugData string) { p.inner.Drain(debugData) }
-
-// bridgeServerStream embeds only the byte-based stream interface, hiding the
-// engine stream's WriteProto fast path (see bridgeClientStream).
-type bridgeServerStream struct {
-	transport.ServerStreamIface
-}
 
 // NewListener returns a net.Listener that serves the SHM transport over the
 // named segment. Pass it to grpc.Server.Serve:

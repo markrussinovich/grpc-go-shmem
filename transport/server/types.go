@@ -31,9 +31,11 @@ import "google.golang.org/grpc/internal/transport"
 // real public API must replace it with a purpose-built minimal option struct
 // (see plugin/DESIGN.md).
 //
-// As on the client side, there is no message-typed WriteProto: the send path is
-// byte-based (ServerStream.Write), and marshal-into-buffer (INLINE_TX) stays a
-// first-party, monolithic-only optimization outside the pluggable contract.
+// As on the client side, there is no message-typed WriteProto in the MANDATORY
+// interface: the required send path is byte-based (ServerStream.Write).
+// Marshal-into-transport-memory (INLINE_TX) is instead the OPTIONAL
+// ProtoWriteStream capability below, which a capable transport MAY implement and
+// grpc-go transparently falls back from to Write when it is absent or declines.
 type (
 	// ServerTransport is a server-side gRPC transport. It is driven by grpc-go's
 	// push model: grpc.Server calls HandleStreams and the transport invokes the
@@ -50,3 +52,13 @@ type (
 	// ServerConfig carries the server-side transport configuration.
 	ServerConfig = transport.ServerConfig
 )
+
+// ProtoWriteStream is the OPTIONAL INLINE_TX capability a ServerStream MAY
+// additionally implement, mirroring transport/client.ProtoWriteStream. It lets
+// grpc-go marshal a protobuf response message directly into transport-owned
+// memory (e.g. an SHM ring) instead of into an intermediate buffer that Write
+// then copies. It is detected by assertion and auto-falls-back to Write; see the
+// client-side ProtoWriteStream doc for the full contract.
+type ProtoWriteStream interface {
+	WriteProto(msg any, opts *WriteOptions) (handled bool, err error)
+}
