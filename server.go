@@ -1029,6 +1029,31 @@ func (s *Server) newHTTP2Transport(c net.Conn) transport.ServerTransport {
 		BufferPool:            s.opts.bufferPool,
 		StaticWindowSize:      s.opts.staticWindowSize,
 	}
+	// Experimental pluggable transport selection, symmetric to the client-side
+	// selection by resolver.Address.TransportType: when a listener tags accepted
+	// connections with a non-empty transport type, that type MUST be served by a
+	// Builder registered in experimental/transport/server. Selection is
+	// fail-closed -- an unregistered type closes the connection instead of handing
+	// bytes that are not HTTP/2 to the HTTP/2 parser. An empty type means "not
+	// tagged" and falls through to the default transport below.
+	if tn, ok := c.(interface{ TransportType() string }); ok && tn.TransportType() != "" {
+		st, found, err := transport.BuildD1ServerByType(c, tn.TransportType(), config)
+		if !found {
+			s.mu.Lock()
+			s.errorf("connection %q requests transport type %q, which is not registered with experimental/transport/server", c.RemoteAddr(), tn.TransportType())
+			s.mu.Unlock()
+			c.Close()
+			return nil
+		}
+		if err != nil {
+			s.mu.Lock()
+			s.errorf("pluggable transport Build(%q) failed: %v", c.RemoteAddr(), err)
+			s.mu.Unlock()
+			c.Close()
+			return nil
+		}
+		return st
+	}
 	st, err := transport.NewServerTransport(c, config)
 	if err != nil {
 		s.mu.Lock()
