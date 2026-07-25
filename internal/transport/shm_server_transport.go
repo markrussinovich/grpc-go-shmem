@@ -83,7 +83,7 @@ type ShmServerTransport struct {
 
 	// Stream management
 	streams    map[uint32]*ServerStream
-	handleFunc func(*ServerStream)
+	handleFunc func(ServerStreamIface)
 	maxStreams uint32
 
 	// cachedStream caches the only active stream pointer for single-stream
@@ -643,7 +643,7 @@ func NewShmServerTransport(segment *Segment, localAddr, remoteAddr net.Addr) (*S
 
 // HandleStreams receives incoming streams using the given handler.
 // This is typically run in a separate goroutine.
-func (t *ShmServerTransport) HandleStreams(ctx context.Context, handle func(*ServerStream)) {
+func (t *ShmServerTransport) HandleStreams(ctx context.Context, handle func(ServerStreamIface)) {
 	t.mu.Lock()
 	if t.closed.Load() {
 		t.mu.Unlock()
@@ -1687,9 +1687,18 @@ func (t *ShmServerTransport) writeProto(s *ServerStream, msg any, _ *WriteOption
 		StreamID: s.id,
 		Flags:    0,
 	}
+	// Marshal on THIS goroutine into an owned pooled buffer so the
+	// writer copies bytes into the ring rather than reading the live
+	// message asynchronously (which would race an application that
+	// reuses the message after SendMsg — see grpc-go SendMsg contract).
+	protoBytes, merr := marshalProtoForAsync(pm, pSize)
+	if merr != nil {
+		return true, merr
+	}
 	s.protoInFlight.Add(1)
-	if err := t.frameWriter.enqueueProtoAsync(s.ctx, &s.Stream, fh, pm, pSize); err != nil {
+	if err := t.frameWriter.enqueueProtoAsync(s.ctx, &s.Stream, fh, protoBytes, pSize); err != nil {
 		s.protoInFlight.Add(-1)
+		putAsyncProtoBuf(protoBytes)
 		return true, err
 	}
 	return true, nil

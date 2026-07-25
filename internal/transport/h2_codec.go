@@ -2724,6 +2724,72 @@ func writeProtoToRingH2Blocking(ctx context.Context, tx *ShmRing, streamID uint3
 	return res.Commit(total)
 }
 
+// writeProtoBytesToRingH2Blocking is the byte-copy counterpart of
+// writeProtoToRingH2Blocking: it emits a single H2 DATA frame whose gRPC
+// LPM body is the PRE-MARSHALLED protoBytes, blocking in ReserveWrite
+// until ring space is available. The async writeProto fallback marshals
+// the proto.Message on the sender goroutine (so the live message is
+// never retained across SendMsg) and hands the owned bytes here; the
+// writer copies them into the ring instead of marshalling a live
+// message. Layout and flags are identical to writeProtoToRingH2Blocking.
+func writeProtoBytesToRingH2Blocking(ctx context.Context, tx *ShmRing, streamID uint32, protoBytes []byte, flags uint8) error {
+	pSize := len(protoBytes)
+	total := h2FrameHeaderSize + 5 + pSize
+	res, err := tx.ReserveWrite(ctx, total)
+	if err != nil {
+		return err
+	}
+
+	// Build the 14-byte preamble (H2 frame header + gRPC LPM header).
+	var hdr14 [h2FrameHeaderSize + 5]byte
+	var h2flags byte
+	if flags&MessageFlagEndStream != 0 {
+		h2flags = H2FlagEndStream
+	}
+	var h2hdr [h2FrameHeaderSize]byte
+	encodeH2FrameHeaderTo(&h2hdr, H2FrameHeader{
+		Length:   uint32(5 + pSize),
+		Type:     H2FrameDATA,
+		Flags:    h2flags,
+		StreamID: streamID,
+	})
+	copy(hdr14[0:h2FrameHeaderSize], h2hdr[:])
+	hdr14[h2FrameHeaderSize] = 0 // gRPC LPM compressed flag = 0
+	binary.BigEndian.PutUint32(hdr14[h2FrameHeaderSize+1:h2FrameHeaderSize+5], uint32(pSize))
+
+	if len(res.Second) == 0 {
+		// Contiguous fast path: preamble + payload copied into ring.
+		copy(res.First[0:h2FrameHeaderSize+5], hdr14[:])
+		copy(res.First[h2FrameHeaderSize+5:total], protoBytes)
+	} else {
+		// Wrap path: write hdr14 then protoBytes sequentially across
+		// res.First + res.Second. No scratch buffer needed — the payload
+		// is already contiguous in protoBytes.
+		writeTwoSegAcrossSpans(res.First, res.Second, hdr14[:], protoBytes)
+	}
+
+	atomic.AddUint64(&shmZCWriteFire, 1)
+	return res.Commit(total)
+}
+
+// writeTwoSegAcrossSpans copies a then b sequentially into the
+// concatenation first++second (used for the ring-wrap case). len(a)+
+// len(b) MUST equal len(first)+len(second).
+func writeTwoSegAcrossSpans(first, second, a, b []byte) {
+	n := copy(first, a)
+	if n < len(a) {
+		// a straddles the wrap: remainder of a into second, then b.
+		m := copy(second, a[n:])
+		copy(second[m:], b)
+		return
+	}
+	// a fully in first; b starts at first[len(a):] and spills to second.
+	k := copy(first[len(a):], b)
+	if k < len(b) {
+		copy(second, b[k:])
+	}
+}
+
 // writeProtoToRingH2Core is the shared body of writeProtoToRingH2 and
 // writeProtoToRingH2Blocking: reserve, lay out H2 header + gRPC LPM
 // header, marshal the proto body directly into the ring slice,
