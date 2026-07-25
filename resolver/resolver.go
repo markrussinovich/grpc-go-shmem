@@ -106,6 +106,14 @@ type Address struct {
 	// consumption by the SubConn.
 	Attributes *attributes.Attributes
 
+	// TransportType selects a pluggable client transport registered with
+	// google.golang.org/grpc/experimental/transport/client. When empty, the
+	// default (HTTP/2, or attribute-based) selection applies.
+	//
+	// Notice: This field is EXPERIMENTAL and may be changed or removed in a
+	// later release.
+	TransportType string
+
 	// BalancerAttributes contains arbitrary data about this address intended
 	// for consumption by the LB policy.  These attributes do not affect SubConn
 	// creation, connection establishment, handshaking, etc.
@@ -129,6 +137,7 @@ type Address struct {
 // more appropriate for the caller to implement custom equality logic.
 func (a Address) Equal(o Address) bool {
 	return a.Addr == o.Addr && a.ServerName == o.ServerName &&
+		a.TransportType == o.TransportType &&
 		a.Attributes.Equal(o.Attributes) &&
 		a.BalancerAttributes.Equal(o.BalancerAttributes) &&
 		a.Metadata == o.Metadata
@@ -139,6 +148,9 @@ func (a Address) String() string {
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("{Addr: %q, ", a.Addr))
 	sb.WriteString(fmt.Sprintf("ServerName: %q, ", a.ServerName))
+	if a.TransportType != "" {
+		sb.WriteString(fmt.Sprintf("TransportType: %q, ", a.TransportType))
+	}
 	if a.Attributes != nil {
 		sb.WriteString(fmt.Sprintf("Attributes: %v, ", a.Attributes.String()))
 	}

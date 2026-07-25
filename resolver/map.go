@@ -43,22 +43,26 @@ type AddressMap = AddressMapV2[any]
 type AddressMapV2[T any] struct {
 	// The underlying map is keyed by an Address with fields that we don't care
 	// about being set to their zero values. The only fields that we care about
-	// are `Addr`, `ServerName` and `Attributes`. Since we need to be able to
-	// distinguish between addresses with same `Addr` and `ServerName`, but
-	// different `Attributes`, we cannot store the `Attributes` in the map key.
+	// are `Addr`, `ServerName`, `TransportType` and `Attributes`. Since we need
+	// to be able to distinguish between addresses with same `Addr`,
+	// `ServerName` and `TransportType`, but different `Attributes`, we cannot
+	// store the `Attributes` in the map key.
 	//
 	// The comparison operation for structs work as follows:
 	//  Struct values are comparable if all their fields are comparable. Two
 	//  struct values are equal if their corresponding non-blank fields are equal.
 	//
 	// The value type of the map contains a slice of addresses which match the key
-	// in their `Addr` and `ServerName` fields and contain the corresponding value
-	// associated with them.
+	// in their `Addr`, `ServerName` and `TransportType` fields and contain the
+	// corresponding value associated with them.
 	m map[Address]addressMapEntryList[T]
 }
 
 func toMapKey(addr *Address) Address {
-	return Address{Addr: addr.Addr, ServerName: addr.ServerName}
+	// TransportType participates in Address equality (see Address.Equal), so it
+	// must also participate in map identity; otherwise two addresses that differ
+	// only by transport would alias and, for example, share a SubConn.
+	return Address{Addr: addr.Addr, ServerName: addr.ServerName, TransportType: addr.TransportType}
 }
 
 type addressMapEntryList[T any] []*addressMapEntry[T]
@@ -79,8 +83,8 @@ func NewAddressMapV2[T any]() *AddressMapV2[T] {
 // present.
 func (l addressMapEntryList[T]) find(addr Address) int {
 	for i, entry := range l {
-		// Attributes are the only thing to match on here, since `Addr` and
-		// `ServerName` are already equal.
+		// Attributes are the only thing to match on here, since `Addr`,
+		// `ServerName` and `TransportType` are already equal.
 		if entry.addr.Attributes.Equal(addr.Attributes) {
 			return i
 		}
