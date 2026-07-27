@@ -48,6 +48,15 @@ var (
 	// stalling the sender on stream-window refill.
 	shmStreamPreCreditEmitted atomic.Uint64
 
+	// shmStreamWindowGrown counts the bytes by which stream inbound
+	// flow-control windows have been permanently enlarged by
+	// shmEnsureStreamWindow to admit messages larger than the initial
+	// window. Unlike pre-credit this is not a loan, so it is not repaid
+	// by onRead. Expect it to rise once per stream per new high-water
+	// message size and then go flat; continuous growth means a peer is
+	// sending ever-larger messages.
+	shmStreamWindowGrown atomic.Uint64
+
 	// shmConnWUCoalesced counts the number of times the frame writer
 	// merged two or more adjacent connection-level WINDOW_UPDATE
 	// frames into a single frame within one drain pass. Non-zero

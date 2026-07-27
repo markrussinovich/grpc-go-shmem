@@ -1959,6 +1959,13 @@ func (t *shmServerTransport) onMessageStart(streamID uint32, lpmSize uint32) {
 	if s == nil {
 		return
 	}
+	// Grow the stream window before falling back to a delta loan; see
+	// shmEnsureStreamWindow for why oversized messages must not depend
+	// on the loan pool.
+	if g := s.fc.shmEnsureStreamWindow(lpmSize); g > 0 {
+		shmStreamWindowGrown.Add(uint64(g))
+		t.sendWindowUpdateForce(streamID, g)
+	}
 	// Use the additive variant; see ShmClientTransport.onMessageStart
 	// for the full rationale (SHM pipelines multiple in-flight LPMs
 	// per stream so the stock SET-based maybeAdjust would lose

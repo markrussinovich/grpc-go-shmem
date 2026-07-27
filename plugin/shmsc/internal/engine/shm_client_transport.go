@@ -1947,6 +1947,17 @@ func (t *shmClientTransport) onMessageStart(streamID uint32, lpmSize uint32) {
 	if s == nil {
 		return
 	}
+	// A message that does not fit in the stream window can only be
+	// completed by lending the sender credit out of inFlow.delta, and
+	// that loan is double-charged under pipelining -- see
+	// shmEnsureStreamWindow for the full analysis. Grow the window to
+	// cover the message first, which retires the loan mechanism for
+	// this size class and keeps credit on the self-balancing
+	// onRead -> WINDOW_UPDATE path.
+	if w := s.fc.shmEnsureStreamWindow(lpmSize); w > 0 {
+		shmStreamWindowGrown.Add(uint64(w))
+		t.sendWindowUpdateForce(streamID, w)
+	}
 	// Use the additive variant: SHM's codec-driven pre-credit fires
 	// per LPM at parse time, so multiple pipelined LPMs can be
 	// in-flight before the application drains the recvBuffer. The

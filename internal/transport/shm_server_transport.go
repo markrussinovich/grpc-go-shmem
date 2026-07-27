@@ -1930,6 +1930,17 @@ func (t *ShmServerTransport) onMessageStart(streamID uint32, lpmSize uint32) {
 	// for the full rationale (SHM pipelines multiple in-flight LPMs
 	// per stream so the stock SET-based maybeAdjust would lose
 	// outstanding pre-credit debt).
+	// A message that does not fit in the stream window can only be
+	// completed by lending the sender credit out of inFlow.delta, and
+	// that loan is double-charged under pipelining -- see
+	// shmEnsureStreamWindow for the full analysis. Grow the window to
+	// cover the message first, which retires the loan mechanism for
+	// this size class and keeps credit on the self-balancing
+	// onRead -> WINDOW_UPDATE path.
+	if g := s.fc.shmEnsureStreamWindow(lpmSize); g > 0 {
+		shmStreamWindowGrown.Add(uint64(g))
+		t.sendWindowUpdateForce(streamID, g)
+	}
 	if w := s.fc.maybeAdjustAdditive(lpmSize); w > 0 {
 		shmStreamPreCreditEmitted.Add(uint64(w))
 		t.sendWindowUpdateForce(streamID, w)

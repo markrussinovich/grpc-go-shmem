@@ -48,6 +48,16 @@ var (
 	// stalling the sender on stream-window refill.
 	shmStreamPreCreditEmitted atomic.Uint64
 
+	// shmStreamWindowGrown counts the bytes by which stream inbound
+	// flow-control windows were permanently widened by
+	// shmEnsureStreamWindow to admit a message larger than the
+	// current window. Growth is monotonic and converges on the
+	// largest message a peer sends, so this counter should go quiet
+	// once a connection has seen its steady-state message size; a
+	// value that keeps climbing means message sizes keep setting new
+	// highs.
+	shmStreamWindowGrown atomic.Uint64
+
 	// shmConnWUCoalesced counts the number of times the frame writer
 	// merged two or more adjacent connection-level WINDOW_UPDATE
 	// frames into a single frame within one drain pass. Non-zero
