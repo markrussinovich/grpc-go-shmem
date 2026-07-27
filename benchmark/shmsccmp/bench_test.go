@@ -20,14 +20,16 @@
 
 // Package shmsccmp benchmarks the in-tree ("monolithic") shared-memory
 // transport against the self-contained plugin transport, through the full
-// gRPC stack.
+// gRPC stack, with stock HTTP/2 over a unix domain socket ("UDS") as the
+// baseline both are trying to beat.
 //
-// Both sides are configured identically:
+// All three arms are configured identically:
 //
-//   - same segment / ring geometry (136 MiB segment, 64 MiB rings, which is
-//     the default for both implementations),
+//   - same segment / ring geometry for the two SHM arms (136 MiB segment,
+//     64 MiB rings, which is the default for both implementations),
 //   - same server and dial options (no transport-specific buffer-pool or
-//     flow-control tuning on either side),
+//     flow-control tuning on any side; UDS runs stock HTTP/2 with gRPC's
+//     default BDP-estimated flow-control windows),
 //   - same payload sweep, same ping-pong / unary loops.
 //
 // Run with:
@@ -38,7 +40,9 @@ package shmsccmp
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -185,6 +189,40 @@ func newPluginEnv(b *testing.B) *benchEnv {
 	}
 }
 
+// newUDSEnv builds a server+client pair over stock HTTP/2 carried on a unix
+// domain socket. This is the baseline: it is the fastest transport a gRPC
+// user gets today without any shared-memory work, so it is what the two SHM
+// implementations have to be measured against.
+func newUDSEnv(b *testing.B) *benchEnv {
+	// The socket lives under TempDir rather than /dev/shm so it is a plain
+	// AF_UNIX rendezvous point and nothing about it is shared-memory backed.
+	path := filepath.Join(b.TempDir(), "bench.sock")
+	lis, err := net.Listen("unix", path)
+	if err != nil {
+		b.Fatalf("net.Listen(unix): %v", err)
+	}
+	stop := benchmark.StartServer(benchmark.ServerInfo{Type: "protobuf", Listener: lis}, serverOpts()...)
+
+	conn, err := grpc.NewClient("unix://"+path, dialOpts()...)
+	if err != nil {
+		stop()
+		lis.Close()
+		b.Fatalf("grpc.NewClient: %v", err)
+	}
+
+	client := testgrpc.NewBenchmarkServiceClient(conn)
+	warmUp(b, client)
+
+	return &benchEnv{
+		stopSrv: stop,
+		conn:    conn,
+		client:  client,
+		cleanups: []func(){
+			func() { lis.Close() },
+		},
+	}
+}
+
 // warmUp forces connection establishment and the first handler dispatch so
 // neither is charged to the first measured iteration.
 func warmUp(b *testing.B, client testgrpc.BenchmarkServiceClient) {
@@ -275,7 +313,9 @@ func sweep(b *testing.B, newEnv func(*testing.B) *benchEnv, run func(*testing.B,
 
 func BenchmarkMonoUnary(b *testing.B)   { sweep(b, newMonoEnv, benchUnary) }
 func BenchmarkPluginUnary(b *testing.B) { sweep(b, newPluginEnv, benchUnary) }
+func BenchmarkUDSUnary(b *testing.B)    { sweep(b, newUDSEnv, benchUnary) }
 func BenchmarkMonoStream(b *testing.B)  { sweep(b, newMonoEnv, benchStream) }
 func BenchmarkPluginStream(b *testing.B) {
 	sweep(b, newPluginEnv, benchStream)
 }
+func BenchmarkUDSStream(b *testing.B) { sweep(b, newUDSEnv, benchStream) }

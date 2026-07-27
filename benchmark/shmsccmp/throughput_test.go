@@ -52,8 +52,11 @@ import (
 // ns/op is retained but is per-round wall clock, which under concurrency is
 // per-stream latency under load, not a throughput figure.
 
-// throughputSizes is smaller at the top end than the latency sweep because
-// concurrent traffic scales as streams x size x b.N.
+// throughputSizes runs up to 16 MiB, well past the point where per-message
+// overhead matters, so the tail of the sweep shows the transports' copy and
+// flow-control ceilings rather than their framing costs. Note that the top of
+// the sweep is expensive: concurrent traffic scales as streams x size x b.N,
+// so streams=100/size=16MB alone has gigabytes in flight.
 var throughputSizes = []struct {
 	bytes int
 	label string
@@ -62,6 +65,8 @@ var throughputSizes = []struct {
 	{4096, "4096"},
 	{64 << 10, "65536"},
 	{1 << 20, "1MB"},
+	{4 << 20, "4MB"},
+	{16 << 20, "16MB"},
 }
 
 // throughputConcurrency is the stream-count dimension for the multiplexing
@@ -255,5 +260,7 @@ func sweepConcurrent(b *testing.B, newEnv func(*testing.B) *benchEnv) {
 
 func BenchmarkMonoPipelined(b *testing.B)    { sweepPipelined(b, newMonoEnv) }
 func BenchmarkPluginPipelined(b *testing.B)  { sweepPipelined(b, newPluginEnv) }
+func BenchmarkUDSPipelined(b *testing.B)     { sweepPipelined(b, newUDSEnv) }
 func BenchmarkMonoConcurrent(b *testing.B)   { sweepConcurrent(b, newMonoEnv) }
 func BenchmarkPluginConcurrent(b *testing.B) { sweepConcurrent(b, newPluginEnv) }
+func BenchmarkUDSConcurrent(b *testing.B)    { sweepConcurrent(b, newUDSEnv) }
