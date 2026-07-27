@@ -1529,7 +1529,18 @@ func (ac *addrConn) createTransport(ctx context.Context, addr resolver.Address, 
 	var newTr transport.ClientTransport
 	var err error
 
-	if transport.IsShmEnabled(addr) {
+	// Experimental pluggable transport selection: when the resolved address names
+	// a transport type, it MUST be served by a Builder registered in
+	// experimental/transport/client. Selection is fail-closed -- an unregistered
+	// type is a connection error rather than a silent downgrade to HTTP/2 -- so an
+	// explicit selector can never quietly change the protocol on the wire.
+	if addr.TransportType != "" {
+		d1tr, found, d1err := transport.BuildD1ClientByType(connectCtx, ac.cc.ctx, addr.TransportType, ac.cc.authority, addr, copts, onClose)
+		if !found {
+			return fmt.Errorf("grpc: address %q requests transport type %q, which is not registered with experimental/transport/client", addr.Addr, addr.TransportType)
+		}
+		newTr, err = d1tr, d1err
+	} else if transport.IsShmEnabled(addr) {
 		// Try shm transport first
 		newTr, err = transport.NewShmClient(connectCtx, ac.cc.ctx, addr, copts, onClose)
 		if err != nil {

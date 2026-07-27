@@ -103,6 +103,82 @@ const (
 	shmBDPLimit = 64 * 1024 * 1024 // 64 MB
 )
 
+// shmEnsureStreamWindow raises the stream's inbound flow-control limit so
+// that a single logical gRPC message (LPM) of n bytes fits inside the
+// window, and returns the WINDOW_UPDATE delta the caller must emit (0 if
+// the window already covers n).
+//
+// Why the window has to grow rather than be pre-credited via inFlow.delta:
+//
+// inFlow.delta is a *loan*. maybeAdjustAdditive lends the sender enough
+// extra credit to finish one oversized message, and inFlow.onRead repays
+// the loan by withholding an equal number of bytes from the WINDOW_UPDATE
+// it would otherwise emit when the application reads that message. That is
+// balanced only when a loan is taken at most once per message and repaid by
+// that same message's read.
+//
+// The SHM transport breaks that assumption. Pre-credit fires per LPM at
+// parse time (onMessageStart), not per application read, so when messages
+// are pipelined the loans accumulate in a single delta pool while onRead
+// drains that pool at the rate the application consumes bytes. Once the
+// pool is larger than the message being read, the read emits no
+// WINDOW_UPDATE at all, and the sender is never re-credited for bytes it
+// has already delivered. Every oversized message therefore erodes the
+// peer's send quota a little further.
+//
+// That erosion is unrecoverable, because the only trigger that can mint
+// fresh credit for a message is onMessageStart, and it fires exactly once
+// per LPM. When the residue finally exceeds the slack, the sender parks
+// with a few bytes of the message left to send and zero quota, the
+// receiver sits on an incomplete LPM with nothing left to read, and the
+// stream is wedged for good.
+//
+// It only bites when a message is larger than the window itself. The
+// shortfall maybeAdjustAdditive lends is measured against *available*
+// capacity, need = n - (limit + delta - pendingData - pendingUpdate), so
+// loans are also taken for ordinary messages whenever the reader happens to
+// be behind. Those are harmless: catching up on reads restores the capacity
+// and the ledger settles. A message bigger than the window can never be
+// admitted by the window alone, so it needs a loan on every send no matter
+// how promptly the application reads, and it is that permanent dependence
+// on the loan pool that decays into deadlock. Hence the observed boundary:
+// messages at or above shmInitialWindowSize (32 MiB by default) wedge,
+// messages below it recover.
+//
+// Growing the limit removes the need for the loan entirely. The window
+// genuinely covers the message, so oversized messages stop depending on
+// delta and credit returns to the ordinary onRead -> WINDOW_UPDATE cycle,
+// which is self-balancing. The limit is monotonic and converges on the
+// largest message the peer sends, so it costs one extra WINDOW_UPDATE the
+// first time a new high-water message size is seen and nothing thereafter.
+// The window is pure accounting -- growing it does not allocate -- and
+// inbound message size is already bounded by MaxRecvMsgSize, with
+// maxWindowSize as the backstop here.
+//
+// Regression coverage: TestShmPipelinedOversizedMessages in
+// benchmark/shmsccmp, which needs the full stack because the deadlock
+// requires the receiving application to lag the sender by about a message.
+// TestShmEnsureStreamWindow covers this function directly.
+func (f *inFlow) shmEnsureStreamWindow(n uint32) uint32 {
+	if n > uint32(maxWindowSize) {
+		n = uint32(maxWindowSize)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if n <= f.limit {
+		return 0
+	}
+	inc := n - f.limit
+	if headroom := uint32(maxWindowSize) - f.limit; inc > headroom {
+		inc = headroom
+	}
+	if inc == 0 {
+		return 0
+	}
+	f.limit += inc
+	return inc
+}
+
 // ConfigureShmFlowControlForBench overrides shmInitialWindowSize and
 // shmWindowUpdateThreshold consistently. Intended for benchmark and
 // regression-test code that wants to exercise the SHM transport under

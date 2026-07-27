@@ -335,7 +335,7 @@ func (s) TestHandlerTransport_HandleStreams(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	defer cancel()
 	st.ht.HandleStreams(
-		ctx, func(s *ServerStream) { go handleStream(s) },
+		ctx, func(si ServerStreamIface) { s := si.(*ServerStream); go handleStream(s) },
 	)
 	wantHeader := http.Header{
 		"Date":          nil,
@@ -370,7 +370,7 @@ func handleStreamCloseBodyTest(t *testing.T, statusCode codes.Code, msg string) 
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	defer cancel()
 	st.ht.HandleStreams(
-		ctx, func(s *ServerStream) { go handleStream(s) },
+		ctx, func(si ServerStreamIface) { s := si.(*ServerStream); go handleStream(s) },
 	)
 	wantHeader := http.Header{
 		"Date":         nil,
@@ -421,7 +421,7 @@ func (s) TestHandlerTransport_HandleStreams_Timeout(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	defer cancel()
 	ht.HandleStreams(
-		ctx, func(s *ServerStream) { go runStream(s) },
+		ctx, func(si ServerStreamIface) { s := si.(*ServerStream); go runStream(s) },
 	)
 	wantHeader := http.Header{
 		"Date":         nil,
@@ -475,7 +475,7 @@ func testHandlerTransportHandleStreams(t *testing.T, handleStream func(st *handl
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	t.Cleanup(cancel)
 	st.ht.HandleStreams(
-		ctx, func(s *ServerStream) { go handleStream(st, s) },
+		ctx, func(si ServerStreamIface) { s := si.(*ServerStream); go handleStream(st, s) },
 	)
 }
 
@@ -510,7 +510,7 @@ func (s) TestHandlerTransport_HandleStreams_ErrDetails(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	defer cancel()
 	hst.ht.HandleStreams(
-		ctx, func(s *ServerStream) { go handleStream(s) },
+		ctx, func(si ServerStreamIface) { s := si.(*ServerStream); go handleStream(s) },
 	)
 	wantHeader := http.Header{
 		"Date":         nil,
@@ -568,7 +568,7 @@ func (s) TestHandlerTransport_HandleStreams_StatsHandlers(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	defer cancel()
 	hst.ht.HandleStreams(
-		ctx, func(s *ServerStream) { go handleStream(s) },
+		ctx, func(si ServerStreamIface) { s := si.(*ServerStream); go handleStream(s) },
 	)
 	wantHeader := http.Header{
 		"Date":         nil,

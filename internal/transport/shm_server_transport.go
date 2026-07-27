@@ -83,7 +83,7 @@ type ShmServerTransport struct {
 
 	// Stream management
 	streams    map[uint32]*ServerStream
-	handleFunc func(*ServerStream)
+	handleFunc func(ServerStreamIface)
 	maxStreams uint32
 
 	// cachedStream caches the only active stream pointer for single-stream
@@ -643,7 +643,7 @@ func NewShmServerTransport(segment *Segment, localAddr, remoteAddr net.Addr) (*S
 
 // HandleStreams receives incoming streams using the given handler.
 // This is typically run in a separate goroutine.
-func (t *ShmServerTransport) HandleStreams(ctx context.Context, handle func(*ServerStream)) {
+func (t *ShmServerTransport) HandleStreams(ctx context.Context, handle func(ServerStreamIface)) {
 	t.mu.Lock()
 	if t.closed.Load() {
 		t.mu.Unlock()
@@ -1687,9 +1687,18 @@ func (t *ShmServerTransport) writeProto(s *ServerStream, msg any, _ *WriteOption
 		StreamID: s.id,
 		Flags:    0,
 	}
+	// Marshal on THIS goroutine into an owned pooled buffer so the
+	// writer copies bytes into the ring rather than reading the live
+	// message asynchronously (which would race an application that
+	// reuses the message after SendMsg — see grpc-go SendMsg contract).
+	protoBytes, merr := marshalProtoForAsync(pm, pSize)
+	if merr != nil {
+		return true, merr
+	}
 	s.protoInFlight.Add(1)
-	if err := t.frameWriter.enqueueProtoAsync(s.ctx, &s.Stream, fh, pm, pSize); err != nil {
+	if err := t.frameWriter.enqueueProtoAsync(s.ctx, &s.Stream, fh, protoBytes, pSize); err != nil {
 		s.protoInFlight.Add(-1)
+		putAsyncProtoBuf(protoBytes)
 		return true, err
 	}
 	return true, nil
@@ -1921,6 +1930,17 @@ func (t *ShmServerTransport) onMessageStart(streamID uint32, lpmSize uint32) {
 	// for the full rationale (SHM pipelines multiple in-flight LPMs
 	// per stream so the stock SET-based maybeAdjust would lose
 	// outstanding pre-credit debt).
+	// A message that does not fit in the stream window can only be
+	// completed by lending the sender credit out of inFlow.delta, and
+	// that loan is double-charged under pipelining -- see
+	// shmEnsureStreamWindow for the full analysis. Grow the window to
+	// cover the message first, which retires the loan mechanism for
+	// this size class and keeps credit on the self-balancing
+	// onRead -> WINDOW_UPDATE path.
+	if g := s.fc.shmEnsureStreamWindow(lpmSize); g > 0 {
+		shmStreamWindowGrown.Add(uint64(g))
+		t.sendWindowUpdateForce(streamID, g)
+	}
 	if w := s.fc.maybeAdjustAdditive(lpmSize); w > 0 {
 		shmStreamPreCreditEmitted.Add(uint64(w))
 		t.sendWindowUpdateForce(streamID, w)

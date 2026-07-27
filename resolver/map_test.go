@@ -38,6 +38,7 @@ var (
 	addr5 = Address{Addr: "a1", Attributes: attributes.New("a1", "3"), ServerName: "s1"}
 	addr6 = Address{Addr: "a1", Attributes: attributes.New("a1", 3), ServerName: "s2"}
 	addr7 = Address{Addr: "a1", Attributes: attributes.New("a1", 3), ServerName: "s1", BalancerAttributes: attributes.New("xx", 3)}
+	addr8 = Address{Addr: "a1", Attributes: attributes.New("a1", 3), ServerName: "s1", TransportType: "tt1"}
 
 	endpoint1   = Endpoint{Addresses: []Address{{Addr: "addr1"}}}
 	endpoint2   = Endpoint{Addresses: []Address{{Addr: "addr2"}}}
@@ -50,6 +51,34 @@ var (
 	endpoint21  = Endpoint{Addresses: []Address{{Addr: "addr2"}, {Addr: "addr1"}}}
 	endpoint123 = Endpoint{Addresses: []Address{{Addr: "addr1"}, {Addr: "addr2"}, {Addr: "addr3"}}}
 )
+
+// TestAddressMap_TransportType verifies that TransportType participates in
+// AddressMapV2 identity.  addr8 differs from addr1 only by TransportType, so
+// the two must not alias: aliasing would let a balancer hand back the SubConn
+// of a different transport for the same endpoint address.
+func (s) TestAddressMap_TransportType(t *testing.T) {
+	addrMap := NewAddressMapV2[int]()
+	addrMap.Set(addr1, 1)
+	addrMap.Set(addr8, 8)
+
+	if got, want := addrMap.Len(), 2; got != want {
+		t.Fatalf("addrMap.Len() = %v; want %v (addresses differing only by TransportType must be distinct)", got, want)
+	}
+	if got, ok := addrMap.Get(addr1); !ok || got != 1 {
+		t.Fatalf("addrMap.Get(addr1) = %v, %v; want 1, true", got, ok)
+	}
+	if got, ok := addrMap.Get(addr8); !ok || got != 8 {
+		t.Fatalf("addrMap.Get(addr8) = %v, %v; want 8, true", got, ok)
+	}
+
+	addrMap.Delete(addr8)
+	if _, ok := addrMap.Get(addr8); ok {
+		t.Fatalf("addrMap.Get(addr8) succeeded after Delete(addr8); want failure")
+	}
+	if got, ok := addrMap.Get(addr1); !ok || got != 1 {
+		t.Fatalf("addrMap.Get(addr1) = %v, %v after Delete(addr8); want 1, true", got, ok)
+	}
+}
 
 func (s) TestAddressMap_Length(t *testing.T) {
 	addrMap := NewAddressMapV2[any]()

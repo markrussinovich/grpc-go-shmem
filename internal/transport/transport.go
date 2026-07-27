@@ -453,6 +453,28 @@ type Stream struct {
 	// Unused (remains false) on TCP/UDS HTTP/2 transports.
 	statusSent atomic.Bool
 
+	// shmDataDropped is a sticky SHM-writer tombstone: set true when the
+	// frame writer DROPS at least one outbound DATA entry for this
+	// stream (a flow-control-deferred entry whose ctx was cancelled, a
+	// stream-local close, or a ring-write error). It means "no further
+	// outbound DATA or successful OK TRAILERS may be emitted for this
+	// stream", WITHOUT claiming the stream-teardown ownership that the
+	// streamDone state carries.
+	//
+	// Rationale: the writer previously overloaded the streamDone STATE
+	// for this purpose (discardDeferredTrailer's unconditional
+	// compareAndSwapState(streamActive, streamDone)). But for a
+	// ClientStream, streamDone ALSO means "a closeStream owns the
+	// teardown and will close s.done"; a writer tombstone that set
+	// streamDone impersonated a closer, so a later closeStream took its
+	// "already streamDone -> wait on <-s.done" branch and deadlocked
+	// (nothing ever closes s.done). A dedicated flag reserves the
+	// streamDone state for real closers.
+	//
+	// Same design principle as statusSent above. Unused (remains false)
+	// on TCP/UDS HTTP/2 transports.
+	shmDataDropped atomic.Bool
+
 	// sendQuota is the per-stream outbound flow-control window (in
 	// bytes) on the SHM transport, replacing the legacy
 	// `ShmClientTransport.streamSendQuota map[uint32]int64` that was
@@ -794,7 +816,7 @@ type ClientTransport interface {
 	GracefulClose()
 
 	// NewStream creates a Stream for an RPC.
-	NewStream(ctx context.Context, callHdr *CallHdr, handler stats.Handler) (*ClientStream, error)
+	NewStream(ctx context.Context, callHdr *CallHdr, handler stats.Handler) (ClientStreamIface, error)
 
 	// Error returns a channel that is closed when some I/O error
 	// happens. Typically the caller should have a goroutine to monitor
@@ -824,7 +846,7 @@ type ClientTransport interface {
 // Write methods for a given Stream will be called serially.
 type ServerTransport interface {
 	// HandleStreams receives incoming streams using the given handler.
-	HandleStreams(context.Context, func(*ServerStream))
+	HandleStreams(context.Context, func(ServerStreamIface))
 
 	// Close tears down the transport. Once it is called, the transport
 	// should not be accessed any more. All the pending streams and their
